@@ -1,0 +1,100 @@
+{
+  "collector_version": "1.10.0",
+  "schema_version": "2.0",
+  "collected_at_utc": "2026-08-07T12:00:00+00:00",
+  "product_url": "https://www.ozon.ru/product/3627230434",
+  "reviews_url": "https://www.ozon.ru/product/3627230434?tab=reviews",
+  "pid": "3627230434",
+  "incomplete": false,
+  "missing_fields": [],
+  "target_variant": {"Цвет": "черный"},
+  "reviews_sorts": ["published_at_desc", "score_desc", "score_asc"],
+  "product": {
+    "title": "Xiaomi REDMI Buds 8 Active Беспроводные вкладыши наушники, черные",
+    "rating": 4.8,
+    "rating_source": "webSingleProductScore",
+    "rating_count": 5145,
+    "price_text": "1 690 ₽",
+    "price_parts": [
+      {"t": "1 690 ₽", "y": 640, "x": 20, "fs": 32, "weight": 700, "strike": false}
+    ],
+    "price_parsed": [{"raw": "1 690 ₽", "value": 1690}],
+    "price": {"current": 1690, "old": 1990, "bank": 1600, "confidence": 0.97, "source": "webPrice"},
+    "characteristics": {
+      "Артикул": "3627230434",
+      "Бренд": "Xiaomi",
+      "Тип": "Вкладыши",
+      "Беспроводные": "Да",
+      "Микрофон": "Да"
+    },
+    "gallery": ["https://ir.ozone.ru/s3/multimedia-x/123.jpg"],
+    "descriptions": ["Описание: наушники Xiaomi REDMI Buds 8 Active"],
+    "infographics": [],
+    "category": "headphones"
+  },
+  "reviews": [
+    {
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "publishedAt": "1786095940",
+      "author": "Светлана В.",
+      "author2": "",
+      "date": "7 августа 2026",
+      "variant": "Цвет товара: черный\nКачество звука:Хорошее",
+      "stars": 5,
+      "text": "купила в подарок, работают, все нормально.",
+      "helpful_yes": 0,
+      "helpful_no": 0,
+      "comments_count": 0,
+      "review_sort": "published_at_desc",
+      "review_sorts": ["published_at_desc", "score_desc", "score_asc"]
+    }
+  ],
+  "reviews_collected": 1,
+  "reviews_expected": null,
+  "pages": 1,
+  "review_pages": [
+    {"page": 1, "n_found": 1, "n_matched": 1, "ok": true, "stop_reason": "no_next"}
+  ],
+  "source": "cdp",
+  "artifacts": {"dom_snapshot": "data/3627230434/dom/2026-08-07.html.gz"},
+  "gallery_ocr": [
+    {
+      "path": "img_002.jpg",
+      "url": "https://ir.ozone.ru/s3/multimedia-x/123.jpg",
+      "text": "Звонки без помех",
+      "mean_conf": 90.6,
+      "width": 900,
+      "height": 1200,
+      "size_bytes": 51076,
+      "md5": "ed9738f5cd020aba5a14169e90f1be7d"
+    }
+  ],
+  "gallery_dir": "data/gallery_3627230434",
+  "gallery_stats": {
+    "downloaded": 1,
+    "skipped_small": 0,
+    "skipped_plain": 0,
+    "failed": 0,
+    "images": {
+      "img_002.jpg": {
+        "width": 900,
+        "height": 1200,
+        "size_bytes": 51076,
+        "md5": "ed9738f5cd020aba5a14169e90f1be7d",
+        "url": "https://ir.ozone.ru/s3/multimedia-x/123.jpg"
+      }
+    },
+    "ocr_failed": 0,
+    "with_text": 1,
+    "no_text": 0,
+    "ocr_mean_conf": 90.6,
+    "total": 1,
+    "ocr_engine": "4.1.1",
+    "ocr_threads": 8,
+    "preprocess": "cv2v1",
+    "ocr_wall_seconds": 32.4,
+    "cache_hits": 0,
+    "cache_misses": 1
+  },
+  "gallery_stats_text": "gallery_ocr: 1 скачано, 1 с текстом, 0 без текста, 0 ошибок загрузки, 0 ошибок OCR, mean_conf 90.6, engine 4.1.1, threads 8, preproc cv2v1, cache 0 hit / 1 miss, 32.4s"
+}

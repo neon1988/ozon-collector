@@ -1,0 +1,6 @@
+pytest>=7
+playwright>=1.40
+pillow>=10.0
+pytesseract>=0.3.10
+opencv-python>=4.8  # опционально: предобработка OCR (gray/upscale/CLAHE)
+# tesseract-ocr + rus: apt install tesseract-ocr tesseract-ocr-rus
