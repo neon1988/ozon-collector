@@ -5,6 +5,9 @@
 - Кеш-хит гарантирует: файл существует, raw полный (incomplete != True),
   collected_at_utc валиден и свеж, schema совместима, версия коллектора
   совпадает с текущей (старые сборки могли содержать ошибки сбора).
+- Хит ищется среди ВСЕХ raw-файлов pid (канон + timestamp-файлы
+  {pid}_raw.*.json): свежий прогон текущей версии не теряется, если канон
+  занят старой версией (overwrite-защита Фазы B) — берётся лучший валидный.
 - Причины промаха различаются для логов (reason), наружу маппятся в
   компактное miss/stale/hit.
 """
@@ -75,6 +78,90 @@ def raw_save_path(pid: str, data_dir: str = "data",
     return cand
 
 
+def _raw_candidates(pid: str, data_dir: str = "data") -> list[str]:
+    """Существующие raw-файлы pid: канон + timestamp-файлы {pid}_raw.*.json.
+
+    Канонический файл первым, остальные в алфавитном порядке имён. Это
+    позволяет кешу видеть данные нового прогона даже когда канон занят
+    старой версией коллектора (overwrite-защита, Фаза B).
+    """
+    canon = os.path.join(data_dir, f"{pid}_raw.json")
+    out = [canon] if os.path.exists(canon) else []
+    prefix = f"{pid}_raw."
+    try:
+        names = sorted(os.listdir(data_dir))
+    except OSError:
+        return out
+    for n in names:
+        if n.startswith(prefix) and n.endswith(".json"):
+            p = os.path.join(data_dir, n)
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def _validate_raw(raw: dict, pid: str | None = None) -> str | None:
+    """Причина непригодности raw для кеша; None — годен (полный, совместимый).
+
+    Порядок проверок как в cache_check: incomplete → schema → версия →
+    timestamp. pid — ожидаемый PID (необязательно): при передаче raw с другим
+    pid (битый файл) тоже отклоняется. Негодные кандидаты не блокируют поиск
+    лучшего файла.
+    """
+    if raw.get("incomplete"):
+        return "incomplete"
+    if pid is not None and str(raw.get("pid") or "") != str(pid):
+        return "pid_mismatch"
+    if raw.get("schema_version") != SCHEMA_VERSION:
+        return "incompatible"
+    vs = version_status(raw.get("collector_version"))
+    if vs in ("old", "invalid"):
+        return "old_version"
+    if vs == "newer":
+        return "newer_version"
+    if not raw.get("collected_at_utc"):
+        return "bad_timestamp"
+    if _parse_utc(raw.get("collected_at_utc")) is None:
+        return "bad_timestamp"
+    return None
+
+
+def _best_raw(pid: str, data_dir: str = "data") -> tuple[dict | None, str]:
+    """Лучший валидный raw среди канона и timestamp-файлов.
+
+    Кандидаты ранжируются по (версия, дата сбора, число отзывов): новейший
+    полный raw текущей версии предпочтительнее старого канона; при равных —
+    больший reviews_collected. Возвращает (raw, reason): reason == "candidate"
+    при валидном кандидате, иначе причина первой неудачной валидации
+    (или "missing", если файлов для pid нет вовсе).
+    """
+    best: dict | None = None
+    best_key: tuple | None = None
+    first_reason: str | None = None
+    for path in _raw_candidates(pid, data_dir):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            continue
+        reason = _validate_raw(raw, pid)
+        if reason is not None:
+            if first_reason is None:
+                first_reason = reason
+            continue
+        dt = _parse_utc(raw.get("collected_at_utc"))
+        key = (
+            _version_tuple(raw.get("collector_version")) or (0,),
+            dt.timestamp() if dt is not None else 0.0,
+            int(raw.get("reviews_collected") or 0),
+        )
+        if best is None or key > best_key:
+            best, best_key = raw, key
+    if best is None:
+        return None, first_reason or "missing"
+    return best, "candidate"
+
+
 def _version_tuple(s) -> tuple[int, ...] | None:
     """'1.10.0' → (1, 10, 0). None при отсутствии или не-разборчивой строке.
 
@@ -134,43 +221,23 @@ def cached_version(pid: str, data_dir: str = "data"):
 
 def cache_check(pid: str, max_age_s: int,
                 data_dir: str = "data") -> tuple[dict | None, str]:
-    """Проверяет кеш {pid}_raw.json. Возвращает (raw|None, reason).
+    """Проверяет кеш raw (канон + timestamp-файлы). Возвращает (raw|None, reason).
 
-    reason: off | missing | incomplete | incompatible | old_version |
-            newer_version | bad_timestamp | stale | hit
+    Ищет лучший валидный raw среди data/{pid}_raw.json и data/{pid}_raw.*.json
+    (_best_raw): данные свежего прогона текущей версии не отбрасываются только
+    потому, что канон занят старой версией коллектора.
+
+    reason: off | missing | pid_mismatch | incomplete | incompatible |
+            old_version | newer_version | bad_timestamp | stale | hit
     """
     if max_age_s <= 0:
         return None, "off"
 
-    path = raw_path(pid, data_dir)
-    if not os.path.exists(path):
-        return None, "missing"
+    raw, reason = _best_raw(pid, data_dir)
+    if raw is None:
+        return None, reason
 
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
-        return None, "missing"
-
-    if raw.get("incomplete"):
-        return None, "incomplete"
-
-    if raw.get("schema_version") != SCHEMA_VERSION:
-        return None, "incompatible"
-
-    vs = version_status(raw.get("collector_version"))
-    if vs in ("old", "invalid"):
-        return None, "old_version"
-    if vs == "newer":
-        return None, "newer_version"
-
-    collected_at = raw.get("collected_at_utc")
-    if not collected_at:
-        return None, "bad_timestamp"
-    dt = _parse_utc(collected_at)
-    if dt is None:
-        return None, "bad_timestamp"
-
+    dt = _parse_utc(raw.get("collected_at_utc"))
     age_s = (datetime.now(timezone.utc) - dt).total_seconds()
     if age_s > max_age_s:
         return None, "stale"

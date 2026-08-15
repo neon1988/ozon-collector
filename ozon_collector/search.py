@@ -128,6 +128,8 @@ def _collect_links_with_recovery(sess, manager, url: str, limit: int,
         attempts += 1
         try:
             sess.goto(url)
+            if getattr(sess, "page", None) is not None:
+                C.check_challenge(sess.page, "search_page")
             return _collect_links(sess, limit)
         except Exception as e:
             cls = B.classify_error(e, sess=sess)

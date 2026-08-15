@@ -651,10 +651,61 @@ def _t_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+CHALLENGE_TITLE_MARKERS = (
+    "похоже, нет соединения",
+    "доступ ограничен",
+    "подтвердите, что вы не робот",
+    "подтвердите, что вы человек",
+    "проверка, что вы не робот",
+)
+
+CHALLENGE_BODY_MARKERS = (
+    "fab_chlg_",
+    "выключите vpn",
+)
+
+
+def detect_challenge(page) -> str | None:
+    """Сигнатура анти-бот-страницы Ozon (FAB/captcha) или None.
+
+    Смотрим document.title (дёшево) и body-текст (маркеры DOM). 0 отзывов
+    НЕ является признаком челленджа — детектор полагается только на эти
+    сигнатуры, чтобы не ронять реальные карточки без отзывов.
+    """
+    try:
+        title = (page.title() or "").strip().lower()
+    except Exception:
+        title = ""
+    for m in CHALLENGE_TITLE_MARKERS:
+        if m in title:
+            return f"title:{m}"
+    try:
+        body = (page.evaluate(
+            "() => (document.body ? document.body.innerText : '')") or "")
+        body = body.lower()
+    except Exception:
+        return None
+    for m in CHALLENGE_BODY_MARKERS:
+        if m in body:
+            return f"dom:{m}"
+    return None
+
+
+def check_challenge(page, where: str) -> None:
+    """Поднять AccessChallengeError, если страница — анти-бот-заглушка."""
+    sig = detect_challenge(page)
+    if sig:
+        raise B.AccessChallengeError(f"анти-бот ({where}): {sig}")
+
+
 def collect_product(page, product_url: str, category: str | None = None) -> dict:
     product = page.evaluate(PRODUCT_JS)
     if not product:
         raise RuntimeError("JS-извлечение карточки вернуло None (антибот?)")
+    title = (product.get("title") or "").strip().lower()
+    for m in CHALLENGE_TITLE_MARKERS:
+        if m in title:
+            raise B.AccessChallengeError(f"анти-бот (product.title): {m}")
     if category:
         product["category"] = category
     return product
@@ -1151,6 +1202,7 @@ def _collect_reviews_pass(
             print(f"[collect] page {p} goto warn: {e}")
             log.warning(f"[collect] page {p} goto warn: {e}")
             page.wait_for_timeout(3000)
+        check_challenge(page, f"reviews_page p{p}")
         if apply_variant_mode:
             vm = _activate_variant_mode(page)
             if variant_mode is None or vm.get("used"):
@@ -1414,6 +1466,7 @@ def collect(
     telemetry: dict = {}
     try:
         sess.goto(product_url)
+        check_challenge(sess.page, "product_page")
         requested_pid = pid_from_url(product_url)
         actual_pid = pid_from_url(sess.page.url)
         if (requested_pid and actual_pid and requested_pid != "unknown"

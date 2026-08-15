@@ -17,6 +17,7 @@ from ozon_collector.cache import (
     cache_is_compatible,
     cache_check,
     cached_version,
+    _raw_candidates,
 )
 from ozon_collector.collect import collect
 from ozon_collector import VERSION
@@ -237,6 +238,113 @@ def test_cache_check_hit_newer_is_miss(tmp_path):
 
 def test_cached_version_missing_file(tmp_path):
     assert cached_version("nope", str(tmp_path)) is None
+
+
+# ---- discovery: канон + timestamp-файлы -------------------------------------
+
+def _write_raw(tmp_path, pid, fname, version=VERSION, incomplete=False,
+               reviews=0, minutes=-5, schema="2.0"):
+    raw = {
+        "schema_version": schema,
+        "collector_version": version,
+        "pid": pid,
+        "incomplete": incomplete,
+        "reviews_collected": reviews,
+        "collected_at_utc": _now_utc_str(minutes=minutes),
+    }
+    with open(os.path.join(tmp_path, fname), "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+
+
+def test_raw_candidates_canonical_first_then_timestamp(tmp_path):
+    _write_raw(tmp_path, "77", "77_raw.json")
+    _write_raw(tmp_path, "77", "77_raw.20260815-203144.1.json")
+    _write_raw(tmp_path, "77", "77_raw.20260815-220702.1.json")
+    cands = _raw_candidates("77", str(tmp_path))
+    assert cands[0].endswith("77_raw.json")
+    assert len(cands) == 3
+    assert all(c.startswith(str(tmp_path)) for c in cands)
+
+
+def test_raw_candidates_ignores_other_pids(tmp_path):
+    _write_raw(tmp_path, "77", "77_raw.json")
+    _write_raw(tmp_path, "77", "77_raw.20260815-203144.1.json")
+    _write_raw(tmp_path, "99", "99_raw.json")
+    _write_raw(tmp_path, "770", "770_raw.json")     # префикс, но другой pid
+    assert len(_raw_candidates("77", str(tmp_path))) == 2
+
+
+def test_raw_candidates_missing_dir(tmp_path):
+    assert _raw_candidates("77", os.path.join(str(tmp_path), "nope")) == []
+
+
+def test_cache_check_picks_valid_timestamp_over_old_canonical(tmp_path):
+    """Канон старой версии (1.5.0), но timestamp-файл текущей версии свежий →
+    hit по timestamp, без похода в Ozon."""
+    _write_raw(tmp_path, "77", "77_raw.json", version="1.5.0", reviews=1)
+    _write_raw(tmp_path, "77", "77_raw.20260815-203144.1.json",
+               reviews=78, minutes=-10)
+    raw, reason = cache_check("77", 86400, str(tmp_path))
+    assert reason == "hit"
+    assert raw["reviews_collected"] == 78
+
+
+def test_cache_check_picks_newest_valid_timestamp(tmp_path):
+    """Несколько валидных timestamp: предпочтение — версия, затем дата."""
+    _write_raw(tmp_path, "77", "77_raw.20260815-203144.1.json",
+               reviews=78, minutes=-120)
+    _write_raw(tmp_path, "77", "77_raw.20260815-211744.1.json",
+               reviews=75, minutes=-60)
+    raw, reason = cache_check("77", 86400, str(tmp_path))
+    assert reason == "hit"
+    assert raw["reviews_collected"] == 75
+
+
+def test_cache_check_skips_incomplete_timestamp(tmp_path):
+    """Свежий timestamp, но неполный (челлендж-прогон) → не берётся; канон
+    старой версии тоже → miss old_version."""
+    _write_raw(tmp_path, "77", "77_raw.json", version="1.5.0", reviews=1)
+    _write_raw(tmp_path, "77", "77_raw.20260815-220702.1.json",
+               incomplete=True, reviews=0, minutes=-5)
+    raw, reason = cache_check("77", 86400, str(tmp_path))
+    assert raw is None and reason == "old_version"
+
+
+def test_cache_check_hit_from_timestamp_only(tmp_path):
+    """Канона нет вовсе, но есть свежий валидный timestamp-файл → hit."""
+    _write_raw(tmp_path, "77", "77_raw.20260815-203144.1.json", reviews=96)
+    raw, reason = cache_check("77", 86400, str(tmp_path))
+    assert reason == "hit"
+    assert raw["reviews_collected"] == 96
+
+
+def test_cache_check_pid_mismatch_rejected(tmp_path):
+    """Файл с чужим pid внутри (битый/подменённый) → не берётся."""
+    _write_raw(tmp_path, "77", "77_raw.json", reviews=5)
+    path = os.path.join(tmp_path, "77_raw.json")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["pid"] = "99"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    r, reason = cache_check("77", 86400, str(tmp_path))
+    assert r is None and reason == "pid_mismatch"
+
+
+def test_cache_check_valid_timestamp_beats_pid_mismatch_canonical(tmp_path):
+    """Канон с чужим pid, но свежий валидный timestamp → hit по timestamp."""
+    _write_raw(tmp_path, "77", "77_raw.json", reviews=5)
+    path = os.path.join(tmp_path, "77_raw.json")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["pid"] = "99"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    _write_raw(tmp_path, "77", "77_raw.20260815-203144.1.json",
+               reviews=78, minutes=-10)
+    r, reason = cache_check("77", 86400, str(tmp_path))
+    assert reason == "hit"
+    assert r["reviews_collected"] == 78
 
 
 # ---- внешняя сессия в collect() -------------------------------------------

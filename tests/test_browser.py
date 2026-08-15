@@ -90,6 +90,7 @@ def test_is_renderer_failure_false():
 def test_classification_should_recycle():
     assert B.Classification("browser").should_recycle is True
     assert B.Classification("renderer_failure").should_recycle is True
+    assert B.Classification("access_challenge").should_recycle is True
     assert B.Classification("target").should_recycle is False
     assert B.Classification("unknown").should_recycle is False
 
@@ -158,6 +159,15 @@ def test_classify_timeout_live_page_not_recyclable():
 def test_classify_non_playwright_error():
     c = B.classify_error(RuntimeError("something else"))
     assert c.error_kind == "unknown"
+
+
+def test_classify_access_challenge():
+    """Анти-бот-заглушка (FAB «Похоже, нет соединения») — отдельный error_kind,
+    recyclable (перезапуск браузера), НЕ маскируется под unknown."""
+    c = B.classify_error(B.AccessChallengeError(
+        "анти-бот (product_page): title:похоже, нет соединения"))
+    assert c.error_kind == "access_challenge"
+    assert c.should_recycle is True
 
 
 def test_classify_without_session_is_unknown():

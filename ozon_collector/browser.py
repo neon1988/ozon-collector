@@ -51,6 +51,15 @@ class BrowserOwnershipError(Exception):
     """
 
 
+class AccessChallengeError(Exception):
+    """Ozon отдал анти-бот/челлендж-страницу (FAB и т.п.) вместо контента.
+
+    Отдельный error_kind (access_challenge): такое НЕ должно считаться
+    успешным сбором — иначе в результат попадает страница-заглушка
+    («Похоже, нет соединения», 0 отзывов) как будто товар собран.
+    """
+
+
 def _launch_script_name() -> str:
     return "launch_chrome.ps1" if os.name == "nt" else "launch_chrome.sh"
 
@@ -144,7 +153,8 @@ class Classification:
 
     @property
     def should_recycle(self) -> bool:
-        return self.error_kind in ("browser", "renderer_failure")
+        return self.error_kind in ("browser", "renderer_failure",
+                                   "access_challenge")
 
 
 class BrowserProbe:
@@ -253,6 +263,8 @@ def classify_error(exc, sess=None) -> Classification:
     if isinstance(exc, BrowserRecoveryError):
         return Classification("browser", probe_state="watchdog",
                               signature=signature)
+    if isinstance(exc, AccessChallengeError):
+        return Classification("access_challenge", signature=signature)
     from playwright.sync_api import Error as PWError
     if not isinstance(exc, PWError):
         return Classification("unknown", signature=signature)
