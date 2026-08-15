@@ -202,6 +202,7 @@ ozon-collector {collect,ocr,report,gather,search} [опции]
 | `--no-ocr` | пропустить OCR (быстрый прогон без tesseract) | OCR выполняется |
 | `--max-age AGE` | TTL сырого кеша (см. ниже), `0` = не читать кеш | `1d` |
 | `--no-dedup-replies` | не скрывать повторяющиеся ответы продавца (см. ниже) | дедуп включён |
+| `--overwrite` | перезаписывать существующий `data/{pid}_raw.json`; иначе новый прогон → `data/{pid}_raw.<ts>.<i>.json` | выкл |
 
 ### `search` — дайджест выдачи Ozon для LLM (v1.11.0)
 
@@ -230,13 +231,17 @@ python3 cli.py search --url "https://www.ozon.ru/category/palatki-4-mestnye-9889
 | `--query TEXT` | поисковый запрос (альтернатива `--url`) | — |
 | `--url URL` | URL выдачи Ozon | — |
 | `--limit N` | сколько товаров собрать | 5 |
-| `--reviews-per-product N` | отзывов на товар в digest (`0` = все) | 15 |
+| `--reviews-per-product N` | отзывов на товар в digest (`0` = все) | 100 |
 | `--min-reviews N` | минимум отзывов на странице (как в `collect`) | 40 |
 | `--max-pages N` | лимит страниц пагинации отзывов | 12 |
 | `--out PATH` | путь markdown-digest | stdout |
 | `--out-raw PATH` | путь combined raw (все товары) | `data/search_combined.json` |
 | `--max-age AGE` | TTL сырого кеша товаров | `1d` |
 | `--no-dedup-replies` | не скрывать повторяющиеся ответы продавца (см. ниже) | дедуп включён |
+| `--parallel N` | кол-во воркер-процессов (1..2), каждый со своим Chromium (Фаза B) | 1 |
+| `--allow-parallel-ocr` | разрешить OCR в параллельном сборе (потоки OCR на воркера уменьшаются) | выкл |
+| `--worker-timeout S` | макс. время ожидания воркеров, сек (5..3600) | 1800 |
+| `--overwrite` | перезаписывать существующий `data/{pid}_raw.json`; иначе новый прогон → `data/{pid}_raw.<ts>.<i>.json` | выкл |
 
 Переиспользуются все опции `gather` (`--variant`, `--category`, `--threads`,
 `--no-preproc`, `--no-dom`, `--no-ocr`, `--no-variant-mode`, `--sorts`,

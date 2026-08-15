@@ -37,6 +37,15 @@ def run_gather(cfg: dict, sess=None) -> dict:
     """
     pid = cfg["pid"]
     max_age_s = cfg.get("max_age_s", 0)
+    overwrite = cfg.get("overwrite", False)
+    out_raw = cfg.get("out_raw") or K.raw_save_path(pid, overwrite=overwrite)
+    canon = K.raw_path(pid)
+    if out_raw != canon and os.path.exists(canon):
+        print(f"[gather] pid={pid}: {canon} уже существует — "
+              f"новый прогон в {os.path.basename(out_raw)} "
+              f"(перезапись только с --overwrite)")
+        log.warning(f"pid={pid}: перезапись запрещена, "
+                    f"новый raw: {out_raw}")
     result = {
         "pid": pid,
         "ok": False,
@@ -83,7 +92,7 @@ def run_gather(cfg: dict, sess=None) -> dict:
                 variant=cfg.get("variant") or "",
                 max_pages=cfg.get("max_pages", 12),
                 min_reviews=cfg.get("min_reviews", 40),
-                out_path=cfg.get("out_raw"),
+                out_path=out_raw,
                 category=cfg.get("category"),
                 save_dom=not cfg.get("no_dom"),
                 apply_variant_mode=not cfg.get("no_variant_mode"),
@@ -112,8 +121,7 @@ def run_gather(cfg: dict, sess=None) -> dict:
                         "data", f"gallery_{pid_}")
                     O.ocr_gallery(raw, gdir, threads=cfg.get("threads", 8),
                                   preproc=not cfg.get("no_preproc"))
-                    raw_path = cfg.get("out_raw") or K.raw_path(pid_)
-                    _save_raw(raw, raw_path)
+                    _save_raw(raw, out_raw)
                     result["ocr"] = "ran"
                     n_img = len(raw.get("gallery_ocr") or []) or len(urls)
                     print(f"[gather] pid={pid}: ocr=ran ({n_img} картинок)")

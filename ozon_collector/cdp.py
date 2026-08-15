@@ -13,6 +13,7 @@ from playwright.sync_api import sync_playwright
 
 from .browser import BrowserWatchdog, is_renderer_failure
 from . import log
+from . import process as P
 
 
 def _cdp_port(cdp_url: str) -> int:
@@ -37,8 +38,12 @@ def _launch_script_path() -> Path:
             / _launch_script_name())
 
 
-def _launch_browser(cdp_url: str):
-    """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url)."""
+def _launch_browser(cdp_url: str, profile_path: str | None = None):
+    """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url).
+
+    profile_path — полный путь --user-data-dir (для воркеров передаёт PROFILE
+    env в launch_chrome.ps1/.sh; None = дефолтный профиль скрипта).
+    """
     script = _launch_script_path()
     if not script.exists():
         raise RuntimeError(
@@ -50,6 +55,8 @@ def _launch_browser(cdp_url: str):
         )
     env = dict(os.environ)
     env["PORT"] = str(_cdp_port(cdp_url))
+    if profile_path:
+        env["PROFILE"] = profile_path
     cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
            if os.name == "nt" else [str(script)])
     subprocess.Popen(cmd, env=env,
@@ -59,18 +66,23 @@ def _launch_browser(cdp_url: str):
 
 
 def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
-                    wait_s: float = 30.0) -> bool:
+                    wait_s: float = 30.0,
+                    profile_token: str | None = None) -> bool:
     """Авто-запуск браузера, если он закрыт; ждёт готовности до wait_s.
 
     Возвращает True, если браузер жив после ожидания (запущен нами или уже был).
     При недоступности — RuntimeError с подсказкой ручного запуска.
+    profile_token — токен профиля воркера (None = дефолтный профиль).
     """
     if browser_alive(cdp_url):
         return True
     print(f"[cdp] браузер не запущен на {cdp_url}, запускаю…")
     log.warning(f"браузер не запущен на {cdp_url}, запускаю…",
                 extra={"cdp_url": cdp_url})
-    _launch_browser(cdp_url)
+    profile_path = None
+    if profile_token:
+        profile_path = P.profile_path(profile_token)
+    _launch_browser(cdp_url, profile_path=profile_path)
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         if browser_alive(cdp_url):
@@ -96,8 +108,10 @@ class Session:
     """
 
     def __init__(self, cdp_url: str = "http://127.0.0.1:9222",
-                 auto_launch: Optional[bool] = None):
+                 auto_launch: Optional[bool] = None,
+                 profile_token: str = P.PROFILE_TOKEN):
         self.cdp_url = cdp_url
+        self.profile_token = profile_token
         self.auto_launch = (auto_launch if auto_launch is not None
                             else os.environ.get("OZON_AUTO_LAUNCH", "1") != "0")
         self._playwright = None
@@ -108,14 +122,15 @@ class Session:
 
     def _connect(self):
         if self.auto_launch and not browser_alive(self.cdp_url):
-            launch_and_wait(self.cdp_url)
+            launch_and_wait(self.cdp_url, profile_token=self.profile_token)
         self._playwright = sync_playwright().start()
         try:
             self._browser = self._playwright.chromium.connect_over_cdp(
                 self.cdp_url)
         except Exception:
             if self.auto_launch and self._browser is None:
-                launch_and_wait(self.cdp_url)
+                launch_and_wait(self.cdp_url,
+                                profile_token=self.profile_token)
                 self._browser = self._playwright.chromium.connect_over_cdp(
                     self.cdp_url)
             else:
@@ -168,7 +183,8 @@ class Session:
         от старого браузера не переносится.
         """
         if self._watchdog is None:
-            self._watchdog = BrowserWatchdog(self.cdp_url)
+            self._watchdog = BrowserWatchdog(self.cdp_url,
+                                             profile_token=self.profile_token)
             self._watchdog.start()
             log.debug(f"watchdog started: {self.cdp_url}")
 

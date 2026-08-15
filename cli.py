@@ -121,6 +121,7 @@ def cmd_gather(args):
         "threads": args.threads,
         "no_preproc": args.no_preproc,
         "gallery_dir": args.gallery_dir,
+        "overwrite": args.overwrite,
     }
     log.info(f"[cli] gather: pid={pid} variant={args.variant!r} "
              f"sorts={cfg['sorts']!r} max_age_s={max_age_s} "
@@ -160,11 +161,13 @@ def _gather_cfg_from_args(args, max_age_s):
         "threads": args.threads,
         "no_preproc": args.no_preproc,
         "dedup_replies": not args.no_dedup_replies,
+        "overwrite": args.overwrite,
     }
 
 
 def cmd_search(args):
     from ozon_collector.cdp import Session
+    from ozon_collector.parallel import collect_parallel
 
     if args.url:
         url = args.url
@@ -179,18 +182,51 @@ def cmd_search(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    _apply_scroll_jitter_seed(args)
+    parallel = args.parallel
+    from ozon_collector import PARALLEL_MAX_WORKERS
+    if not (1 <= parallel <= PARALLEL_MAX_WORKERS):
+        print(f"Error: --parallel должен быть в 1..{PARALLEL_MAX_WORKERS}",
+              file=sys.stderr)
+        sys.exit(1)
+    if parallel > 1 and not args.no_ocr and not args.allow_parallel_ocr:
+        print(f"Error: OCR в параллельном сборе требует --allow-parallel-ocr "
+              f"(или --no-ocr)", file=sys.stderr)
+        sys.exit(1)
+    if not (5 <= args.worker_timeout <= 3600):
+        print("Error: --worker-timeout должен быть в 5..3600 секунд",
+              file=sys.stderr)
+        sys.exit(1)
+
+    seed = _apply_scroll_jitter_seed(args)
     log.info(f"[cli] search: url={url} limit={args.limit} "
-             f"query={args.query!r} max_age_s={max_age_s}")
-    sess = Session()
-    try:
-        combined = S.collect_search(
-            sess, url, limit=args.limit,
-            gather_cfg=_gather_cfg_from_args(args, max_age_s),
-            query=args.query,
-        )
-    finally:
-        sess.close()
+             f"query={args.query!r} max_age_s={max_age_s} "
+             f"parallel={parallel}")
+    gather_cfg = _gather_cfg_from_args(args, max_age_s)
+    gather_cfg["scroll_jitter_seed"] = seed
+    if parallel > 1:
+        if not args.no_bootstrap_workers:
+            from ozon_collector.process import bootstrap_worker_profiles
+            bs = bootstrap_worker_profiles(range(1, parallel + 1))
+            for k, st in bs.items():
+                print(f"[parallel] bootstrap worker-{k}: {st}")
+                log.info(f"[parallel] bootstrap worker-{k}: {st}")
+        if args.allow_parallel_ocr:
+            import os as _os
+            gather_cfg["threads"] = max(2, (_os.cpu_count() or 2) // parallel)
+        combined = collect_parallel(
+            url, limit=args.limit, gather_cfg=gather_cfg,
+            parallel=parallel, query=args.query,
+            max_recycles=2, join_timeout_s=args.worker_timeout)
+    else:
+        sess = Session()
+        try:
+            combined = S.collect_search(
+                sess, url, limit=args.limit,
+                gather_cfg=gather_cfg,
+                query=args.query,
+            )
+        finally:
+            sess.close()
 
     md = R.render_search_digest(
         combined, reviews_per_product=args.reviews_per_product,
@@ -287,6 +323,9 @@ def main():
                     help="пропустить OCR (быстрый прогон, без tesseract)")
     pg.add_argument("--no-variant-mode", action="store_true",
                     help="не включать нативный фильтр «Этот вариант товара» (собрать все отзывы)")
+    pg.add_argument("--overwrite", action="store_true",
+                    help="разрешить перезапись существующего data/{pid}_raw.json "
+                         "(по умолчанию новый прогон пишется в data/{pid}_raw.<ts>.<i>.json)")
     pg.add_argument("--sorts", default=None,
                     help="сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
                          "(по умолчанию — одна сортировка «новые и полезные»)")
@@ -323,8 +362,23 @@ def main():
     ps.add_argument("--no-dom", action="store_true", help="не сохранять DOM-снимок")
     ps.add_argument("--no-ocr", action="store_true",
                     help="пропустить OCR (быстрый прогон, без tesseract)")
+    ps.add_argument("--parallel", type=int, default=1,
+                    help="кол-во воркер-процессов для search (1..2; "
+                         "каждый со своим Chromium)")
+    ps.add_argument("--allow-parallel-ocr",
+                    action="store_true",
+                    help="разрешить OCR в параллельном сборе "
+                         "(потоки OCR на воркера уменьшаются)")
+    ps.add_argument("--worker-timeout", type=float, default=1800.0,
+                    help="макс. время ожидания воркеров, сек (по умолч. 1800)")
+    ps.add_argument("--no-bootstrap-workers", action="store_true",
+                    help="не сеять cookies из ozon-profile в холодные "
+                         "воркер-профили (по умолч. автоматически при --parallel>1)")
     ps.add_argument("--no-variant-mode", action="store_true",
                     help="не включать нативный фильтр «Этот вариант товара» (собрать все отзывы)")
+    ps.add_argument("--overwrite", action="store_true",
+                    help="разрешить перезапись существующего data/{pid}_raw.json "
+                         "(по умолчанию новый прогон пишется в data/{pid}_raw.<ts>.<i>.json)")
     ps.add_argument("--sorts", default=None,
                     help="сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
                          "(по умолчанию — одна сортировка «новые и полезные»)")

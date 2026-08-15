@@ -13,6 +13,7 @@ from ozon_collector.cache import (
     _version_tuple,
     version_status,
     raw_path,
+    raw_save_path,
     cache_is_compatible,
     cache_check,
     cached_version,
@@ -308,3 +309,39 @@ def test_collect_owns_own_session(monkeypatch):
 
 def test_raw_path():
     assert raw_path("42") == os.path.join("data", "42_raw.json")
+
+
+def test_raw_save_path_returns_canonical_when_absent(tmp_path):
+    """Нет существующего raw → канонический data/{pid}_raw.json."""
+    p = raw_save_path("42", data_dir=str(tmp_path))
+    assert p == os.path.join(str(tmp_path), "42_raw.json")
+
+
+def test_raw_save_path_no_overwrite(tmp_path):
+    """Существующий raw НЕ перезаписывается: новый путь с суффиксом."""
+    canon = tmp_path / "42_raw.json"
+    canon.write_text('{"pid": "42", "reviews": []}', encoding="utf-8")
+    p = raw_save_path("42", data_dir=str(tmp_path))
+    assert p != str(canon)
+    assert os.path.basename(p).startswith("42_raw.")
+    assert p.endswith(".json")
+    # оригинал не тронут
+    assert canon.read_text(encoding="utf-8").startswith('{"pid": "42"')
+
+
+def test_raw_save_path_unique_collision(tmp_path):
+    """После записи run-id файла следующий вызов даёт другой файл (счётчик i)."""
+    canon = tmp_path / "42_raw.json"
+    canon.write_text("x", encoding="utf-8")
+    p1 = raw_save_path("42", data_dir=str(tmp_path))
+    tmp_path.joinpath(os.path.basename(p1)).write_text("data", encoding="utf-8")
+    p2 = raw_save_path("42", data_dir=str(tmp_path))
+    assert p1 != p2
+
+
+def test_raw_save_path_overwrite_force(tmp_path):
+    """overwrite=True → всегда канонический путь."""
+    canon = tmp_path / "42_raw.json"
+    canon.write_text("old", encoding="utf-8")
+    assert raw_save_path("42", data_dir=str(tmp_path),
+                         overwrite=True) == str(canon)

@@ -56,6 +56,25 @@ def raw_path(pid: str, data_dir: str = "data") -> str:
     return os.path.join(data_dir, f"{pid}_raw.json")
 
 
+def raw_save_path(pid: str, data_dir: str = "data",
+                  overwrite: bool = False) -> str:
+    """Путь для СОХРАНЕНИЯ raw.json с защитой от перезаписи (Фаза B).
+
+    Канонический data/{pid}_raw.json перезаписывается только с
+    overwrite=True. Иначе при существующем файле возвращается отдельный
+    data/{pid}_raw.<ts>.<i>.json (новый прогон не трогает старый артефакт).
+    """
+    canon = os.path.join(data_dir, f"{pid}_raw.json")
+    if overwrite or not os.path.exists(canon):
+        return canon
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for i in range(1, 10000):
+        cand = os.path.join(data_dir, f"{pid}_raw.{ts}.{i}.json")
+        if not os.path.exists(cand):
+            return cand
+    return cand
+
+
 def _version_tuple(s) -> tuple[int, ...] | None:
     """'1.10.0' → (1, 10, 0). None при отсутствии или не-разборчивой строке.
 

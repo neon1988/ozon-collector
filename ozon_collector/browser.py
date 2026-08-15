@@ -60,8 +60,12 @@ def _launch_script_path() -> Path:
             / _launch_script_name())
 
 
-def _launch_script(cdp_url: str):
-    """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url)."""
+def _launch_script(cdp_url: str, profile_path: str | None = None):
+    """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url).
+
+    profile_path — полный путь --user-data-dir (для воркеров передаёт PROFILE
+    env в launch_chrome.ps1/.sh; None = дефолтный профиль скрипта).
+    """
     script = _launch_script_path()
     if not script.exists():
         hint = ("powershell -ExecutionPolicy Bypass -File "
@@ -72,6 +76,8 @@ def _launch_script(cdp_url: str):
             f"Запустите браузер вручную: {hint}")
     env = dict(os.environ)
     env["PORT"] = str(P.cdp_port(cdp_url))
+    if profile_path:
+        env["PROFILE"] = profile_path
     cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
            if os.name == "nt" else [str(script)])
     subprocess.Popen(cmd, env=env,
@@ -291,8 +297,10 @@ class BrowserWatchdog:
     """
 
     def __init__(self, cdp_url: str, poll_interval: float = 2.0,
-                 grace_s: float = 4.0, probe: BrowserProbe | None = None):
+                 grace_s: float = 4.0, probe: BrowserProbe | None = None,
+                 profile_token: str = P.PROFILE_TOKEN):
         self.cdp_url = cdp_url
+        self.profile_token = profile_token
         self.poll_interval = poll_interval
         self.grace_s = grace_s
         self.probe = probe or BrowserProbe(http_timeout=1.0)
@@ -369,7 +377,8 @@ class BrowserWatchdog:
         """
         if self.probe.cdp_http_ok(self.cdp_url):
             return True
-        return bool(P.browser_processes(self.cdp_url))
+        return bool(P.browser_processes(self.cdp_url,
+                                        profile_token=self.profile_token))
 
 
 # ---- управление процессом браузера -----------------------------------------
@@ -391,12 +400,20 @@ class BrowserProcessManager:
     """
 
     def __init__(self, cdp_url: str = "http://127.0.0.1:9222",
+                 profile_token: str = P.PROFILE_TOKEN,
                  launch_wait_s: float = 8.0, kill_wait_s: float = 3.0,
                  capture_interval: float = 0.2):
         self.cdp_url = cdp_url
+        self.profile_token = profile_token
         self.launch_wait_s = launch_wait_s
         self.kill_wait_s = kill_wait_s
         self.capture_interval = capture_interval
+        self.profile_path = P.profile_path(profile_token)
+
+    def _matching(self) -> list:
+        """Matching-процессы на нашем (порт, profile_token)."""
+        return P.browser_processes(self.cdp_url,
+                                   profile_token=self.profile_token)
 
     def port_state(self) -> str:
         """Диагностика: 'listening' | 'not_listening' (TCP connect к порту).
@@ -422,12 +439,12 @@ class BrowserProcessManager:
         matching>1 -> BrowserOwnershipError.
         """
         wait_s = wait_s or self.launch_wait_s
-        _launch_script(self.cdp_url)
+        _launch_script(self.cdp_url, profile_path=self.profile_path)
         record = None
         deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline:
             if record is None:
-                matches = P.browser_processes(self.cdp_url)
+                matches = self._matching()
                 if matches:
                     if len(matches) > 1:
                         raise BrowserOwnershipError(
@@ -440,7 +457,7 @@ class BrowserProcessManager:
                 return record
             time.sleep(self.capture_interval)
         if record is None:
-            matches = P.browser_processes(self.cdp_url)
+            matches = self._matching()
             if matches:
                 if len(matches) > 1:
                     raise BrowserOwnershipError(
@@ -475,7 +492,7 @@ class BrowserProcessManager:
         После остановки не должно остаться matching-процессов (чужие -> violation).
         """
         self._assert_browser_stopped(old_records)
-        matching = P.browser_processes(self.cdp_url)
+        matching = self._matching()
         if matching:
             raise BrowserOwnershipError(
                 f"после остановки старых процессов на {self.cdp_url} найден "
@@ -495,7 +512,7 @@ class BrowserProcessManager:
         Чужой matching-процесс -> BrowserOwnershipError, ничего не убиваем.
         """
         wait_s = wait_s or self.kill_wait_s
-        matching = P.browser_processes(self.cdp_url)
+        matching = self._matching()
         owned_ids = {rec.identity for rec in owned}
         for ident in matching:
             if ident not in owned_ids:

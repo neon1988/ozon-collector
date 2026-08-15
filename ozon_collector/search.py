@@ -93,17 +93,17 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
     return [{"pid": p, "url": u} for p, u in seen.items()]
 
 
-def _recycle_browser(sess, launch_id: str, max_launch_wait: float = 20.0):
+def _recycle_browser(sess, manager, launch_id: str):
     """Recovery R1: перезапуск Chromium + переподключение CDP-сессии.
 
-    old_records — записи ТЕКУЩИХ matching-процессов на cdp_url сессии
-    (наш браузер). BrowserProcessManager.restart убивает их (identity-сверка),
-    проверяет отсутствие чужих, запускает новый процесс и дожидается CDP.
-    Затем сессия переподключается к новому браузеру.
+    manager — BrowserProcessManager (main или воркера): restart убивает только
+    matching-процессы (identity-сверка на (порт, профиль) менеджера), проверяет
+    отсутствие чужих, запускает новый процесс и дожидается CDP. Затем сессия
+    переподключается к новому браузеру.
     """
-    manager = B.BrowserProcessManager(cdp_url=sess.cdp_url)
     old = [P.ProcessRecord(launch_id, ident)
-           for ident in P.browser_processes(sess.cdp_url)]
+           for ident in P.browser_processes(
+               sess.cdp_url, profile_token=manager.profile_token)]
     manager.restart(old, launch_id)
     sess.reconnect()
 
@@ -114,7 +114,7 @@ def _recycle_browser(sess, launch_id: str, max_launch_wait: float = 20.0):
 RECYCLE_EVERY = 40
 
 
-def _collect_links_with_recovery(sess, url: str, limit: int,
+def _collect_links_with_recovery(sess, manager, url: str, limit: int,
                                  max_recycles: int, recovery: dict):
     """Докрутка выдачи с recovery: goto + _collect_links, при recyclable-ошибке
     браузер перезапускается (R1) и докрутка повторяется (до max_recycles).
@@ -141,13 +141,99 @@ def _collect_links_with_recovery(sess, url: str, limit: int,
                         extra={"signature": cls.signature,
                                "probe": cls.probe_state})
             try:
-                _recycle_browser(sess, f"search-links-r{attempts}")
+                _recycle_browser(sess, manager, f"search-links-r{attempts}")
             except Exception as re:
                 raise RuntimeError(
                     f"recycle при докрутке выдачи FAILED: {re}") from e
             recovery["recycles"] += 1
             recovery["events"].append(
                 {"pid": "links", "attempt": attempts, "kind": kind})
+
+
+def _collect_shard(sess, manager, items, gather_cfg: dict,
+                   max_recycles: int, recovery: dict,
+                   on_recovery=None, label: str = "search") -> list[dict]:
+    """Per-product recovery-цикл над списком (index, pid, url) в одной сессии.
+
+    ОДИН код для collect_search (main) и воркеров (parallel._worker_main):
+    R1/R2 recycle через переданный manager (identity-сверка на (порт, профиль)
+    менеджера) + preventive recycle каждые RECYCLE_EVERY товаров. Ошибка
+    отдельного товара не прерывает цикл.
+
+    Возвращает list[dict] результатов (res run_gather + recycle_attempts),
+    строго в порядке items. Телеметрия recovery пишется в recovery; on_recovery
+    — колбэк события (воркер → pipe телеметрия), None для main.
+    """
+    products: list[dict] = []
+    collected = 0
+    since_recycle = 0
+    total = len(items)
+    for n, (idx, pid, url) in enumerate(items, 1):
+        tag = f"[{label}] товар {n}/{total}"
+        print(f"{tag}: pid={pid} ({url})")
+        log.info(f"товар {n}/{total}: pid={pid}", extra={"url": url})
+        cfg = dict(gather_cfg)
+        cfg["pid"] = pid
+        cfg["url"] = url
+        attempts = 0
+        while True:
+            res = run_gather(cfg, sess=sess)
+            attempts += 1
+            if res["ok"] or not res.get("recyclable") or attempts > max_recycles:
+                break
+            kind = res.get("error_kind") or "unknown"
+            print(f"{tag}: {kind} → recycle браузера "
+                  f"(попытка {attempts}/{max_recycles})")
+            log.warning(f"товар {n}/{total}: {kind} → recycle браузера "
+                        f"(попытка {attempts}/{max_recycles})",
+                        extra={"pid": pid, "probe": res.get("error_probe_state"),
+                               "signature": res.get("error_signature")})
+            try:
+                _recycle_browser(sess, manager, f"{label}-{pid}-r{attempts}")
+            except Exception as e:
+                print(f"{tag}: recycle FAILED: {type(e).__name__}: {e}")
+                log.error(f"товар {n}/{total}: recycle FAILED: "
+                          f"{type(e).__name__}: {e}", extra={"pid": pid})
+                res["error"] = f"{res['error']}; recycle_failed: {e}"
+                res["recyclable"] = False
+                break
+            recovery["recycles"] += 1
+            ev = {"pid": pid, "attempt": attempts, "kind": kind}
+            recovery["events"].append(ev)
+            if on_recovery is not None:
+                on_recovery(ev)
+        res["recycle_attempts"] = attempts
+        products.append(res)
+        if res["ok"]:
+            collected += 1
+            n_rev = len((res.get("raw") or {}).get("reviews", []))
+            print(f"{tag}: ok · cache={res['cache']} · ocr={res['ocr']} "
+                  f"· отзывов {n_rev}")
+            log.info(f"товар {n}/{total}: ok · cache={res['cache']} "
+                     f"· ocr={res['ocr']} · отзывов {n_rev}", extra={"pid": pid})
+        else:
+            print(f"{tag}: fail · {res['error']}")
+            log.warning(f"товар {n}/{total}: fail · {res['error']}",
+                        extra={"pid": pid})
+        since_recycle += 1
+        if since_recycle >= RECYCLE_EVERY:
+            try:
+                _recycle_browser(sess, manager, f"{label}-preventive-{n}")
+            except Exception as e:
+                print(f"{tag}: preventive recycle FAILED: "
+                      f"{type(e).__name__}: {e}")
+                log.error(f"товар {n}/{total}: preventive recycle FAILED: "
+                          f"{type(e).__name__}: {e}", extra={"pid": pid})
+            else:
+                since_recycle = 0
+                recovery["recycles"] += 1
+                ev = {"pid": pid, "attempt": 0, "kind": "preventive"}
+                recovery["events"].append(ev)
+                if on_recovery is not None:
+                    on_recovery(ev)
+                log.info(f"preventive recycle после {n} товаров",
+                         extra={"pid": pid})
+    return products
 
 
 def collect_search(sess, url: str, limit: int, gather_cfg: dict,
@@ -169,80 +255,21 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
       products[{pid,ok,error,error_kind,error_probe_state,recycle_attempts,...}]
     """
     recovery = {"recycles": 0, "events": []}
+    manager = B.BrowserProcessManager(
+        cdp_url=getattr(sess, "cdp_url", "http://127.0.0.1:9222"))
     links = _collect_links_with_recovery(
-        sess, url, limit, max_recycles, recovery)
+        sess, manager, url, limit, max_recycles, recovery)
 
     found = len(links)
     selected = links[:limit]
-    total = len(selected)
+    items = [(i, it["pid"], it["url"]) for i, it in enumerate(selected)]
+    total = len(items)
     print(f"[search] найдено {found} товаров в выдаче, собираю {total}")
     log.info(f"найдено {found} товаров в выдаче, собираю {total}")
 
-    products = []
-    collected = 0
-    since_recycle = 0
-    for i, item in enumerate(selected, 1):
-        pid = item["pid"]
-        print(f"[search] товар {i}/{total}: pid={pid} ({item['url']})")
-        log.info(f"товар {i}/{total}: pid={pid}", extra={"url": item["url"]})
-        cfg = dict(gather_cfg)
-        cfg["pid"] = pid
-        cfg["url"] = item["url"]
-        attempts = 0
-        while True:
-            res = run_gather(cfg, sess=sess)
-            attempts += 1
-            if res["ok"] or not res.get("recyclable") or attempts > max_recycles:
-                break
-            kind = res.get("error_kind") or "unknown"
-            print(f"[search] товар {i}/{total}: {kind} → recycle браузера "
-                  f"(попытка {attempts}/{max_recycles})")
-            log.warning(f"товар {i}/{total}: {kind} → recycle браузера "
-                        f"(попытка {attempts}/{max_recycles})",
-                        extra={"pid": pid, "probe": res.get("error_probe_state"),
-                               "signature": res.get("error_signature")})
-            try:
-                _recycle_browser(sess, f"search-{pid}-r{attempts}")
-            except Exception as e:
-                print(f"[search] товар {i}/{total}: recycle FAILED: "
-                      f"{type(e).__name__}: {e}")
-                log.error(f"товар {i}/{total}: recycle FAILED: "
-                          f"{type(e).__name__}: {e}", extra={"pid": pid})
-                res["error"] = f"{res['error']}; recycle_failed: {e}"
-                res["recyclable"] = False
-                break
-            recovery["recycles"] += 1
-            recovery["events"].append(
-                {"pid": pid, "attempt": attempts, "kind": kind})
-        res["recycle_attempts"] = attempts
-        products.append(res)
-        if res["ok"]:
-            collected += 1
-            n = len((res.get("raw") or {}).get("reviews", []))
-            print(f"[search] товар {i}/{total}: ok · cache={res['cache']} "
-                  f"· ocr={res['ocr']} · отзывов {n}")
-            log.info(f"товар {i}/{total}: ok · cache={res['cache']} "
-                     f"· ocr={res['ocr']} · отзывов {n}", extra={"pid": pid})
-        else:
-            print(f"[search] товар {i}/{total}: fail · {res['error']}")
-            log.warning(f"товар {i}/{total}: fail · {res['error']}",
-                        extra={"pid": pid})
-        since_recycle += 1
-        if since_recycle >= RECYCLE_EVERY:
-            try:
-                _recycle_browser(sess, f"search-preventive-{i}")
-            except Exception as e:
-                print(f"[search] товар {i}/{total}: preventive recycle "
-                      f"FAILED: {type(e).__name__}: {e}")
-                log.error(f"товар {i}/{total}: preventive recycle FAILED: "
-                          f"{type(e).__name__}: {e}", extra={"pid": pid})
-            else:
-                since_recycle = 0
-                recovery["recycles"] += 1
-                recovery["events"].append(
-                    {"pid": pid, "attempt": 0, "kind": "preventive"})
-                log.info(f"preventive recycle после {i} товаров",
-                         extra={"pid": pid})
+    products = _collect_shard(sess, manager, items, gather_cfg,
+                              max_recycles, recovery, label="search")
+    collected = sum(1 for p in products if p["ok"])
 
     return {
         "schema_version": SCHEMA_VERSION,

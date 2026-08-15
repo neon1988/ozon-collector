@@ -75,6 +75,214 @@
       (265, новые константы) и `data/phaseA_accept_3627230434_raw.json` (264, возвращённые).
     - **Git:** Фаза A закоммичена (коммит согласован после приёмки 2 стабильных товаров).
 
+ - **ФАЗА B (`--parallel`): ПЛАН v2 — УТВЕРЖДЁН К РЕАЛИЗАЦИИ (2026-08-15).**
+   Цель: ускорить search-сбор за счёт N независимых CDP-сессий, НЕ трогая механику
+   `collect_reviews()` (вывод Фазы A: константы скролла зафиксированы, сбор — одиночный снимок DOM).
+   Принцип: параллельность = изолированные воркер-процессы, каждый владеет СВОИМ Chromium.
+   ```text
+   parent (CLI search)  ── main Session (порт 9222, ozon-profile) ── links (докрутка выдачи)
+        │   close Session + ПОЛНЫЙ recycle main-Chromium (kill на 9222)
+        │   round-robin шардирование (индекс — часть задания воркера)
+        ├─ worker-1: порт 9223, профиль ozon-profile-worker-1, всё своё
+        └─ worker-2: порт 9224, профиль ozon-profile-worker-2, всё своё
+        каждый worker: items[(index,pid,url)] → run_gather × N → payload по Pipe → parent merge
+   ```
+   ### 1. Архитектура и сериализация (правка 1)
+   - Новый `ozon_collector/parallel.py`: `collect_parallel(url, limit, gather_cfg, parallel, ...)` →
+     combined-объект схемы 2.0 + `parallel{workers[], shards[]}` (аддитивно).
+   - **spawn** (`multiprocessing.get_context("spawn")`, явно и на Linux — единый путь). Аргументы `worker_main` —
+     ТОЛЬКО сериализуемые:
+     ```python
+     spec = {"worker_id": k, "cdp_url": "http://127.0.0.1:9223",
+             "port": 9223, "profile_path": "...", "profile_token": "ozon-profile-worker-1",
+             "log_path": "logs/ozon_worker_1.log"}
+     task = {"items": [(0, pid, url), (2, pid, url), ...],   # index — ЧАСТЬ задания (правка 2)
+             "gather_cfg": { ...скалярные значения, БЕЗ лямбд/объектов... },
+             "max_recycles": 2, "scroll_jitter_seed": 12345}
+     ```
+     Никаких Session/Manager/Watchdog/ProcessRecord/лямбд/pipe в аргументах. Всё это создаётся ВНУТРИ
+     воркера в `worker_main`. Результат — picklable dict по Pipe; для больших raw (много МБ) — опция
+     сохранения в файл и передачи пути (принято для v2 как опция, по умолчанию — pipe).
+   - Схема: main-session собирает `links` (существующий `_collect_links_with_recovery`),
+     `selected = links[:limit]`, parent шардирует и запускает воркеров. Категория воркерами НЕ переоткрывается.
+   ### 2. Ownership (правка 4/6/9)
+   - **Жёсткий инвариант (проверяется тестами).** Parent имеет право: spawn, monitor, collect payload,
+     terminate hang-воркера, final merge, cleanup по ЗАРЕГИСТРИРОВАННЫМ identity. Parent НЕ имеет права:
+     `BrowserProcessManager` воркера, `ProcessRecord` воркера, `BrowserWatchdog` воркера,
+     `force_stop/recycle` браузера воркера.
+   - Воркер владеет своим браузером целиком: launch/restart/force_stop через собственный
+     `BrowserProcessManager`, kill — только через свои ProcessRecord (identity-сверка process.py).
+   - **Ownership identity = (port, profile_token, ProcessIdentity)**, а не просто (profile_token):
+     `process.browser_processes(cdp_url, profile_token)` проверяет И порт, И профиль (защита от случайного
+     переиспользования профиля на чужом порту). Матчинг в `_matches_browser` — basename `--user-data-dir`
+     == ТОКЕН профиля (сейчас захардкожен `PROFILE_TOKEN="ozon-profile"` → воркер-профили не матчились бы).
+   - **Профиль и порт (правило 2):** `profile_path_for_worker(k)` — ЕДИНЫЙ хелпер именования профилей
+     (часть security/ownership-контракта, тестируется отдельно). Профиль воркера k — `ozon-profile-worker-{k}`,
+     порт — `9222 + k` (k=1..N; база 9222 занята main → «9222+i» = i-й воркер, без лишнего +1).
+   ### 3. Изменения по файлам
+   - `process.py`: `browser_processes(cdp_url, profile_token)` — матчинг по порту И токену;
+     `rss_bytes(pid)` (Windows: ctypes GetProcessMemoryInfo; Linux: /proc/pid/status VmRSS) — диагностика.
+   - `browser.py`: `_launch_script(cdp_url, profile_token)` → env `PORT` + `PROFILE` (скрипты уже читают
+     PROFILE; Python-путь сейчас передаёт только PORT). `BrowserProcessManager(cdp_url, profile_token=...)` —
+     token сквозной в launch/preflight/restart. `force_stop` для main (полный recycle main-Chromium).
+   - `cdp.py`: `Session` без изменений (cdp_url параметризуется уже сейчас).
+   - `log.py`: **`attach_file(path, mode="a", prefix="")`** — отдельный файл на воркера (правка 2); воркеры
+     `setup()` НЕ зовут (нет ротации/перезаписи чужого лога). Префикс **`[worker=k pid=NNN] `** (правка 10).
+     `OZON_WORKER_ID=k` в env воркера. На атомарность одного `write` НЕ полагаемся (гонка двух fd).
+   - `parallel.py` (новый): `worker_main(spec, task, conn)`, `collect_parallel(...)`, preflight (4 ресурса),
+     sharding, merge, watchdog-завершение.
+   - `search.py`: per-product recovery-цикл (R1/R2 + preventive) вынести в переиспользуемую
+     `_collect_shard(sess, manager, items, gather_cfg, max_recycles, recovery)` — ОДИН код для search и воркеров.
+   - `cli.py`: `--parallel N` (default 1, валидация `1 ≤ N ≤ 2`), `--allow-parallel-ocr`.
+     `--parallel>1` + OCR без флага → ошибка ДО запуска. При `--allow-parallel-ocr` OCR-потоки воркера
+     уменьшаются: `max(2, os.cpu_count() // parallel)` (правка 6).
+   - `__init__.py`: VERSION → 1.14.0; `PARALLEL_MAX_WORKERS = 2` (жёсткий предел).
+   ### 4. Lifecycle и последовательность (правка 4)
+   1. main-session: links.
+   2. **`main_session.close()` + ПОЛНЫЙ recycle/stop main-Chromium** (force_stop по главному токену на 9222).
+      Session.close гасит только CDP-клиент — main Chromium нужно остановить ОТДЕЛЬНО, иначе лишний
+      процесс ест RAM. Принято: main браузер → stopped до запуска воркеров.
+   3. Bootstrap профилей воркеров — по решению «сначала cold» (см. §14): НЕ копировать user-data-dir на
+      старте; профили воркеров — самостоятельные persistent (создаются один раз).
+   4. Preflight каждого воркера (§5) → Process(spawn) → start.
+   5. worker: attach_file → Session → shard-цикл → payload → **try/finally: stop своего
+      BrowserProcessManager + close Session** (правка 3) → exit 0.
+   6. parent: join(timeout) → merge → CLI.
+   ### 5. Preflight — 4 независимых ресурса (правка 5)
+   Для каждого воркера k ДО старта:
+   - **PORT**: TCP connect к `127.0.0.1:9222+k` НЕ открывается;
+   - **PROCESS OWNERSHIP**: `P.browser_processes(cdp_url_k, token_k) == []`;
+   - **CDP**: `/json/version` недоступен;
+   - **PROFILE**: `profile_path_k != profile_path_main`; `profile_path_k` попарно различны у воркеров;
+     каталог создаётся / не заблокирован другим Chromium.
+   Любое нарушение → **fatal** (ошибка, воркеры не запускаются, попытка «подхватить» чужой Chromium
+   исключена). Без fallback.
+   ### 6. Логирование (правка 2/10)
+   - parent: `log.setup()` (ротация main-лога), свой контекст/префикс.
+   - worker: `attach_file(logs/ozon_worker_{k}.log, mode="a", prefix="[worker=k pid=NNN] ")`.
+     Консоль воркера наследует stdout parent (spawn) — все строки с префиксом. Файл воркера — отдельный
+     (append, без ротации), чужой лог не затрагивается. Acceptance по логам: нет потерянных строк,
+     строки не перемешаны внутри одной записи, есть `[worker=0]` и `[worker=1]`.
+   ### 7. Шардирование и слияние (правка 2)
+   - Round-robin по индексу: `index % parallel`. Индекс — ЧАСТЬ задания: `items = [(0,url),(2,url),...]`.
+     Merge НЕ зависит от позиции результата. Детерминизм: тот же links → те же шарды.
+   - Слияние по `index` → `products` строго в исходном порядке; товар без результата →
+     `ok=False, error="worker{k} terminated/failed"`. `products` всегда limit записей.
+   ### 8. Worker → parent протокол (правка 7)
+   - `{"t":"start","worker":k,"pid":…,"profile":…,"port":…}` — для тестов изоляции (identity до/после).
+   - `{"t":"recovery","worker":k,"pid":pid,"kind":…,"attempt":n}` — recovery-события воркера.
+   - `{"t":"done","worker":k,"payload":{...}}` → exit 0. **payload:**
+     ```python
+     {"worker_idx": k, "started": ts, "finished": ts, "exitcode": 0,
+      "products": [...], "processed_indexes": [...], "failed_indexes": [...],
+      "recovery_metrics": {...}, "rss_bytes": N, "fatal_error": None, "browser_stopped": True}
+     ```
+     `processed_indexes/failed_indexes` дают parent различать «нормально обработано 0» и «умер после 2-го».
+     `browser_stopped` подтверждает, что воркер сам погасил свой браузер (cleanup parent — только аварии).
+   - **Top-level обёртка воркера (правка 5):** весь `worker_main` в try/except; любое исключение →
+     payload с `fatal_error` + частичные `processed/failed` → exit 0 (parent принимает и маркирует остаток fail).
+   - Чтение: reader-поток на каждый worker (select по pipe на Windows не работает) → общая queue.
+   ### 9. Recovery-изоляция (правило 6/9, правка 9)
+   - R1/R2 + preventive — внутри воркера, его менеджером; recovery-метрики — в его payload.
+   - Parent: recovery-события только телеметрия; никаких перезапусков чужих браузеров.
+   - **Тест через ProcessIdentity (не только события):** worker0 old != worker0 new;
+     worker1 before == worker1 after; pid/profile воркеров попарно различны весь тест.
+   ### 10. Shutdown (правка 8)
+   - `join()` «в голом виде» ЗАПРЕЩЁН — только `join(timeout)`.
+   - Нормальный: все воркеры → done → join → merge → exit 0.
+   - timeout/повис: `terminate()` → `join(2s)` → **cleanup по последнему валидному ownership snapshot**
+     (зарегистрированные identity воркера), НЕ «любой Chromium на порту» → товары без результата → fail,
+     exit 1. Worker, умерший внезапно, может оставить Chromium — именно поэтому snapshot, а не поиск по порту.
+   ### 11. OCR и ресурсы (правило 5/7, правка 6)
+   - `--parallel 2 --no-ocr` — стабильный режим Фазы B (основной acceptance). OCR в параллель — ТОЛЬКО
+     с `--allow-parallel-ocr`, отдельным экспериментом ПОСЛЕ фиксации no-ocr-режима.
+   - При `--allow-parallel-ocr`: OCR-потоки воркера = `max(2, os.cpu_count() // parallel)`.
+   - RSS воркера — диагностика (`rss_bytes(pid)`), в payload и `combined["parallel"]`. Без новых депсов.
+   ### 12. Тесты
+   - **Unit (без браузера):** sharding (детерминизм, баланс, каждый товар ровно 1 раз, index в задании);
+     merge (исходный порядок, пропуски → fail-запись, частичные processed/failed);
+     `log.attach_file` (append, префикс `[worker=k pid=…]`, без ротации); preflight (4 ресурса: порт занят /
+     процессы есть / CDP жив / профиль занят или совпадает → fatal); token-матчинг
+     `browser_processes(cdp_url, profile_token)`; `profile_path_for_worker` (попарная уникальность).
+   - **Worker-макет (без живого Ozon):** `worker_main` с fake-Session (monkeypatch Session в воркере) —
+     recovery-цикл + протокол + exit 0 после done; исключение в воркере → payload `fatal_error` + частичные
+     индексы + exit 0, parent не зависает; повисший воркер → terminate по таймауту.
+   - **Изоляция recovery (ОБЯЗАТЕЛЬНЫЙ):** два воркера-макета; kill «браузера» воркера-0 (его ProcessRecord)
+     → recycle только у 0; воркер-1: 0 recovery-событий, identity/profile/port БЕЗ изменений;
+     `ProcessIdentity(worker0 old) != ProcessIdentity(worker0 new)`,
+     `ProcessIdentity(worker1 before) == ProcessIdentity(worker1 after)`; pid/profile воркеров != друг друга
+     и != main весь тест.
+   - **Живой тест изоляции:** `--parallel 2 --no-ocr --limit 6`, принудительный kill браузера воркера-0
+     на середине → recovery воркера-0, воркер-1 без перерыва; в combined ровно 1 recovery-событие у воркера-0.
+   ### 13. Acceptance (правило 9) — сначала корректность, потом скорость
+   - Корректность (`--parallel 2 --no-ocr --limit 6`): 6/6 собрано; no fatal; no hang; порядок товаров ==
+     исходному; нет кросс-воркер вмешательства (порты/профили/identity не пересекаются);
+     main браузер → stopped; worker-0/worker-1 → alive; recovery-изоляция (identity-ассерты выше).
+   - **Live acceptance 2026-08-15: PASS** (после bootstrap §14). `--parallel 2 --no-ocr --limit 6`,
+     категория «роботы-пылесосы»: found=56, collected=6, ok=6, recovery=0, fatal=0, hang=0.
+     Реальные названия товаров; отзывы собраны (96/96/96/96/1/0). Существующие `data/*_raw.json`
+     не изменены (0 changed; новые прогоны — только run-id файлы + 1 новый канон). Браузеры воркеров
+     чисто закрыты. Логи: 649 строк с префиксами `[worker=1]/[worker=2]`.
+     Осталось наблюдение: у 2/6 товаров мало/0 отзывов на этом прогоне — перепроверить при следующем
+     сборе (вероятно нестабильность окна отзывов, не механизм параллели).
+   - Benchmark (правка 12): `parallel=1` vs `parallel=2` на ОДНОМ frozen наборе links (одинаковый набор
+     товаров, одинаковое число отзывов; корректность — на реальных links, бенч — на замороженном).
+     Скорость — НЕ pass/fail, только после зелёной корректности.
+   ### 14. Профили — решение (правка 1) — РЕАЛИЗОВАНО (bootstrap)
+   - Изначально: **сначала ЧИСТЫЕ независимые cold-профили.** НЕ копировать user-data-dir на старте
+     (риск переноса повреждённого состояния/lock-файлов/runtime-кэша).
+   - **Холодные профили УПЕРЛИСЬ в анти-бот (подтверждено):** воркер-браузеры получали страницу
+     Ozon «Похоже, нет соединения» (title продукта = это сообщение, отзывы не появлялись). Main-браузер
+     (залогиненный ozon-profile: 14 cookies, включая `__Secure-access-token/refresh-token/user-id`)
+     работал. Решение §14 включено:
+   - **Bootstrap воркер-профилей** (`process.bootstrap_worker_profiles`, §14):
+     копирует `Local State` (os_crypt-ключ) + `Default/Network/Cookies` из main-профиля в холодные
+     воркер-профили. Инварианты: ТОЛЬКО при остановленном main-браузере; воркер с уже имеющейся
+     Ozon-сессией не трогается (idempotent); работающий воркер пропускается.
+     Проверено эмпирически: после bootstrap воркер открывает товар с реальным title (PASS).
+   - CLI: `--parallel>1` автоматически сеет cookies; отключение — `--no-bootstrap-workers`.
+   - Local Storage/IndexedDB из main не нужны (в main их нет; cookies+Local State достаточно — доказано).
+   - Bootstrap-детекция: `process._ozon_cookie_names` (sqlite `Default/Network/Cookies`, host like %ozon%),
+     сессия = наличие любого из {`__Secure-access-token`,`__Secure-refresh-token`,`__Secure-user-id`,
+     `rfuid`,`xcid`,`guest`}.
+   ### 15. Риски
+   - Холодные воркер-профили → возможен FAB-челлендж (инцидент Фазы A) — п.1 §14 как fallback.
+   - Память: 2-3 Chromium + OCR — RSS диагностика; лимиты в B не вводим.
+   - spawn на Windows: каждый воркер импортирует проект (~1-2с на старт) — для длинного search несущественно.
+   - Гонка двух fd при записи логов — отдельные файлы на воркера; атомарность write не гарантируется.
+    - Git: коммит Фазы B — только после зелёного acceptance (как и в Фазе A).
+    ### 16. Защита raw от перезаписи (инцидент 2026-08-15) — РЕАЛИЗОВАНО
+    - **Инцидент:** live-прогон `search --parallel 2 --no-ocr` перезаписал
+      `data/3627230434_raw.json` (source raw Phase A) усечённым fresh-сбором
+      (2232 Б, 0 отзывов вместо 228 КБ, 250 отзывов). `data/` в gitignore,
+      бэкапов нет, отзывы на Ozon сменились (в свежих данных осталось лишь
+      85/250 baseline-ключей) — исходник невосстановим.
+    - **Решение:** `data/3627230434_raw.json` удалён (тест по дизайну допускает
+      отсутствие source-файла). **Baseline НЕ изменяется.** Товар исключён из
+      source-vs-baseline проверки до появления нового валидного source raw.
+      Это НЕ основание для пересборки baseline.
+    - **Новый инвариант (защита):** существующий `data/{pid}_raw.json` НИКОГДА
+      не перезаписывается live-прогоном без явного `--overwrite`.
+      - `cache.raw_save_path(pid, data_dir, overwrite)` — канонический путь,
+        если файла нет или `overwrite=True`; иначе
+        `data/{pid}_raw.<ts>.<i>.json` (новый прогон отдельным файлом).
+      - Единая точка: `gather.run_gather` считает `out_raw` один раз и передаёт
+        в `collect()` и в OCR-сохранение; прямой путь `collect()` без `out_path`
+        тоже защищён.
+      - CLI: `--overwrite` у `gather` и `search`; воркеры параллели получают его
+        через gather_cfg.
+    - Тесты: `raw_save_path` (канон при отсутствии / run-id при существующем /
+      уникальность при коллизии / overwrite=True → канон).
+    ### 17. Открытый вопрос: параллель во вкладках (вместо браузеров)
+    - Запрос пользователя (2026-08-15): можно ли при `--parallel` собирать в ДВУХ ВКЛАДКАХ
+      одного Chromium вместо двух браузеров? Отложено — сначала коммит текущей Фазы B.
+    - Трейдоффы (зафиксировать при решении): 1 браузер вместо 3 = легче/быстрее старт/меньше RAM,
+      одна сессия (анти-бот не применим, bootstrap не нужен); НО теряется изоляция крашей
+      (смерть общего браузера = смерть всех «воркеров»), recovery деградирует до уровня вкладки,
+      машинерия Фазы B (процессы/профили/порты/preflight/тесты изоляции) в этом режиме не используется.
+      Вероятный путь: отдельный режим `--parallel-tabs` (ThreadPoolExecutor + Page per tab,
+      recovery = перезагрузка вкладки), параллельные браузеры оставить как основной режим.
+
 
  - **v1.13.0: WATCHDOG (fail-fast) + ФИКС EVAL_TIMEOUT-РЕГРЕССИИ — РЕАЛИЗОВАНО (2026-08-09).**
    Дополняет v1.12.0: раньше смерть браузера замечалась только по ошибке на

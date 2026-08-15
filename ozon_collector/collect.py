@@ -30,6 +30,7 @@ from typing import List, Optional
 
 from . import VERSION, SCHEMA_VERSION, DEFAULT_CDP_URL
 from . import browser as B
+from . import cache as K
 from . import log
 from .cdp import Session
 
@@ -1391,6 +1392,7 @@ def collect(
     apply_variant_mode: bool = True,
     sorts: Optional[List[str]] = None,
     sess=None,
+    overwrite: bool = False,
 ) -> dict:
     """Полный сбор: карточка + отзывы варианта.
 
@@ -1493,7 +1495,11 @@ def collect(
 
     if not out_path:
         pid = pid_from_url(product_url)
-        out_path = os.path.join("data", f"{pid}_raw.json")
+        out_path = K.raw_save_path(pid, overwrite=overwrite)
+    if out_path != K.raw_path(pid_from_url(product_url)) and not overwrite:
+        print(f"[collect] {K.raw_path(pid_from_url(product_url))} уже "
+              f"существует — сохраняю в {os.path.basename(out_path)} "
+              f"(перезапись только с --overwrite)")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)

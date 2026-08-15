@@ -22,6 +22,7 @@ _DEFAULT_LOG = "logs/ozon_collector.log"
 _log_path = Path(os.environ.get("OZON_COLLECTOR_LOG", _DEFAULT_LOG))
 
 _fh = None
+_worker_prefix = ""
 
 
 def _project_root() -> Path:
@@ -61,11 +62,38 @@ def setup():
                  f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
+def set_prefix(prefix: str):
+    """Установить префикс всех строк лога/консоли (напр. '[worker=1 pid=123] ').
+
+    Процесс-локальный глобал: воркер ставит свой префикс после spawn, не влияя
+    на parent (отдельный процесс) и на других воркеров.
+    """
+    global _worker_prefix
+    _worker_prefix = prefix or ""
+
+
+def attach_file(path, mode: str = "a", prefix: str = ""):
+    """Присоединить файл лога воркера (БЕЗ ротации/перезаписи).
+
+    Используется воркерами ВМЕСТО setup(): setup() делает ротацию (w-режим) и
+    может затереть чужой лог. Здесь файл открывается в заданном режиме (по
+    умолчанию "a" — append), плюс ставится префикс [worker=k pid=N].
+    """
+    global _fh
+    if prefix:
+        set_prefix(prefix)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _fh = open(p, mode, encoding="utf-8")
+    _write_file("INFO", "log", f"attach_file start pid={os.getpid()} at "
+                 f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
 def _write_file(level: str, module: str, msg: str, extra: dict | None = None):
     if _fh is None:
         return
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{ts} {level:7s} [{module}] {msg}"
+    line = f"{ts} {level:7s} [{module}] {_worker_prefix}{msg}"
     if extra:
         line += " " + json.dumps(extra, ensure_ascii=False, default=str)
     try:
@@ -87,10 +115,11 @@ def _caller_module() -> str:
 
 def _emit(level: str, msg: str, extra: dict | None, to_stderr: bool):
     _write_file(level, _caller_module(), msg, extra)
+    out = _worker_prefix + msg
     if to_stderr:
-        print(msg, file=sys.stderr)
+        print(out, file=sys.stderr)
     else:
-        print(msg)
+        print(out)
 
 
 def info(msg: str, extra: dict | None = None):

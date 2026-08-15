@@ -240,7 +240,7 @@ def test_collect_search_recycle_and_retry(monkeypatch):
             return _recyclable_fail(cfg["pid"])
         return _ok_result(cfg["pid"])
 
-    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+    def fake_recycle(sess, manager, launch_id):
         recycled.append(launch_id)
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
@@ -268,7 +268,7 @@ def test_collect_search_no_recycle_for_non_recyclable(monkeypatch):
         res["error_kind"] = "target"
         return res
 
-    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+    def fake_recycle(sess, manager, launch_id):
         recycled.append(launch_id)
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
@@ -289,7 +289,7 @@ def test_collect_search_recycle_until_success_or_limit(monkeypatch):
     def fake_run_gather(cfg, sess=None):
         return _recyclable_fail(cfg["pid"])
 
-    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+    def fake_recycle(sess, manager, launch_id):
         recycled.append(launch_id)
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
@@ -310,7 +310,7 @@ def test_collect_search_recycle_failure_marks_product(monkeypatch):
     def fake_run_gather(cfg, sess=None):
         return _recyclable_fail(cfg["pid"])
 
-    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+    def fake_recycle(sess, manager, launch_id):
         raise RuntimeError("BrowserOwnershipError: чужой Chromium")
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
@@ -332,7 +332,7 @@ def test_collect_search_preventive_recycle(monkeypatch):
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
-                        lambda sess, launch_id, max_launch_wait=20.0:
+                        lambda sess, manager, launch_id:
                         recycled.append(launch_id))
     monkeypatch.setattr("ozon_collector.search.RECYCLE_EVERY", 2)
     c = collect_search(sess, "u", limit=5, gather_cfg={})
@@ -370,7 +370,7 @@ def test_collect_search_links_recovery(monkeypatch):
             raise TimeoutError("Timeout 15000ms exceeded")
         return links
 
-    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+    def fake_recycle(sess, manager, launch_id):
         recycled.append(launch_id)
 
     monkeypatch.setattr("ozon_collector.search._collect_links", fake_collect_links)

@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
+import sqlite3
 import subprocess
 import time
 from urllib.parse import urlparse
@@ -39,6 +41,134 @@ if os.name == "nt":
                     ("dwHighDateTime", ctypes.c_uint32)]
 
 PROFILE_TOKEN = "ozon-profile"
+
+
+def profile_base_dir() -> str:
+    r"""Базовая директория профилей Chromium (дефолты как в launch_chrome.*).
+
+    Переопределяется env OZON_PROFILE_BASE. Windows: %LOCALAPPDATA%\opencode
+    (совпадает с launch_chrome.ps1), Linux: /tmp/opencode (launch_chrome.sh).
+    """
+    base = os.environ.get("OZON_PROFILE_BASE")
+    if base:
+        return base
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA",
+                            os.path.expanduser(r"~\AppData\Local"))
+        return os.path.join(la, "opencode")
+    return "/tmp/opencode"
+
+
+def profile_path(token: str) -> str:
+    """Полный путь профиля по токену (token = имя каталога, напр. 'ozon-profile')."""
+    return os.path.join(profile_base_dir(), token)
+
+
+def worker_profile_token(worker_id: int) -> str:
+    """Токен профиля воркера: 'ozon-profile-worker-{k}' (часть ownership-контракта)."""
+    return f"ozon-profile-worker-{int(worker_id)}"
+
+
+def worker_profile_path(worker_id: int) -> str:
+    """Полный путь профиля воркера (для launch env PROFILE и preflight)."""
+    return profile_path(worker_profile_token(worker_id))
+
+
+_OZON_SESSION_COOKIES = {
+    "__Secure-access-token", "__Secure-refresh-token",
+    "__Secure-user-id", "rfuid", "xcid", "guest",
+}
+
+
+def _ozon_cookie_names(profile: str) -> set | None:
+    """Имена ozon-cookies профиля (детекция «есть ли сессия Ozon»).
+
+    Читает Default/Network/Cookies (Chrome ≥ v92). None — файла нет или
+    не читается (занят другим процессом / повреждён).
+    """
+    p = os.path.join(profile, "Default", "Network", "Cookies")
+    if not os.path.exists(p):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=1)
+        try:
+            rows = con.execute(
+                "select name from cookies where host_key like '%ozon%'").fetchall()
+            return {r[0] for r in rows}
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def has_ozon_session(profile: str) -> bool:
+    """Есть ли в профиле Ozon-сессия (login/identity-cookies из main)."""
+    names = _ozon_cookie_names(profile)
+    return bool(names and names & _OZON_SESSION_COOKIES)
+
+
+def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
+                              main_alive_check=None, worker_alive_check=None,
+                              src_path=None) -> dict:
+    """Сеять Ozon-сессию (cookies) из main-профиля в холодные воркер-профили.
+
+    Решение §14 плана Фазы B: холодные профили Ozon блочит анти-бот
+    («Похоже, нет соединения»). Доказано эмпирически: копирование
+    Local State (os_crypt-ключ) + Default/Network/Cookies из main-профиля
+    снимает блок (воркер открывает страницы как человек).
+
+    Инварианты:
+    - копирование ТОЛЬКО при остановленном main-браузере (иначе файлы заняты);
+    - воркер с уже имеющейся Ozon-сессией НЕ трогается (idempotent);
+    - работающий воркер-браузер пропускается.
+
+    Возвращает {worker_id: статус} для логов.
+    """
+    from .cdp import browser_alive as _ba
+    if main_profile is None:
+        main_profile = profile_path(PROFILE_TOKEN)
+    if main_alive_check is None:
+        main_alive_check = lambda: _ba("http://127.0.0.1:9222")
+    if worker_alive_check is None:
+        def _w(k):
+            url = f"http://127.0.0.1:{9222 + int(k)}"
+            return bool(browser_processes(url, worker_profile_token(k)))
+        worker_alive_check = _w
+
+    status = {}
+    if main_alive_check():
+        for k in worker_ids:
+            status[int(k)] = "skipped:main_browser_running"
+        return status
+
+    src = src_path or main_profile
+    src_cookies = os.path.join(src, "Default", "Network", "Cookies")
+    src_cookies_legacy = os.path.join(src, "Default", "Cookies")
+    src_local = os.path.join(src, "Local State")
+    if not os.path.exists(src_cookies) and not os.path.exists(src_cookies_legacy):
+        for k in worker_ids:
+            status[int(k)] = "skipped:no_main_cookies"
+        return status
+
+    for k in worker_ids:
+        k = int(k)
+        wp = worker_profile_path(k)
+        if worker_alive_check(k):
+            status[k] = "skipped:worker_browser_running"
+            continue
+        if has_ozon_session(wp):
+            status[k] = "skipped:already_has_session"
+            continue
+        os.makedirs(os.path.join(wp, "Default", "Network"), exist_ok=True)
+        copied = []
+        for s, d in ((src_local, os.path.join(wp, "Local State")),
+                     (src_cookies, os.path.join(wp, "Default", "Network", "Cookies")),
+                     (src_cookies_legacy, os.path.join(wp, "Default", "Cookies"))):
+            if os.path.exists(s):
+                shutil.copy2(s, d)
+                copied.append(os.path.basename(d))
+        status[k] = f"seeded ({', '.join(copied)})"
+    return status
 
 _PIDFD_SIGNAL_OK: bool | None = None
 
@@ -238,6 +368,52 @@ def identity_alive(identity: ProcessIdentity) -> bool:
     return _linux_identity_alive(identity)
 
 
+# ---- RSS (диагностика воркеров; без новых зависимостей) -------------------
+
+def rss_bytes(pid: int) -> int | None:
+    """Resident Set Size процесса в байтах (диагностика) или None."""
+    if os.name == "nt":
+        return _win_rss_bytes(pid)
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8",
+                  errors="replace") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _win_rss_bytes(pid: int) -> int | None:
+    class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [("cb", ctypes.c_uint32),
+                    ("PageFaultCount", ctypes.c_uint32),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t)]
+
+    h = _win_open_process(pid, _WIN_PROCESS_QUERY)
+    if h is None:
+        return None
+    try:
+        pmc = _PROCESS_MEMORY_COUNTERS()
+        pmc.cb = ctypes.sizeof(pmc)
+        if not ctypes.windll.psapi.GetProcessMemoryInfo(
+                h, ctypes.byref(pmc), pmc.cb):
+            return None
+        return int(pmc.WorkingSetSize)
+    finally:
+        _win_close_handle(h)
+
+
 # ---- поиск наших browser-процессов по profile + port ----------------------
 
 def _tokenize_cmdline(s: str) -> list[str]:
@@ -259,12 +435,14 @@ def _tokenize_cmdline(s: str) -> list[str]:
     return args
 
 
-def _matches_browser(args, port: int) -> bool:
+def _matches_browser(args, port: int,
+                     profile_token: str = PROFILE_TOKEN) -> bool:
     """Browser-процесс Chromium на нашем profile+port (не дочерний renderer).
 
     Дочерние процессы (renderer/gpu/utility) наследуют команду, но имеют
     --type=... — они исключаются. --user-data-dir считается нашим, если
-    последний компонент пути == PROFILE_TOKEN.
+    последний компонент пути == profile_token (по умолчанию PROFILE_TOKEN;
+    для воркеров — 'ozon-profile-worker-{k}').
     """
     user_data_dir: str | None = None
     has_port = False
@@ -281,7 +459,7 @@ def _matches_browser(args, port: int) -> bool:
     if has_type:
         return False
     name = os.path.basename(user_data_dir.rstrip("/\\"))
-    return name == PROFILE_TOKEN
+    return name == profile_token
 
 
 def _linux_iter_chromium_processes():
@@ -336,12 +514,17 @@ def _iter_chromium_processes():
         yield from _linux_iter_chromium_processes()
 
 
-def browser_processes(cdp_url: str = "http://127.0.0.1:9222") -> list[ProcessIdentity]:
-    """Идентичности Browser-процессов Chromium на profile+port из cdp_url."""
+def browser_processes(cdp_url: str = "http://127.0.0.1:9222",
+                      profile_token: str = PROFILE_TOKEN) -> list[ProcessIdentity]:
+    """Идентичности Browser-процессов Chromium на profile+port из cdp_url.
+
+    Ownership identity = (port, profile_token): матчатся только процессы на
+    данном remote-debugging-port И с данным profile_token в --user-data-dir.
+    """
     port = cdp_port(cdp_url)
     out: list[ProcessIdentity] = []
     for pid, argv in _iter_chromium_processes():
-        if not _matches_browser(argv, port):
+        if not _matches_browser(argv, port, profile_token=profile_token):
             continue
         ident = process_identity(pid)
         if ident is not None:

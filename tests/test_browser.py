@@ -410,7 +410,8 @@ def _patch_manager(monkeypatch, processes=None, cdp_ready=None):
         cdp_url="http://127.0.0.1:9222",
         launch_wait_s=0.2, kill_wait_s=0.2, capture_interval=0.01)
     monkeypatch.setattr(B.time, "sleep", lambda s: None)
-    monkeypatch.setattr(B, "_launch_script", lambda cdp_url: None)
+    monkeypatch.setattr(B, "_launch_script",
+                        lambda cdp_url, profile_path=None: None)
     if processes is not None:
         monkeypatch.setattr(P, "browser_processes",
                             lambda *a, **kw: processes() if callable(processes)
@@ -580,7 +581,8 @@ def test_watchdog_sample_http_down_process_alive(monkeypatch):
     """CDP молчит, но процесс ещё жив → транзиент, НЕ смерть."""
     w = B.BrowserWatchdog("http://127.0.0.1:9222")
     monkeypatch.setattr(w.probe, "cdp_http_ok", lambda url: False)
-    monkeypatch.setattr(P, "browser_processes", lambda url: [_identity()])
+    monkeypatch.setattr(P, "browser_processes",
+                        lambda url, **kw: [_identity()])
     assert w._sample() is True
 
 
@@ -588,7 +590,7 @@ def test_watchdog_sample_dead(monkeypatch):
     """CDP молчит И процесса нет → браузер мёртв."""
     w = B.BrowserWatchdog("http://127.0.0.1:9222")
     monkeypatch.setattr(w.probe, "cdp_http_ok", lambda url: False)
-    monkeypatch.setattr(P, "browser_processes", lambda url: [])
+    monkeypatch.setattr(P, "browser_processes", lambda url, **kw: [])
     assert w._sample() is False
 
 
