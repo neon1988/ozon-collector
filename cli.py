@@ -363,14 +363,15 @@ def main():
     ps.add_argument("--no-ocr", action="store_true",
                     help="пропустить OCR (быстрый прогон, без tesseract)")
     ps.add_argument("--parallel", type=int, default=1,
-                    help="кол-во воркер-процессов для search (1..2; "
+                    help="кол-во воркер-процессов для search (1..N; "
+                         "по умолчанию лимит 2, выше — OZON_PARALLEL_MAX; "
                          "каждый со своим Chromium)")
     ps.add_argument("--allow-parallel-ocr",
                     action="store_true",
                     help="разрешить OCR в параллельном сборе "
                          "(потоки OCR на воркера уменьшаются)")
-    ps.add_argument("--worker-timeout", type=float, default=1800.0,
-                    help="макс. время ожидания воркеров, сек (по умолч. 1800)")
+    ps.add_argument("--worker-timeout", type=float, default=3600.0,
+                    help="макс. время ожидания воркеров, сек (по умолч. 3600)")
     ps.add_argument("--no-bootstrap-workers", action="store_true",
                     help="не сеять cookies из ozon-profile в холодные "
                          "воркер-профили (по умолч. автоматически при --parallel>1)")

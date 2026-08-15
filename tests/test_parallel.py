@@ -345,9 +345,18 @@ def test_worker_hang_terminated(monkeypatch, tmp_path):
 
 # ---- CLI валидация (через helpers) --------------------------------------------
 
-def test_parallel_validation_bounds():
+def test_parallel_validation_bounds(monkeypatch):
+    monkeypatch.delenv("OZON_PARALLEL_MAX", raising=False)
     from ozon_collector import PARALLEL_MAX_WORKERS
     assert PARALLEL_MAX_WORKERS == 2
+    monkeypatch.setenv("OZON_PARALLEL_MAX", "8")
+    from importlib import reload
+    import ozon_collector as oc
+    reload(oc)
+    from ozon_collector import PARALLEL_MAX_WORKERS as PMW2
+    assert PMW2 == 8
+    monkeypatch.setenv("OZON_PARALLEL_MAX", "2")
+    reload(oc)
     with pytest.raises(ZeroDivisionError):
         PL.shard_items(_items(3), 0)
 

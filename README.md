@@ -238,9 +238,9 @@ python3 cli.py search --url "https://www.ozon.ru/category/palatki-4-mestnye-9889
 | `--out-raw PATH` | путь combined raw (все товары) | `data/search_combined.json` |
 | `--max-age AGE` | TTL сырого кеша товаров | `1d` |
 | `--no-dedup-replies` | не скрывать повторяющиеся ответы продавца (см. ниже) | дедуп включён |
-| `--parallel N` | кол-во воркер-процессов (1..2), каждый со своим Chromium (Фаза B) | 1 |
+| `--parallel N` | кол-во воркер-процессов (1..2; выше — env `OZON_PARALLEL_MAX`), каждый со своим Chromium (Фаза B) | 1 |
 | `--allow-parallel-ocr` | разрешить OCR в параллельном сборе (потоки OCR на воркера уменьшаются) | выкл |
-| `--worker-timeout S` | макс. время ожидания воркеров, сек (5..3600) | 1800 |
+| `--worker-timeout S` | макс. время ожидания воркеров, сек (5..3600) | 3600 |
 | `--overwrite` | перезаписывать существующий `data/{pid}_raw.json`; иначе новый прогон → `data/{pid}_raw.<ts>.<i>.json` | выкл |
 
 Переиспользуются все опции `gather` (`--variant`, `--category`, `--threads`,
