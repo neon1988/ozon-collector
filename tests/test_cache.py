@@ -290,7 +290,7 @@ def test_cache_check_picks_valid_timestamp_over_old_canonical(tmp_path):
 
 
 def test_cache_check_picks_newest_valid_timestamp(tmp_path):
-    """Несколько валидных timestamp: предпочтение — версия, затем дата."""
+    """Несколько валидных timestamp с отзывами: предпочтение — свежайший."""
     _write_raw(tmp_path, "77", "77_raw.20260815-203144.1.json",
                reviews=78, minutes=-120)
     _write_raw(tmp_path, "77", "77_raw.20260815-211744.1.json",
@@ -298,6 +298,42 @@ def test_cache_check_picks_newest_valid_timestamp(tmp_path):
     raw, reason = cache_check("77", 86400, str(tmp_path))
     assert reason == "hit"
     assert raw["reviews_collected"] == 75
+
+
+def test_cache_check_prefers_reviews_over_newer_empty(tmp_path):
+    """Регресс: свежий stress-прогон с 0 отзывов НЕ вытесняет полный raw
+    с отзывами только из-за более поздней даты (ранжирование кеша)."""
+    _write_raw(tmp_path, "77", "77_raw.20260815-211744.1.json",
+               reviews=0, minutes=-60)
+    _write_raw(tmp_path, "77", "77_raw.20260815-210856.1.json",
+               reviews=97, minutes=-120)
+    raw, reason = cache_check("77", 86400, str(tmp_path))
+    assert reason == "hit"
+    assert raw["reviews_collected"] == 97
+
+
+def test_cache_check_prefers_more_reviews_at_same_date(tmp_path):
+    """Одинаковая дата: больший reviews_collected предпочтительнее."""
+    ts = _now_utc_str(minutes=-120)
+    _write_raw(tmp_path, "77", "77_raw.20260815-210856.1.json",
+               reviews=96, minutes=0)
+    path1 = os.path.join(tmp_path, "77_raw.20260815-210856.1.json")
+    with open(path1, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["collected_at_utc"] = ts
+    with open(path1, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    _write_raw(tmp_path, "77", "77_raw.20260815-210856.2.json",
+               reviews=97, minutes=0)
+    path2 = os.path.join(tmp_path, "77_raw.20260815-210856.2.json")
+    with open(path2, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["collected_at_utc"] = ts
+    with open(path2, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    r, reason = cache_check("77", 86400, str(tmp_path))
+    assert reason == "hit"
+    assert r["reviews_collected"] == 97
 
 
 def test_cache_check_skips_incomplete_timestamp(tmp_path):

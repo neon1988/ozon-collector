@@ -96,8 +96,10 @@ def run_gather(cfg: dict, sess=None) -> dict:
             age = ""
             if dt is not None:
                 age = f", age={int((datetime.now(timezone.utc) - dt).total_seconds() // 60)}m"
-            print(f"[gather] pid={pid}: cache=hit ({ver}{age})")
-            log.info(f"pid={pid}: cache=hit ({ver}{age})")
+            src = (raw.get("collected_at_utc") or "?")[:19]
+            revs = int(raw.get("reviews_collected") or 0)
+            print(f"[gather] pid={pid}: cache=hit (v{ver}, reviews={revs}, from={src}{age})")
+            log.info(f"pid={pid}: cache=hit (v{ver}, reviews={revs}, from={src}{age})")
         elif max_age_s <= 0:
             print(f"[gather] pid={pid}: cache=off (--max-age 0)")
             log.info(f"pid={pid}: cache=off (--max-age 0)")

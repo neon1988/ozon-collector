@@ -129,11 +129,14 @@ def _validate_raw(raw: dict, pid: str | None = None) -> str | None:
 def _best_raw(pid: str, data_dir: str = "data") -> tuple[dict | None, str]:
     """Лучший валидный raw среди канона и timestamp-файлов.
 
-    Кандидаты ранжируются по (версия, дата сбора, число отзывов): новейший
-    полный raw текущей версии предпочтительнее старого канона; при равных —
-    больший reviews_collected. Возвращает (raw, reason): reason == "candidate"
-    при валидном кандидате, иначе причина первой неудачной валидации
-    (или "missing", если файлов для pid нет вовсе).
+    Кандидаты ранжируются по (наличие отзывов, дата сбора, число отзывов):
+    сначала — файлы с реальными данными (reviews_collected > 0): пустой/не
+    дособранный stress-прогон (0 отзывов) не должен вытеснять полный raw
+    только потому, что собран позже; среди файлов одного класса —
+    свежайший, при равной дате — больший reviews_collected. Версия в ключе
+    не участвует: _validate_raw уже допускает только текущую. Возвращает
+    (raw, reason): reason == "candidate" при валидном кандидате, иначе
+    причина первой неудачной валидации (или "missing", если файлов нет).
     """
     best: dict | None = None
     best_key: tuple | None = None
@@ -150,10 +153,11 @@ def _best_raw(pid: str, data_dir: str = "data") -> tuple[dict | None, str]:
                 first_reason = reason
             continue
         dt = _parse_utc(raw.get("collected_at_utc"))
+        reviews = int(raw.get("reviews_collected") or 0)
         key = (
-            _version_tuple(raw.get("collector_version")) or (0,),
+            1 if reviews > 0 else 0,
             dt.timestamp() if dt is not None else 0.0,
-            int(raw.get("reviews_collected") or 0),
+            reviews,
         )
         if best is None or key > best_key:
             best, best_key = raw, key
