@@ -176,3 +176,38 @@ def test_digest_no_dedup_flag():
                               dedup_replies=False)
     assert md.count("спасибо за заказ") == 1  # всего один комментарий
     assert "пропущено" not in md
+
+
+# ---- Phase A: единый дефолт 100 + размер дайджеста -------------------------
+
+def test_default_reviews_per_product_is_100():
+    """Единый источник дефолта: константа == 100 и используется рендером."""
+    from ozon_collector.report import DEFAULT_REVIEWS_PER_PRODUCT
+    assert DEFAULT_REVIEWS_PER_PRODUCT == 100
+    assert render_search_digest.__defaults__[0] == DEFAULT_REVIEWS_PER_PRODUCT
+
+
+def test_digest_default_caps_at_100():
+    """Дефолт режет digest до 100 отзывов (raw в combined остаётся полным)."""
+    ok = _ok_result("1")
+    ok["raw"]["reviews"] = [
+        {"author": f"Автор{i}", "date": "2026-08-01", "stars": 5,
+         "text": f"текст {i}"} for i in range(250)
+    ]
+    md = render_search_digest(_combined([ok]))
+    assert "Автор99" in md
+    assert "Автор100" not in md
+    # raw в combined не тронут (обрезка только в копии для дайджеста)
+    assert len(_combined([ok])["products"][0]["raw"]["reviews"]) == 250
+
+
+def test_digest_size_kb_line():
+    """В дайджест добавляется строка размера (для контроля роста из-за 100)."""
+    ok = _ok_result("1")
+    ok["raw"]["reviews"] = [
+        {"author": f"Автор{i}", "date": "2026-08-01", "stars": 5,
+         "text": f"текст {i}"} for i in range(120)
+    ]
+    md = render_search_digest(_combined([ok]), reviews_per_product=100)
+    assert "Размер дайджеста" in md
+    assert "КБ" in md

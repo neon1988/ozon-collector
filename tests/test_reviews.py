@@ -157,7 +157,7 @@ class _FakePage:
     def wait_for_timeout(self, ms):
         pass
 
-    def evaluate(self, js):
+    def evaluate(self, js, *args, **kwargs):
         return self.reviews_data
 
 
@@ -173,7 +173,7 @@ def _patch_variant_collect(monkeypatch, used=True, reason="click_ok"):
     )
     monkeypatch.setattr(
         collect_mod, "_scroll_to_converge",
-        lambda page, target_min=40: (5, False),
+        lambda page, target_min=40, telemetry=None: (5, False),
     )
     monkeypatch.setattr(
         collect_mod, "_detect_pagination",
@@ -330,20 +330,17 @@ def test_next_page_fallback_layout_page_index(browser):
 
 
 def _scroll_converge_page(cap):
-    class _Mouse:
-        def wheel(self, dx, dy):
-            pass
-
     class _P:
         def __init__(self):
-            self.mouse = _Mouse()
             self.n = 0
+            self.scrolls = 0
 
-        def evaluate(self, js):
+        def evaluate(self, js, *args, **kwargs):
             if "data-review-uuid" in js:
                 self.n += 1
                 return [f"id{i}" for i in range(min(self.n, cap))]
-            if "scrollTo" in js:
+            if "scrollBy" in js or "scrollTo" in js:
+                self.scrolls += 1
                 return None
             return None
 
@@ -359,6 +356,47 @@ def test_scroll_to_converge_plateaus():
     page = _scroll_converge_page(cap=8)
     count, resumed = collect_mod._scroll_to_converge(page, target_min=40)
     assert count == 8
+    assert resumed is False
+
+
+def test_scroll_to_converge_raises_on_timeout():
+    """Зависший renderer (TimeoutError на evaluate) пробрасывается наверх —
+    чтобы сработал recovery, а не молча собранный пустой товар."""
+    from playwright.sync_api import TimeoutError
+    page = _scroll_converge_page(cap=5)
+
+    def _boom(js, *args, **kwargs):
+        raise TimeoutError("Timeout 15000ms exceeded")
+
+    page.evaluate = _boom
+    with pytest.raises(TimeoutError):
+        collect_mod._scroll_to_converge(page, target_min=40)
+
+
+def test_scroll_to_converge_raises_on_frame_detached():
+    """OOM-краш вкладки (frame was detached) пробрасывается наверх."""
+    from playwright.sync_api import Error as PWError
+    page = _scroll_converge_page(cap=5)
+
+    def _boom(js, *args, **kwargs):
+        raise PWError("net::ERR_ABORTED: The frame was detached from the DOM")
+
+    page.evaluate = _boom
+    with pytest.raises(PWError):
+        collect_mod._scroll_to_converge(page, target_min=40)
+
+
+def test_scroll_to_converge_swallows_plain_error():
+    """Обычная (не renderer) ошибка evaluate не роняет прокрутку —
+    прежнее поведение: сход по плато с 0 отзывов."""
+    page = _scroll_converge_page(cap=5)
+
+    def _boom(js, *args, **kwargs):
+        raise ValueError("bad js")
+
+    page.evaluate = _boom
+    count, resumed = collect_mod._scroll_to_converge(page, target_min=40)
+    assert count == 0
     assert resumed is False
 
 
@@ -381,7 +419,7 @@ def test_detect_pagination_modes():
             self.sp = sp
             self.legacy = legacy
 
-        def evaluate(self, js):
+        def evaluate(self, js, *args, **kwargs):
             if "state-paginator" in js:
                 return self.sp
             if "webListReviews" in js:
@@ -601,7 +639,7 @@ class _RecordingPage:
     def wait_for_timeout(self, ms):
         pass
 
-    def evaluate(self, js):
+    def evaluate(self, js, *args, **kwargs):
         if js is not collect_mod.REVIEWS_JS:
             return 0
         cur = self.gotos[-1] if self.gotos else self.url
@@ -698,3 +736,50 @@ def test_collect_reviews_legacy_no_sort_tagging(monkeypatch):
     assert "review_sort" not in r
     assert "review_sorts" not in r
     assert page.gotos == [base_url]
+
+
+# ---- Phase A: jitter-паузы (детерминированный seed) ------------------------
+
+def test_scroll_jitter_deterministic_seed():
+    """Одинаковый seed → одинаковая последовательность пауз (воспроизводимость)."""
+    collect_mod.set_scroll_jitter_seed(12345)
+    a = [collect_mod.scroll_pause_ms() for _ in range(20)]
+    collect_mod.set_scroll_jitter_seed(12345)
+    b = [collect_mod.scroll_pause_ms() for _ in range(20)]
+    assert a == b
+    for v in a:
+        assert 1360 <= v <= 1840  # 1600 ± 15% (SCROLL_PAUSE_MS после A/B-реверта)
+
+
+def test_scroll_jitter_range_zero():
+    """jitter=0 — пауза ровно равна базе (без вариации)."""
+    collect_mod.set_scroll_jitter_seed(7)
+    assert collect_mod.scroll_pause_ms(base=1000, jitter=0.0) == 1000
+
+
+def test_scroll_jitter_effective_seed_self_set():
+    """Без заданного seed эффективный seed self-set'ится один раз и стабилен."""
+    collect_mod.set_scroll_jitter_seed(None)
+    s1 = collect_mod.effective_scroll_jitter_seed()
+    assert isinstance(s1, int) and s1 > 0
+    assert collect_mod.effective_scroll_jitter_seed() == s1
+
+
+# ---- Phase A: телеметрия сходимости ----------------------------------------
+
+def test_scroll_to_converge_telemetry():
+    """Телеметрия плато: scroll_count, стабилизация, прогрессия, докрутка к низу."""
+    page = _scroll_converge_page(cap=8)
+    tel = {}
+    count, resumed = collect_mod._scroll_to_converge(
+        page, target_min=40, telemetry=tel)
+    assert count == 8
+    assert resumed is False
+    assert tel["scroll_count"] >= 1
+    assert tel["last_growth_iteration"] >= 1
+    assert tel["stable_iterations"] >= tel["last_growth_iteration"]
+    assert tel["stable_rounds"] == collect_mod.MAX_SCROLL_STABLE
+    assert tel["bottom_passes"] == collect_mod.MAX_SCROLL_BOTTOM
+    assert tel["progression"] and tel["progression"][-1] == 8
+    assert tel["scroll_wait_seconds"] > 0
+    assert tel["bottom_growth"] is False

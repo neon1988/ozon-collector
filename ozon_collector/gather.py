@@ -11,8 +11,10 @@ import os
 from datetime import datetime, timezone
 
 from . import VERSION, SCHEMA_VERSION
+from . import browser as B
 from . import cache as K
 from . import collect as C
+from . import log
 from . import ocr as O
 from . import report as R
 
@@ -55,18 +57,24 @@ def run_gather(cfg: dict, sess=None) -> dict:
             if dt is not None:
                 age = f", age={int((datetime.now(timezone.utc) - dt).total_seconds() // 60)}m"
             print(f"[gather] pid={pid}: cache=hit ({ver}{age})")
+            log.info(f"pid={pid}: cache=hit ({ver}{age})")
         elif max_age_s <= 0:
             print(f"[gather] pid={pid}: cache=off (--max-age 0)")
+            log.info(f"pid={pid}: cache=off (--max-age 0)")
         elif reason == "old_version":
             ver = K.cached_version(pid)
             print(f"[gather] pid={pid}: cache=miss (old_version {ver or '—'} < {VERSION})")
+            log.info(f"pid={pid}: cache=miss (old_version {ver or '—'} < {VERSION})")
         elif reason == "newer_version":
             ver = K.cached_version(pid)
             print(f"[gather] pid={pid}: cache=miss (newer_version {ver or '—'} > {VERSION})")
+            log.info(f"pid={pid}: cache=miss (newer_version {ver or '—'} > {VERSION})")
         elif reason == "incompatible":
             print(f"[gather] pid={pid}: cache=miss (schema != {SCHEMA_VERSION})")
+            log.info(f"pid={pid}: cache=miss (schema != {SCHEMA_VERSION})")
         else:
             print(f"[gather] pid={pid}: cache=miss ({reason})")
+            log.info(f"pid={pid}: cache=miss ({reason})")
 
         if raw is None:
             raw = C.collect(
@@ -83,18 +91,21 @@ def run_gather(cfg: dict, sess=None) -> dict:
                 sess=sess,
             )
             print(f"[gather] pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
+            log.info(f"pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
         result["raw"] = raw
 
         if not cfg.get("no_ocr"):
             if raw.get("gallery_ocr"):
                 result["ocr"] = "hit"
                 print(f"[gather] pid={pid}: ocr=hit (в кеше)")
+                log.info(f"pid={pid}: ocr=hit (в кеше)")
             else:
                 urls = (raw.get("product", {}).get("gallery")
                         or raw.get("product", {}).get("infographics"))
                 if not urls:
                     result["ocr"] = "error"
                     print(f"[gather] pid={pid}: ocr=error (нет галереи/инфографики)")
+                    log.warning(f"pid={pid}: ocr=error (нет галереи/инфографики)")
                 else:
                     pid_ = raw.get("pid") or pid
                     gdir = cfg.get("gallery_dir") or os.path.join(
@@ -106,14 +117,26 @@ def run_gather(cfg: dict, sess=None) -> dict:
                     result["ocr"] = "ran"
                     n_img = len(raw.get("gallery_ocr") or []) or len(urls)
                     print(f"[gather] pid={pid}: ocr=ran ({n_img} картинок)")
+                    log.info(f"pid={pid}: ocr=ran ({n_img} картинок)")
         else:
             result["ocr"] = "off"
             print(f"[gather] pid={pid}: ocr=off")
+            log.info(f"pid={pid}: ocr=off")
 
         result["markdown"] = R.render(
             raw, dedup_replies=cfg.get("dedup_replies", True))
         result["ok"] = True
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
-        print(f"[gather] pid={pid}: error: {result['error']}")
+        cls = B.classify_error(e, sess=sess)
+        result["error_kind"] = cls.error_kind
+        result["error_probe_state"] = cls.probe_state
+        result["error_probe_attempts"] = cls.probe_attempts
+        result["error_signature"] = cls.signature
+        result["recyclable"] = cls.should_recycle
+        print(f"[gather] pid={pid}: error: {result['error']} "
+              f"(kind={cls.error_kind})")
+        log.error(f"pid={pid}: error: {result['error']} "
+                  f"(kind={cls.error_kind}, probe={cls.probe_state}, "
+                  f"recyclable={cls.should_recycle})")
     return result

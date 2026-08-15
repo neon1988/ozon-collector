@@ -21,6 +21,7 @@ import gzip
 import hashlib
 import json
 import os
+import random as _random
 import re
 import time
 import urllib.parse
@@ -28,9 +29,49 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from . import VERSION, SCHEMA_VERSION, DEFAULT_CDP_URL
+from . import browser as B
+from . import log
 from .cdp import Session
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.34 Safari/537.36"
+
+# ---------------------------------------------------------------------------
+# Параметры докрутки отзывов (tuning Phase A: скорость без потери данных)
+# ---------------------------------------------------------------------------
+SCROLL_STEP_PX = 900           # px за один скролл (было 1200; A/B: см. PROJECT_NOTES)
+SCROLL_PAUSE_MS = 1600         # базовая пауза скролла, мс (было 1000; A/B: см. PROJECT_NOTES)
+SCROLL_PAUSE_JITTER = 0.15     # ±15% случайная вариация паузы (антибот)
+MAX_SCROLL_STABLE = 6          # плато без роста → конец загрузки (было 4; A/B: см. PROJECT_NOTES)
+MAX_SCROLL_BOTTOM = 3          # финальная докрутка к низу (не менялось)
+
+_scroll_rng = _random.Random()
+SCROLL_JITTER_SEED: int | None = None
+
+
+def set_scroll_jitter_seed(seed: int | None):
+    """Задать детерминированный seed jitter-пауз (None = случайный при 1-м использовании)."""
+    global SCROLL_JITTER_SEED
+    SCROLL_JITTER_SEED = int(seed) if seed is not None else None
+    if SCROLL_JITTER_SEED is not None:
+        _scroll_rng.seed(SCROLL_JITTER_SEED)
+
+
+def effective_scroll_jitter_seed() -> int:
+    """Фактический seed текущего прогона (self-seed при None — для логирования)."""
+    if SCROLL_JITTER_SEED is None:
+        set_scroll_jitter_seed(_random.randrange(1 << 32))
+    return SCROLL_JITTER_SEED
+
+
+def scroll_pause_ms(base: int = SCROLL_PAUSE_MS,
+                    jitter: float = SCROLL_PAUSE_JITTER) -> int:
+    """Пауза скролла с равномерным jitter ±jitter% (детерминированный seed)."""
+    effective_scroll_jitter_seed()
+    if jitter <= 0:
+        return int(base)
+    low = int(base * (1 - jitter))
+    high = int(base * (1 + jitter))
+    return _scroll_rng.randint(low, high)
 
 # ---------------------------------------------------------------------------
 # Сортировки отзывов (URL-параметр sort=)
@@ -638,9 +679,11 @@ def _next_page(page) -> Optional[str]:
                 if (d.fetchType === 'scroll') return null;
                 return d.nextPage || null;
               } catch (e) { return null; }
-            }"""
-        )
-    except Exception:
+            }""",
+                )
+    except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
         sp = None
     if sp:
         if sp.startswith("/"):
@@ -655,9 +698,11 @@ def _next_page(page) -> Optional[str]:
             """() => {
               const a = document.querySelector('a[href*="layout_page_index="]');
               return a ? a.getAttribute('href') : null;
-            }"""
-        )
-    except Exception:
+            }""",
+                )
+    except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
         href = None
     if href:
         if href.startswith("/"):
@@ -679,9 +724,11 @@ def next_url(page) -> Optional[str]:
               if (a) return a.getAttribute('href');
               const m = String(node.innerText || '').match(/Дальше/);
               return m ? '__CLICK__' : null;
-            }"""
-        )
-    except Exception:
+            }""",
+                )
+    except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
         return None
     if not pag:
         return None
@@ -693,11 +740,13 @@ def next_url(page) -> Optional[str]:
                   const node = list.children[2];
                   const btn = node.querySelector('button') || node;
                   btn.click();
-                }"""
-            )
+                }""",
+                )
             page.wait_for_timeout(6000)
             return None  # страница уже обновилась на месте
-        except Exception:
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             return None
     if pag.startswith("/"):
         return "https://www.ozon.ru" + pag
@@ -721,16 +770,18 @@ def _scroll_to_reviews(
     for _ in range(max_iters):
         try:
             count = page.evaluate(
-                "() => document.querySelectorAll('[data-review-uuid]').length"
-            )
+                "() => document.querySelectorAll('[data-review-uuid]').length",
+                )
             has_next = page.evaluate(
                 """() => {
                   const list = document.querySelector('div[data-widget="webListReviews"]');
                   if (!list || !list.children[2]) return false;
                   return /Дальше/.test(list.children[2].innerText || '');
-                }"""
-            )
-        except Exception:
+                }""",
+                )
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             count, has_next = 0, False
         if count > 0 and has_next:
             break
@@ -744,18 +795,17 @@ def _scroll_to_reviews(
             stale = 0
         last_count = count
         try:
-            page.mouse.wheel(0, 900)
-        except Exception:
+            page.evaluate(f"() => window.scrollBy(0, {SCROLL_STEP_PX})")
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             break
-        page.wait_for_timeout(1600)
+        page.wait_for_timeout(scroll_pause_ms())
     return count > 0
 
 
-MAX_SCROLL_STABLE = 6
-MAX_SCROLL_BOTTOM = 3
-
-
-def _scroll_to_converge(page, target_min: int = 40, max_iters: int = 90):
+def _scroll_to_converge(page, target_min: int = 40, max_iters: int = 90,
+                        telemetry: dict | None = None):
     """Докручивает страницу до сходимости числа уникальных отзывов.
 
     Ozon грузит отзывы лениво: классическая пагинация («Дальше»), бесконечный
@@ -764,40 +814,79 @@ def _scroll_to_converge(page, target_min: int = 40, max_iters: int = 90):
     пока число уникальных отзывов растёт; стабильность MAX_SCROLL_STABLE итераций
     → финальная докрутка к низу (MAX_SCROLL_BOTTOM раз) для ленивых чанков.
     Возвращает (count, resumed): число уникальных отзывов и признак того,
-    что рост возобновился при финальной докрутке к низу."""
+    что рост возобновился при финальной докрутке к низу.
+
+    telemetry (dict, мутируется) — диагностика сходимости: scroll_count,
+    scroll_wait_seconds, stable_rounds, stable_iterations, last_growth_iteration,
+    progression (уникальные после каждой итерации), bottom_passes, bottom_growth.
+    Аккумуляторный стиль: при повторном вызове на той же странице значения
+    складываются (нужно для «возобновления роста» в _collect_reviews_pass).
+    """
     def unique_count():
         try:
             ids = page.evaluate(REVIEW_IDS_JS)
             return len(set(ids)) if isinstance(ids, list) else 0
-        except Exception:
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             return 0
 
+    tel = telemetry
+    if tel is None:
+        tel = {}
+    tel.setdefault("scroll_count", 0)
+    tel.setdefault("scroll_wait_seconds", 0.0)
+    tel.setdefault("progression", [])
+
     last, stable = -1, 0
-    for _ in range(max_iters):
+    stable_iterations = 0
+    last_growth_iteration = 0
+    for it in range(max_iters):
         n = unique_count()
+        tel["progression"].append(n)
         if n > last:
             stable = 0
+            last_growth_iteration = it + 1
         else:
             stable += 1
         last = n
+        log.debug(f"converge it={it}: unique={n} stable={stable}")
         if stable >= MAX_SCROLL_STABLE:
+            stable_iterations = it + 1
+            log.debug(f"converge done: stable плато {MAX_SCROLL_STABLE}, unique={n}")
             break
         try:
-            page.mouse.wheel(0, 900)
-        except Exception:
+            page.evaluate(f"() => window.scrollBy(0, {SCROLL_STEP_PX})")
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             break
-        page.wait_for_timeout(1600)
+        tel["scroll_count"] += 1
+        pause = scroll_pause_ms()
+        tel["scroll_wait_seconds"] += pause / 1000.0
+        page.wait_for_timeout(pause)
     resumed = False
     for _ in range(MAX_SCROLL_BOTTOM):
         try:
             page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
-        except Exception:
+            pause = scroll_pause_ms()
+            tel["scroll_wait_seconds"] += pause / 1000.0
+            page.wait_for_timeout(pause)
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             break
         n = unique_count()
         if n > last:
             last = n
             resumed = True
+            tel["progression"].append(n)
+    tel["stable_rounds"] = stable
+    tel["stable_iterations"] = stable_iterations
+    tel["last_growth_iteration"] = last_growth_iteration
+    tel["bottom_passes"] = tel.get("bottom_passes", 0) + MAX_SCROLL_BOTTOM
+    tel["bottom_growth"] = tel.get("bottom_growth", False) or resumed
+    log.debug(f"converge final: unique={last} resumed={resumed}")
     return last, resumed
 
 
@@ -812,7 +901,9 @@ def _expand_review_texts(page, max_passes: int = 8) -> int:
     for _ in range(max_passes):
         try:
             n = page.evaluate(EXPAND_REVIEWS_JS) or 0
-        except Exception:
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             n = 0
         if not n:
             break
@@ -841,7 +932,9 @@ def _expand_review_comments(page, max_passes: int = 6) -> int:
     for _ in range(max_passes):
         try:
             n = page.evaluate(MARK_COMMENT_CARDS_JS) or 0
-        except Exception:
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             n = 0
         if not n:
             break
@@ -863,7 +956,9 @@ def _expand_review_comments(page, max_passes: int = 6) -> int:
                 h.click(timeout=4000)
                 clicked += 1
                 page.wait_for_timeout(400)
-        except Exception:
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             clicked = 0
         if not clicked:
             break
@@ -891,17 +986,22 @@ def _detect_pagination(page, grew: bool = True) -> str:
                 const d = JSON.parse(el.getAttribute('data-state'));
                 return d.fetchType || 'page';
               } catch (e) { return 'page'; }
-            }"""
-        )
-    except Exception:
+            }""",
+                )
+    except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
         sp = None
     if sp == "scroll":
-        return "infinite_scroll"
-    if sp is not None:
-        return "next_button"
-    if next_url(page):
-        return "next_button"
-    return "converged" if grew else "unknown"
+        result = "infinite_scroll"
+    elif sp is not None:
+        result = "next_button"
+    elif next_url(page):
+        result = "next_button"
+    else:
+        result = "converged" if grew else "unknown"
+    log.debug(f"pagination detected: {result} (sp={sp!r}, grew={grew})")
+    return result
 
 
 def _review_key(r: dict) -> str:
@@ -944,7 +1044,10 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
     try:
         snap = page.evaluate(VARIANT_MODE_JS)
     except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
         print(f"[variant_mode] evaluate warn: {e}")
+        log.warning(f"[variant_mode] evaluate warn: {e}")
     if not snap or not snap.get("found"):
         return {"used": False, "clicked": False, "variant_present": False,
                 "variant_count": None, "active": None, "total_count": None,
@@ -974,13 +1077,16 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
         )
     except Exception as e:
         print(f"[variant_mode] click warn: {e}")
+        log.warning(f"[variant_mode] click warn: {e}")
         return {**base, "used": False, "clicked": True, "reason": "click_error"}
     deadline = time.monotonic() + timeout_s
     active = False
     while time.monotonic() < deadline:
         try:
             snap = page.evaluate(VARIANT_MODE_JS)
-        except Exception:
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             snap = None
         if snap and snap.get("active") == "Этот вариант товара":
             active = True
@@ -988,6 +1094,7 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
         time.sleep(0.8)
     if not active:
         print("[variant_mode] клик не применился, собираем без нативного фильтра")
+        log.warning("[variant_mode] клик не применился, собираем без нативного фильтра")
         return {**base, "used": False, "clicked": True, "reason": "click_no_effect"}
     try:
         page.wait_for_timeout(2500)
@@ -1008,6 +1115,7 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
 def _collect_reviews_pass(
     page, page_url: str, sort: str | None, target_variant: dict,
     max_pages: int = 12, min_reviews: int = 40, apply_variant_mode: bool = True,
+    telemetry: dict | None = None,
 ) -> tuple[List[dict], int, List[dict], dict | None]:
     """Один проход сбора отзывов по одной сортировке (см. collect_reviews).
 
@@ -1015,28 +1123,53 @@ def _collect_reviews_pass(
     профильтрованы по target_variant и дедуплицированы внутри прохода;
     variant_mode — сырая диагностика фильтра варианта (finalize делает
     collect_reviews на объединённом списке). В page_log каждая запись несёт
-    поле 'sort' (сортировка прохода) для диагностики multi-sort сборки."""
+    поле 'sort' (сортировка прохода) для диагностики multi-sort сборки.
+
+    telemetry (dict, мутируется) — аккумулятор диагностики: scroll_time
+    (только _scroll_to_converge), extract_time (раскрытие текстов/комментариев
+    + извлечение REVIEWS_JS; БЕЗ goto и активации варианта), pages[].
+    """
     seen = set()
     reviews = []
     total_pages = 1
     page_log = []
     variant_mode: dict | None = None
+    tel = telemetry
+    if tel is None:
+        tel = {}
+    tel.setdefault("scroll_time", 0.0)
+    tel.setdefault("extract_time", 0.0)
+    tel.setdefault("pages", [])
     for p in range(1, max_pages + 1):
         try:
             page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(6000)
         except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             print(f"[collect] page {p} goto warn: {e}")
+            log.warning(f"[collect] page {p} goto warn: {e}")
             page.wait_for_timeout(3000)
         if apply_variant_mode:
             vm = _activate_variant_mode(page)
             if variant_mode is None or vm.get("used"):
                 variant_mode = vm
-        count, resumed = _scroll_to_converge(page, target_min=min_reviews)
+        page_tel: dict = {}
+        _t0 = time.monotonic()
+        count, resumed = _scroll_to_converge(
+            page, target_min=min_reviews, telemetry=page_tel)
         if resumed:
-            count, _ = _scroll_to_converge(page, target_min=min_reviews)
+            count, _ = _scroll_to_converge(
+                page, target_min=min_reviews, telemetry=page_tel)
+        page_tel["count"] = count
+        page_tel["resumed"] = resumed
+        page_tel["page"] = p
+        page_tel["sort"] = sort
+        tel["scroll_time"] += time.monotonic() - _t0
+        tel["pages"].append(page_tel)
         if count == 0:
             print(f"[collect] page {p}: отзывы не появились при прокрутке, стоп")
+            log.warning(f"[collect] page {p}: отзывы не появились при прокрутке, стоп")
             page_log.append({"page": p, "n_found": 0, "n_matched": 0, "ok": False,
                              "stop_reason": "no_scroll", "sort": sort})
             break
@@ -1044,22 +1177,33 @@ def _collect_reviews_pass(
             variant_mode = {}
         if "pagination_type" not in variant_mode:
             variant_mode["pagination_type"] = _detect_pagination(page, grew=count > 0)
+        _et0 = time.monotonic()
         try:
             n_expanded = _expand_review_texts(page)
             if n_expanded:
                 print(f"[collect] стр. {p}: раскрыто «Читать полностью»: {n_expanded} кнопок")
+                log.info(f"[collect] стр. {p}: раскрыто «Читать полностью»: {n_expanded} кнопок")
         except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             print(f"[collect] стр. {p}: раскрытие отзывов warn: {e}")
+            log.warning(f"[collect] стр. {p}: раскрытие отзывов warn: {e}")
         try:
             n_comment = _expand_review_comments(page)
             if n_comment:
                 print(f"[collect] стр. {p}: раскрыто комментариев к отзывам: {n_comment} кнопок")
+                log.info(f"[collect] стр. {p}: раскрыто комментариев к отзывам: {n_comment} кнопок")
         except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
             print(f"[collect] стр. {p}: раскрытие комментариев warn: {e}")
+            log.warning(f"[collect] стр. {p}: раскрытие комментариев warn: {e}")
         data = page.evaluate(REVIEWS_JS)
+        tel["extract_time"] += time.monotonic() - _et0
         ok = bool(data and data.get("ok"))
         if not ok:
             print(f"[collect] page {p}: пустая выдача, стоп")
+            log.warning(f"[collect] page {p}: пустая выдача, стоп")
             page_log.append({"page": p, "n_found": 0, "n_matched": 0, "ok": False,
                              "stop_reason": "empty", "sort": sort})
             break
@@ -1082,11 +1226,14 @@ def _collect_reviews_pass(
                 matched_this += 1
         print(f"[collect] стр. {p}: всего на странице {len(data['reviews'])}, "
               f"под вариант {len(reviews)} (виден {len(seen)})")
+        log.debug(f"стр. {p}: всего на странице {len(data['reviews'])}, "
+                  f"под вариант {len(reviews)} (виден {len(seen)})")
         nxt = _next_page(page)
         if nxt and sort is not None:
             nxt = _sort_url(nxt, SORT_PARAMS.get(sort))
         if not nxt:
             print(f"[collect] стр. {p}: пагинации нет, стоп")
+            log.warning(f"[collect] стр. {p}: пагинации нет, стоп")
             page_log.append({
                 "page": p, "n_found": len(data["reviews"]), "n_matched": matched_this,
                 "ok": True, "stop_reason": "no_next", "sort": sort,
@@ -1135,6 +1282,7 @@ def _finalize_variant_mode(variant_mode: dict | None, reviews: list,
             warning = "native_filter_active_no_matching_reviews"
             variant_mode["warning"] = warning
             print(f"[collect] warning: {warning}")
+            log.warning(f"[collect] warning: {warning}")
         return variant_mode
     base = {"used": False, "variant_present": False, "active": None,
             "variant_count": None, "total_count": None,
@@ -1147,7 +1295,7 @@ def _finalize_variant_mode(variant_mode: dict | None, reviews: list,
 def collect_reviews(
     page, reviews_url: str, target_variant: dict, max_pages: int = 12,
     min_reviews: int = 40, apply_variant_mode: bool = True,
-    sorts: Optional[List[str]] = None,
+    sorts: Optional[List[str]] = None, telemetry: dict | None = None,
 ) -> tuple[List[dict], int, List[dict], dict]:
     """Собирает отзывы варианта. Возвращает (reviews, total_pages, page_log, variant_mode).
 
@@ -1168,14 +1316,23 @@ def collect_reviews(
     один список с дедупликацией по uuid: у каждого отзыва поле review_sort
     (сортировка первого появления) и review_sorts (все сортировки, где отзыв
     встретился). page_log — сквозной по всем сортировкам (с полем sort).
+
+    telemetry (dict, мутируется) — аккумулятор диагностики сбора
+    (scroll_time, extract_time, pages[]); см. _collect_reviews_pass.
     """
+    tel = {} if telemetry is None else telemetry
+    tel.setdefault("scroll_time", 0.0)
+    tel.setdefault("extract_time", 0.0)
+    tel.setdefault("pages", [])
     if sorts is None:
         reviews, total_pages, page_log, variant_mode = _collect_reviews_pass(
             page, reviews_url, None, target_variant,
             max_pages=max_pages, min_reviews=min_reviews,
-            apply_variant_mode=apply_variant_mode,
+            apply_variant_mode=apply_variant_mode, telemetry=tel,
         )
         variant_mode = _finalize_variant_mode(variant_mode, reviews, apply_variant_mode)
+        if telemetry is not None:
+            telemetry.update(tel)
         return reviews, total_pages, page_log, variant_mode
 
     unknown = [s for s in sorts if s not in SORT_PARAMS]
@@ -1191,10 +1348,11 @@ def collect_reviews(
     for sort in sorts:
         start_url = _sort_url(reviews_url, SORT_PARAMS[sort])
         print(f"[collect] сортировка «{SORT_LABELS.get(sort, sort)}» (sort={sort}): {start_url}")
+        log.info(f"[collect] сортировка «{SORT_LABELS.get(sort, sort)}» (sort={sort}): {start_url}")
         pass_reviews, tp, pl, vm = _collect_reviews_pass(
             page, start_url, sort, target_variant,
             max_pages=max_pages, min_reviews=min_reviews,
-            apply_variant_mode=apply_variant_mode,
+            apply_variant_mode=apply_variant_mode, telemetry=tel,
         )
         page_log.extend(pl)
         total_pages = max(total_pages, tp)
@@ -1205,8 +1363,12 @@ def collect_reviews(
         _merge_review_sorts(pass_reviews, merged, order, sort)
         print(f"[collect] сортировка «{SORT_LABELS.get(sort, sort)}»: собрано {len(pass_reviews)}"
               f", всего уникальных {len(order)}")
+        log.info(f"[collect] сортировка «{SORT_LABELS.get(sort, sort)}»: "
+                 f"собрано {len(pass_reviews)}, всего уникальных {len(order)}")
     reviews = [merged[uid] for uid in order]
     variant_mode = _finalize_variant_mode(variant_mode, reviews, apply_variant_mode)
+    if telemetry is not None:
+        telemetry.update(tel)
     return reviews, total_pages, page_log, variant_mode
 
 
@@ -1247,6 +1409,7 @@ def collect(
     if sess_owned:
         sess = Session(cdp_url)
     dom_html = None
+    telemetry: dict = {}
     try:
         sess.goto(product_url)
         requested_pid = pid_from_url(product_url)
@@ -1262,17 +1425,22 @@ def collect(
         if "Артикул" in chars and str(chars["Артикул"]) != str(requested_pid):
             print(f"[collect] warning: артикул в характеристиках ({chars['Артикул']}) "
                   f"отличается от PID {requested_pid}")
+            log.warning(f"[collect] warning: артикул в характеристиках "
+                        f"({chars['Артикул']}) отличается от PID {requested_pid}")
         if save_dom:
             try:
                 dom_html = sess.page.content()
             except Exception as e:
+                if B.is_renderer_failure(e):
+                    raise
                 print(f"[collect] dom snapshot warn: {e}")
+                log.warning(f"[collect] dom snapshot warn: {e}")
                 dom_html = None
         rurl = reviews_url or product_url + "?tab=reviews"
         reviews, total_pages, page_log, variant_mode = collect_reviews(
             sess.page, rurl, target_variant, max_pages=max_pages,
             min_reviews=min_reviews, apply_variant_mode=apply_variant_mode,
-            sorts=sorts,
+            sorts=sorts, telemetry=telemetry,
         )
     finally:
         if sess_owned:
@@ -1296,6 +1464,14 @@ def collect(
         "review_pages": page_log,
         "source": "cdp",
     }
+
+    telemetry.setdefault("scroll_time", 0.0)
+    telemetry.setdefault("extract_time", 0.0)
+    telemetry.setdefault("pages", [])
+    telemetry["scroll_jitter_seed"] = effective_scroll_jitter_seed()
+    telemetry["total_review_collection_time"] = (
+        telemetry["scroll_time"] + telemetry["extract_time"])
+    raw["collection_telemetry"] = telemetry
 
     missing_fields = []
     if not (product.get("price") and product["price"].get("current")):
@@ -1322,4 +1498,5 @@ def collect(
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
     print(f"[collect] сохранено: {out_path} ({len(reviews)} отзывов)")
+    log.info(f"[collect] сохранено: {out_path} ({len(reviews)} отзывов)")
     return raw

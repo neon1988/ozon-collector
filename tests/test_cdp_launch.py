@@ -6,6 +6,7 @@ from contextlib import ExitStack
 import pytest
 
 import ozon_collector.cdp as cdp
+from ozon_collector import browser as B
 
 
 def _patch_alive(sequence):
@@ -168,3 +169,68 @@ class TestSessionAutoLaunch:
         with pytest.raises(RuntimeError):
             cdp.Session("http://127.0.0.1:9999")
         assert calls["n"] == 0
+
+    def test_reconnect_after_close(self, monkeypatch):
+        """reconnect: закрывает старую сессию и подключается заново."""
+        self._install(monkeypatch, lambda: True)
+        s = cdp.Session("http://127.0.0.1:9999")
+        assert s._browser is not None
+        old_browser = s._browser
+        s.reconnect()
+        assert s._browser is not None
+        assert s._browser is not old_browser
+        assert s.cdp_url == "http://127.0.0.1:9999"
+
+
+class _FakePage:
+    def __init__(self):
+        self.evals = 0
+        self.evaluated = []
+
+    def evaluate(self, js, *args, **kwargs):
+        self.evals += 1
+        self.evaluated.append(js)
+        return 2
+
+    def goto(self, *a, **kw):
+        return None
+
+    def wait_for_timeout(self, ms):
+        return None
+
+    def is_closed(self):
+        return False
+
+
+class TestSessionWatchdogGuard:
+    def _session(self, monkeypatch):
+        TestSessionAutoLaunch()._install(monkeypatch, lambda: True)
+        s = cdp.Session("http://127.0.0.1:9999")
+        s.page = _FakePage()
+        return s
+
+    def test_guard_raises_when_watchdog_dead(self, monkeypatch):
+        """Мёртвый сторож → eval падает BrowserRecoveryError ДО обращения к page."""
+        s = self._session(monkeypatch)
+        s._watchdog = B.BrowserWatchdog("http://127.0.0.1:9999")
+        s._watchdog._dead = True
+        with pytest.raises(B.BrowserRecoveryError):
+            s.eval("1+1")
+        assert s.page.evals == 0
+
+    def test_guard_auto_starts_watchdog_and_scope(self, monkeypatch):
+        """Первая guarded-операция стартует сторож; close() его останавливает."""
+        monkeypatch.setattr(B.BrowserWatchdog, "_sample", lambda self: True)
+        s = self._session(monkeypatch)
+        assert s._watchdog is None
+        s.eval("1+1")
+        assert s._watchdog is not None
+        assert s._watchdog._thread is not None
+        assert s._watchdog._thread.is_alive()
+        s.wait(10)
+        s.scroll(100)
+        s.goto("https://www.ozon.ru/product/1", wait_ms=0)
+        assert s.page.evals >= 1
+        assert any("window.scrollBy" in e for e in s.page.evaluated)
+        s.close()
+        assert s._watchdog is None

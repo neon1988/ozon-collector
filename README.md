@@ -244,9 +244,32 @@ python3 cli.py search --url "https://www.ozon.ru/category/palatki-4-mestnye-9889
 
 `search` открывает **одну CDP-сессию** на весь прогон. В `--out-raw` пишется
 combined-файл: `{schema_version, collector_version, collected_at_utc, search
-{url, query}, found, limit, collected, products[{pid, ok, error, raw, markdown,
-cache, ocr}]}`. `found` — уникальные товары, найденные на странице выдачи;
-`collected` — сколько удалось собрать до `limit`.
+{url, query}, found, limit, collected, recovery, products[{pid, ok, error,
+error_kind, recycle_attempts, raw, markdown, cache, ocr}]}`. `found` —
+уникальные товары, найденные на странице выдачи; `collected` — сколько удалось
+собрать до `limit`.
+
+### Recovery после краша браузера (v1.12.0)
+
+Длительный `search` может упереться в OOM-краш renderer'а Chromium (типовой
+сценарий: `net::ERR_ABORTED: The frame was detached from the DOM`). Коллектор
+классифицирует ошибку сбора (независимый health probe по OS-identity процесса
++ CDP HTTP `/json/version` + состоянию target'а) и:
+
+- **recyclable** (`browser` / `renderer_failure`) → **R1**: браузер
+  перезапускается (`BrowserProcessManager`: kill старых процессов с сверкой
+  identity против PID-reuse → проверка, что не осталось чужих → запуск нового
+  Chromium через `scripts/launch_chrome`) → сессия переподключается →
+  **R2**: товар собирается заново. До `max_recycles` (внутренний лимит 2)
+  на товар.
+- **non-recyclable** (`target` / `unknown`) → ошибка товара фиксируется, цикл
+  продолжается на следующем товаре (крах вкладки без краха браузера не
+  требует перезапуска Chromium).
+
+Телеметрия: у каждого товара `error_kind`/`error_probe_state`/
+`recycle_attempts`; в combined — `recovery{recycles, events[{pid, attempt,
+kind}]}`. В консоли видно `[search] товар N/M: renderer_failure → recycle
+браузера (попытка 1/2)`.
 
 ### Прогресс-логи
 
@@ -266,6 +289,35 @@ cache, ocr}]}`. `found` — уникальные товары, найденны�
 
 Так всегда видно, на каком товаре процесс находится и что именно происходит
 (проверка кеша → сбор → OCR → отчёт), а не «немое ожидание».
+
+### Файловый лог прогона (`--log`)
+
+Помимо консоли, каждая команда автоматически пишет подробный лог в файл
+`logs/ozon_collector.log` (папка `logs/` создаётся сама при первом запуске).
+Путь меняется глобальным `--log <path>` или env `OZON_COLLECTOR_LOG`. При
+каждом запуске лог ротируется: текущий сохраняется как
+`logs/ozon_collector.log.1`, пишется новый.
+
+- `info`/`warning`/`error` дублируют консольный вывод (то же сообщение, +
+  время, уровень, модуль);
+- `debug` пишется **только в файл**: итерации докрутки выдачи и
+  converge/pagination, каждый `goto`/`scroll`/`eval`, переходы watchdog
+  (`alive → transient → dead`), recycles браузера — по этому логу можно
+  восстановить, что происходило во время длинного прогона.
+
+Пример строки файла:
+
+```
+2026-08-09 18:00:01,123 INFO  [search] товар 1/32: pid=1674716363 {"url": "https://www.ozon.ru/product/1674716363"}
+2026-08-09 18:00:02,010 DEBUG [cdp] goto: https://www.ozon.ru/product/1674716363 → 340ms
+```
+
+Запуск (лог и так пишется по умолчанию; `--log` — если нужен отдельный файл):
+
+```bash
+python cli.py search --query "палатка 4 местная" --limit 5
+python cli.py --log logs/run1.log search --query "палатка 4 местная" --limit 5
+```
 
 ### Кеш сырых данных (`--max-age`, v1.11.0)
 

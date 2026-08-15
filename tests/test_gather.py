@@ -72,3 +72,34 @@ def test_run_gather_error_logs(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "error: RuntimeError: сеть пропала" in out
     assert res["ok"] is False
+
+
+def test_run_gather_classifies_recyclable_error(monkeypatch, capsys):
+    """Playwright browser-closed ошибка → error_kind=browser, recyclable=True."""
+    from playwright.sync_api import Error as PWError
+
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma: (None, "missing"))
+    def boom(**kw):
+        raise PWError("Browser has been closed")
+    monkeypatch.setattr("ozon_collector.gather.C.collect", boom)
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400})
+    out = capsys.readouterr().out
+    assert res["ok"] is False
+    assert res["error_kind"] == "browser"
+    assert res["recyclable"] is True
+
+
+def test_run_gather_classifies_non_recyclable(monkeypatch, capsys):
+    """Пользовательское исключение → error_kind=unknown, recyclable=False."""
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma: (None, "missing"))
+    def boom(**kw):
+        raise ValueError("внутренняя ошибка")
+    monkeypatch.setattr("ozon_collector.gather.C.collect", boom)
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400})
+    assert res["ok"] is False
+    assert res["error_kind"] == "unknown"
+    assert res["recyclable"] is False

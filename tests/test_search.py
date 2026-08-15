@@ -216,6 +216,177 @@ def test_collect_search_progress_output(monkeypatch, capsys):
     assert "товар 3/3: ok" in out
 
 
+# ---- recovery (R1 recycle / R2 retry) --------------------------------------
+
+def _recyclable_fail(pid, error="net::ERR_ABORTED: The frame was detached"):
+    return {
+        "pid": pid, "ok": False, "error": f"Error: {error}",
+        "raw": None, "markdown": "", "cache": "miss", "ocr": "off",
+        "recyclable": True, "error_kind": "renderer_failure",
+        "error_probe_state": "renderer_failure", "error_signature": True,
+    }
+
+
+def test_collect_search_recycle_and_retry(monkeypatch):
+    """R1+R2: recyclable-ошибка → recycle браузера → повторный сбор успешен."""
+    links = [{"pid": "1", "url": "u1"}, {"pid": "2", "url": "u2"}]
+    sess = _FakeSess(links)
+    recycled = []
+    calls = {}
+
+    def fake_run_gather(cfg, sess=None):
+        if cfg["pid"] == "1" and "retried" not in calls:
+            calls["retried"] = True
+            return _recyclable_fail(cfg["pid"])
+        return _ok_result(cfg["pid"])
+
+    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+        recycled.append(launch_id)
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert len(recycled) == 1             # ровно один recycle
+    assert recycled[0] == "search-1-r1"
+    assert c["recovery"]["recycles"] == 1
+    assert c["recovery"]["events"][0]["kind"] == "renderer_failure"
+    ok = [p for p in c["products"] if p["ok"]]
+    assert len(ok) == 2
+    assert ok[0]["recycle_attempts"] == 2
+    assert ok[1]["recycle_attempts"] == 1
+
+
+def test_collect_search_no_recycle_for_non_recyclable(monkeypatch):
+    """Не-recyclable ошибка (target/unknown) → без recycle, сразу fail."""
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    recycled = []
+
+    def fake_run_gather(cfg, sess=None):
+        res = _recyclable_fail(cfg["pid"])
+        res["recyclable"] = False
+        res["error_kind"] = "target"
+        return res
+
+    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+        recycled.append(launch_id)
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert recycled == []
+    assert c["recovery"]["recycles"] == 0
+    assert c["products"][0]["ok"] is False
+    assert c["products"][0]["recycle_attempts"] == 1
+
+
+def test_collect_search_recycle_until_success_or_limit(monkeypatch):
+    """Лимит max_recycles: после N рециклов ошибка остаётся как есть."""
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    recycled = []
+
+    def fake_run_gather(cfg, sess=None):
+        return _recyclable_fail(cfg["pid"])
+
+    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+        recycled.append(launch_id)
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
+    c = collect_search(sess, "u", limit=5, gather_cfg={},
+                       max_recycles=2)
+    assert len(recycled) == 2              # 2 попытки рецикла
+    assert c["recovery"]["recycles"] == 2
+    assert c["products"][0]["ok"] is False
+    assert c["products"][0]["recycle_attempts"] == 3
+
+
+def test_collect_search_recycle_failure_marks_product(monkeypatch):
+    """recycle сам упал → ошибка товара дополняется recycle_failed."""
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+
+    def fake_run_gather(cfg, sess=None):
+        return _recyclable_fail(cfg["pid"])
+
+    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+        raise RuntimeError("BrowserOwnershipError: чужой Chromium")
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert c["recovery"]["recycles"] == 0
+    p = c["products"][0]
+    assert p["ok"] is False
+    assert "recycle_failed" in p["error"]
+    assert p["recyclable"] is False
+
+
+def test_collect_search_preventive_recycle(monkeypatch):
+    """Профилактический recycle каждые RECYCLE_EVERY товаров (OOM-превенция):
+    браузер перезапускается принудительно, чтобы renderer не дорастал до OOM."""
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 6)]
+    sess = _FakeSess(links)
+    recycled = []
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, launch_id, max_launch_wait=20.0:
+                        recycled.append(launch_id))
+    monkeypatch.setattr("ozon_collector.search.RECYCLE_EVERY", 2)
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    preventive = [r for r in recycled if "preventive" in r]
+    assert len(preventive) == 2                 # после 2-го и 4-го товара
+    assert c["recovery"]["recycles"] == 2
+    kinds = [e["kind"] for e in c["recovery"]["events"]]
+    assert kinds == ["preventive", "preventive"]
+    assert c["collected"] == 5
+
+
+class _HangPage:
+    """Зависший renderer: evaluate не возвращается (TimeoutError)."""
+
+    def evaluate(self, *args, **kwargs):
+        from playwright.sync_api import TimeoutError
+        raise TimeoutError("Timeout 4000ms exceeded")
+
+
+def test_collect_search_links_recovery(monkeypatch):
+    """Докрутка выдачи: TimeoutError (завис renderer) → recycle → повтор успешен.
+
+    Зависание при сборе ссылок выдачи не должно ронять весь search traceback'ом."""
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    sess.page = _HangPage()
+    recycled = []
+    calls = {"n": 0}
+
+    def fake_collect_links(sess, limit, scan_limit=None, max_scrolls=40,
+                           scroll_by=1500, wait_ms=1000, quiet_after=2):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            from playwright.sync_api import TimeoutError
+            raise TimeoutError("Timeout 15000ms exceeded")
+        return links
+
+    def fake_recycle(sess, launch_id, max_launch_wait=20.0):
+        recycled.append(launch_id)
+
+    monkeypatch.setattr("ozon_collector.search._collect_links", fake_collect_links)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert calls["n"] == 2                        # первый провалился, второй — успех
+    assert len(recycled) == 1
+    assert recycled[0] == "search-links-r1"
+    assert c["recovery"]["recycles"] == 1
+    assert c["recovery"]["events"][0]["pid"] == "links"
+    assert c["recovery"]["events"][0]["kind"] == "renderer_failure"
+    assert c["collected"] == 1
+
+
 def _growing_links(n, start=0):
     return [{"pid": str(start + i), "url": f"https://www.ozon.ru/product/{start + i}"}
             for i in range(1, n + 1)]

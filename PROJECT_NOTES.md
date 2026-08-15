@@ -3,7 +3,142 @@
 > Память проекта. Вся история, статус и решения по `~/ozon-collector` фиксируются
 > ТОЛЬКО здесь (и в `README.md`/`docs/`). В `AGENTS.md` — только ссылка на этот файл.
 
-## Статус и следующие шаги (последнее обновление: 2026-08-08)
+## Статус и следующие шаги (последнее обновление: 2026-08-15)
+
+ - **ФАЗА A (tuning отзывов): ЕДИНЫЙ ДЕФОЛТ 100 + КОНСТАНТЫ + BASELINE — РЕАЛИЗОВАНО (2026-08-15).**
+   Часть A плана ускорения сбора отзывов без потери данных (Фаза B — `--parallel` — отложена
+   до отдельного ревью; см. историю). Смысл изменений — ускорение докрутки отзывов и контроль
+   объёма дайджеста, с доказательной базой на review-ключах.
+   - **Единый дефолт `DEFAULT_REVIEWS_PER_PRODUCT = 100`** (`report.py`): используется и
+     `render_search_digest`, и argparse `--reviews-per-product` (`cli.py`). Дефолт влияет ТОЛЬКО
+     на обрезку отзывов в digest (`report.py` `raw_view["reviews"] = reviews[:N]`), raw остаётся
+     полным. Один источник истины — тест `test_default_reviews_per_product_is_100`.
+    - **Константы докрутки — A/B-реверт (2026-08-15):** опытные `SCROLL_STEP_PX 900→1200`,
+      `SCROLL_PAUSE_MS 1600→1000`, `MAX_SCROLL_STABLE 6→4` **отменены — возвращены 900/1600/6**
+      (применялись в `_scroll_to_reviews` и `_scroll_to_converge`; jitter-инфраструктура и
+      телеметрия остаются). Причина: извлечение отзывов — ОДИН снимок DOM после докрутки
+      (`_collect_reviews_pass` → `page.evaluate(REVIEWS_JS)`), и набор отзывов, попавших в DOM,
+      зависит от траектории скролла. Живой acceptance (3 товара baseline, новые константы):
+      `1779338676` PASS (missing=0), но `2561238412` — 96 vs baseline 97 (missing=29, extra=28;
+      повтор прогона идентичен 96/96 → детерминирован), `3627230434` (с `--sorts`) — 265 vs 250
+      (missing=165, extra=180). **A/B-тест** (monkeypatch старых констант,
+      `D:\Temp\opencode\ab_constants_test.py`): старые 900/1600/6 сейчас воспроизводят baseline
+      ТОЧНО (97/97, miss=0, extra=0), overlap старые-новые = 68. Вывод: расхождение — НЕ дрейф
+      Ozon, а регрессия констант → baseline НЕ пересоздаётся (правило ниже), константы
+      возвращены на 900/1600/6. Тест обновлён: `test_reviews.py` jitter-диапазон 1600±15% = 1360..1840.
+   - **Jitter-паузы ±15%** (`scroll_pause_ms`, `set_scroll_jitter_seed`,
+     `effective_scroll_jitter_seed`): production — случайный seed; воспроизводимость — явный
+     `--scroll-jitter-seed N` (CLI collect/gather/search). Фактический seed пишется в
+     `raw["collection_telemetry"]["scroll_jitter_seed"]`.
+   - **Телеметрия сбора** (`raw["collection_telemetry"]`, аддитивно к схеме 2.0):
+     `scroll_time`/`extract_time` (границы: только `_scroll_to_converge` и раскрытие+REVIEWS_JS,
+     БЕЗ goto/активации варианта), `pages[]` с `scroll_count`, `stable_rounds`,
+     `stable_iterations`, `last_growth_iteration`, `progression` (unique после каждого скролла),
+     `bottom_passes`, `scroll_jitter_seed`, `total_review_collection_time`.
+   - **Baseline отзывов (immutable)**: `tests/data/baseline_products.json` (schema 1.0) — 3 товара
+     по review-ключам `_review_key` (uuid): 2561238412 (97), 1779338676 (96), 3627230434 (250 ≥ 200).
+     Создан до изменения констант, автоматически НЕ перезаписывается.
+     **SHA-256 файла: `DCABF74747BB82EAC95B4AACB6DDE3138FEC1AD28BA406C025D43F09DC1ACF90`**
+     (пересоздавать baseline только сознательно, после проверки, что расхождение — дрейф Ozon,
+     а не регрессия кода).
+   - **Инструмент сравнения**: `python -m tests.compare_baseline --raw <raw.json> --baseline
+     tests/data/baseline_products.json [--pid N] [--strict-extra] [--extract-runs 3]
+     [--digest-limit 100]`. Exit code для CI: 0 = `missing_keys == ∅` (нет потери baseline);
+     1 = потеря отзывов; 2 = недетерминизм извлечения (`--extract-runs`).
+     `extra_keys` по умолчанию — диагностика (дрейф Ozon на живом товаре), FAIL только с
+     `--strict-extra`. `--pid` — сравнение одного товара (остальные baseline не fail).
+   - **Решение (зафиксировано):** порядок отзывов НЕ является контрактом — acceptance проверяет
+     полноту множества review-ключей, упорядоченность — только информационная метрика.
+     Детерминизм baseline: один живой прогон + офлайн-пересчёт review_keys 3 раза
+     (`--extract-runs 3`) — честный детерминизм слоя анализа, дрейф Ozon между живыми
+     прогонами не ломает эталон.
+   - **Проверено:** `pytest` **232 passed + 4 skipped** (было 217/4). Новые: `test_report.py` +3
+     (дефолт 100, обрезка digest, размер дайджеста), `test_reviews.py` +4 (jitter-детерминизм,
+     диапазон, effective-seed, телеметрия converge), `tests/test_baseline.py` +8 (самоконсистентность
+     baseline, missing/extra, exit codes, source-проверка).
+    - **Приёмка Фазы A (2026-08-15, живые прогоны, возвращённые константы 900/1600/6, seed=1):**
+      `2561238412` — **97/97, missing=0 extra=0, PASS** (raw: `data/phaseA_accept_2561238412_raw.json`);
+      `1779338676` — PASS (missing=0, проходил и при новых константах); `3627230434` — см. раздел
+      «Анализ стабильности baseline» ниже (исключён из gate). Детерминизм извлечения: `--extract-runs 3` OK.
+    - **Gate Фазы A (зафиксировано):** стабильные товары baseline → `missing_keys == 0`;
+      `3627230434` → diagnostic/excluded (не участвует в PASS/FAIL); baseline НЕ пересоздаётся только
+      ради зелёного теста; дальнейшие изменения констант по результатам этого товара НЕ вносятся.
+      Фаза A не заявлена полностью доказанной на трёх товарах — валидация по двум стабильным.
+    - **Анализ стабильности baseline (2026-08-15):** `3627230434` исключён из строгого acceptance gate
+      из-за доказанной нестабильности Ozon review-window. Baseline от 08.08 не воспроизводится даже
+      между двумя прогонами одного дня: (а) новые константы → 265 собр., missing=165, overlap=85;
+      (б) возвращённые константы → 264 собр., missing=210, overlap=40 — за ~1.5ч overlap упал вдвое,
+      причём возврат старых констант НЕ приблизил результат к baseline (для 2561238412 наоборот
+      воспроизвёл точно). Изменение констант — недостаточное объяснение расхождения → это дрейф/шум
+      окон сортировок Ozon (входная стена ~96 на сортировку), а не регрессия кода. Товар — только
+      диагностический кейс. Оба сегодняшних raw-прогона сохранены: `data/phaseA_3627230434_raw.json`
+      (265, новые константы) и `data/phaseA_accept_3627230434_raw.json` (264, возвращённые).
+    - **Git:** Фаза A закоммичена (коммит согласован после приёмки 2 стабильных товаров).
+
+
+ - **v1.13.0: WATCHDOG (fail-fast) + ФИКС EVAL_TIMEOUT-РЕГРЕССИИ — РЕАЛИЗОВАНО (2026-08-09).**
+   Дополняет v1.12.0: раньше смерть браузера замечалась только по ошибке на
+   операции; теперь фоновый сторож ловит её раньше и fail-fast на границе
+   операций.
+   - **`BrowserWatchdog`** (`browser.py`, после `classify_error`): daemon-поток
+     опрашивает независимый CDP HTTP-probe (`/json/version`, `http_timeout=1.0`)
+     каждые `poll_interval=2.0с`; CDP молчит → сверка `browser_processes(cdp_url)`
+     (процесс жив = транзиент `BROWSER_UNHEALTHY`, НЕ смерть); флаг «мёртв»
+     только после непрерывного bad-окна ≥ `grace_s=4.0` (debounce).
+     `check()` → `BrowserRecoveryError` → в `classify_error` = kind "browser",
+     probe_state "watchdog" → recyclable.
+   - **Guard в `Session`** (`cdp.py`): `_guard_check()` перед `goto`/`scroll`/
+     `wait`/`eval` (ленивый `_ensure_watchdog()` при первой guarded-операции,
+     `watchdog_stop()` в `close()`, новый инстанс после `reconnect()`). Зависшую
+     Playwright-операцию прервать нельзя (знание из v1.12.0) — watchdog спасает
+     СЛЕДУЮЩИЕ операции, а не текущую.
+   - **ФИКС РЕГРЕССИИ (важно):** незакоммиченный слой `timeout=EVAL_TIMEOUT`
+     в `page.evaluate` (cdp.py `scroll`/`eval` + ~15 мест в collect.py) оказался
+     сломан: в playwright **1.62.0 `Page.evaluate` НЕ принимает `timeout=`**
+     (TypeError; `set_default_timeout` тоже не действует — проверено экспериментом).
+     Это роняло 7 тестов (`test_reviews.py` 6, `test_extractors.py` 1) и сломал бы
+     любой живой прогон. Фикс: kwarg удалён, константа `EVAL_TIMEOUT` убрана из
+     cdp.py и collect.py. Защита от зависаний теперь — только watchdog на границах
+     операций (per-op таймаут evaluate в playwright 1.62 в принципе нереализуем).
+   - **Проверено:** `pytest` **217 passed + 4 skipped** (Linux-only pidfd),
+      `py_compile` чисто. Новые: `test_browser.py` +8 (watchdog alive/dead,
+      debounce через time.monotonic, ветки `_sample`, start/stop потока,
+      классификация watchdog-ошибки recyclable), `test_cdp_launch.py` +2
+      (`TestSessionWatchdogGuard` + `_FakePage`). До фикса регрессии: 210/7/4.
+   - **ФАЙЛОВЫЙ ЛОГ ПАРСИНГА (`log.py`, той же ревизии):** подробный лог всех
+      операций пишется в `logs/ozon_collector.log` (папка `logs/` создаётся
+      автоматически; переопределение: `--log` или env `OZON_COLLECTOR_LOG`).
+      При КАЖДОМ запуске ротация: текущий → `logs/ozon_collector.log.1`.
+      `log.info/warning/error` дублируют прежний `print` в stdout (capsys-тесты
+      не сломаны — проверено 217/4), `log.debug` пишет ТОЛЬКО в файл
+      (шаги докрутки выдачи, converge/pagination, goto/scroll/eval, переходы
+      watchdog alive→transient→dead, итерации поиска). `log.setup()` вызывается
+      только в `cli.main()` — pytest файлы не создаёт. Модули: cdp.py
+      (`_js_label`, goto/scroll/wait/eval/watchdog/reconnect/close), collect.py
+      (все 18 print → log.* + debug в `_scroll_to_converge`/`_detect_pagination`),
+      gather.py (cache-причины, collect/ocr), ocr.py (fetch/skip/tessdata),
+      search.py (итерации, recycles, preventive), browser.py (watchdog-переходы,
+      start/stop/check). Цель: по логу воспроизводить проблемы длинных прогонов.
+   - **Следующий шаг (живой):** `search --limit 100` по «роботам-пылесосам»
+      (сначала `--limit 3 --no-ocr` для валидации) — проверить, что recovery
+      реально срабатывает на длинном прогоне.
+   - **Git:** изменения v1.12.0 + v1.13.0 НЕ закоммичены (последний коммит
+      `11ea53d`). Модифицированы: PROJECT_NOTES.md, README.md, cli.py,
+      `ozon_collector/{__init__,browser,cdp,collect,gather,log,ocr,search}.py`,
+      `tests/{test_cdp_launch,test_gather,test_reviews,test_search}.py`;
+      новые: `ozon_collector/{browser,log,process}.py`,
+      `tests/{test_browser,test_process}.py`. Коммит — только по запросу пользователя.
+
+
+ - **ОКРУЖЕНИЕ: Windows PowerShell.** Запуск CLI — `python` (НЕ `python3` — это заглушка
+   Microsoft Store, выводит «Python was not found»), Python 3.12.5. Перед любой командой
+   CLI обязателен `$env:PYTHONIOENCODING="utf-8"` (иначе `UnicodeEncodeError cp1251` на
+   кириллице). Рабочий каталог — папка проекта (`ozon-collector`), иначе `cli.py` не
+   находится. Вставка в консоль PowerShell: правый клик или Ctrl+V. Всё окружение,
+   зависимости, tesseract, git, живой сбор Ecovacs — см. «История» → Windows-окружение.
+   **Следующий шаг:** живой `search --limit 100` по категории «роботы-пылесосы»
+   (`--url` выдачи, `--out docs/роботпылесос.md`); для валидации сначала
+   `--limit 3 --no-ocr`. Запуск: `python` + `$env:PYTHONIOENCODING="utf-8"` из каталога проекта.
 
  - **v1.11.0: SEARCH + TTL-КЕШ — РЕАЛИЗОВАНО (2026-08-08).** Команда `search`
    (`--query`/`--url`) собирает до `--limit` товаров из выдачи Ozon (докрутка
@@ -418,6 +553,175 @@
   `data/{pid}_raw.json`, `data/{pid}/dom/`, `data/gallery_{pid}/`; `docs/` + `docs/archive/`.
 
 ## История
+
+### v1.13.0: BrowserWatchdog + Session guard + фикс EVAL_TIMEOUT (2026-08-09)
+
+Задача: v1.12.0 замечал смерть браузера только по исключению на операции.
+Добавлен фоновый сторож, чтобы fail-fast срабатывал раньше (проверка перед
+каждой операцией вместо ожидания ошибки), и по пути найден и исправлен сломанный
+слой `timeout=` в `page.evaluate`.
+
+- **`BrowserWatchdog` (`browser.py`):**
+  - daemon-поток `ozon-watchdog`, `start()` идемпотентен, `stop()` — через event.
+  - `_sample()`: `BrowserProbe.cdp_http_ok(cdp_url)` (http_timeout=1.0); при
+    провале HTTP → `bool(P.browser_processes(cdp_url))` — процесс жив = транзиент
+    (BROWSER_UNHEALTHY), процесс исчез = смерть.
+  - `_report(ok)` — debounce через `time.monotonic`: флаг `alive=False` только
+    после непрерывного bad-окна ≥ `grace_s` (защита от временных сбоев CDP).
+  - `check()` бросает `BrowserRecoveryError` на операционных границах.
+  - `classify_error`: `BrowserRecoveryError` → `Classification("browser",
+    probe_state="watchdog", signature=...)` → recyclable (как renderer_failure).
+- **`Session` (`cdp.py`):**
+  - `self._watchdog` (None до первого guarded-вызова), `_ensure_watchdog()`
+    (ленивый старт), `watchdog_stop()` (в `close()`), `_guard_check()`.
+  - guard в `goto`/`scroll`/`wait`/`eval`; после `reconnect()` — новый инстанс
+    (состояние «мёртв» от старого браузера не переносится).
+  - Поток НЕ трогает Playwright (только HTTP + OS probe) — безопасен при работе
+    main-потока с page.
+- **Регрессия EVAL_TIMEOUT (найдена по 7 красным тестам):**
+  - `pytest` после watchdog: **210 passed / 7 failed** — падали
+    `test_reviews.py` (6: activate, next_page×3, expand_comments) и
+    `test_extractors.py::test_extract_live_markup[xiaomi]`.
+  - Диагностика: `TypeError: Page.evaluate() got an unexpected keyword argument
+    'timeout'`. В playwright 1.62.0 сигнатура `Page.evaluate(expression, arg)`,
+    kwarg `timeout=` не существует; `page.set_default_timeout` на evaluate НЕ
+    влияет (проверено экспериментом: infinite-loop evaluate не прерывается).
+  - Источник: незакоммиченный EVAL_TIMEOUT-слой (из ранней части работ) —
+    `timeout=EVAL_TIMEOUT` в cdp.py `scroll`/`eval` и ~15 местах в collect.py
+    (`_next_page`, `next_url`, `_scroll_to_reviews`, `_scroll_to_converge`,
+    `_expand_review_texts`, `_expand_review_comments`, `_detect_pagination`,
+    `_activate_variant_mode` и др.). Сломал бы и живой прогон (первый же
+    `sess.eval`/`sess.scroll` → TypeError).
+  - Фикс: `timeout=` удалён из всех `page.evaluate`; `EVAL_TIMEOUT = 15000`
+    удалён из cdp.py и collect.py; докстринг watchdog обновлён.
+    Вывод: per-op таймаут evaluate в playwright 1.62 в принципе нереализуем —
+    защита от зависших операций теперь только на границах операций (watchdog).
+- **Тесты:** `test_browser.py` +8 (`test_watchdog_check_alive`,
+  `test_watchdog_check_dead`, `test_watchdog_grace_debounce` (monkeypatch
+  `time.monotonic`), `test_watchdog_sample_http_ok_skips_process`,
+  `test_watchdog_sample_http_down_process_alive_is_transient`,
+  `test_watchdog_sample_http_down_process_dead`,
+  `test_watchdog_start_starts_daemon_thread`, `test_classify_watchdog_recyclable`).
+  `test_cdp_launch.py` +2 (`TestSessionWatchdogGuard`: guard бросает при мёртвом
+  watchdog + ленивый авто-старт и scope). `_FakePage.evaluate` принимает
+  `*args/**kwargs`. Вспомогательные диагностики (удалены после работы):
+  `D:\Temp\opencode\wd_debug*.py`.
+- **Файловый лог парсинга (`log.py`, та же ревизия):** пользователь попросил вести
+  подробные логи в файлы, чтобы потом по ним искать причины проблем.
+  - Дизайн: `log.info/warning/error` дублируют прежний `print` в stdout
+    (консольный вывод не меняется — на нём стоят capsys-тесты), `log.debug`
+    пишет только в файл. Файл по умолчанию `logs/ozon_collector.log` (папка
+    `logs/` в корне проекта, создаётся автоматически), переопределение
+    `--log <path>` или env `OZON_COLLECTOR_LOG`; ротация при КАЖДОМ запуске:
+    `.log→.log.1` (текущий лог всегда свежий, `.log.1` — предыдущий прогон).
+    `log.setup()` вызывается только в `cli.main()` — pytest файлы не создаёт.
+    Без `setup()` модуль работает как чистый `print` (поведение тестов не меняется).
+  - `_caller_module()` — `sys._getframe(2)` для атрибуции записи по модулю;
+    `extra={...}` сериализуется через `json.dumps(ensure_ascii=False,
+    default=str)`.
+  - Покрытие: cdp.py (`_js_label()` — метка JS ≤40 симв.; debug в
+    goto/scroll/wait/eval, watchdog start/stop/check, reconnect, close;
+    `[cdp] браузер не запущен` → + warning), collect.py (все 18 print → log.*;
+    debug-шаги `_scroll_to_converge` — it/unique/stable/плато/финал, и
+    `_detect_pagination` — sp/grew), gather.py (cache-причины, collect/ocr
+    off/hit/ran/error), ocr.py (download tessdata, fail fetch, skip small/plain),
+    search.py (итерации докрутки, ok/fail товара, recycles, preventive),
+    browser.py (переходы watchdog alive→transient→dead, start/stop).
+  - Проверено: `pytest` 217 passed + 4 skipped после всех правок (capsys
+    целы), `py_compile` чисто.
+- **Итог:** `pytest` **217 passed + 4 skipped**, `py_compile` чисто.
+
+
+
+Задача: длинный `search` (десятки товаров, одна CDP-сессия) падает при OOM-краше
+renderer'а Chromium — типовой сценарий `net::ERR_ABORTED: The frame was detached
+from the DOM` — и все последующие товары проваливаются. Решение: классификация
+ошибок + авто-перезапуск браузера + retry товара.
+
+- **`ozon_collector/process.py` (новый, изолированный process layer):**
+  - `ProcessIdentity(pid, start_key)` — физическое владение; переживает PID-reuse
+    (start_key = Linux: starttime из `/proc/<pid>/stat`; Windows: время создания
+    процесса через `GetProcessTimes`).
+  - `ProcessRecord(launch_id, identity, lifecycle)` — логическое владение
+    (какая попытка recovery); lifecycle строго монотонен
+    `created → alive → cdp_ready → killed → verified_dead`; `partial=True` —
+    launch поднял процесс, но CDP так и не поднялся.
+  - `browser_processes(cdp_url)` — поиск Browser-процессов по profile
+    (`--user-data-dir=…/ozon-profile`) + port; renderer/дочерние исключаются по
+    `--type=`. `identity_alive()`/`kill_records()` — убийство только после
+    повторной сверки start_key (PID-reuse → чужой процесс не трогаем).
+  - Убийство Linux: pidfd + `os.kill(pidfd, sig)` (exit-detection через
+    `select.poll` POLLIN, работает для non-child); Windows: OpenProcess-хэндл
+    после валидации identity + `TerminateProcess` (вместо PID).
+- **`ozon_collector/browser.py` (новый):**
+  - `has_renderer_signature(msg)` — сигнатуры наблюдённого OOM-сценария.
+  - `Classification{error_kind, probe_state, probe_attempts, signature}` +
+    `should_recycle` (browser/renderer_failure → True, target/unknown → False).
+  - `BrowserProbe` — независимый health probe: OS identity + CDP HTTP
+    `/json/version` (ретраи) + состояние target (`/json/list` page-таргеты +
+    `page.is_closed()`). ProbeState: BROWSER_DEAD / BROWSER_UNHEALTHY /
+    RENDERER_FAILURE / TARGET_LOST / HEALTHY / UNKNOWN.
+  - `classify_error(exc, sess)` — Playwright-error + (если сессия есть) probe:
+    BROWSER_UNHEALTHY (identity жив, CDP HTTP не отвечает) НЕ считается смертью
+    браузера для kill — телеметрия отдельно от error_kind.
+  - `BrowserProcessManager` — launch/restart/force_stop: каждый появившийся
+    процесс регистрируется сразу; restart = kill old (verified_dead обязателен)
+    → проверка отсутствия чужих matching-процессов → запуск; чужой/неизвестный
+    процесс или matching>1 → `BrowserOwnershipError` (ручное вмешательство).
+- **Recovery-автомат (`search.py`):**
+  - `collect_search(..., max_recycles=2)`: если `run_gather` вернул
+    `recyclable=True` → **R1** `_recycle_browser()`: `BrowserProcessManager.
+    restart` (old = текущие matching-процессы на cdp_url) + `Session.
+    reconnect()` → **R2**: повторный `run_gather` того же товара. После лимита
+    попыток ошибка остаётся как есть. При неудаче самого recycle — товар
+    помечается `recycle_failed`, `recyclable=False`.
+  - `cdp.py`: добавлен `Session.reconnect()` (close + _connect заново).
+  - Телеметрия: у товара `error_kind`/`error_probe_state`/`recycle_attempts`;
+    в combined `recovery{recycles, events[{pid, attempt, kind}]}`.
+- **`gather.py`:** `run_gather` при исключении классифицирует его
+  (`B.classify_error(e, sess=sess)`) и возвращает `error_kind`/`recyclable`/
+  `error_probe_state`/`error_signature`; лог `[gather] pid=…: error: … (kind=…)`.
+- **VERSION → 1.12.0** (инвалидация старых кешей raw — осознанно).
+- **Проверки:** `pytest` **197/197 + 4 skipped** (skipped — Linux-only pidfd,
+  тесты `test_process.py` пропускаются на Windows); `py_compile` чисто.
+  `test_browser.py` 42 (классификация, probe 16 веток, manager launch/restart/
+  force_stop на моках без живого Chromium); `test_process.py` (~24, включая
+  живые sleep-процессы и PID-reuse негатив); recovery в `test_search.py` (+4:
+  R1+R2 успех, no-recycle для non-recyclable, лимит max_recycles, recycle FAILED);
+  классификация в `test_gather.py` (+2); `Session.reconnect` в `test_cdp_launch.py`.
+- **Документы:** README (+раздел «Recovery после краша браузера», combined-схема
+  с recovery/error_kind), PROJECT_NOTES (эта запись).
+
+### Windows-окружение: python, зависимости, tesseract, git, живой сбор Ecovacs (2026-08-08)
+
+- **Среда:** Windows PowerShell (win32), Python 3.12.5 (`D:\Users\Neon\AppData\Local\
+  Programs\Python\Python312`). Ранее проект работал в Linux-контейнере — эта среда устарела.
+- **Запуск CLI:** `python` — `python3` в этой системе заглушка Microsoft Store
+  (WindowsApps alias, печатает «Python was not found»). Обязателен
+  `$env:PYTHONIOENCODING="utf-8"` перед командами — иначе `UnicodeEncodeError cp1251`
+  на кириллице (текст запроса, пути, вывод). Рабочий каталог — папка проекта, иначе
+  «cli.py no such file». Вставка в консоль: правый клик / Ctrl+V.
+- **Зависимости (Windows):** playwright 1.62.0 + chromium-1234, pytest 9.1.1,
+  pillow 12.3.0, pytesseract 0.3.13, opencv-python 5.0.0.93, httpx, jinja2, pyyaml,
+  selenium — все установлены (ALL PYTHON DEPS OK).
+- **tesseract:** v5.4.0 (winget `UB-Mannheim.TesseractOCR`), путь `C:\Program Files\
+  Tesseract-OCR`, добавлен в пользовательский PATH (новые PowerShell-сессии подхватят
+  сами; в текущей — `$env:PATH += ";C:\Program Files\Tesseract-OCR"`). `rus.traineddata`
+  (tessdata_best, 15301764 байт) скачан и скопирован через elevated Start-Process (UAC,
+  нет прав на Program Files). `tesseract --list-langs`: eng, osd, rus. OCR-тесты 16/16.
+- **git:** `git init` + первый коммит `11ea53d` (37 файлов, 8052 insertions). По решению
+  пользователя в коммит вошёл ТОЛЬКО код (cli.py, ozon_collector/, tests/, scripts/,
+  README, PROJECT_NOTES, requirements); `data/` (~187 МБ: raw, галереи, ocr_cache) и
+  `docs/` исключены `.gitignore`.
+- **Живой сбор Ecovacs T50S Pro Omni (PID 5023742495):** цена **43 151 ₽** (старая
+  199 990, с банком 38 836, conf 0.97, webPrice), рейтинг 5/5 (1 оценка), 31
+  характеристика, 13 фото галереи, 1 отзыв (5★, «Имя скрыто», 5 авг 2026). OCR галереи:
+  **12/12 с текстом, mean_conf 86.9**, engine 5.4.0.20240606, threads 8, 11.7s.
+  Отчёт: `docs/ecovacs_t50s_pro_omni.md`, данные: `data/5023742495_raw.json`.
+  Ozon при живой сессии показывал капчу «Доступ, который ограничен» — проходится
+  вручную в окне CDP-браузера (пользователь открывает Ozon сам).
+- **Тесты:** полный прогон **132 passed** (test_cdp_launch 11, test_ocr 16, остальные зелёные).
+- **Известный артефакт среды:** вывод read/grep дублирует строки — файлы на диске целы.
 
 ### Windows: скрипт запуска CDP-браузера launch_chrome.ps1 (2026-08-08)
 
@@ -1277,3 +1581,11 @@ regression = ручной гейт после пересбора.
 - **Чистка вкладок при Session.close() (2026-08-08):** браузер не гасится между
   командами, `Session.close()` закрывает все вкладки кроме `pages[0]` и уводит
   её на `about:blank`.
+- **Recovery после краша браузера (v1.12.0, 2026-08-09):** recyclable-ошибка
+  (browser / renderer_failure) перезапускает Chromium и повторяет товар;
+  non-recyclable (target / unknown) — только фиксирует ошибку. Основа —
+  изолированный `process.py` (identity против PID-reuse) + `browser.py`
+  (probe/классификация/manager). Чужой или неподтверждённый процесс Chromium
+  НИКОГДА не убивается (`BrowserOwnershipError`) — требуется ручное
+  вмешательство. BROWSER_UNHEALTHY (identity жив, CDP HTTP молчит) не является
+  причиной kill — это телеметрия, повторяем probe. Детали — «История» → v1.12.0.

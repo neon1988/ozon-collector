@@ -21,6 +21,7 @@ from ozon_collector import ocr as O
 from ozon_collector import report as R
 from ozon_collector import cache as K
 from ozon_collector import search as S
+from ozon_collector import log
 from ozon_collector.gather import run_gather
 
 
@@ -31,8 +32,22 @@ def _parse_sorts(value):
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _apply_scroll_jitter_seed(args):
+    """Применяет детерминированный seed jitter-пауз (None = случайный)."""
+    seed = getattr(args, "scroll_jitter_seed", None)
+    C.set_scroll_jitter_seed(seed)
+    effective = C.effective_scroll_jitter_seed()
+    log.info(f"[cli] scroll jitter seed: {effective} "
+             f"({'задан' if seed is not None else 'случайный'})")
+    return effective
+
+
 def cmd_collect(args):
     url = args.url or f"https://www.ozon.ru/product/{args.pid}"
+    _apply_scroll_jitter_seed(args)
+    log.info(f"[cli] collect: url={url} variant={args.variant!r} "
+             f"sorts={args.sorts!r} max_pages={args.max_pages} "
+             f"min_reviews={args.min_reviews}")
     raw = C.collect(
         product_url=url,
         reviews_url=args.reviews_url,
@@ -47,27 +62,35 @@ def cmd_collect(args):
     )
     print(f"DONE. reviews={raw['reviews_collected']}, "
           f"out=data/{C.pid_from_url(url)}_raw.json")
+    log.info(f"[cli] DONE. reviews={raw['reviews_collected']}, "
+             f"out=data/{C.pid_from_url(url)}_raw.json")
 
 
 def cmd_ocr(args):
     raw = json.load(open(args.raw, encoding="utf-8"))
     pid = args.pid or C.pid_from_url(raw.get("product_url", ""))
     gdir = args.gallery_dir or os.path.join("data", f"gallery_{pid}")
+    log.info(f"[cli] ocr: raw={args.raw} pid={pid} gdir={gdir} "
+             f"threads={args.threads} preproc={not args.no_preproc}")
     O.ocr_gallery(raw, gdir, threads=args.threads, preproc=not args.no_preproc)
     with open(args.raw, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
     print("OCR:", raw.get("gallery_stats_text"))
     print("DONE. raw обновлён:", args.raw)
+    log.info(f"[cli] OCR: {raw.get('gallery_stats_text')}; "
+             f"DONE. raw обновлён: {args.raw}")
 
 
 def cmd_report(args):
     raw = json.load(open(args.raw, encoding="utf-8"))
+    log.info(f"[cli] report: raw={args.raw} out={args.out}")
     md = R.render(raw, dedup_replies=not args.no_dedup_replies)
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(md)
         print(f"SAVED {args.out}")
+        log.info(f"[cli] SAVED {args.out}")
     else:
         sys.stdout.write(md)
 
@@ -75,6 +98,7 @@ def cmd_report(args):
 def cmd_gather(args):
     url = args.url or f"https://www.ozon.ru/product/{args.pid}"
     pid = C.pid_from_url(url)
+    _apply_scroll_jitter_seed(args)
     try:
         max_age_s = K.parse_max_age(args.max_age)
     except ValueError as e:
@@ -98,17 +122,25 @@ def cmd_gather(args):
         "no_preproc": args.no_preproc,
         "gallery_dir": args.gallery_dir,
     }
+    log.info(f"[cli] gather: pid={pid} variant={args.variant!r} "
+             f"sorts={cfg['sorts']!r} max_age_s={max_age_s} "
+             f"no_ocr={args.no_ocr}")
     res = run_gather(cfg)
     if not res["ok"]:
         print(f"Error: {res['error']}", file=sys.stderr)
+        log.error(f"[cli] gather FAILED pid={pid}: {res['error']} "
+                  f"(kind={res.get('error_kind')})", stderr=True)
         sys.exit(1)
     print(f"[gather] {pid}: cache={res['cache']} ocr={res['ocr']}")
+    log.info(f"[cli] gather OK pid={pid}: cache={res['cache']} "
+             f"ocr={res['ocr']}")
     md = res["markdown"]
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(md)
         print(f"SAVED {args.out}")
+        log.info(f"[cli] SAVED {args.out}")
     else:
         sys.stdout.write(md)
 
@@ -147,6 +179,9 @@ def cmd_search(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    _apply_scroll_jitter_seed(args)
+    log.info(f"[cli] search: url={url} limit={args.limit} "
+             f"query={args.query!r} max_age_s={max_age_s}")
     sess = Session()
     try:
         combined = S.collect_search(
@@ -165,6 +200,7 @@ def cmd_search(args):
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(md)
         print(f"SAVED {args.out}")
+        log.info(f"[cli] SAVED {args.out}")
     else:
         sys.stdout.write(md)
 
@@ -173,14 +209,21 @@ def cmd_search(args):
         with open(args.out_raw, "w", encoding="utf-8") as f:
             json.dump(combined, f, ensure_ascii=False, indent=2)
         print(f"SAVED {args.out_raw}")
+        log.info(f"[cli] SAVED {args.out_raw}")
 
     ok = sum(1 for p in combined["products"] if p["ok"])
     print(f"[search] found={combined['found']} limit={combined['limit']} "
           f"collected={combined['collected']} ok={ok}")
+    log.info(f"[cli] search DONE: found={combined['found']} "
+             f"limit={combined['limit']} collected={combined['collected']} "
+             f"ok={ok}")
 
 
 def main():
     p = argparse.ArgumentParser(prog="ozon-collector")
+    p.add_argument("--log", default=None,
+                   help="путь файла лога прогона (по умолч. logs/ozon_collector.log; "
+                        "ротация при каждом запуске: предыдущий — logs/ozon_collector.log.1)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pc = sub.add_parser("collect", help="сбор карточки + отзывов варианта (CDP)")
@@ -201,6 +244,9 @@ def main():
     pc.add_argument("--sorts", default=None,
                     help="сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
                          "(по умолчанию — одна сортировка «новые и полезные»)")
+    pc.add_argument("--scroll-jitter-seed", type=int, default=None,
+                    help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
+                         "по умолчанию случайный)")
     pc.set_defaults(fn=cmd_collect)
 
     po = sub.add_parser("ocr", help="OCR галереи в raw.json")
@@ -248,6 +294,9 @@ def main():
                     help="макс. возраст кеша raw: '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 1d)")
     pg.add_argument("--no-dedup-replies", action="store_true",
                     help="показывать все ответы продавца, без дедупа повторяющихся (по умолч. дедуп включён)")
+    pg.add_argument("--scroll-jitter-seed", type=int, default=None,
+                    help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
+                         "по умолчанию случайный)")
     pg.set_defaults(fn=cmd_gather)
 
     ps = sub.add_parser(
@@ -257,8 +306,10 @@ def main():
     ps.add_argument("--url", help="URL выдачи Ozon (/search/ или /category/…)")
     ps.add_argument("--limit", type=int, default=5,
                     help="макс. товаров для сбора (по умолч. 5)")
-    ps.add_argument("--reviews-per-product", type=int, default=15,
-                    help="макс. отзывов на товар в дайджесте (по умолч. 15)")
+    ps.add_argument("--reviews-per-product", type=int,
+                    default=R.DEFAULT_REVIEWS_PER_PRODUCT,
+                    help=f"макс. отзывов на товар в дайджесте "
+                         f"(по умолч. {R.DEFAULT_REVIEWS_PER_PRODUCT})")
     ps.add_argument("--variant", default="", help="'200x90x6' или 'Цвет:белый'")
     ps.add_argument("--max-pages", type=int, default=12)
     ps.add_argument("--min-reviews", type=int, default=40)
@@ -281,9 +332,15 @@ def main():
                     help="макс. возраст кеша raw: '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 1d)")
     ps.add_argument("--no-dedup-replies", action="store_true",
                     help="показывать все ответы продавца, без дедупа повторяющихся (по умолч. дедуп включён)")
+    ps.add_argument("--scroll-jitter-seed", type=int, default=None,
+                    help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
+                         "по умолчанию случайный)")
     ps.set_defaults(fn=cmd_search)
 
     args = p.parse_args()
+    if args.log:
+        os.environ["OZON_COLLECTOR_LOG"] = args.log
+    log.setup()
     args.fn(args)
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 
+DEFAULT_REVIEWS_PER_PRODUCT = 100
+
 
 def plural(n: int, forms=("отзыв", "отзыва", "отзывов")) -> str:
     n10, n100 = n % 10, n % 100
@@ -296,7 +298,8 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
     return "\n".join(L).rstrip() + "\n"
 
 
-def render_search_digest(combined: dict, reviews_per_product: int = 15,
+def render_search_digest(combined: dict,
+                         reviews_per_product: int = DEFAULT_REVIEWS_PER_PRODUCT,
                          dedup_replies: bool = True) -> str:
     """Markdown-дайджест выдачи Ozon для передачи в LLM (Gemini).
 
@@ -360,4 +363,7 @@ def render_search_digest(combined: dict, reviews_per_product: int = 15,
              "Учитывай цену, рейтинг, количество оценок и содержание отзывов "
              "(плюсы/минусы, частые жалобы).")
     L.append("")
+    md = "\n".join(L)
+    size_kb = len(md.encode("utf-8")) / 1024
+    L.append(f"- **Размер дайджеста:** {size_kb:.2f} КБ")
     return "\n".join(L)

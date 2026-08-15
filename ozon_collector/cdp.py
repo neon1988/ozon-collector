@@ -11,10 +11,19 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
+from .browser import BrowserWatchdog, is_renderer_failure
+from . import log
+
 
 def _cdp_port(cdp_url: str) -> int:
     port = urlparse(cdp_url).port
     return port if port else 9222
+
+
+def _js_label(js: str) -> str:
+    """Короткая метка JS-выражения для логов (до 40 символов, без переносов)."""
+    s = " ".join(js.split())
+    return s[:40] + ("…" if len(s) > 40 else "")
 
 
 def _launch_script_name() -> str:
@@ -59,6 +68,8 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
     if browser_alive(cdp_url):
         return True
     print(f"[cdp] браузер не запущен на {cdp_url}, запускаю…")
+    log.warning(f"браузер не запущен на {cdp_url}, запускаю…",
+                extra={"cdp_url": cdp_url})
     _launch_browser(cdp_url)
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
@@ -92,6 +103,7 @@ class Session:
         self._playwright = None
         self._browser = None
         self.page = None
+        self._watchdog = None
         self._connect()
 
     def _connect(self):
@@ -119,20 +131,72 @@ class Session:
 
     def goto(self, url: str, wait_ms: int = 7000):
         """Перейти на страницу, дождаться domcontentloaded + паузу."""
+        self._guard_check()
+        log.debug(f"goto: {url}", extra={"wait_ms": wait_ms})
         try:
             self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
+            if is_renderer_failure(e):
+                log.warning(f"goto renderer_failure: {url} → {type(e).__name__}: {e}")
+                raise
             print(f"[cdp] goto warn: {e}")
+            log.warning(f"goto warn: {url} → {type(e).__name__}: {e}")
         self.page.wait_for_timeout(wait_ms)
+        log.debug(f"goto done: {url}")
 
     def scroll(self, by: int = 600):
-        self.page.mouse.wheel(0, by)
+        self._guard_check()
+        log.debug(f"scroll by={by}")
+        self.page.evaluate("(dy) => window.scrollBy(0, dy)", by)
 
     def wait(self, ms: int = 1000):
+        self._guard_check()
+        log.debug(f"wait {ms}ms")
         self.page.wait_for_timeout(ms)
 
     def eval(self, js: str):
+        self._guard_check()
+        label = _js_label(js)
+        log.debug(f"eval: {label}")
         return self.page.evaluate(js)
+
+    def _ensure_watchdog(self):
+        """Ленивый запуск фонового сторожа браузера (первая guarded-операция).
+
+        Сторож работает весь прогон (в т.ч. длинный search) и останавливается
+        в close(). После reconnect() создаётся новый инстанс — состояние «мёртв»
+        от старого браузера не переносится.
+        """
+        if self._watchdog is None:
+            self._watchdog = BrowserWatchdog(self.cdp_url)
+            self._watchdog.start()
+            log.debug(f"watchdog started: {self.cdp_url}")
+
+    def watchdog_stop(self):
+        """Остановить фоновый сторож (если запущен)."""
+        if self._watchdog is not None:
+            self._watchdog.stop()
+            log.debug("watchdog stopped")
+            self._watchdog = None
+
+    def _guard_check(self):
+        """Fail-fast перед операцией: мёртвый браузер → BrowserRecoveryError."""
+        if self._watchdog is not None:
+            self._watchdog.check()
+        else:
+            self._ensure_watchdog()
+
+    def reconnect(self):
+        """Переподключиться к (новому) Chromium на том же CDP URL.
+
+        Используется после recycle браузера (recovery R1): старая сессия
+        закрывается, соединение устанавливается заново. auto_launch при этом
+        НЕ запускает браузер повторно — после restart новый процесс уже жив.
+        """
+        log.info(f"reconnect: {self.cdp_url}")
+        self.close()
+        self._connect()
+        log.info("reconnect: done")
 
     def screenshot(self, path: str):
         self.page.screenshot(path=path)
@@ -143,6 +207,8 @@ class Session:
         Браузер НЕ гасится — остаётся жив для следующей команды.
         Все вкладки кроме pages[0] закрываются; pages[0] уводится на about:blank.
         """
+        self.watchdog_stop()
+        log.debug("Session.close()")
         try:
             ctx = (self._browser.contexts[0]
                    if self._browser and self._browser.contexts else None)
