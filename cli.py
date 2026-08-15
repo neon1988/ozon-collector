@@ -254,6 +254,20 @@ def cmd_search(args):
              f"limit={combined['limit']} collected={combined['collected']} "
              f"ok={ok}")
 
+    aborted = combined.get("aborted")
+    if aborted:
+        extra = ""
+        if "workers_stormed" in aborted:
+            extra = (f" (workers_stormed={aborted['workers_stormed']}, "
+                     f"all_workers={aborted.get('all_workers')})")
+        print(f"[search] ПРОГОН ОСТАНОВЛЕН: challenge storm{extra}. "
+              "Уйди в cooldown 2+ часа перед повторным запуском.",
+              file=sys.stderr)
+        log.error(f"[cli] search ABORTED: challenge storm "
+                  f"{aborted.get('reason')}: "
+                  f"streak={aborted.get('streak')}, "
+                  f"remaining_aborted={aborted.get('remaining_aborted')}")
+
 
 def main():
     p = argparse.ArgumentParser(prog="ozon-collector")

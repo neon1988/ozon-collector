@@ -113,6 +113,13 @@ def _recycle_browser(sess, manager, launch_id: str):
 # search держит десятки страниц в одной сессии, JS heap копится).
 RECYCLE_EVERY = 40
 
+# Challenge-шторм: если CHALLENGE_STORM_LIMIT товаров ПОДРЯД закончились
+# access_challenge (после своих retry/recycle) — Ozon душит аккаунт/IP.
+# Агрессивный retry-loop бесполезен и усугубляет: шард останавливается,
+# остаток помечается aborted, в recovery пишется challenge_storm → combined
+# получает aborted (CLI советует cooldown).
+CHALLENGE_STORM_LIMIT = 3
+
 
 def _collect_links_with_recovery(sess, manager, url: str, limit: int,
                                  max_recycles: int, recovery: dict):
@@ -169,6 +176,7 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
     products: list[dict] = []
     collected = 0
     since_recycle = 0
+    challenge_streak = 0
     total = len(items)
     for n, (idx, pid, url) in enumerate(items, 1):
         tag = f"[{label}] товар {n}/{total}"
@@ -217,6 +225,31 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
             print(f"{tag}: fail · {res['error']}")
             log.warning(f"товар {n}/{total}: fail · {res['error']}",
                         extra={"pid": pid})
+        if not res["ok"] and res.get("error_kind") == "access_challenge":
+            challenge_streak += 1
+        else:
+            challenge_streak = 0
+        if challenge_streak >= CHALLENGE_STORM_LIMIT:
+            print(f"{tag}: {challenge_streak} access_challenge подряд — "
+                  f"останавливаю прогон (challenge storm, cooldown)")
+            log.error(f"товар {n}/{total}: challenge storm "
+                      f"({challenge_streak} подряд) — останавливаю прогон",
+                      extra={"pid": pid})
+            recovery["challenge_storm"] = {
+                "streak": challenge_streak,
+                "remaining_aborted": total - n,
+                "pid": pid,
+            }
+            for _m, (_i2, pid2, _u2) in enumerate(items[n:], n + 1):
+                products.append({
+                    "pid": pid2, "ok": False,
+                    "error": "aborted: challenge storm (cooldown)",
+                    "error_kind": "challenge_storm",
+                    "raw": None, "markdown": "", "cache": "off",
+                    "ocr": "off", "recyclable": False,
+                    "recycle_attempts": 0,
+                })
+            break
         since_recycle += 1
         if since_recycle >= RECYCLE_EVERY:
             try:
@@ -273,7 +306,7 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
                               max_recycles, recovery, label="search")
     collected = sum(1 for p in products if p["ok"])
 
-    return {
+    combined = {
         "schema_version": SCHEMA_VERSION,
         "collector_version": VERSION,
         "collected_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -284,3 +317,7 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
         "recovery": recovery,
         "products": products,
     }
+    storm = recovery.get("challenge_storm")
+    if storm:
+        combined["aborted"] = {"reason": "challenge_storm", **storm}
+    return combined

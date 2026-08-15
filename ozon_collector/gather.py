@@ -25,6 +25,37 @@ def _save_raw(raw, path):
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
 
+def assert_raw_structure(raw, pid) -> None:
+    """Acceptance-gate: ok только для успешной карточки с валидной структурой.
+
+    Проверки: raw — dict; pid raw совпадает с запрошенным; product — непустой
+    dict; product.title — непустой текст (не challenge-маркер); reviews —
+    список (0 отзывов допустимо и НЕ является ошибкой).
+
+    Битая структура → StructureError (не recyclable, ретрай бесполезен).
+    Challenge-заглушка в product.title → AccessChallengeError (recyclable:
+    retry с recycle браузера). Gate применяется и к кеш-хиту, и к свежему
+    сбору — challenge никогда не проходит в products как успех.
+    """
+    if not isinstance(raw, dict):
+        raise B.StructureError("raw не является dict")
+    if str(raw.get("pid") or "") != str(pid):
+        raise B.StructureError(
+            f"pid raw={raw.get('pid')!r} != ожидаемый {pid!r}")
+    product = raw.get("product")
+    if not isinstance(product, dict) or not product:
+        raise B.StructureError("product отсутствует или пуст")
+    title = (product.get("title") or "").strip()
+    if not title:
+        raise B.StructureError("product.title пуст")
+    low = title.lower()
+    for m in C.CHALLENGE_TITLE_MARKERS:
+        if m in low:
+            raise B.AccessChallengeError(f"анти-бот (product.title): {m}")
+    if not isinstance(raw.get("reviews"), list):
+        raise B.StructureError("reviews не является списком")
+
+
 def run_gather(cfg: dict, sess=None) -> dict:
     """Сбор одного товара: collect → ocr → report, с кешем и без sys.exit.
 
@@ -102,6 +133,7 @@ def run_gather(cfg: dict, sess=None) -> dict:
             print(f"[gather] pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
             log.info(f"pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
         result["raw"] = raw
+        assert_raw_structure(raw, pid)
 
         if not cfg.get("no_ocr"):
             if raw.get("gallery_ocr"):

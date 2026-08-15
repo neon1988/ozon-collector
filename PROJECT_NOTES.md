@@ -16,9 +16,20 @@
    - **Фикс cache discovery**: `cache_check` находит лучший валидный raw среди КАНОНА и
      timestamp-файлов — v1.14.0-данные не теряются за старым каноном (1.11–1.13),
      cache=hit вместо повторного похода в Ozon.
+   - **Acceptance-gate (ok = успешная карточка)**: `gather.assert_raw_structure` —
+     raw dict, pid совпал, product непустой, title непустой и НЕ challenge, reviews —
+     список. Битая структура → `StructureError` (error_kind=structure, НЕ recyclable);
+     challenge-title → `AccessChallengeError` (retry с recycle). Gate работает и на
+     кеш-хите, и на свежем сборе — challenge никогда не попадает в products как успех.
+   - **Challenge-storm abort**: `_collect_shard` считает access_challenge ПОДРЯД;
+     при `CHALLENGE_STORM_LIMIT=3` прогон останавливается (без агрессивного retry-loop),
+     остаток шарда → error_kind=challenge_storm, в combined — `aborted`
+     (в параллели: `workers_stormed`/`all_workers` через `parallel._storm_summary`);
+     CLI печатает «уйди в cooldown 2+ часа». Тесты: pytest 299 passed, 4 skipped.
    - **Следующий шаг (после cooldown, §18):** smoke воркер-профиля (1 известный товар,
      реальный title, отзывы>0) → полный пересбор 20 товаров
-     `search --limit 20 --parallel 2 --worker-timeout 3600 --reviews-per-product 100 --no-ocr`.
+     `search --limit 20 --parallel 2 --worker-timeout 3600 --reviews-per-product 100 --no-ocr`
+     (с `--max-age 7d` — cache-aware, свежие timestamp-raw берутся без нагрузки на Ozon).
 
  - **ФАЗА A (tuning отзывов): ЕДИНЫЙ ДЕФОЛТ 100 + КОНСТАНТЫ + BASELINE — РЕАЛИЗОВАНО (2026-08-15).**
    Часть A плана ускорения сбора отзывов без потери данных (Фаза B — `--parallel` — отложена
@@ -382,6 +393,37 @@
    - **План пересборки (после cooldown, §18):** smoke воркер-профиля (1 известный
      товар, реальный title, отзывы>0) → полный пересбор 20 товаров. Теперь
      challenge-страницы не дадут ложный ok.
+
+   ### 19.1. ГЕЙТЫ ПЕРЕД БОЕВЫМ ПРОГОНОМ (2026-08-16)
+   - **Acceptance-gate `gather.assert_raw_structure(raw, pid)`** — ok ставится ТОЛЬКО
+     при успешной карточке с валидной структурой (вызывается в run_gather после
+     collect ИЛИ кеш-хита, до render/ok=True):
+     - raw — dict; `str(raw.pid) == str(pid)`; product — непустой dict;
+       product.title — непустой текст; reviews — список (0 отзывов допустимо).
+     - Битая структура → `browser.StructureError` → error_kind=`structure`,
+       recyclable=False (ретрай бесполезен — данные чужие/неполные).
+     - Challenge-маркер в product.title → `AccessChallengeError` (access_challenge,
+       recyclable=True — R1 restart + R2 retry). Т.е. challenge всегда попытка
+       retry с recycle, а не тихий провал и не ложный успех.
+   - **Challenge-storm abort** (не бить по Ozon агрессивным retry-loop):
+     - `search.CHALLENGE_STORM_LIMIT = 3`: N товаров ПОДРЯД закончились
+       access_challenge (после своих retry/recycle) → `_collect_shard` останавливает
+       прогон, остаток шарда помечается `error_kind="challenge_storm"`,
+       `error="aborted: challenge storm (cooldown)"`, в recovery —
+       `challenge_storm{streak, remaining_aborted, pid}`.
+     - `collect_search`: `combined["aborted"] = {reason: challenge_storm, ...}`.
+     - `collect_parallel`: `parallel._storm_summary(wctxs, payloads, n)` агрегирует
+       по payload воркеров: `workers_stormed[]` + `all_workers` (шторм у всех →
+       аккаунт/IP душат целиком).
+     - CLI (`cmd_search`): при aborted печатает в stderr «уйди в cooldown 2+ часа».
+   - **Кейсы из требований пользователя (обязательные к проверке после пересборки):**
+     1) ok = успешная карточка + валидный title + НЕ challenge + ожидаемая структура;
+     2) access_challenge → НЕуспешный товар (retry/recycle, потом fail), никогда не ok;
+     3) 0 отзывов — не ошибка (только «нет отзывов», не challenge);
+     4) оба воркера в challenge → прогон останавливается, cooldown (all_workers=True).
+   - Тесты: `tests/test_gather.py` (+9: assert_raw_structure, challenge-hit,
+     broken-structure), `tests/test_search.py` (+3 storm), `tests/test_parallel.py`
+     (+3 storm summary). Итог: **pytest 299 passed, 4 skipped**.
 
 
  - **v1.13.0: WATCHDOG (fail-fast) + ФИКС EVAL_TIMEOUT-РЕГРЕССИИ — РЕАЛИЗОВАНО (2026-08-09).**

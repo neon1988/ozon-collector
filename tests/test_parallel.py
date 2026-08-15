@@ -116,6 +116,53 @@ def test_merge_empty_inputs():
     assert products == []
 
 
+# ---- challenge storm сводка --------------------------------------------------
+
+def _wctx(idx):
+    class _W:
+        worker_idx = idx
+        pid = 1000 + idx
+    return _W()
+
+
+def _storm_payload(k, storm):
+    return {"recovery_metrics": ({"recycles": 0, "events": [],
+                                  "challenge_storm": storm}
+                                 if storm else {"recycles": 0, "events": []})}
+
+
+def test_storm_summary_none_when_no_storm():
+    wctxs = [_wctx(1), _wctx(2)]
+    payloads = [_storm_payload(1, None), _storm_payload(2, None)]
+    assert PL._storm_summary(wctxs, payloads, 2) is None
+
+
+def test_storm_summary_one_worker():
+    wctxs = [_wctx(1), _wctx(2)]
+    payloads = [
+        _storm_payload(1, {"streak": 3, "remaining_aborted": 4, "pid": "1002"}),
+        _storm_payload(2, None),
+    ]
+    s = PL._storm_summary(wctxs, payloads, 2)
+    assert s["reason"] == "challenge_storm"
+    assert s["workers_stormed"] == [1]
+    assert s["all_workers"] is False
+    assert s["streak"] == 3
+    assert s["remaining_aborted"] == 4
+
+
+def test_storm_summary_all_workers():
+    wctxs = [_wctx(1), _wctx(2)]
+    payloads = [
+        _storm_payload(1, {"streak": 3, "remaining_aborted": 2, "pid": "1"}),
+        _storm_payload(2, {"streak": 4, "remaining_aborted": 1, "pid": "2"}),
+    ]
+    s = PL._storm_summary(wctxs, payloads, 2)
+    assert s["workers_stormed"] == [1, 2]
+    assert s["all_workers"] is True
+    assert s["streak"] == 3          # первый штормивший воркер
+
+
 # ---- attach_file --------------------------------------------------------------
 
 def test_attach_file_appends_with_prefix(tmp_path, reset_log):

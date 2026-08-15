@@ -357,6 +357,30 @@ def _cleanup_worker(wctx: WorkerContext):
                     f"{type(e).__name__}: {e}")
 
 
+def _storm_summary(wctxs, payloads, parallel: int) -> dict | None:
+    """Сводка challenge-storm'ов по payload воркеров (или None, если шторма нет).
+
+    Воркер, упёршийся в персистентный access_challenge, останавливает свой
+    шард и кладёт recovery_metrics.challenge_storm. Родитель собирает сводку:
+    какие воркеры штормили и был ли шторм у ВСЕХ (all_workers — признак того,
+    что Ozon душит аккаунт/IP целиком → полный cooldown).
+    """
+    storms = []
+    for w, pl in zip(wctxs, payloads):
+        rm = pl.get("recovery_metrics") or {}
+        if rm.get("challenge_storm"):
+            storms.append({"worker": w.worker_idx,
+                           **rm["challenge_storm"]})
+    if not storms:
+        return None
+    return {
+        "reason": "challenge_storm",
+        "workers_stormed": [s["worker"] for s in storms],
+        "all_workers": len(storms) == parallel,
+        **storms[0],
+    }
+
+
 def _stop_main_browser():
     """Полный останов main-Chromium (порт 9222, ozon-profile) ДО воркеров.
 
@@ -451,7 +475,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     products = merge_shard_results(payloads, shards)
     collected = sum(1 for p in products if p["ok"])
 
-    return {
+    combined = {
         "schema_version": SCHEMA_VERSION,
         "collector_version": VERSION,
         "collected_at_utc": _now(),
@@ -469,6 +493,10 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                        for k, s in enumerate(shards, 1)],
         },
     }
+    storm = _storm_summary(wctxs, payloads, parallel)
+    if storm:
+        combined["aborted"] = storm
+    return combined
 
 
 def _worker_summary(wctx: WorkerContext, pl: dict) -> dict:

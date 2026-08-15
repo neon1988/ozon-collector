@@ -227,6 +227,15 @@ def _recyclable_fail(pid, error="net::ERR_ABORTED: The frame was detached"):
     }
 
 
+def _challenge_fail(pid, error="анти-бот (product_page): title:похоже, нет соединения"):
+    return {
+        "pid": pid, "ok": False, "error": error,
+        "raw": None, "markdown": "", "cache": "miss", "ocr": "off",
+        "recyclable": True, "error_kind": "access_challenge",
+        "error_probe_state": None, "error_signature": False,
+    }
+
+
 def test_collect_search_recycle_and_retry(monkeypatch):
     """R1+R2: recyclable-ошибка → recycle браузера → повторный сбор успешен."""
     links = [{"pid": "1", "url": "u1"}, {"pid": "2", "url": "u2"}]
@@ -342,6 +351,74 @@ def test_collect_search_preventive_recycle(monkeypatch):
     kinds = [e["kind"] for e in c["recovery"]["events"]]
     assert kinds == ["preventive", "preventive"]
     assert c["collected"] == 5
+
+
+# ---- challenge storm (абort при персистентном access_challenge) ------------
+
+def test_collect_search_challenge_storm_aborts(monkeypatch):
+    """3 access_challenge подряд → прогон останавливается, остаток aborted.
+
+    Никакого агрессивного retry-loop: после шторма не пытаемся собирать
+    дальше, remaining помечается error_kind=challenge_storm, combined.aborted."""
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 6)]
+    sess = _FakeSess(links)
+    recycled = []
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _challenge_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id:
+                        recycled.append(launch_id))
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert len(recycled) == 3 * 2               # 3 товара × max_recycles=2
+    kinds = [p["error_kind"] for p in c["products"]]
+    assert kinds == (["access_challenge"] * 3
+                     + ["challenge_storm"] * 2)
+    aborted = [p for p in c["products"]
+               if p["error_kind"] == "challenge_storm"]
+    assert len(aborted) == 2
+    assert all("cooldown" in p["error"] for p in aborted)
+    assert all(p["recyclable"] is False for p in aborted)
+    storm = c["recovery"]["challenge_storm"]
+    assert storm["streak"] == 3
+    assert storm["remaining_aborted"] == 2
+    assert c["aborted"]["reason"] == "challenge_storm"
+    assert c["collected"] == 0
+
+
+def test_collect_search_challenge_storm_resets_on_ok(monkeypatch):
+    """Успешный товар сбрасывает счётчик шторма; срабатывание на последнем
+    товаре фиксирует storm, но остаток aborted = 0."""
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 7)]
+    sess = _FakeSess(links)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None:
+                        _ok_result(cfg["pid"]) if cfg["pid"] == "3"
+                        else _challenge_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    c = collect_search(sess, "u", limit=6, gather_cfg={})
+    kinds = [p.get("error_kind") for p in c["products"]]
+    assert kinds == (["access_challenge", "access_challenge", None]
+                     + ["access_challenge"] * 3)
+    assert c["collected"] == 1
+    storm = c["recovery"]["challenge_storm"]
+    assert storm["streak"] == 3
+    assert storm["remaining_aborted"] == 0
+    assert c["aborted"]["reason"] == "challenge_storm"
+
+
+def test_collect_search_two_challenges_no_storm(monkeypatch):
+    """2 access_challenge (< лимита 3) → шторма нет, прогон продолжается."""
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _challenge_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    assert "aborted" not in c
+    assert c["recovery"].get("challenge_storm") is None
+    assert c["collected"] == 0
 
 
 class _HangPage:

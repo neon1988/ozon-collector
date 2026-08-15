@@ -60,6 +60,16 @@ class AccessChallengeError(Exception):
     """
 
 
+class StructureError(Exception):
+    """Структура собранного raw не похожа на карточку товара (acceptance-gate).
+
+    Не recyclable: повторная попытка с перезапуском браузера не исправит
+    неполные/чужие/битые данные (product пуст, pid не совпал, reviews не
+    список). Челлендж-title в product.title обрабатывается отдельно
+    (AccessChallengeError) — он recyclable, retry с recycle.
+    """
+
+
 def _launch_script_name() -> str:
     return "launch_chrome.ps1" if os.name == "nt" else "launch_chrome.sh"
 
@@ -265,6 +275,8 @@ def classify_error(exc, sess=None) -> Classification:
                               signature=signature)
     if isinstance(exc, AccessChallengeError):
         return Classification("access_challenge", signature=signature)
+    if isinstance(exc, StructureError):
+        return Classification("structure", signature=signature)
     from playwright.sync_api import Error as PWError
     if not isinstance(exc, PWError):
         return Classification("unknown", signature=signature)

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from ozon_collector.gather import run_gather
+from ozon_collector.gather import run_gather, assert_raw_structure
+from ozon_collector import browser as B
 
 
 def _raw(pid="42"):
@@ -102,4 +103,82 @@ def test_run_gather_classifies_non_recyclable(monkeypatch, capsys):
                       "max_age_s": 86400})
     assert res["ok"] is False
     assert res["error_kind"] == "unknown"
+    assert res["recyclable"] is False
+
+
+# ---- acceptance-gate: assert_raw_structure ---------------------------------
+
+def test_structure_gate_valid_raw():
+    raw = _raw()
+    assert_raw_structure(raw, "42")          # не бросает
+
+
+def test_structure_gate_pid_mismatch():
+    with pytest.raises(B.StructureError):
+        assert_raw_structure(_raw(), "999")
+
+
+def test_structure_gate_not_a_dict():
+    with pytest.raises(B.StructureError):
+        assert_raw_structure(None, "42")
+
+
+def test_structure_gate_product_missing():
+    raw = _raw()
+    raw["product"] = {}
+    with pytest.raises(B.StructureError):
+        assert_raw_structure(raw, "42")
+
+
+def test_structure_gate_empty_title():
+    raw = _raw()
+    raw["product"] = {"title": "   "}
+    with pytest.raises(B.StructureError):
+        assert_raw_structure(raw, "42")
+
+
+def test_structure_gate_reviews_not_list():
+    raw = _raw()
+    raw["reviews"] = None
+    with pytest.raises(B.StructureError):
+        assert_raw_structure(raw, "42")
+
+
+def test_structure_gate_zero_reviews_ok():
+    raw = _raw()
+    raw["reviews"] = []
+    assert_raw_structure(raw, "42")          # 0 отзывов ≠ ошибка
+
+
+def test_structure_gate_challenge_title_recyclable():
+    """Челлендж-title в product.title → AccessChallengeError (не StructureError)."""
+    raw = _raw()
+    raw["product"] = {"title": "Похоже, нет соединения"}
+    with pytest.raises(B.AccessChallengeError):
+        assert_raw_structure(raw, "42")
+
+
+def test_run_gather_challenge_title_cache_hit_fails(monkeypatch, capsys):
+    """Challenge-raw даже из кеша → ok=False, error_kind=access_challenge."""
+    raw = _raw()
+    raw["product"] = {"title": "Подтвердите, что вы не робот"}
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma: (raw, "hit"))
+    res = run_gather({"pid": "42", "max_age_s": 86400, "no_ocr": True})
+    assert res["ok"] is False
+    assert res["error_kind"] == "access_challenge"
+    assert res["recyclable"] is True
+
+
+def test_run_gather_broken_structure_fails(monkeypatch, capsys):
+    """Битая структура (product пуст) → StructureError, НЕ recyclable."""
+    raw = _raw()
+    raw["product"] = {}
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma: (None, "missing"))
+    monkeypatch.setattr("ozon_collector.gather.C.collect", lambda **kw: raw)
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400, "no_ocr": True})
+    assert res["ok"] is False
+    assert res["error_kind"] == "structure"
     assert res["recyclable"] is False
