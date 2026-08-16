@@ -783,3 +783,25 @@ def test_scroll_to_converge_telemetry():
     assert tel["progression"] and tel["progression"][-1] == 8
     assert tel["scroll_wait_seconds"] > 0
     assert tel["bottom_growth"] is False
+
+
+# ---- Speed-тест: защита от регрессии констант (1500/400/6) -----------------
+
+def test_scroll_constants_regression():
+    """Speed-тест 2026-08-16 зафиксировал 1500/400/6 (missing=0 на 2 товарах,
+    −58..80% времени). Шаг 2000px/400ms ПОКАЗАТЕЛЬНО НЕБЕЗОПАСЕН: на живом Ozon
+    он пропускает lazy-load DOM-чанк (missing=9 из 96) при выигрыше лишь ~6%
+    времени. Поэтому рост шага — регрессия, а не ускорение:
+    константы не должны произвольно «ускоряться» в обход новой матрицы A/B."""
+    assert collect_mod.SCROLL_STEP_PX <= 1500, (
+        f"SCROLL_STEP_PX={collect_mod.SCROLL_STEP_PX}: шаг 2000px теряет отзывы "
+        f"(lazy-load, missing=9 из 96 на speed-тесте 2026-08-16)"
+    )
+    assert collect_mod.SCROLL_PAUSE_MS <= 400, (
+        f"SCROLL_PAUSE_MS={collect_mod.SCROLL_PAUSE_MS}: ускорение ниже 400ms не "
+        f"проверялось матрицей (максимум A/B — 400ms, missing=0)"
+    )
+    assert collect_mod.MAX_SCROLL_STABLE <= 6, (
+        f"MAX_SCROLL_STABLE={collect_mod.MAX_SCROLL_STABLE}: ниже 6 плато без "
+        f"роста не проверялось (A/B максимум — 6, missing=0)"
+    )
