@@ -748,7 +748,7 @@ def test_scroll_jitter_deterministic_seed():
     b = [collect_mod.scroll_pause_ms() for _ in range(20)]
     assert a == b
     for v in a:
-        assert 1360 <= v <= 1840  # 1600 ± 15% (SCROLL_PAUSE_MS после A/B-реверта)
+        assert 340 <= v <= 460  # 400 ± 15% (SCROLL_PAUSE_MS: speed-тест 1500/400/6, 2026-08-16)
 
 
 def test_scroll_jitter_range_zero():
