@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +31,34 @@ def _parse_sorts(value):
     if not value:
         return None
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def parse_pids(raw):
+    """Разбирает сырые токены (артикулы/URL Ozon) в список уникальных PID.
+
+    Принимает голые артикулы ('3627230434') и полные URL выдачи/карточки
+    ('https://www.ozon.ru/product/xiaomi-...-3627230434' или
+    '/product/3627230434/'). Нечисловые токены пропускаются.
+    """
+    pids, seen = [], set()
+
+    def add(tok):
+        t = (tok or "").strip()
+        if not t:
+            return
+        t = t.split("#")[0].split("?")[0].rstrip("/")
+        if "/product/" in t:
+            m = re.search(r"(?:/product/|\D)(\d+)$", t)
+            p = m.group(1) if m else None
+        else:
+            p = t if t.isdigit() else None
+        if p and p not in seen:
+            seen.add(p)
+            pids.append(p)
+
+    for tok in raw:
+        add(tok)
+    return pids
 
 
 def _apply_scroll_jitter_seed(args):
@@ -169,13 +198,31 @@ def cmd_search(args):
     from ozon_collector.cdp import Session
     from ozon_collector.parallel import collect_parallel
 
-    if args.url:
-        url = args.url
-    elif args.query:
-        url = S.search_url(args.query)
+    pids = []
+    if args.pids:
+        pids += parse_pids(args.pids.split(","))
+    if args.pids_file:
+        try:
+            with open(args.pids_file, encoding="utf-8") as f:
+                pids += parse_pids(f.read().splitlines())
+        except OSError as e:
+            print(f"Error: не могу прочитать --pids-file: {e}", file=sys.stderr)
+            sys.exit(1)
+    pids = parse_pids(pids)
+
+    if pids:
+        limit = len(pids)
+        url = f"список из {limit} артикулов: " + ", ".join(pids)
     else:
-        print("Error: нужен --query или --url", file=sys.stderr)
-        sys.exit(1)
+        limit = args.limit
+        if args.url:
+            url = args.url
+        elif args.query:
+            url = S.search_url(args.query)
+        else:
+            print("Error: нужен --query, --url или --pids/--pids-file",
+                  file=sys.stderr)
+            sys.exit(1)
     try:
         max_age_s = K.parse_max_age(args.max_age)
     except ValueError as e:
@@ -198,9 +245,9 @@ def cmd_search(args):
         sys.exit(1)
 
     seed = _apply_scroll_jitter_seed(args)
-    log.info(f"[cli] search: url={url} limit={args.limit} "
+    log.info(f"[cli] search: url={url} limit={limit} "
              f"query={args.query!r} max_age_s={max_age_s} "
-             f"parallel={parallel}")
+             f"parallel={parallel} pids={len(pids)}")
     gather_cfg = _gather_cfg_from_args(args, max_age_s)
     gather_cfg["scroll_jitter_seed"] = seed
     if parallel > 1:
@@ -214,16 +261,18 @@ def cmd_search(args):
             import os as _os
             gather_cfg["threads"] = max(2, (_os.cpu_count() or 2) // parallel)
         combined = collect_parallel(
-            url, limit=args.limit, gather_cfg=gather_cfg,
+            url, limit=limit, gather_cfg=gather_cfg,
             parallel=parallel, query=args.query,
-            max_recycles=2, join_timeout_s=args.worker_timeout)
+            max_recycles=2, join_timeout_s=args.worker_timeout,
+            pids=pids or None)
     else:
         sess = Session()
         try:
             combined = S.collect_search(
-                sess, url, limit=args.limit,
+                sess, url, limit=limit,
                 gather_cfg=gather_cfg,
                 query=args.query,
+                pids=pids or None,
             )
         finally:
             sess.close()
@@ -357,6 +406,13 @@ def main():
         help="сбор выдачи по запросу/URL → markdown-дайджест для LLM (CDP)")
     ps.add_argument("--query", help="текстовый поисковый запрос")
     ps.add_argument("--url", help="URL выдачи Ozon (/search/ или /category/…)")
+    ps.add_argument("--pids", default=None,
+                    help="артикулы через запятую (можно полные URL карточек "
+                         "'https://www.ozon.ru/product/<pid>'); гибрид: "
+                         "кеш + досбор без докрутки выдачи")
+    ps.add_argument("--pids-file", default=None,
+                    help="файл со списком артикулов/URL (по одному в строке; "
+                         "совместим с --pids)")
     ps.add_argument("--limit", type=int, default=5,
                     help="макс. товаров для сбора (по умолч. 5)")
     ps.add_argument("--reviews-per-product", type=int,

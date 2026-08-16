@@ -216,6 +216,55 @@ def test_collect_search_progress_output(monkeypatch, capsys):
     assert "товар 3/3: ok" in out
 
 
+# ---- pids-режим (явный список артикулов вместо докрутки выдачи) ------------
+
+def test_collect_search_pids_skips_link_scan(monkeypatch):
+    """pids-режим: выдача не сканируется (ноль скроллов), собираются ТОЛЬКО
+    перечисленные артикулы, found = len(pids)."""
+    links = [{"pid": "1", "url": "u1"}, {"pid": "2", "url": "u2"}]
+    sess = _FakeSess(links)
+
+    def fake_run_gather(cfg, sess=None):
+        sess.called_pids.append(cfg["pid"])
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=x",
+                       limit=5, gather_cfg={}, query="x",
+                       pids=["999", "777"])
+    assert sess.scrolls == 0                    # докрутки нет
+    assert sess.gotos == 0
+    assert c["found"] == 2
+    assert c["collected"] == 2
+    assert [p["pid"] for p in c["products"]] == ["999", "777"]
+
+
+def test_collect_search_pids_uses_product_url(monkeypatch):
+    """pids-режим: URL карточки строится как /product/{pid}."""
+    sess = _FakeSess([])
+    seen = {}
+
+    def fake_run_gather(cfg, sess=None):
+        seen["url"] = cfg.get("url")
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    collect_search(sess, "u", limit=5, gather_cfg={}, pids=["1234567"])
+    assert seen["url"] == "https://www.ozon.ru/product/1234567"
+
+
+def test_collect_search_pids_respects_limit(monkeypatch):
+    """pids-режим: limit обрезает сбор, но found = полный список."""
+    sess = _FakeSess([])
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+    c = collect_search(sess, "u", limit=2, gather_cfg={},
+                       pids=["1", "2", "3"])
+    assert c["found"] == 3
+    assert c["collected"] == 2
+    assert len(c["products"]) == 2
+
+
 # ---- recovery (R1 recycle / R2 retry) --------------------------------------
 
 def _recyclable_fail(pid, error="net::ERR_ABORTED: The frame was detached"):

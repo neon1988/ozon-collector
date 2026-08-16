@@ -402,25 +402,34 @@ def _stop_main_browser():
 
 def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      query: str | None = None, max_recycles: int = 2,
-                     join_timeout_s: float = 1800.0) -> dict:
+                     join_timeout_s: float = 1800.0,
+                     pids: list | None = None) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
+
+    pids — явный список артикулов вместо докрутки выдачи: main-сессия не
+    запускается, товары берутся ТОЛЬКО из списка (found = len(pids)).
 
     Возвращает combined-объект схемы 2.0 (аддитивно parallel{workers[],shards[]}).
     Ошибка preflight → RuntimeError (воркеры не запускаются).
     """
     parallel = int(parallel)
-    sess = cdp.Session()
-    recovery_main = {"recycles": 0, "events": []}
-    try:
-        manager_main = BrowserProcessManager(cdp_url=sess.cdp_url)
-        links = S._collect_links_with_recovery(
-            sess, manager_main, url, limit, max_recycles, recovery_main)
-    finally:
+    if pids:
+        links = [{"pid": str(p), "url": f"https://www.ozon.ru/product/{p}"}
+                 for p in pids]
+        recovery_main = {"recycles": 0, "events": []}
+    else:
+        sess = cdp.Session()
+        recovery_main = {"recycles": 0, "events": []}
         try:
-            sess.close()
-        except Exception:
-            pass
-        _stop_main_browser()
+            manager_main = BrowserProcessManager(cdp_url=sess.cdp_url)
+            links = S._collect_links_with_recovery(
+                sess, manager_main, url, limit, max_recycles, recovery_main)
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+            _stop_main_browser()
 
     found = len(links)
     selected = links[:limit]

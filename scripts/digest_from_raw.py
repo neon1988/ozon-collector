@@ -12,6 +12,8 @@
 
 Использование:
     python scripts/digest_from_raw.py [--data-dir data] [--out data/digest_from_raw.md]
+    python scripts/digest_from_raw.py --pids 1234567,2345678 --out d.md
+    python scripts/digest_from_raw.py --pids-file pids.txt --out d.md
 """
 from __future__ import annotations
 
@@ -22,6 +24,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows-консоль (cp1251) не кодирует ₽ из отзывов — переключаем stdout на UTF-8.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+from cli import parse_pids
 from ozon_collector import cache as K
 from ozon_collector.collect import CHALLENGE_TITLE_MARKERS
 from ozon_collector.report import render_search_digest
@@ -76,6 +83,11 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None,
                     help="файл для дайджеста (по умолчанию печать в stdout)")
     ap.add_argument("--query", default="роботы пылесосы (офлайн, из raw)")
+    ap.add_argument("--pids", default=None,
+                    help="артикулы через запятую (можно URL карточек) — "
+                         "только их и обрабатывать")
+    ap.add_argument("--pids-file", default=None,
+                    help="файл со списком артикулов/URL (по одному в строке)")
     args = ap.parse_args(argv)
 
     pids = set()
@@ -91,6 +103,19 @@ def main(argv=None) -> int:
             pid = n.split("_raw.", 1)[0]
         if pid is not None and pid.isdigit():
             pids.add(pid)
+
+    only = set()
+    if args.pids:
+        only |= set(parse_pids(args.pids.split(",")))
+    if args.pids_file:
+        try:
+            with open(args.pids_file, encoding="utf-8") as f:
+                only |= set(parse_pids(f.read().splitlines()))
+        except OSError as e:
+            print(f"Error: не могу прочитать --pids-file: {e}", file=sys.stderr)
+            return 1
+    if only:
+        pids &= only
 
     products = []
     table = []
@@ -119,8 +144,10 @@ def main(argv=None) -> int:
     print("\n".join(table))
 
     from datetime import datetime, timezone
+    query = (f"артикулы: {', '.join(sorted(pids))} (офлайн, из raw)"
+             if only else args.query)
     combined = {
-        "search": {"query": args.query},
+        "search": {"query": query},
         "collected_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "found": len(pids),
         "collected": ok_n,

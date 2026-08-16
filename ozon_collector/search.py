@@ -273,11 +273,16 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
 
 def collect_search(sess, url: str, limit: int, gather_cfg: dict,
                    query: Optional[str] = None,
-                   max_recycles: int = 2) -> dict:
+                   max_recycles: int = 2,
+                   pids: Optional[list] = None) -> dict:
     """Собирает до limit товаров из выдачи url в одной CDP-сессии.
 
     gather_cfg — базовый конфиг для run_gather (pid/url подставляются на
     каждый товар). Ошибка отдельного товара не прерывает цикл.
+
+    pids — явный список артикулов вместо докрутки выдачи: выдача не
+    сканируется, товары берутся ТОЛЬКО из списка (found = len(pids), url
+    игнорируется). Режим для «собрать/обновить конкретные товары».
 
     Recovery (OOM-краш renderer'а): если run_gather вернул recyclable-ошибку
     (browser / renderer_failure) — браузер перезапускается (R1: recycle) и
@@ -292,8 +297,12 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
     recovery = {"recycles": 0, "events": []}
     manager = B.BrowserProcessManager(
         cdp_url=getattr(sess, "cdp_url", "http://127.0.0.1:9222"))
-    links = _collect_links_with_recovery(
-        sess, manager, url, limit, max_recycles, recovery)
+    if pids:
+        links = [{"pid": str(p), "url": f"https://www.ozon.ru/product/{p}"}
+                 for p in pids]
+    else:
+        links = _collect_links_with_recovery(
+            sess, manager, url, limit, max_recycles, recovery)
 
     found = len(links)
     selected = links[:limit]
