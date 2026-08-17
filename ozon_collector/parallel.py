@@ -194,6 +194,7 @@ def _empty_payload(k: int) -> dict:
         "failed_indexes": [],
         "recovery_metrics": {"recycles": 0, "events": []},
         "rss_bytes": None,
+        "warmup": None,
         "fatal_error": None,
         "browser_stopped": False,
     }
@@ -233,6 +234,41 @@ def _run_shard(spec: dict, sess, manager, items, gather_cfg: dict,
                             label=f"worker{spec['worker_id']}")
 
 
+WARMUP_URL = "https://www.ozon.ru/"
+WARMUP_WAIT_MS = 4000
+
+
+def _warmup_session(sess, label: str = "warmup") -> dict:
+    """Прогрев сессии: переход на главную ozon.ru ДО сбора товаров.
+
+    Зачем: Ozon формирует антибот-куки/решает JS-челлендж при первом
+    «человеческом» заходе на главную. Начало сбора сразу с целевого URL
+    (карточка/выдача) без прогрева расценивается как подозрительное
+    поведение и провоцирует access_challenge. Свежие куки после главной
+    снимают блок (доказано экспериментами 2026-08-17).
+
+    Безопасно: challenge на главной → логируем и продолжаем (не фейлим
+    воркер — решает уже сам _collect_shard по товарам).
+    """
+    from .collect import detect_challenge
+    t0 = time.monotonic()
+    result = {"url": WARMUP_URL, "challenge": False, "elapsed_s": 0.0}
+    try:
+        sess.goto(WARMUP_URL, wait_ms=WARMUP_WAIT_MS)
+        sig = detect_challenge(sess.page)
+        if sig is not None:
+            result["challenge"] = True
+            result["sig"] = str(sig)
+            log.warning(f"[{label}] challenge на главной: {sig}")
+        else:
+            log.info(f"[{label}] главная открыта, сессия прогрета")
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        log.warning(f"[{label}] warmup warn: {result['error']}")
+    result["elapsed_s"] = round(time.monotonic() - t0, 2)
+    return result
+
+
 def worker_main(spec: dict, task: dict, conn):
     """Точка входа воркер-процесса: свой браузер, свой шард, payload → pipe.
 
@@ -264,6 +300,10 @@ def worker_main(spec: dict, task: dict, conn):
         manager = _make_manager(spec)
         from .collect import set_scroll_jitter_seed
         set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
+
+        warmup = _warmup_session(sess, label=f"worker{spec['worker_id']}")
+        payload["warmup"] = warmup
+        _send(conn, {"t": "warmup", "worker": k, **warmup})
 
         items = list(task["items"])
         gather_cfg = dict(task.get("gather_cfg") or {})

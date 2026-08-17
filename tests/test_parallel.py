@@ -492,6 +492,50 @@ def test_bootstrap_no_main_cookies(profile_base):
     assert bs[1] == "skipped:no_main_cookies"
 
 
+class _FakePage:
+    pass
+
+
+class _FakeSess:
+    def __init__(self, challenge=False, raise_on_goto=False):
+        self.challenge = challenge
+        self.raise_on_goto = raise_on_goto
+        self.goto_calls = []
+        self.page = _FakePage()
+
+    def goto(self, url, wait_ms=7000):
+        self.goto_calls.append((url, wait_ms))
+        if self.raise_on_goto:
+            raise RuntimeError("goto boom")
+
+
+def test_warmup_session_ok(monkeypatch):
+    from ozon_collector import collect as C
+    sess = _FakeSess()
+    monkeypatch.setattr(C, "detect_challenge", lambda page: None)
+    res = PL._warmup_session(sess, label="w1")
+    assert res["url"] == PL.WARMUP_URL
+    assert res["challenge"] is False
+    assert sess.goto_calls == [(PL.WARMUP_URL, PL.WARMUP_WAIT_MS)]
+
+
+def test_warmup_session_challenge(monkeypatch):
+    from ozon_collector import collect as C
+    sess = _FakeSess()
+    monkeypatch.setattr(C, "detect_challenge",
+                       lambda page: "title:похоже, нет соединения")
+    res = PL._warmup_session(sess, label="w1")
+    assert res["challenge"] is True
+    assert "похоже, нет соединения" in res["sig"]
+
+
+def test_warmup_session_goto_error():
+    sess = _FakeSess(raise_on_goto=True)
+    res = PL._warmup_session(sess, label="w1")
+    assert res["challenge"] is False
+    assert "goto boom" in res["error"]
+
+
 # ---- Чистые функции: _port_free / _empty_payload / _now / _worker_summary ----
 
 def test_port_free_real_socket():
