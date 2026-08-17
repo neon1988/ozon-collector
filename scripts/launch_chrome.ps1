@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Запуск живого Chromium для CDP-сбора Ozon (Windows).
 # НЕ передавать --enable-automation (иначе navigator.webdriver === true → антибот).
 # Использование: powershell -ExecutionPolicy Bypass -File scripts/launch_chrome.ps1
@@ -46,7 +46,7 @@ if (-not $Chrome) {
 # тогда полагаемся на уже запущенный инстанс.
 New-Item -ItemType Directory -Force -Path $Profile | Out-Null
 
-$args = @(
+$chromeArgs = @(
     "--remote-debugging-port=$Port",
     "--user-data-dir=$Profile",
     "--no-first-run",
@@ -57,12 +57,215 @@ $args = @(
     "about:blank"
 )
 
-Start-Process -FilePath $Chrome -ArgumentList $args | Out-Null
+# Запуск через CreateProcess со STARTUPINFO.wShowWindow=SW_HIDE (0):
+# окно создаётся СКРЫТЫМ и физически не может активироваться/украсть фокус,
+# даже если Chrome при старте пытается показать себя. После полной готовности
+# CDP (конец скрипта) показываем окно свёрнутым без активации (SW_SHOWMINNOACTIVE).
+# В отличие от Start-Process -WindowStyle Minimized (SW_SHOWMINIMIZED), который
+# АКТИВИРУЕТ окно на ~30-100мс и крадёт фокус у пользователя (прерывает печать).
+# Весь вызов — внутри C#-метода: маршалинг структуры STARTUPINFO через
+# [ref] из PowerShell возвращал Win32Error 123 (ERROR_INVALID_NAME).
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
 
-Start-Sleep -Seconds 2
-try {
-    $ver = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 5
-    Write-Host "OK: $($ver.Browser) на порту $Port" -ForegroundColor Green
-} catch {
+public class ChromeLaunch {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize;
+        public int dwXCountChars, dwYCountChars, dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateProcessW(
+        string lpApplicationName, string lpCommandLine,
+        IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
+        bool bInheritHandles, uint dwCreationFlags,
+        IntPtr lpEnvironment, string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr hObject);
+
+    public const int STARTF_USESHOWWINDOW = 0x00000001;
+    public const short SW_HIDE = 0;
+    public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+
+    public static int Launch(string commandLine) {
+        STARTUPINFO si = new STARTUPINFO();
+        si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi;
+        bool ok = CreateProcessW(null, commandLine, IntPtr.Zero, IntPtr.Zero, false,
+            CREATE_UNICODE_ENVIRONMENT, IntPtr.Zero, null, ref si, out pi);
+        if (!ok) {
+            return -Marshal.GetLastWin32Error();
+        }
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return pi.dwProcessId;
+    }
+}
+"@
+
+# Полная командная строка: chrome.exe + аргументы (CreateProcessW, Unicode).
+$cmdLine = "`"$Chrome`" " + ($chromeArgs -join " ")
+$targetPid = [ChromeLaunch]::Launch($cmdLine)
+if ($targetPid -lt 0) {
+    Write-Host "Не удалось запустить Chromium (CreateProcess, Win32Error=$(-$targetPid))" -ForegroundColor Red
+    exit 1
+}
+
+# Принудительно сворачиваем главное окно запущенного инстанса и отключаем его
+# активацию (WS_EX_NOACTIVATE): Chromium всё равно разворачивает окно при
+# подключении CDP, но без активации оно не перехватывает фокус у пользователя.
+# Фильтр по PID запущенного процесса — окна обычного Chrome не трогаем.
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public class LaunchChromeMin {
+    public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll", SetLastError=true)] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    public static IntPtr FindMainWindow(int pid) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr h, IntPtr lp) {
+            uint p; GetWindowThreadProcessId(h, out p);
+            if (p != (uint)pid) return true;
+            StringBuilder cls = new StringBuilder(256);
+            GetClassName(h, cls, 256);
+            if (cls.ToString() == "Chrome_WidgetWin_1") {
+                found = h;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+}
+"@
+$GWL_EXSTYLE = -20
+$WS_EX_NOACTIVATE = 0x08000000
+
+# Запоминаем окно, которое было в фокусе ДО запуска — вернём ему фокус после
+# (Chrome при старте сам вызывает SetForegroundWindow и крадёт фокус).
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class FocusSave {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+}
+"@
+$prevFg = [FocusSave]::GetForegroundWindow()
+
+function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowMin = $true) {
+    # Сворачивает окно (SW_SHOWMINNOACTIVE=7) и ставит WS_EX_NOACTIVATE,
+    # чтобы дальнейшие разворачивания Chromium не крали фокус.
+    # Окно ищем через EnumWindows (для скрытых окон MainWindowHandle = 0).
+    # $ShowMin=$false — только ставим WS_EX_NOACTIVATE, не показывая окно.
+    $deadline = (Get-Date).AddMilliseconds($WaitMs)
+    while ((Get-Date) -lt $deadline) {
+        $win = Get-Process -Id $PidToWatch -ErrorAction SilentlyContinue
+        $h = if ($win) { [LaunchChromeMin]::FindMainWindow($PidToWatch) } else { [IntPtr]::Zero }
+        if ($h -ne [IntPtr]::Zero) {
+            $style = [LaunchChromeMin]::GetWindowLong($h, $GWL_EXSTYLE)
+            [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $style -bor $WS_EX_NOACTIVATE) | Out-Null
+            if ($ShowMin) { [LaunchChromeMin]::ShowWindow($h, 7) | Out-Null }
+            return $true
+        }
+        Start-Sleep -Milliseconds 30
+    }
+    return $false
+}
+
+# Возвращаем фокус окну, которое было активным до запуска Chromium
+# (Chrome сам вызывает SetForegroundWindow при старте — фокус крадётся даже
+# у свёрнутого окна). SetForegroundWindow не сработает, если вызывающий
+# процесс не находится на переднем плане, поэтому применяем трюк с
+# AttachThreadInput: привязываем НАШ поток ввода к foreground-потоку chrome,
+# тогда вызов SetForegroundWindow из нашего потока разрешён системой.
+function Restore-Focus {
+    param([IntPtr]$PrevFg, [bool]$Verbose = $true)
+    if ($PrevFg -eq [IntPtr]::Zero) { return }
+    $curFg = [FocusSave]::GetForegroundWindow()
+    if ($curFg -eq $PrevFg) { return }
+    $selfThread = [FocusSave]::GetCurrentThreadId()
+    $curThread = 0; [FocusSave]::GetWindowThreadProcessId($curFg, [ref]$curThread) | Out-Null
+    [FocusSave]::AttachThreadInput($selfThread, $curThread, $true) | Out-Null
+    $restored = [FocusSave]::SetForegroundWindow($PrevFg)
+    [FocusSave]::AttachThreadInput($selfThread, $curThread, $false) | Out-Null
+    if ($Verbose) {
+        if ($restored) {
+            Write-Host "OK: фокус возвращён предыдущему окну"
+        } else {
+            Write-Warning "не удалось вернуть фокус предыдущему окну (SetForegroundWindow=$restored)"
+        }
+    }
+}
+
+# Первый проход: находим окно и ставим WS_EX_NOACTIVATE как можно раньше,
+# НЕ показывая его (оно скрыто с рождения — SW_HIDE).
+$minimized = Invoke-MinimizeNoActivate $targetPid 10000 $false
+
+# Ждём, пока CDP-порт ответит: к этому моменту Chrome закончил старт и
+# свои попытки активации окна (мелькание).
+$ready = $false
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Sleep -Milliseconds 500
+    try {
+        $ver = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
+        $ready = $true
+        Write-Host "OK: $($ver.Browser) на порту $Port" -ForegroundColor Green
+        break
+    } catch { }
+}
+if (-not $ready) {
     Write-Host "ждём... проверьте http://127.0.0.1:$Port/json/version"
+}
+
+# Контрольные проходы ПОСЛЕ полного старта: повторно применяем стиль
+# WS_EX_NOACTIVATE и показываем окно свёрнутым (SW_SHOWMINNOACTIVE=7),
+# затем возвращаем фокус. Chrome больше не активируется сам — готово к
+# подключению CDP (которое разворачивает окно, но без активации).
+if (-not $minimized) {
+    $minimized = Invoke-MinimizeNoActivate $targetPid 3000 $false
+}
+for ($i = 0; $i -lt 3; $i++) {
+    [void](Invoke-MinimizeNoActivate $targetPid 300 $true)
+    Restore-Focus -PrevFg $prevFg -Verbose ($i -eq 0)
+}
+if ($minimized) {
+    Write-Host "OK: окно PID $targetPid свёрнуто, активация отключена"
+} else {
+    Write-Warning "не удалось найти окно PID $targetPid для сворачивания"
 }

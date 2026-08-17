@@ -21,6 +21,28 @@ def _cdp_port(cdp_url: str) -> int:
     return port if port else 9222
 
 
+def _window_for_pid(pid: int):
+    """Главное видимое окно процесса pid (user32 EnumWindows) или None."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    found = []
+
+    def _cb(hwnd, lparam):
+        wpid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+        if wpid.value == pid and user32.IsWindowVisible(hwnd):
+            found.append(hwnd)
+            return False  # первое видимое окно процесса — и достаточно
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    return found[0] if found else None
+
+
 def _js_label(js: str) -> str:
     """Короткая метка JS-выражения для логов (до 40 символов, без переносов)."""
     s = " ".join(js.split())
@@ -143,6 +165,81 @@ class Session:
             )
         except Exception:
             pass
+        self._minimize_window()
+
+    def _minimize_window(self):
+        """Сворачивает окно Chromium, чтобы не перекрывало работу пользователя.
+
+        При запуске и подключении CDP Chromium разворачивает окно поверх всех
+        и крадёт фокус. Двойная защита:
+        1) CDP Browser.setWindowBounds (windowState=minimized) — сворачивание
+           через сам браузер;
+        2) user32: WS_EX_NOACTIVATE + SW_MINIMIZE на главное окно процесса —
+           окно не получает фокус при разворачивании (важно при live-сборе,
+           чтобы печать в другом приложении не прерывалась).
+        Игнорируем ошибки: сбой минимизации некритичен.
+        """
+        try:
+            sess = self._browser.new_browser_cdp_session()
+            targets = sess.send("Target.getTargets")
+            tid = None
+            for t in targets.get("targetInfos", []):
+                if t.get("type") == "page":
+                    tid = t["targetId"]
+                    break
+            if tid is not None:
+                res = sess.send("Browser.getWindowForTarget", {"targetId": tid})
+                sess.send("Browser.setWindowBounds", {
+                    "windowId": res["windowId"],
+                    "bounds": {"windowState": "minimized"},
+                })
+        except Exception as e:
+            log.debug(f"minimize_window cdp: {type(e).__name__}: {e}")
+        self._minimize_window_native(_cdp_port(self.cdp_url))
+
+    @staticmethod
+    def _minimize_window_native(port: int):
+        """user32: свёртывание + запрет активации окна CDP-Chromium (Windows).
+
+        Находит главное окно процесса chrome с remote-debugging-port=port
+        (наш воркер), ставит WS_EX_NOACTIVATE и сворачивает (SW_MINIMIZE).
+        Окна обычного Chrome пользователя не трогаются. Не-Windows — no-op.
+        """
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            SW_MINIMIZE = 6
+
+            # ищем PID процесса chrome с remote-debugging-port через wmic
+            import subprocess
+            out = subprocess.run(
+                ["wmic", "process", "where",
+                 "Name='chrome.exe'",
+                 "get", "ProcessId,CommandLine",
+                 "/format:csv"],
+                capture_output=True, text=True, timeout=10).stdout
+            pids = set()
+            for line in out.splitlines():
+                if f"--remote-debugging-port={port}" in line:
+                    parts = line.strip().split(",")
+                    if parts and parts[-1].strip().isdigit():
+                        pids.add(int(parts[-1].strip()))
+            for pid in pids:
+                hwnd = _window_for_pid(pid)
+                if hwnd:
+                    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                          style | WS_EX_NOACTIVATE)
+                    user32.ShowWindow(hwnd, SW_MINIMIZE)
+                    break
+        except Exception as e:
+            log.debug(f"minimize_window native: {type(e).__name__}: {e}")
 
     def goto(self, url: str, wait_ms: int = 7000):
         """Перейти на страницу, дождаться domcontentloaded + паузу."""
@@ -195,6 +292,7 @@ class Session:
                 old.close()
             except Exception:
                 pass
+        self._minimize_window()
         log.debug(f"new_page: {self.cdp_url}")
         return new
 
