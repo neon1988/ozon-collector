@@ -5,6 +5,27 @@
 
 ## Статус и следующие шаги (последнее обновление: 2026-08-17)
 
+ - **⛔ ИНЦИДЕНТ: большой прогон 300 товаров → FAB на всех живых, new_tab НЕ разблокировал (2026-08-17, 13:02–13:16).**
+   `search --limit 300 --parallel 2` (нашёлся 304, последние контакты 12:56 и 12:58 — запуск сразу после двух прогонов):
+   **все ok = cache=hit** (w1 123, w2 126), **ни одного живого товара**, fail=8 у каждого (все cache=miss → access_challenge).
+   **new_tab recovery: 28 попыток (14+14), успехов 0** — FAB не отпускает ни новая вкладка, ни recycle.
+   Шторм в конце: worker2 149/150 `challenge storm` (streak=3, remaining_aborted=1) → `search ABORTED`, CLI посоветовал cooldown.
+   Итог: `found=304 limit=300 collected=241 ok=266 excluded=25 aborted`. Даже без нового кода дайджест бы вышел из кеша.
+   **Вывод:** guard и recovery отработали штатно (ни одного challenge в products, шторм остановил прогон), но new_tab
+   снимает ТОЛЬКО tab-уровневую блокировку (эксперимент — анонимная сессия), а здесь блокировка уровня IP/аккаунта
+   (кумулятивная нагрузка: 300 товаров parallel 2 сразу после двух прогонов) — ни одна вкладка не проходит.
+   **Правило подтверждено:** большой прогон только после паузы (последний контакт ≥2–4ч) + smoke на 1 товар
+   (`--parallel 1`), иначе Ozon душит целиком. Теперь стоп на живой сбор (cooldown 12–24ч).
+   ⚠️ **Разбиение md сработало в проде:** дайджест 12 МБ разбился на 3 файла (`.md` + `.part2` + `.part3`) — фича
+   `write_search_digest` из этого раздела (ещё НЕ закоммичена).
+ - **Разбиение md-дайджеста на части по 100 товаров (2026-08-17, НЕ закоммичено).**
+   `render_search_digest` принимает `products` (срез для рендера) и `chunk=(k,n)` —
+   в шапку части добавляется «Часть k из N». Новая `report.write_search_digest(combined,
+   out, max_products_per_file=100)` — пишет файлы, разбивая при >100 товаров:
+   `out` + `out.part2`, `out.part3`, … (`max_products_per_file=0` — без разбиения).
+   CLI `search --max-products-per-file` (default 100) и `scripts/digest_from_raw.py
+   --max-products-per-file` используют её. pytest 360 passed (было 356), 1 pre-existing
+   fail `test_baseline_matches_source_raw` (дрейф raw). Не закоммичено — ждёт согласия.
  - **new_tab recovery ВНЕДРЁН И ЗАКОММИЧЕН (2026-08-17, коммит `7429cda`).** Реализация
    принята пользователем, git-коммит сделан (`feat: recover from access_challenge via new
    tab in same context`). Артефакты live-прогона `.coverage` и `challenge_probe_report.json`
