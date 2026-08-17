@@ -15,6 +15,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import socket
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -245,6 +246,14 @@ def worker_main(spec: dict, task: dict, conn):
     sess = None
     manager = None
     try:
+        # Windows-консоль по умолчанию cp1251: юникодные символы (→ и др.)
+        # в print падают с UnicodeEncodeError и роняют воркер. Переключаем
+        # stdout/stderr на UTF-8 с безопасным fallback.
+        for _s in (sys.stdout, sys.stderr):
+            try:
+                _s.reconfigure(encoding="utf-8", errors="backslashreplace")
+            except Exception:
+                pass
         log.attach_file(spec["log_path"], mode="a", prefix=prefix)
         os.environ["OZON_WORKER_ID"] = str(k)
         payload["started"] = _now()
