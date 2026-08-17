@@ -482,7 +482,9 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         payloads.append(pl)
 
     products = merge_shard_results(payloads, shards)
-    collected = sum(1 for p in products if p["ok"])
+    collected = sum(1 for p in products
+                    if p["ok"] and not p.get("excluded"))
+    excluded = sum(1 for p in products if p.get("excluded"))
 
     combined = {
         "schema_version": SCHEMA_VERSION,
@@ -492,6 +494,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         "found": found,
         "limit": limit,
         "collected": collected,
+        "excluded": excluded,
         "recovery": recovery_main,
         "products": products,
         "parallel": {
@@ -502,6 +505,9 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                        for k, s in enumerate(shards, 1)],
         },
     }
+    mr = gather_cfg.get("min_rating")
+    if mr is not None:
+        combined["min_rating"] = mr
     storm = _storm_summary(wctxs, payloads, parallel)
     if storm:
         combined["aborted"] = storm

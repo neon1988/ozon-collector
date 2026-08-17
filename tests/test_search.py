@@ -99,6 +99,7 @@ class _FakeSess:
         self.gotos = 0
         self.scrolls = 0
         self.called_pids = []
+        self.new_pages = 0
 
     def goto(self, url, wait_ms=None):
         self.gotos += 1
@@ -111,6 +112,9 @@ class _FakeSess:
 
     def wait(self, ms=1000):
         pass
+
+    def new_page(self, close_current=True):
+        self.new_pages += 1
 
 
 class _GrowingSess:
@@ -159,6 +163,49 @@ def test_collect_search_limit(monkeypatch):
     assert c["collected"] == 5
     assert len(c["products"]) == 5
     assert sess.called_pids == [str(i) for i in range(1, 6)]
+
+
+def _ok_rating(pid, rating):
+    res = _ok_result(pid)
+    res["raw"]["product"]["rating"] = rating
+    return res
+
+
+def test_collect_search_min_rating_excludes(monkeypatch):
+    """--min-rating: собранный товар с рейтингом ниже порога → excluded.
+
+    raw остаётся собранным (ok=True), но из collected/дайджеста исключается.
+    Рейтинг == порогу (4.7) и None (не извлечён) не исключаются."""
+    links = [{"pid": str(i), "url": f"https://www.ozon.ru/product/{i}"}
+             for i in range(1, 5)]
+    sess = _FakeSess(links)
+    ratings = {"1": 4.5, "2": 4.8, "3": None, "4": 4.7}
+
+    def fake(cfg, sess=None):
+        return _ok_rating(cfg["pid"], ratings[cfg["pid"]])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake)
+    c = collect_search(sess, "u", limit=5,
+                       gather_cfg={"min_rating": 4.7})
+    assert c["collected"] == 3
+    assert c["excluded"] == 1
+    assert c["min_rating"] == 4.7
+    assert all(p["ok"] for p in c["products"])
+    ex = [p for p in c["products"] if p.get("excluded")]
+    assert [p["pid"] for p in ex] == ["1"]
+    assert ex[0]["excluded"] == {"reason": "rating_below", "rating": 4.5,
+                                 "min_rating": 4.7}
+
+
+def test_collect_search_min_rating_disabled(monkeypatch):
+    """Без min_rating в gather_cfg фильтр выключен (даже при низком рейтинге)."""
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_rating(cfg["pid"], 3.0))
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert c["collected"] == 1
+    assert c["excluded"] == 0
+    assert "min_rating" not in c
 
 
 def test_collect_search_found_less_than_limit(monkeypatch):
@@ -468,6 +515,128 @@ def test_collect_search_two_challenges_no_storm(monkeypatch):
     assert "aborted" not in c
     assert c["recovery"].get("challenge_storm") is None
     assert c["collected"] == 0
+
+
+# ---- new_tab recovery (эксперимент 2026-08-17: FAB → новая вкладка) ----------
+
+def test_collect_search_challenge_new_tab_recovers(monkeypatch):
+    """access_challenge → recovery новой вкладкой: товар собирается БЕЗ recycle.
+
+    Эксперимент: FAB залипает на навигации конкретной вкладки, а свежая
+    вкладка проходит Qrator и разблокирует сессию (auth-куки)."""
+    links = [{"pid": "1", "url": "u1"}, {"pid": "2", "url": "u2"}]
+    sess = _FakeSess(links)
+    recycled = []
+    calls = {}
+
+    def fake_run_gather(cfg, sess=None):
+        if cfg["pid"] == "1" and "nt" not in calls:
+            calls["nt"] = True
+            return _challenge_fail(cfg["pid"])
+        return _ok_result(cfg["pid"])
+
+    def fake_recycle(sess, manager, launch_id):
+        recycled.append(launch_id)
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert recycled == []                    # recycle НЕ вызывался
+    assert sess.new_pages == 1               # одна новая вкладка
+    ok = [p for p in c["products"] if p["ok"]]
+    assert len(ok) == 2
+    p1 = [p for p in c["products"] if p["pid"] == "1"][0]
+    assert p1["ok"] is True
+    assert p1["new_tab_attempts"] == 1
+    assert p1["recovery_kind"] == "new_tab"
+    assert p1["recycle_attempts"] == 2       # 1 вызов + 1 повтор после вкладки
+    assert c["recovery"]["new_tab_attempts"] == 1
+    assert c["recovery"]["new_tab_successes"] == 1
+    assert c["recovery"]["recycles"] == 0
+    assert any(e["kind"] == "new_tab" for e in c["recovery"]["events"])
+
+
+def test_collect_search_challenge_new_tab_fallback_recycle(monkeypatch):
+    """Персистентный challenge: 2 новые вкладки → затем recycle (fallback) → успех."""
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    recycled = []
+    calls = {"n": 0}
+
+    def fake_run_gather(cfg, sess=None):
+        calls["n"] += 1
+        if calls["n"] == 4:                  # 1 + 2 вкладки + 1 recycle
+            return _ok_result(cfg["pid"])
+        return _challenge_fail(cfg["pid"])
+
+    def fake_recycle(sess, manager, launch_id):
+        recycled.append(launch_id)
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert sess.new_pages == 2
+    assert len(recycled) == 1
+    p = c["products"][0]
+    assert p["ok"] is True
+    assert p["new_tab_attempts"] == 2
+    assert p["recovery_kind"] == "recycle"   # последний recovery — recycle
+    assert p["recycle_attempts"] == 4        # 1 + 2 вкладки + 1 recycle
+    assert c["recovery"]["new_tab_attempts"] == 2
+    assert c["recovery"]["new_tab_successes"] == 0
+    assert c["recovery"]["recycles"] == 1
+    kinds = [e["kind"] for e in c["recovery"]["events"]]
+    assert kinds == ["new_tab", "new_tab", "access_challenge"]
+
+
+def test_collect_search_challenge_new_tab_max_then_recycle_limit(monkeypatch):
+    """Максимум: 2 вкладки + 2 recycle на товар → ошибка как есть (без шторма)."""
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    recycled = []
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _challenge_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id:
+                        recycled.append(launch_id))
+    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    assert sess.new_pages == 2 * 2           # 2 товара × 2 вкладки
+    assert len(recycled) == 2 * 2            # 2 товара × 2 recycle
+    for p in c["products"]:
+        assert p["ok"] is False
+        assert p["new_tab_attempts"] == 2
+        assert p["recovery_kind"] == "recycle"
+        assert p["recycle_attempts"] == 5    # 1 + 2 вкладки + 2 recycle
+    assert c["recovery"]["new_tab_attempts"] == 4
+    assert c["recovery"]["new_tab_successes"] == 0
+    assert c["recovery"]["recycles"] == 4
+
+
+def test_collect_search_challenge_new_tab_failure_marks_product(monkeypatch):
+    """new_page сам упал → ошибка дополняется new_tab_failed, без recycle."""
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    recycled = []
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("CDP target closed")
+
+    sess.new_page = _boom
+
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _challenge_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id:
+                        recycled.append(launch_id))
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    assert recycled == []
+    p = c["products"][0]
+    assert p["ok"] is False
+    assert "new_tab_failed" in p["error"]
+    assert p["recyclable"] is False
+    assert p["new_tab_attempts"] == 1
+    assert c["recovery"]["new_tab_attempts"] == 1
+    assert c["recovery"]["recycles"] == 0
 
 
 class _HangPage:

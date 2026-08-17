@@ -234,3 +234,56 @@ class TestSessionWatchdogGuard:
         assert any("window.scrollBy" in e for e in s.page.evaluated)
         s.close()
         assert s._watchdog is None
+
+
+class _TabPage:
+    """Мини-фейк вкладки: close + init_script для Session.new_page."""
+
+    def __init__(self):
+        self.closed = False
+        self.init_scripts = []
+
+    def close(self):
+        self.closed = True
+
+    def add_init_script(self, js):
+        self.init_scripts.append(js)
+
+
+class TestSessionNewPage:
+    """new_page (recovery new_tab): новая вкладка в том же контексте браузера."""
+
+    def _session(self):
+        ctx = type("Ctx", (), {"new_tabs": []})()
+        ctx.new_page = lambda: ctx.new_tabs.append(_TabPage()) or ctx.new_tabs[-1]
+        browser = type("Browser", (),
+                       {"contexts": [ctx]})()
+        s = cdp.Session.__new__(cdp.Session)
+        s.cdp_url = "http://127.0.0.1:9222"
+        s._browser = browser
+        s.page = _TabPage()
+        return s, ctx
+
+    def test_new_page_switches_active_and_closes_old(self):
+        s, ctx = self._session()
+        old = s.page
+        new = s.new_page()
+        assert s.page is new
+        assert new is not old
+        assert ctx.new_tabs == [new]
+        assert old.closed is True
+        assert new.init_scripts != []      # анти-детект init_script на вкладке
+
+    def test_new_page_keeps_old_when_close_false(self):
+        s, ctx = self._session()
+        old = s.page
+        new = s.new_page(close_current=False)
+        assert old.closed is False
+        assert s.page is new
+
+    def test_new_page_without_browser_raises(self):
+        s = cdp.Session.__new__(cdp.Session)
+        s._browser = None
+        s.page = None
+        with pytest.raises(RuntimeError):
+            s.new_page()

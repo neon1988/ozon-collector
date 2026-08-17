@@ -326,7 +326,15 @@ def render_search_digest(combined: dict,
     L.append("")
 
     products = combined.get("products") or []
-    for i, p in enumerate(products, 1):
+    listed = [p for p in products if not p.get("excluded")]
+    excluded = [p for p in products if p.get("excluded")]
+    if excluded:
+        e0 = excluded[0].get("excluded") or {}
+        L.append(f"- **Исключено по рейтингу:** {len(excluded)} товаров "
+                 f"(рейтинг ниже {e0.get('min_rating', '?')}, см. секцию "
+                 f"«Исключено по рейтингу»).")
+        L.append("")
+    for i, p in enumerate(listed, 1):
         L.append("---")
         L.append("")
         if not p.get("ok"):
@@ -353,6 +361,19 @@ def render_search_digest(combined: dict,
         md = render(raw_view, dedup_replies=dedup_replies)
         for line in md.rstrip("\n").split("\n"):
             L.append(line)
+        L.append("")
+
+    if excluded:
+        L.append("---")
+        L.append("")
+        L.append("## Исключено по рейтингу")
+        L.append("")
+        for p in excluded:
+            e = p.get("excluded") or {}
+            rawp = p.get("raw") or {}
+            title = (rawp.get("product", {}).get("title") or "").strip() or "—"
+            L.append(f"- **{p.get('pid')}** · рейтинг {e.get('rating')} "
+                     f"(мин. {e.get('min_rating')}): {title}")
         L.append("")
 
     L.append("---")

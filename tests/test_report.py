@@ -178,6 +178,26 @@ def test_digest_no_dedup_flag():
     assert "пропущено" not in md
 
 
+def test_digest_excluded_section():
+    """Исключённые по рейтингу не рендерятся полностью, а выносятся в секцию."""
+    low = _ok_result("1")
+    low["excluded"] = {"reason": "rating_below", "rating": 4.3,
+                       "min_rating": 4.7}
+    low["raw"]["product"]["title"] = "Товар Низкий"
+    good = _ok_result("2")
+    md = render_search_digest(_combined([low, good]), reviews_per_product=5)
+    head, sep = md.split("## Исключено по рейтингу")
+    # в основной части только полный render хорошего товара (нумерация 1)
+    assert "Товар Низкий" not in head
+    assert "## Товар 1: 2" in head
+    assert "## Товар 2:" not in head
+    # секция исключённых: pid, рейтинг, порог, заголовок товара
+    assert "**1** · рейтинг 4.3 (мин. 4.7): Товар Низкий" in sep
+    assert "# Товар Низкий" not in sep  # полного render исключённого нет
+    # строка в шапке про исключённые
+    assert "Исключено по рейтингу:** 1 товаров" in md
+
+
 # ---- Phase A: единый дефолт 100 + размер дайджеста -------------------------
 
 def test_default_reviews_per_product_is_100():

@@ -191,6 +191,7 @@ def _gather_cfg_from_args(args, max_age_s):
         "no_preproc": args.no_preproc,
         "dedup_replies": not args.no_dedup_replies,
         "overwrite": args.overwrite,
+        "min_rating": getattr(args, "min_rating", None),
     }
 
 
@@ -297,11 +298,12 @@ def cmd_search(args):
         log.info(f"[cli] SAVED {args.out_raw}")
 
     ok = sum(1 for p in combined["products"] if p["ok"])
+    excluded = sum(1 for p in combined["products"] if p.get("excluded"))
     print(f"[search] found={combined['found']} limit={combined['limit']} "
-          f"collected={combined['collected']} ok={ok}")
+          f"collected={combined['collected']} ok={ok} excluded={excluded}")
     log.info(f"[cli] search DONE: found={combined['found']} "
              f"limit={combined['limit']} collected={combined['collected']} "
-             f"ok={ok}")
+             f"ok={ok} excluded={excluded}")
 
     aborted = combined.get("aborted")
     if aborted:
@@ -318,7 +320,7 @@ def cmd_search(args):
                   f"remaining_aborted={aborted.get('remaining_aborted')}")
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ozon-collector")
     p.add_argument("--log", default=None,
                    help="путь файла лога прогона (по умолч. logs/ozon_collector.log; "
@@ -392,8 +394,8 @@ def main():
     pg.add_argument("--sorts", default=None,
                     help="сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
                          "(по умолчанию — одна сортировка «новые и полезные»)")
-    pg.add_argument("--max-age", default="1d",
-                    help="макс. возраст кеша raw: '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 1d)")
+    pg.add_argument("--max-age", default="7d",
+                    help="макс. возраст кеша raw: '7d', '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 7d)")
     pg.add_argument("--no-dedup-replies", action="store_true",
                     help="показывать все ответы продавца, без дедупа повторяющихся (по умолч. дедуп включён)")
     pg.add_argument("--scroll-jitter-seed", type=int, default=None,
@@ -419,6 +421,10 @@ def main():
                     default=R.DEFAULT_REVIEWS_PER_PRODUCT,
                     help=f"макс. отзывов на товар в дайджесте "
                          f"(по умолч. {R.DEFAULT_REVIEWS_PER_PRODUCT})")
+    ps.add_argument("--min-rating", type=float,
+                    default=S.DEFAULT_MIN_RATING,
+                    help="игнорировать товары с рейтингом ниже значения "
+                         "(по умолч. 4.7; 0 — отключить фильтр)")
     ps.add_argument("--variant", default="", help="'200x90x6' или 'Цвет:белый'")
     ps.add_argument("--max-pages", type=int, default=12)
     ps.add_argument("--min-reviews", type=int, default=40)
@@ -453,8 +459,8 @@ def main():
     ps.add_argument("--sorts", default=None,
                     help="сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
                          "(по умолчанию — одна сортировка «новые и полезные»)")
-    ps.add_argument("--max-age", default="1d",
-                    help="макс. возраст кеша raw: '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 1d)")
+    ps.add_argument("--max-age", default="7d",
+                    help="макс. возраст кеша raw: '7d', '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 7d)")
     ps.add_argument("--no-dedup-replies", action="store_true",
                     help="показывать все ответы продавца, без дедупа повторяющихся (по умолч. дедуп включён)")
     ps.add_argument("--scroll-jitter-seed", type=int, default=None,
@@ -462,6 +468,11 @@ def main():
                          "по умолчанию случайный)")
     ps.set_defaults(fn=cmd_search)
 
+    return p
+
+
+def main():
+    p = build_parser()
     args = p.parse_args()
     if args.log:
         os.environ["OZON_COLLECTOR_LOG"] = args.log

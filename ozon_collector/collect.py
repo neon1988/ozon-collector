@@ -969,6 +969,18 @@ def _expand_review_texts(page, max_passes: int = 8) -> int:
 
 _COMMENT_BTN_RE = re.compile(r'[1-9]\d*\s*комментар', re.IGNORECASE)
 
+_STICKY_INTERCEPT_HINT = "intercepts pointer events"
+
+
+def _is_sticky_intercept(exc) -> bool:
+    """True, если клик не прошёл из-за перекрытия элемента sticky-блоком.
+
+    Playwright сообщает об этом в тексте ошибки: «... subtree intercepts
+    pointer events». Это НЕ hang renderer: клик таймаутит, а renderer жив.
+    Такую ошибку нельзя пробрасывать как renderer_failure — надо продолжить
+    сбор (карточка уже помечена data-comments-clicked и больше не тронется)."""
+    return _STICKY_INTERCEPT_HINT in str(exc)
+
 
 def _expand_review_comments(page, max_passes: int = 6) -> int:
     """Раскрывает комментарии к отзывам («N комментарий»).
@@ -1005,11 +1017,19 @@ def _expand_review_comments(page, max_passes: int = 6) -> int:
                     " if (c) c.setAttribute('data-comments-clicked', '1'); }"
                 )
                 h.scroll_into_view_if_needed(timeout=3000)
-                h.click(timeout=4000)
+                try:
+                    h.click(timeout=4000)
+                except Exception as e:
+                    if B.is_renderer_failure(e) and not _is_sticky_intercept(e):
+                        raise
+                    try:
+                        h.evaluate("(el) => el.click()")
+                    except Exception:
+                        pass
                 clicked += 1
                 page.wait_for_timeout(400)
         except Exception as e:
-            if B.is_renderer_failure(e):
+            if B.is_renderer_failure(e) and not _is_sticky_intercept(e):
                 raise
             clicked = 0
         if not clicked:

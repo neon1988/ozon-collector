@@ -31,6 +31,7 @@ def _now_utc_str(**delta):
 # ---- parse_max_age ---------------------------------------------------------
 
 def test_parse_max_age_ok():
+    assert parse_max_age("7d") == 604800
     assert parse_max_age("1d") == 86400
     assert parse_max_age("12h") == 43200
     assert parse_max_age("6h") == 21600

@@ -1,6 +1,7 @@
-"""Тесты CLI: парсинг списка артикулов/URL в PID (cli.parse_pids)."""
+"""Тесты CLI: парсинг списка артикулов/URL в PID (cli.parse_pids) и дефолты."""
 from __future__ import annotations
 
+import cli
 from cli import parse_pids
 
 
@@ -31,3 +32,29 @@ def test_parse_pids_slug_with_leading_digits():
 def test_parse_pids_file_lines():
     assert parse_pids(["11111111", "https://www.ozon.ru/product/22222222",
                        "33333333"]) == ["11111111", "22222222", "33333333"]
+
+
+def test_gather_default_max_age_7d():
+    args = cli.build_parser().parse_args(["gather", "--pid", "123"])
+    assert args.max_age == "7d"
+
+
+def test_search_default_max_age_7d():
+    args = cli.build_parser().parse_args(["search", "--limit", "10"])
+    assert args.max_age == "7d"
+
+
+def test_search_default_min_rating():
+    args = cli.build_parser().parse_args(["search", "--limit", "10"])
+    assert args.min_rating == 4.7
+
+
+def test_search_min_rating_zero_disables():
+    args = cli.build_parser().parse_args(
+        ["search", "--limit", "10", "--min-rating", "0"])
+    assert args.min_rating == 0
+
+
+def test_gather_has_no_min_rating():
+    args = cli.build_parser().parse_args(["gather", "--pid", "123"])
+    assert not hasattr(args, "min_rating")

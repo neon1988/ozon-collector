@@ -169,6 +169,35 @@ class Session:
         log.debug(f"wait {ms}ms")
         self.page.wait_for_timeout(ms)
 
+    def new_page(self, close_current: bool = True):
+        """Recovery new_tab: НОВАЯ вкладка в том же контексте браузера.
+
+        Эксперимент 2026-08-17: access_challenge (FAB) Ozon залипает на
+        навигации КОНКРЕТНОЙ вкладки — повторы/reload в той же вкладке не
+        помогают, а свежая вкладка проходит (Qrator выдаёт auth-куки и
+        разблокирует всю сессию). Метод закрывает текущую (FAB-залипшую)
+        вкладку, открывает новую и переключает self.page на неё.
+        """
+        if self._browser is None or not self._browser.contexts:
+            raise RuntimeError("нет CDP-контекста для новой вкладки")
+        ctx = self._browser.contexts[0]
+        old = self.page
+        new = ctx.new_page()
+        try:
+            new.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+            )
+        except Exception:
+            pass
+        self.page = new
+        if close_current and old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        log.debug(f"new_page: {self.cdp_url}")
+        return new
+
     def eval(self, js: str):
         self._guard_check()
         label = _js_label(js)

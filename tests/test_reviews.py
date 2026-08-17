@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from ozon_collector.collect import _activate_variant_mode  # noqa: E402
@@ -122,6 +124,100 @@ def test_activate_no_toggle_returns_used_false(variant_mode_page):
     assert vm["used"] is False
     assert vm["clicked"] is False
     assert vm["reason"] == "no_widget"
+
+
+class _VariantModeFakePage:
+    """Страница с управляемым VARIANT_MODE_JS для ветвей _activate_variant_mode:
+    initial — первый снапшот, on_click — эффект клика по опции, evaluate_errors —
+    какие evaluate бросать (для веток warn/click_error)."""
+
+    def __init__(self, initial, url="https://www.ozon.ru/product/x-123/?tab=reviews",
+                 on_click=None, evaluate_errors=None):
+        self.snap = initial
+        self.url = url
+        self.on_click = on_click
+        self.evaluate_errors = evaluate_errors or {}
+        self.click_calls = 0
+
+    def evaluate(self, js, *args, **kwargs):
+        for probe, exc in self.evaluate_errors.items():
+            if probe in str(js):
+                raise exc
+        if js is collect_mod.VARIANT_MODE_JS:
+            return self.snap
+        self.click_calls += 1
+        if self.on_click:
+            self.on_click(self)
+        return None
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+_SNAP_WITH_OPTION = {
+    "found": True, "variant_present": True, "variant_count": 5,
+    "active": "Все отзывы", "total_count": 100,
+}
+
+
+def test_activate_url_param_no_click():
+    """reviewsVariantMode=1 уже в URL → фильтр серверно активен, клик не нужен."""
+    page = _VariantModeFakePage(
+        _SNAP_WITH_OPTION,
+        url="https://www.ozon.ru/product/x-123/?tab=reviews&reviewsVariantMode=1",
+    )
+    vm = _activate_variant_mode(page)
+    assert vm["used"] is True
+    assert vm["clicked"] is False
+    assert vm["reason"] == "url_param"
+    assert page.click_calls == 0
+
+
+def test_activate_click_ok():
+    """Клик по опции применился (active сменился) → click_ok, used=True."""
+    def _apply(self):
+        self.snap = {**self.snap, "active": "Этот вариант товара"}
+
+    page = _VariantModeFakePage(_SNAP_WITH_OPTION, on_click=_apply)
+    vm = _activate_variant_mode(page, timeout_s=1.0)
+    assert vm["used"] is True
+    assert vm["clicked"] is True
+    assert vm["reason"] == "click_ok"
+    assert page.click_calls == 1
+    assert vm["variant_count"] == 5
+
+
+def test_activate_click_no_effect():
+    """Клик не применился (активность не сменилась) → click_no_effect, used=False,
+    сбор продолжается без нативного фильтра."""
+    page = _VariantModeFakePage(_SNAP_WITH_OPTION)
+    vm = _activate_variant_mode(page, timeout_s=0.2)
+    assert vm["used"] is False
+    assert vm["clicked"] is True
+    assert vm["reason"] == "click_no_effect"
+
+
+def test_activate_click_error():
+    """Ошибка на клике → click_error (used=False), прогон не падает."""
+    page = _VariantModeFakePage(
+        _SNAP_WITH_OPTION,
+        evaluate_errors={"target) target.click": RuntimeError("click boom")},
+    )
+    vm = _activate_variant_mode(page)
+    assert vm["used"] is False
+    assert vm["clicked"] is True
+    assert vm["reason"] == "click_error"
+
+
+def test_activate_evaluate_warn_falls_back_to_no_widget():
+    """Ошибка на первом evaluate VARIANT_MODE_JS (не renderer) → warn и no_widget."""
+    page = _VariantModeFakePage(
+        _SNAP_WITH_OPTION,
+        evaluate_errors={"const totalEl = document.querySelector": RuntimeError("boom")},
+    )
+    vm = _activate_variant_mode(page)
+    assert vm["reason"] == "no_widget"
+    assert vm["used"] is False
 
 
 # ---- Вариантная лента однородна (режим «Этот вариант товара») ---------------
@@ -619,6 +715,46 @@ def test_expand_comments_trusted_clicks(browser):
         page.close()
 
 
+def test_is_sticky_intercept():
+    """_is_sticky_intercept отличает перекрытие sticky-блоком от прочих ошибок:
+    только сообщение «intercepts pointer events» должно давать True (это НЕ
+    renderer_failure — сбор должен продолжаться, а не падать)."""
+    assert collect_mod._is_sticky_intercept(
+        Exception("Timeout 4000ms exceeded. ... subtree intercepts pointer events ...")
+    ) is True
+    assert collect_mod._is_sticky_intercept(
+        Exception("Timeout 30000ms exceeded")
+    ) is False
+    assert collect_mod._is_sticky_intercept(
+        Exception("Element is not attached to the DOM")
+    ) is False
+
+
+def test_expand_comments_sticky_fallback(browser):
+    """Кнопка «N комментария» перекрыта fixed-оверлеем: trusted-клик Playwright
+    таймаутит («intercepts pointer events»), fallback el.click() раскрывает
+    комментарий, а сам прогон НЕ падает (не классифицируется как renderer_failure)."""
+    html = '''<html><head><style>
+      #overlay { position: fixed; inset: 0; z-index: 100; background: transparent; }
+    </style></head><body>
+      <div id="overlay"></div>
+      <div data-review-uuid="u1">
+        <button id="cm1" onclick="document.getElementById('c1').style.display='block'; this.remove()">
+          <div class="tsBodyControl400Small">2 комментария</div>
+        </button>
+        <div id="c1" style="display:none">два</div>
+      </div>
+    </body></html>'''
+    page = _open_html(browser, html)
+    try:
+        n = collect_mod._expand_review_comments(page)
+        assert n == 1
+        assert page.locator("#c1").evaluate("el => el.style.display") == "block"
+        assert page.locator("#cm1").count() == 0
+    finally:
+        page.close()
+
+
 # ---- Multi-sort: сбор отзывов в нескольких сортировках -----------------------
 
 class _RecordingPage:
@@ -805,3 +941,69 @@ def test_scroll_constants_regression():
         f"MAX_SCROLL_STABLE={collect_mod.MAX_SCROLL_STABLE}: ниже 6 плато без "
         f"роста не проверялось (A/B максимум — 6, missing=0)"
     )
+
+
+# ---- Вспомогательные функции: parse_variant, pid_from_url, _t_utc ------------
+
+def test_parse_variant_dimensions():
+    """Габариты '200x90x6' → {'Длина_см':200,'Ширина_см':90,'Высота_см':6}
+    (порядок ДЛИНА x ШИРИНА x ВЫСОТА), включая разные разделители x/х/* и
+    пробелы вокруг них."""
+    assert collect_mod.parse_variant("200x90x6") == {
+        "Длина_см": 200, "Ширина_см": 90, "Высота_см": 6,
+    }
+    assert collect_mod.parse_variant(" 200 x 90 х 6 ") == {
+        "Длина_см": 200, "Ширина_см": 90, "Высота_см": 6,
+    }
+    assert collect_mod.parse_variant("200*90*6") == {
+        "Длина_см": 200, "Ширина_см": 90, "Высота_см": 6,
+    }
+
+
+def test_parse_variant_key_value_pairs():
+    """Пары 'ключ:значение' через ';' и ','; пробелы обрезаются; пустые
+    ключ/значение пропускаются (но если не осталось ни одной пары — ValueError);
+    габаритная часть перед ';' игнорируется."""
+    assert collect_mod.parse_variant("Цвет: белый-прозрачный") == {
+        "Цвет": "белый-прозрачный",
+    }
+    got = collect_mod.parse_variant("Цвет: белый; Тип: наушники, Комплект: 2 шт")
+    assert got == {"Цвет": "белый", "Тип": "наушники", "Комплект": "2 шт"}
+    assert collect_mod.parse_variant("200x90x6; Цвет:белый") == {"Цвет": "белый"}
+    assert collect_mod.parse_variant("   ") == {}
+
+
+def test_parse_variant_bad_raises():
+    for bad in ("200x90", "цвет", "Цвет:", ":белый", "xX*"):
+        with pytest.raises(ValueError):
+            collect_mod.parse_variant(bad)
+
+
+def test_pid_from_url_variants():
+    """pid из любых форм URL товара: slug, query, hash, trailing slash;
+    не-товарные URL → 'unknown'."""
+    cases = [
+        ("https://www.ozon.ru/product/3627230434", "3627230434"),
+        ("https://www.ozon.ru/product/xiaomi-redmi-buds-8-3627230434/",
+         "3627230434"),
+        ("/product/3627230434/?tab=reviews", "3627230434"),
+        ("https://www.ozon.ru/product/2000-1234567/", "1234567"),
+        ("https://ozon.ru/product/1234567#reviews", "1234567"),
+    ]
+    for url, pid in cases:
+        assert collect_mod.pid_from_url(url) == pid, url
+
+
+def test_pid_from_url_unknown():
+    assert collect_mod.pid_from_url("") == "unknown"
+    assert collect_mod.pid_from_url("abc") == "unknown"
+    assert collect_mod.pid_from_url("https://www.ozon.ru/category/phones/") == "unknown"
+
+
+def test_t_utc_iso_with_offset():
+    import datetime
+    s = collect_mod._t_utc()
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$", s), s
+    dt = datetime.datetime.fromisoformat(s)
+    assert dt.tzinfo is not None
+    assert dt.utcoffset() == datetime.timedelta(0)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -489,3 +490,123 @@ def test_bootstrap_no_main_cookies(profile_base):
         [1], main_profile=str(profile_base / "ozon-profile"),
         main_alive_check=lambda: False, worker_alive_check=lambda k: False)
     assert bs[1] == "skipped:no_main_cookies"
+
+
+# ---- Чистые функции: _port_free / _empty_payload / _now / _worker_summary ----
+
+def test_port_free_real_socket():
+    """_port_free на реальном сокете: занятый порт → False, свободный → True."""
+    import socket
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        assert PL._port_free(port) is False
+    finally:
+        srv.close()
+    assert PL._port_free(port) is True
+
+
+def test_empty_payload_shape():
+    pl = PL._empty_payload(3)
+    assert pl["worker_idx"] == 3
+    assert pl["processed_indexes"] == []
+    assert pl["failed_indexes"] == []
+    assert pl["fatal_error"] is None
+    assert pl["recovery_metrics"] == {"recycles": 0, "events": []}
+
+
+def test_now_iso_utc():
+    import datetime
+    s = PL._now()
+    assert s.endswith("+00:00")
+    dt = datetime.datetime.fromisoformat(s)
+    assert dt.utcoffset() == datetime.timedelta(0)
+
+
+def test_worker_summary_shape():
+    """_worker_summary сводит WorkerContext + payload в диагностику воркера."""
+    spec = PL.worker_spec(2)
+    wctx = PL.WorkerContext(spec, proc=object(), conn=object())
+    wctx.pid = 1234
+    pl = PL._empty_payload(2)
+    pl.update({
+        "exitcode": 7, "processed_indexes": [0, 1], "failed_indexes": [1],
+        "fatal_error": "boom", "rss_bytes": 10_000, "browser_stopped": True,
+    })
+    s = PL._worker_summary(wctx, pl)
+    assert s["worker_idx"] == 2
+    assert wctx.worker_idx == 2
+    assert s["pid"] == 1234
+    assert s["port"] == spec["port"]
+    assert s["exitcode"] == 7
+    assert s["processed"] == 2
+    assert s["failed"] == 1
+    assert s["fatal_error"] == "boom"
+    assert s["rss_bytes"] == 10_000
+    assert s["browser_stopped"] is True
+    assert s["recovery"] == {"recycles": 0, "events": []}
+
+
+def test_send_swallows_closed_conn():
+    """_send не бросает исключений при закрытом/сломанном канале."""
+    import multiprocessing
+    a, b = multiprocessing.Pipe(duplex=False)
+    a.close()
+    PL._send(a, {"t": "x"})  # должно молча проглотить
+    b.close()
+
+
+def test_reader_loop_eof_cleans_conn():
+    """_reader_loop завершается по EOF и в finally закрывает канал."""
+    import multiprocessing
+    parent, child = multiprocessing.Pipe(duplex=False)
+    wctx = PL.WorkerContext({"worker_id": "1"}, proc=object(), conn=parent)
+    t = threading.Thread(target=PL._reader_loop, args=(wctx,), daemon=True)
+    t.start()
+    child.send({"t": "start", "pid": 99})
+    child.close()
+    t.join(3)
+    assert t.is_alive() is False
+    assert wctx.pid == 99
+    assert wctx.started is True
+
+
+def test_reader_loop_done_sets_payload():
+    import multiprocessing
+    parent, child = multiprocessing.Pipe(duplex=False)
+    wctx = PL.WorkerContext({"worker_id": "1"}, proc=object(), conn=parent)
+    t = threading.Thread(target=PL._reader_loop, args=(wctx,), daemon=True)
+    t.start()
+    child.send({"t": "done", "payload": {"worker_idx": 1, "x": 1}})
+    child.close()
+    t.join(3)
+    assert wctx.payload == {"worker_idx": 1, "x": 1}
+
+
+# ---- preflight: ветви profile_path и makedirs ---------------------------------
+
+def test_preflight_profile_path_collision(monkeypatch, profile_base):
+    """Дубликаты profile_path (напр. одинаковые каталоги) ловятся preflight."""
+    _free_ports(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
+    monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
+    s1 = dict(PL.worker_spec(1))
+    s2 = dict(PL.worker_spec(2), profile_path=s1["profile_path"])
+    errs = PL.preflight_check([s1, s2])
+    assert any("profile_path" in e for e in errs)
+
+
+def test_preflight_makedirs_error(monkeypatch, profile_base):
+    """Ошибка создания каталога профиля → понятная ошибка preflight."""
+    _free_ports(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
+    monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
+
+    def _raise(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "makedirs", _raise)
+    errs = PL.preflight_check([PL.worker_spec(1)])
+    assert any("не удалось создать профиль" in e for e in errs)

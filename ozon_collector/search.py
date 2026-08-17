@@ -113,6 +113,17 @@ def _recycle_browser(sess, manager, launch_id: str):
 # search держит десятки страниц в одной сессии, JS heap копится).
 RECYCLE_EVERY = 40
 
+# Первый recovery для access_challenge — НОВАЯ ВКЛАДКА (эксперимент 2026-08-17):
+# FAB залипает на навигации конкретной вкладки (повторы 10с/15с/reload в той же
+# вкладке НЕ помогают), а свежая вкладка проходит через Qrator, получает auth-куки
+# и разблокирует всю сессию. Максимум NEW_TAB_ATTEMPTS попыток на товар, затем —
+# существующий recycle (fallback, см. _collect_shard). Storm-лимит не меняется.
+NEW_TAB_ATTEMPTS = 2
+
+# Порог рейтинга по умолчанию: товары с product.rating < DEFAULT_MIN_RATING
+# исключаются из дайджеста (res["excluded"]), но raw остаётся собранным.
+DEFAULT_MIN_RATING = 4.7
+
 # Challenge-шторм: если CHALLENGE_STORM_LIMIT товаров ПОДРЯД закончились
 # access_challenge (после своих retry/recycle) — Ozon душит аккаунт/IP.
 # Агрессивный retry-loop бесполезен и усугубляет: шард останавливается,
@@ -165,13 +176,16 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
     """Per-product recovery-цикл над списком (index, pid, url) в одной сессии.
 
     ОДИН код для collect_search (main) и воркеров (parallel._worker_main):
-    R1/R2 recycle через переданный manager (identity-сверка на (порт, профиль)
-    менеджера) + preventive recycle каждые RECYCLE_EVERY товаров. Ошибка
-    отдельного товара не прерывает цикл.
+    recovery access_challenge → НОВАЯ ВКЛАДКА (до NEW_TAB_ATTEMPTS раз, сессия
+    не перезапускается), затем R1/R2 recycle через переданный manager
+    (identity-сверка на (порт, профиль) менеджера) + preventive recycle каждые
+    RECYCLE_EVERY товаров. Ошибка отдельного товара не прерывает цикл.
 
-    Возвращает list[dict] результатов (res run_gather + recycle_attempts),
-    строго в порядке items. Телеметрия recovery пишется в recovery; on_recovery
-    — колбэк события (воркер → pipe телеметрия), None для main.
+    Возвращает list[dict] результатов (res run_gather + recycle_attempts +
+    new_tab_attempts + recovery_kind), строго в порядке items. Телеметрия
+    recovery пишется в recovery (recycles/events/new_tab_attempts/
+    new_tab_successes); on_recovery — колбэк события (воркер → pipe
+    телеметрия), None для main.
     """
     products: list[dict] = []
     collected = 0
@@ -186,20 +200,60 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
         cfg["pid"] = pid
         cfg["url"] = url
         attempts = 0
+        recycles_done = 0
+        new_tab_budget = NEW_TAB_ATTEMPTS
+        last_recovery = None
         while True:
             res = run_gather(cfg, sess=sess)
             attempts += 1
-            if res["ok"] or not res.get("recyclable") or attempts > max_recycles:
+            if res["ok"] or not res.get("recyclable"):
                 break
             kind = res.get("error_kind") or "unknown"
+
+            # 1) access_challenge → recovery НОВОЙ ВКЛАДКОЙ (до recycle):
+            #    FAB залипает на вкладке, свежая навигация проходит и
+            #    разблокирует сессию (auth-куки). Бюджет на товар —
+            #    NEW_TAB_ATTEMPTS; recycle-бюджет (max_recycles) не тратится.
+            if kind == "access_challenge" and new_tab_budget > 0:
+                new_tab_budget -= 1
+                nt_used = NEW_TAB_ATTEMPTS - new_tab_budget
+                last_recovery = "new_tab"
+                recovery.setdefault("new_tab_successes", 0)
+                recovery["new_tab_attempts"] = (
+                    recovery.get("new_tab_attempts", 0) + 1)
+                print(f"{tag}: access_challenge → новая вкладка "
+                      f"(попытка {nt_used}/{NEW_TAB_ATTEMPTS})")
+                log.warning(f"товар {n}/{total}: access_challenge → новая "
+                            f"вкладка (попытка {nt_used}/{NEW_TAB_ATTEMPTS})",
+                            extra={"pid": pid})
+                ev = {"pid": pid, "attempt": attempts, "kind": "new_tab"}
+                recovery["events"].append(ev)
+                if on_recovery is not None:
+                    on_recovery(ev)
+                try:
+                    sess.new_page()
+                except Exception as e:
+                    print(f"{tag}: new_tab FAILED: {type(e).__name__}: {e}")
+                    log.error(f"товар {n}/{total}: new_tab FAILED: "
+                              f"{type(e).__name__}: {e}", extra={"pid": pid})
+                    res["error"] = f"{res['error']}; new_tab_failed: {e}"
+                    res["recyclable"] = False
+                    break
+                continue
+
+            # 2) fallback: recycle браузера (существующий recovery R1/R2)
+            if recycles_done >= max_recycles:
+                break
+            recycles_done += 1
+            last_recovery = "recycle"
             print(f"{tag}: {kind} → recycle браузера "
-                  f"(попытка {attempts}/{max_recycles})")
+                  f"(попытка {recycles_done}/{max_recycles})")
             log.warning(f"товар {n}/{total}: {kind} → recycle браузера "
-                        f"(попытка {attempts}/{max_recycles})",
+                        f"(попытка {recycles_done}/{max_recycles})",
                         extra={"pid": pid, "probe": res.get("error_probe_state"),
                                "signature": res.get("error_signature")})
             try:
-                _recycle_browser(sess, manager, f"{label}-{pid}-r{attempts}")
+                _recycle_browser(sess, manager, f"{label}-{pid}-r{recycles_done}")
             except Exception as e:
                 print(f"{tag}: recycle FAILED: {type(e).__name__}: {e}")
                 log.error(f"товар {n}/{total}: recycle FAILED: "
@@ -213,14 +267,35 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
             if on_recovery is not None:
                 on_recovery(ev)
         res["recycle_attempts"] = attempts
+        nt_used = NEW_TAB_ATTEMPTS - new_tab_budget
+        res["new_tab_attempts"] = nt_used
+        if last_recovery is not None:
+            res["recovery_kind"] = last_recovery
+        if res["ok"] and last_recovery == "new_tab":
+            recovery["new_tab_successes"] = (
+                recovery.get("new_tab_successes", 0) + 1)
+        mr = gather_cfg.get("min_rating")
+        if res["ok"] and mr is not None:
+            rating = (res.get("raw") or {}).get("product", {}).get("rating")
+            if isinstance(rating, (int, float)) and rating < mr:
+                res["excluded"] = {
+                    "reason": "rating_below",
+                    "rating": rating,
+                    "min_rating": mr,
+                }
         products.append(res)
         if res["ok"]:
             collected += 1
             n_rev = len((res.get("raw") or {}).get("reviews", []))
+            excl = ""
+            if res.get("excluded"):
+                e = res["excluded"]
+                excl = f" · исключён по рейтингу {e['rating']} < {e['min_rating']}"
             print(f"{tag}: ok · cache={res['cache']} · ocr={res['ocr']} "
-                  f"· отзывов {n_rev}")
+                  f"· отзывов {n_rev}{excl}")
             log.info(f"товар {n}/{total}: ok · cache={res['cache']} "
-                     f"· ocr={res['ocr']} · отзывов {n_rev}", extra={"pid": pid})
+                     f"· ocr={res['ocr']} · отзывов {n_rev}{excl}",
+                     extra={"pid": pid})
         else:
             print(f"{tag}: fail · {res['error']}")
             log.warning(f"товар {n}/{total}: fail · {res['error']}",
@@ -284,15 +359,17 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
     сканируется, товары берутся ТОЛЬКО из списка (found = len(pids), url
     игнорируется). Режим для «собрать/обновить конкретные товары».
 
-    Recovery (OOM-краш renderer'а): если run_gather вернул recyclable-ошибку
-    (browser / renderer_failure) — браузер перезапускается (R1: recycle) и
-    товар собирается заново (R2: retry), до max_recycles раз на товар.
-    Телеметрия recovery пишется в combined["recovery"].
+    Recovery: access_challenge → НОВАЯ ВКЛАДКА (до NEW_TAB_ATTEMPTS, сессия не
+    перезапускается); прочие recyclable-ошибки (browser / renderer_failure) →
+    браузер перезапускается (R1: recycle) и товар собирается заново (R2: retry),
+    до max_recycles раз на товар. Телеметрия recovery пишется в
+    combined["recovery"] (recycles/events/new_tab_attempts/new_tab_successes).
 
     Возвращает combined-объект (схема 2.0, аддитивно):
       search{url,query}, found, limit, collected,
       recovery{recycles, events[]},
-      products[{pid,ok,error,error_kind,error_probe_state,recycle_attempts,...}]
+      products[{pid,ok,error,error_kind,error_probe_state,recycle_attempts,
+                new_tab_attempts,recovery_kind,...}]
     """
     recovery = {"recycles": 0, "events": []}
     manager = B.BrowserProcessManager(
@@ -313,7 +390,9 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
 
     products = _collect_shard(sess, manager, items, gather_cfg,
                               max_recycles, recovery, label="search")
-    collected = sum(1 for p in products if p["ok"])
+    collected = sum(1 for p in products
+                    if p["ok"] and not p.get("excluded"))
+    excluded = sum(1 for p in products if p.get("excluded"))
 
     combined = {
         "schema_version": SCHEMA_VERSION,
@@ -323,9 +402,13 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
         "found": found,
         "limit": limit,
         "collected": collected,
+        "excluded": excluded,
         "recovery": recovery,
         "products": products,
     }
+    mr = gather_cfg.get("min_rating")
+    if mr is not None:
+        combined["min_rating"] = mr
     storm = recovery.get("challenge_storm")
     if storm:
         combined["aborted"] = {"reason": "challenge_storm", **storm}

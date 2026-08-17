@@ -26,6 +26,9 @@ class FakeSession:
     def close(self):
         self.closed = True
 
+    def new_page(self, close_current: bool = True):
+        return None
+
 
 class FakeManager:
     """BrowserProcessManager-дубль: force_stop запоминает records."""
