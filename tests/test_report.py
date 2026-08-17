@@ -231,3 +231,46 @@ def test_digest_size_kb_line():
     md = render_search_digest(_combined([ok]), reviews_per_product=100)
     assert "Размер дайджеста" in md
     assert "КБ" in md
+
+
+# ---- splitting: max товаров на файл (по умолчанию 100) ----------------------
+
+def _mk_combined(n):
+    return _combined([_ok_result(str(i), n_same=1) for i in range(n)])
+
+
+def test_default_max_products_per_file_is_100():
+    from ozon_collector.report import DEFAULT_MAX_PRODUCTS_PER_FILE
+    assert DEFAULT_MAX_PRODUCTS_PER_FILE == 100
+
+
+def test_write_digest_no_split_when_within_limit(tmp_path):
+    from ozon_collector.report import write_search_digest
+    out = tmp_path / "d.md"
+    written = write_search_digest(_mk_combined(3), str(out))
+    assert written == [str(out)]
+    assert out.exists()
+    assert not (tmp_path / "d.part2.md").exists()
+
+
+def test_write_digest_splits_over_limit(tmp_path):
+    from ozon_collector.report import write_search_digest
+    out = tmp_path / "d.md"
+    written = write_search_digest(_mk_combined(250), str(out),
+                                  max_products_per_file=100)
+    assert written == [str(out), str(tmp_path / "d.part2.md"),
+                       str(tmp_path / "d.part3.md")]
+    assert "Часть 1 из 3" in out.read_text(encoding="utf-8")
+    assert "Часть 2 из 3" in (tmp_path / "d.part2.md").read_text(encoding="utf-8")
+    assert "Часть 3 из 3" in (tmp_path / "d.part3.md").read_text(encoding="utf-8")
+    assert "## Товар 100:" in out.read_text(encoding="utf-8")
+    assert "## Товар 101:" not in out.read_text(encoding="utf-8")
+
+
+def test_write_digest_zero_limit_no_split(tmp_path):
+    from ozon_collector.report import write_search_digest
+    out = tmp_path / "d.md"
+    written = write_search_digest(_mk_combined(250), str(out),
+                                  max_products_per_file=0)
+    assert written == [str(out)]
+    assert "Часть" not in out.read_text(encoding="utf-8")

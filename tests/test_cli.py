@@ -49,6 +49,18 @@ def test_search_default_min_rating():
     assert args.min_rating == 4.7
 
 
+def test_default_sorts_new_plus_negative():
+    """Дефолт sorts: сначала «новые и полезные», потом «сначала низкие оценки»."""
+    from cli import DEFAULT_SORTS
+    assert DEFAULT_SORTS == "published_at_desc,score_asc"
+    for cmd in ("collect", "gather", "search"):
+        args = cli.build_parser().parse_args([cmd, "--pid", "123"]
+                                             if cmd != "search"
+                                             else [cmd, "--limit", "1"])
+        assert args.sorts == DEFAULT_SORTS
+        assert cli._parse_sorts(args.sorts) == ["published_at_desc", "score_asc"]
+
+
 def test_search_min_rating_zero_disables():
     args = cli.build_parser().parse_args(
         ["search", "--limit", "10", "--min-rating", "0"])

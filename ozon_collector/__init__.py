@@ -1,6 +1,6 @@
 import os
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 SCHEMA_VERSION = "2.0"
 
 # Жёсткий предел параллельных воркеров (--parallel). Переопределяется env

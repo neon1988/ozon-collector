@@ -126,7 +126,23 @@ def _validate_raw(raw: dict, pid: str | None = None) -> str | None:
     return None
 
 
-def _best_raw(pid: str, data_dir: str = "data") -> tuple[dict | None, str]:
+def _covers_sorts(raw: dict, sorts) -> bool:
+    """Покрывает ли raw все запрошенные сортировки отзывов.
+
+    raw["reviews_sorts"] — список сортировок, по которым собирался отзыв
+    (None для старых сборок и для одиночного прохода «новые и полезные»).
+    Если sorts запрошены (не None), кеш годен только когда raw покрывает
+    их все (суперсет). Иначе старый raw без негативных (score_asc) отдавался
+    бы как hit при новом дефолте sorts.
+    """
+    if not sorts:
+        return True
+    got = set(raw.get("reviews_sorts") or [])
+    return got >= set(sorts)
+
+
+def _best_raw(pid: str, data_dir: str = "data",
+              sorts=None) -> tuple[dict | None, str]:
     """Лучший валидный raw среди канона и timestamp-файлов.
 
     Кандидаты ранжируются по (наличие отзывов, дата сбора, число отзывов):
@@ -134,7 +150,10 @@ def _best_raw(pid: str, data_dir: str = "data") -> tuple[dict | None, str]:
     дособранный stress-прогон (0 отзывов) не должен вытеснять полный raw
     только потому, что собран позже; среди файлов одного класса —
     свежайший, при равной дате — больший reviews_collected. Версия в ключе
-    не участвует: _validate_raw уже допускает только текущую. Возвращает
+    не участвует: _validate_raw уже допускает только текущую.
+
+    sorts (необязательно) — запрошенные сортировки: кандидаты, НЕ покрывающие
+    их (_covers_sorts), отбрасываются (причина "sorts_missing"). Возвращает
     (raw, reason): reason == "candidate" при валидном кандидате, иначе
     причина первой неудачной валидации (или "missing", если файлов нет).
     """
@@ -151,6 +170,10 @@ def _best_raw(pid: str, data_dir: str = "data") -> tuple[dict | None, str]:
         if reason is not None:
             if first_reason is None:
                 first_reason = reason
+            continue
+        if not _covers_sorts(raw, sorts):
+            if first_reason is None:
+                first_reason = "sorts_missing"
             continue
         dt = _parse_utc(raw.get("collected_at_utc"))
         reviews = int(raw.get("reviews_collected") or 0)
@@ -224,20 +247,26 @@ def cached_version(pid: str, data_dir: str = "data"):
 
 
 def cache_check(pid: str, max_age_s: int,
-                data_dir: str = "data") -> tuple[dict | None, str]:
+                data_dir: str = "data",
+                sorts=None) -> tuple[dict | None, str]:
     """Проверяет кеш raw (канон + timestamp-файлы). Возвращает (raw|None, reason).
 
     Ищет лучший валидный raw среди data/{pid}_raw.json и data/{pid}_raw.*.json
     (_best_raw): данные свежего прогона текущей версии не отбрасываются только
     потому, что канон занят старой версией коллектора.
 
+    sorts (необязательно) — запрошенные сортировки отзывов: raw, собранный
+    без них (напр. старый дефолт без score_asc), кешем не считается → "miss"
+    и повторный сбор. Иначе канон вернёт raw без негативных отзывов.
+
     reason: off | missing | pid_mismatch | incomplete | incompatible |
-            old_version | newer_version | bad_timestamp | stale | hit
+            old_version | newer_version | bad_timestamp | sorts_missing |
+            stale | hit
     """
     if max_age_s <= 0:
         return None, "off"
 
-    raw, reason = _best_raw(pid, data_dir)
+    raw, reason = _best_raw(pid, data_dir, sorts=sorts)
     if raw is None:
         return None, reason
 

@@ -87,7 +87,7 @@ def run_gather(cfg: dict, sess=None) -> dict:
         "ocr": "off",
     }
     try:
-        raw, reason = K.cache_check(pid, max_age_s)
+        raw, reason = K.cache_check(pid, max_age_s, sorts=cfg.get("sorts"))
         result["cache"] = ("hit" if reason == "hit"
                            else "stale" if reason == "stale" else "miss")
         if reason == "hit":

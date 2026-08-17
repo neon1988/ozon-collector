@@ -31,7 +31,7 @@ if hasattr(sys.stdout, "reconfigure"):
 from cli import parse_pids
 from ozon_collector import cache as K
 from ozon_collector.collect import CHALLENGE_TITLE_MARKERS
-from ozon_collector.report import render_search_digest
+from ozon_collector.report import render_search_digest, write_search_digest
 
 
 def _best_for_digest(pid: str, data_dir: str):
@@ -88,6 +88,9 @@ def main(argv=None) -> int:
                          "только их и обрабатывать")
     ap.add_argument("--pids-file", default=None,
                     help="файл со списком артикулов/URL (по одному в строке)")
+    ap.add_argument("--max-products-per-file", type=int, default=100,
+                    help="макс. товаров в одном md-файле дайджеста "
+                         "(по умолч. 100; 0 — без разбиения)")
     args = ap.parse_args(argv)
 
     pids = set()
@@ -155,11 +158,12 @@ def main(argv=None) -> int:
     }
     md = render_search_digest(combined)
     if args.out:
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(md)
-        size = os.path.getsize(args.out) / 1024
-        print(f"\nДайджест сохранён: {args.out} ({size:.2f} КБ)")
+        written = write_search_digest(
+            combined, args.out,
+            max_products_per_file=args.max_products_per_file)
+        for path in written:
+            size = os.path.getsize(path) / 1024
+            print(f"\nДайджест сохранён: {path} ({size:.2f} КБ)")
     else:
         print("\n" + md)
     return 0

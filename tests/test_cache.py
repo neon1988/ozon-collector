@@ -139,6 +139,49 @@ def test_cache_check_off_does_not_read(tmp_path, monkeypatch):
     assert not called["stat"]
 
 
+def test_cache_check_sorts_covered_hit(tmp_path):
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "42", "incomplete": False,
+        "collected_at_utc": _now_utc_str(minutes=-5),
+        "reviews_sorts": ["published_at_desc", "score_asc"],
+    }
+    with open(os.path.join(tmp_path, "42_raw.json"), "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    r, reason = cache_check("42", 86400, str(tmp_path),
+                            sorts=["published_at_desc", "score_asc"])
+    assert reason == "hit" and r["pid"] == "42"
+
+
+def test_cache_check_sorts_missing_miss(tmp_path):
+    """Raw без score_asc (старый дефолт) НЕ годится, если сортировки запрошены."""
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "42", "incomplete": False,
+        "collected_at_utc": _now_utc_str(minutes=-5),
+        "reviews_sorts": None,
+    }
+    with open(os.path.join(tmp_path, "42_raw.json"), "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    r, reason = cache_check("42", 86400, str(tmp_path),
+                            sorts=["published_at_desc", "score_asc"])
+    assert r is None and reason == "sorts_missing"
+
+
+def test_cache_check_sorts_none_hit(tmp_path):
+    """sorts=None (legacy) — сортировочных требований нет, старый raw годен."""
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "42", "incomplete": False,
+        "collected_at_utc": _now_utc_str(minutes=-5),
+        "reviews_sorts": None,
+    }
+    with open(os.path.join(tmp_path, "42_raw.json"), "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    r, reason = cache_check("42", 86400, str(tmp_path), sorts=None)
+    assert reason == "hit" and r["pid"] == "42"
+
+
 def test_cache_check_missing(tmp_path):
     raw, reason = cache_check("999", 86400, str(tmp_path))
     assert raw is None and reason == "missing"

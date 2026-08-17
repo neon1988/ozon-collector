@@ -1,9 +1,11 @@
 """Рендер Markdown-отчёта по собранному raw.json (без analysis-слоя)."""
 from __future__ import annotations
 
+import os
 import re
 
 DEFAULT_REVIEWS_PER_PRODUCT = 100
+DEFAULT_MAX_PRODUCTS_PER_FILE = 100
 
 
 def plural(n: int, forms=("отзыв", "отзыва", "отзывов")) -> str:
@@ -300,12 +302,17 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
 
 def render_search_digest(combined: dict,
                          reviews_per_product: int = DEFAULT_REVIEWS_PER_PRODUCT,
-                         dedup_replies: bool = True) -> str:
+                         dedup_replies: bool = True,
+                         products: list | None = None,
+                         chunk: tuple[int, int] | None = None) -> str:
     """Markdown-дайджест выдачи Ozon для передачи в LLM (Gemini).
 
     combined — результат collect_search. Для каждого успешного товара
     используется существующий render(raw), но отзывы обрезаются ТОЛЬКО в
     дайджесте (raw остаётся полным). Ошибки товаров — компактным блоком.
+
+    products — необязательный список товаров для рендера (по умолчанию берутся
+    все из combined["products"]). chunk — (номер, всего) для файлов-частей.
     """
     import copy
 
@@ -313,6 +320,8 @@ def render_search_digest(combined: dict,
     search = combined.get("search") or {}
     L.append("# Дайджест выдачи Ozon")
     L.append("")
+    if chunk:
+        L.append(f"- **Часть {chunk[0]} из {chunk[1]}**")
     if search.get("query"):
         L.append(f"- **Запрос:** {search['query']}")
     if search.get("url"):
@@ -325,7 +334,7 @@ def render_search_digest(combined: dict,
              f"(в raw сохраняются все).")
     L.append("")
 
-    products = combined.get("products") or []
+    products = combined.get("products") or [] if products is None else products
     listed = [p for p in products if not p.get("excluded")]
     excluded = [p for p in products if p.get("excluded")]
     if excluded:
@@ -388,3 +397,47 @@ def render_search_digest(combined: dict,
     size_kb = len(md.encode("utf-8")) / 1024
     L.append(f"- **Размер дайджеста:** {size_kb:.2f} КБ")
     return "\n".join(L)
+
+
+def write_search_digest(combined: dict,
+                        out: str,
+                        reviews_per_product: int = DEFAULT_REVIEWS_PER_PRODUCT,
+                        dedup_replies: bool = True,
+                        max_products_per_file: int = DEFAULT_MAX_PRODUCTS_PER_FILE) -> list:
+    """Записать дайджест в md-файл(ы), разбивая на части по числу товаров.
+
+    max_products_per_file (по умолчанию 100) — максимум товаров в одном файле.
+    При превышении рендерятся отдельные файлы: `out` для первой части,
+    `out.part2`, `out.part3`, … (каждая со своей шапкой «Часть k из N»).
+    `max_products_per_file <= 0` — без разбиения. Возвращает список записанных путей.
+    """
+    import math
+
+    products = combined.get("products") or []
+    total = len(products)
+    if max_products_per_file <= 0 or total <= max_products_per_file:
+        md = render_search_digest(combined, reviews_per_product, dedup_replies)
+        _write_md(md, out)
+        return [out]
+
+    n_parts = math.ceil(total / max_products_per_file)
+    written = []
+    for k in range(n_parts):
+        chunk_products = products[k * max_products_per_file:(k + 1) * max_products_per_file]
+        md = render_search_digest(
+            combined, reviews_per_product, dedup_replies,
+            products=chunk_products, chunk=(k + 1, n_parts))
+        if k == 0:
+            path = out
+        else:
+            root, ext = os.path.splitext(out)
+            path = f"{root}.part{k + 1}{ext}"
+        _write_md(md, path)
+        written.append(path)
+    return written
+
+
+def _write_md(md: str, path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(md)

@@ -25,6 +25,11 @@ from ozon_collector import search as S
 from ozon_collector import log
 from ozon_collector.gather import run_gather
 
+# Сортировки отзывов по умолчанию: сначала «новые и полезные» (published_at_desc),
+# затем «сначала низкие оценки» (score_asc) — негативные отзывы попадают в сбор,
+# дедуп по uuid убирает дубли между проходами.
+DEFAULT_SORTS = "published_at_desc,score_asc"
+
 
 def _parse_sorts(value):
     """Парсит --sorts 'a,b,c' в список (None при пустом значении)."""
@@ -278,16 +283,20 @@ def cmd_search(args):
         finally:
             sess.close()
 
-    md = R.render_search_digest(
-        combined, reviews_per_product=args.reviews_per_product,
-        dedup_replies=not args.no_dedup_replies)
     if args.out:
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(md)
-        print(f"SAVED {args.out}")
-        log.info(f"[cli] SAVED {args.out}")
+        paths = R.write_search_digest(
+            combined,
+            args.out,
+            reviews_per_product=args.reviews_per_product,
+            dedup_replies=not args.no_dedup_replies,
+            max_products_per_file=args.max_products_per_file)
+        for path in paths:
+            print(f"SAVED {path}")
+            log.info(f"[cli] SAVED {path}")
     else:
+        md = R.render_search_digest(
+            combined, reviews_per_product=args.reviews_per_product,
+            dedup_replies=not args.no_dedup_replies)
         sys.stdout.write(md)
 
     if args.out_raw:
@@ -342,9 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="не сохранять DOM-снимок (data/{pid}/dom/…)")
     pc.add_argument("--no-variant-mode", action="store_true",
                     help="не включать нативный фильтр «Этот вариант товара» (собрать все отзывы)")
-    pc.add_argument("--sorts", default=None,
-                    help="сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
-                         "(по умолчанию — одна сортировка «новые и полезные»)")
+    pc.add_argument("--sorts", default=DEFAULT_SORTS,
+                    help=f"сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
+                         f"(по умолчанию: {DEFAULT_SORTS} — новые и полезные + сначала низкие оценки)")
     pc.add_argument("--scroll-jitter-seed", type=int, default=None,
                     help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
                          "по умолчанию случайный)")
@@ -391,9 +400,9 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--overwrite", action="store_true",
                     help="разрешить перезапись существующего data/{pid}_raw.json "
                          "(по умолчанию новый прогон пишется в data/{pid}_raw.<ts>.<i>.json)")
-    pg.add_argument("--sorts", default=None,
-                    help="сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
-                         "(по умолчанию — одна сортировка «новые и полезные»)")
+    pg.add_argument("--sorts", default=DEFAULT_SORTS,
+                    help=f"сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
+                         f"(по умолчанию: {DEFAULT_SORTS} — новые и полезные + сначала низкие оценки)")
     pg.add_argument("--max-age", default="7d",
                     help="макс. возраст кеша raw: '7d', '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 7d)")
     pg.add_argument("--no-dedup-replies", action="store_true",
@@ -429,7 +438,13 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--max-pages", type=int, default=12)
     ps.add_argument("--min-reviews", type=int, default=40)
     ps.add_argument("--category", help="категория товара (сохраняется в product.category)")
-    ps.add_argument("--out", help="путь markdown-дайджеста (по умолчанию stdout)")
+    ps.add_argument("--out", help="путь markdown-дайджеста (по умолчанию stdout); "
+                                "при >--max-products-per-file товаров файл разбивается "
+                                "на части out.part2, out.part3, …")
+    ps.add_argument("--max-products-per-file", type=int,
+                    default=R.DEFAULT_MAX_PRODUCTS_PER_FILE,
+                    help=f"макс. товаров в одном md-файле дайджеста "
+                         f"(по умолч. {R.DEFAULT_MAX_PRODUCTS_PER_FILE}; 0 — без разбиения)")
     ps.add_argument("--out-raw", help="путь combined-json (схема 2.0)")
     ps.add_argument("--threads", type=int, default=8,
                     help="кол-во процессов OCR (по умолч. 8)")
@@ -456,9 +471,9 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--overwrite", action="store_true",
                     help="разрешить перезапись существующего data/{pid}_raw.json "
                          "(по умолчанию новый прогон пишется в data/{pid}_raw.<ts>.<i>.json)")
-    ps.add_argument("--sorts", default=None,
-                    help="сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
-                         "(по умолчанию — одна сортировка «новые и полезные»)")
+    ps.add_argument("--sorts", default=DEFAULT_SORTS,
+                    help=f"сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
+                         f"(по умолчанию: {DEFAULT_SORTS} — новые и полезные + сначала низкие оценки)")
     ps.add_argument("--max-age", default="7d",
                     help="макс. возраст кеша raw: '7d', '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 7d)")
     ps.add_argument("--no-dedup-replies", action="store_true",
