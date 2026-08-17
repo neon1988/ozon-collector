@@ -5,6 +5,17 @@
 
 ## Статус и следующие шаги (последнее обновление: 2026-08-17)
 
+ - **feat: дефолт sorts `published_at_desc,score_asc` + кеш по sorts, версия 1.15.0 (коммит `6e5f29a`).**
+   Дефолт `--sorts` для collect/gather/search теперь `published_at_desc,score_asc` (константа `DEFAULT_SORTS`
+   в cli.py): сначала «новые и полезные», потом «сначала низкие оценки», дедуп по uuid (`_review_key`),
+   у каждого отзыва `review_sort` + `review_sorts`. Кеш теперь учитывает sorts: `cache_check(pid, max_age,
+   data_dir, sorts=...)` / `_best_raw(..., sorts=...)` — raw без запрошенных сортировок (`reviews_sorts`
+   не суперсет) отдаёт `sorts_missing` вместо hit. **Версия 1.15.0 → старые raw 1.14.0 дают `old_version`
+   → miss (принудительный пересбор).** Разбиение md-дайджеста на ≤100 товаров (`--max-products-per-file`)
+   вошло в этот же коммит. Live-проверка: 2561238412 пересобран, 181 отзыв (было 96), 17 негативных
+   (1–2 зв.), 0 дублей, `reviews_sorts: [published_at_desc, score_asc]`. pytest: 364 passed, 1 pre-existing
+   fail `test_baseline_matches_source_raw`, 4 skipped.
+
  - **⛔ ИНЦИДЕНТ: большой прогон 300 товаров → FAB на всех живых, new_tab НЕ разблокировал (2026-08-17, 13:02–13:16).**
    `search --limit 300 --parallel 2` (нашёлся 304, последние контакты 12:56 и 12:58 — запуск сразу после двух прогонов):
    **все ok = cache=hit** (w1 123, w2 126), **ни одного живого товара**, fail=8 у каждого (все cache=miss → access_challenge).
