@@ -452,19 +452,19 @@ def test_bootstrap_seeds_worker(profile_base, monkeypatch):
     assert P.has_ozon_session(wp) is True
 
 
-def test_bootstrap_skips_if_session_present(profile_base, monkeypatch):
+def test_bootstrap_refreshes_existing_session(profile_base, monkeypatch):
     main = _mk_main_profile(profile_base)
     P.bootstrap_worker_profiles(
         [1], main_profile=str(main),
         main_alive_check=lambda: False, worker_alive_check=lambda k: False)
-    wp = P.worker_profile_path(1)
-    before = os.path.getmtime(os.path.join(wp, "Default", "Network", "Cookies"))
     bs = P.bootstrap_worker_profiles(
         [1], main_profile=str(main),
         main_alive_check=lambda: False, worker_alive_check=lambda k: False)
-    assert bs[1] == "skipped:already_has_session"
-    assert os.path.getmtime(
-        os.path.join(wp, "Default", "Network", "Cookies")) == before
+    assert bs[1].startswith("refreshed")
+    wp = P.worker_profile_path(1)
+    assert os.path.exists(os.path.join(wp, "Local State"))
+    assert os.path.exists(os.path.join(wp, "Default", "Network", "Cookies"))
+    assert P.has_ozon_session(wp) is True
 
 
 def test_bootstrap_skips_main_running(profile_base):

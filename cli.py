@@ -257,12 +257,6 @@ def cmd_search(args):
     gather_cfg = _gather_cfg_from_args(args, max_age_s)
     gather_cfg["scroll_jitter_seed"] = seed
     if parallel > 1:
-        if not args.no_bootstrap_workers:
-            from ozon_collector.process import bootstrap_worker_profiles
-            bs = bootstrap_worker_profiles(range(1, parallel + 1))
-            for k, st in bs.items():
-                print(f"[parallel] bootstrap worker-{k}: {st}")
-                log.info(f"[parallel] bootstrap worker-{k}: {st}")
         if args.allow_parallel_ocr:
             import os as _os
             gather_cfg["threads"] = max(2, (_os.cpu_count() or 2) // parallel)
@@ -270,7 +264,7 @@ def cmd_search(args):
             url, limit=limit, gather_cfg=gather_cfg,
             parallel=parallel, query=args.query,
             max_recycles=2, join_timeout_s=args.worker_timeout,
-            pids=pids or None)
+            pids=pids or None, no_bootstrap=args.no_bootstrap_workers)
     else:
         sess = Session()
         try:

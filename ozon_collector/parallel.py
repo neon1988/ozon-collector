@@ -412,11 +412,15 @@ def _stop_main_browser():
 def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      query: str | None = None, max_recycles: int = 2,
                      join_timeout_s: float = 1800.0,
-                     pids: list | None = None) -> dict:
+                     pids: list | None = None,
+                     no_bootstrap: bool = False) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
 
     pids — явный список артикулов вместо докрутки выдачи: main-сессия не
     запускается, товары берутся ТОЛЬКО из списка (found = len(pids)).
+
+    bootstrap: сев Ozon-сессии в воркеры выполняется ЗДЕСЬ (после остановки
+    main-браузера), а не в cli — иначе main жив и профили не обновляются.
 
     Возвращает combined-объект схемы 2.0 (аддитивно parallel{workers[],shards[]}).
     Ошибка preflight → RuntimeError (воркеры не запускаются).
@@ -448,6 +452,12 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
           f"собираю {total} через {parallel} воркер(ов)")
     log.info(f"найдено {found} товаров в выдаче, собираю {total} "
              f"через {parallel} воркер(ов)")
+
+    if not no_bootstrap:
+        bs = P.bootstrap_worker_profiles(range(1, parallel + 1))
+        for k, st in bs.items():
+            print(f"[parallel] bootstrap worker-{k}: {st}")
+            log.info(f"[parallel] bootstrap worker-{k}: {st}")
 
     shards = shard_items(items, parallel)
     specs = [worker_spec(k) for k in range(1, parallel + 1)]

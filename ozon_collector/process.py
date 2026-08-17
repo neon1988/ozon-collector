@@ -117,10 +117,15 @@ def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
     Local State (os_crypt-ключ) + Default/Network/Cookies из main-профиля
     снимает блок (воркер открывает страницы как человек).
 
+    Обновление 2026-08-17: куки СИНХРОНИЗИРУЮТСЯ при КАЖДОМ вызове, а не
+    только при первом сидинге. Просроченные куки воркера (после долгой
+    паузы/смены сессии main) Ozon блочит анти-ботом; главный профиль
+    проходит проверку, поэтому его куки всегда перезаписывают воркерские.
+
     Инварианты:
     - копирование ТОЛЬКО при остановленном main-браузере (иначе файлы заняты);
-    - воркер с уже имеющейся Ozon-сессией НЕ трогается (idempotent);
-    - работающий воркер-браузер пропускается.
+    - работающий воркер-браузер пропускается;
+    - при отсутствии кук в main — пропуск (нечего сеять).
 
     Возвращает {worker_id: статус} для логов.
     """
@@ -156,9 +161,7 @@ def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
         if worker_alive_check(k):
             status[k] = "skipped:worker_browser_running"
             continue
-        if has_ozon_session(wp):
-            status[k] = "skipped:already_has_session"
-            continue
+        had_session = has_ozon_session(wp)
         os.makedirs(os.path.join(wp, "Default", "Network"), exist_ok=True)
         copied = []
         for s, d in ((src_local, os.path.join(wp, "Local State")),
@@ -167,7 +170,8 @@ def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
             if os.path.exists(s):
                 shutil.copy2(s, d)
                 copied.append(os.path.basename(d))
-        status[k] = f"seeded ({', '.join(copied)})"
+        status[k] = (f"refreshed ({', '.join(copied)})" if had_session
+                     else f"seeded ({', '.join(copied)})")
     return status
 
 _PIDFD_SIGNAL_OK: bool | None = None
