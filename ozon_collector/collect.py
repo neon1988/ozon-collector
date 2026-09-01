@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import json
 import os
 import random as _random
 import re
@@ -813,6 +812,18 @@ def normalize_text(s: str) -> str:
     return s
 
 
+def _variant_matches(target_variant: dict | None, review: dict) -> bool:
+    """Совпадает ли отзыв с описанием варианта (все непустые значения).
+
+    Общий предикат фильтрации отзывов варианта (topup-добор и основной
+    проход) — раньше дублировался в двух местах.
+    """
+    for key, val in (target_variant or {}).items():
+        if val and str(val) not in normalize_text(review.get("variant", "")):
+            return False
+    return True
+
+
 def parse_variant(spec: str) -> dict:
     """Разбор описания варианта для фильтрации отзывов.
 
@@ -1453,11 +1464,7 @@ def _merge_topup(data_reviews, seen: set, index: dict, reviews: list,
                 continue
         else:
             seen.add(uid)
-        ok_v = True
-        for key, val in (target_variant or {}).items():
-            if val and str(val) not in normalize_text(r.get("variant", "")):
-                ok_v = False
-                break
+        ok_v = _variant_matches(target_variant, r)
         if ok_v:
             reviews.append(r)
             index[uid] = r
@@ -1808,12 +1815,7 @@ def _collect_reviews_pass(
                 pass
         matched_this = 0
         for r in _dedupe_reviews(data["reviews"], seen):
-            ok_v = True
-            for key, val in target_variant.items():
-                if val and str(val) not in normalize_text(r.get("variant", "")):
-                    ok_v = False
-                    break
-            if ok_v:
+            if _variant_matches(target_variant, r):
                 reviews.append(r)
                 matched_this += 1
         log.debug(f"стр. {p}: всего на странице {len(data['reviews'])}, "

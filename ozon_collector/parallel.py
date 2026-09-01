@@ -655,9 +655,25 @@ def _wait_port_free(spec: dict, timeout_s: float = 8.0):
         time.sleep(0.2)
 
 
-def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
+def _terminate_worker(wctx: WorkerContext, reason: str,
+                      finalize: bool = True):
+    """Принудительно завершить воркера: terminate + join + cleanup.
+
+    Общий код для stall (нет heartbeat) и hang (истёк дедлайн). Если
+    finalize=True — дополнительно фиксируем exitcode и ждём reader-поток
+    (нужно перед включением воркера в finalized / перезапуском).
+    """
+    log.warning(f"worker{wctx.worker_idx} {reason}: terminate()")
+    wctx.proc.terminate()
+    wctx.proc.join(2)
+    if finalize:
+        _finalize_worker(wctx)
+    _cleanup_worker(wctx)
+
+
+def _await_workers(wctxs: list, deadline: float,
                    max_worker_restarts: int, items_by_index: dict,
-                   specs: list, gather_cfg: dict, max_recycles: int,
+                   gather_cfg: dict, max_recycles: int,
                    session_budget: dict | None, on_event=None,
                    worker_log: str | None = None,
                    poll: float = 0.3) -> list:
@@ -675,12 +691,10 @@ def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
                        and now - wctx.last_activity > WORKER_STALL_S]
             if stalled:
                 for wctx in stalled:
-                    log.warning(f"worker{wctx.worker_idx} stall: нет heartbeat "
-                                f"{int(now - wctx.last_activity)}s "
-                                f"(> {WORKER_STALL_S}s) — terminate()")
-                    wctx.proc.terminate()
-                    wctx.proc.join(2)
-                    _cleanup_worker(wctx)
+                    _terminate_worker(
+                        wctx,
+                        f"stall: нет heartbeat {int(now - wctx.last_activity)}s "
+                        f"(> {WORKER_STALL_S}s)")
                 break
             remain = deadline - time.monotonic()
             if remain <= 0:
@@ -692,10 +706,7 @@ def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
             time.sleep(min(poll, remain))
         for wctx in wctxs:
             if wctx.proc.is_alive() and not wctx.done:
-                log.warning(f"worker{wctx.worker_idx} hang: terminate()")
-                wctx.proc.terminate()
-                wctx.proc.join(2)
-                _cleanup_worker(wctx)
+                _terminate_worker(wctx, "hang: нет завершения к дедлайну")
         for wctx in wctxs:
             _finalize_worker(wctx)
         return wctxs
@@ -712,13 +723,10 @@ def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
                 active.remove(wctx)
                 continue
             if now - wctx.last_activity > WORKER_STALL_S:
-                log.warning(f"worker{wctx.worker_idx} stall: нет heartbeat "
-                            f"{int(now - wctx.last_activity)}s "
-                            f"(> {WORKER_STALL_S}s) — terminate()")
-                wctx.proc.terminate()
-                wctx.proc.join(2)
-                _finalize_worker(wctx)
-                _cleanup_worker(wctx)
+                _terminate_worker(
+                    wctx,
+                    f"stall: нет heartbeat {int(now - wctx.last_activity)}s "
+                    f"(> {WORKER_STALL_S}s)")
                 finalized.append(wctx)
                 active.remove(wctx)
                 continue
@@ -801,8 +809,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     """
     parallel = int(parallel)
     if pids:
-        links = [{"pid": str(p), "url": f"https://www.ozon.ru/product/{p}"}
-                 for p in pids]
+        links = S._links_from_pids(pids)
         recovery_main = {"recycles": 0, "events": []}
     else:
         _wm_main = gather_cfg.get("window_mode")
@@ -821,13 +828,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
             _stop_main_browser()
 
     found = len(links)
-    if skip_pids:
-        skip = set(str(p) for p in skip_pids)
-        before = len(links)
-        links = [it for it in links if str(it["pid"]) not in skip]
-        if len(links) < before:
-            log.info(f"[search] skip_pids: пропущено {before - len(links)} "
-                     f"уже обработанных (осталось {len(links)})")
+    links = S._filter_skip_pids(links, skip_pids)
     selected = links[:limit]
     items = [(i, it["pid"], it["url"]) for i, it in enumerate(selected)]
     total = len(items)
@@ -862,10 +863,10 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
 
     deadline = time.monotonic() + join_timeout_s
     wctxs = _await_workers(
-        wctxs, deadline=deadline, join_timeout_s=join_timeout_s,
+        wctxs, deadline=deadline,
         max_worker_restarts=max_worker_restarts,
         items_by_index={i: (pid, url) for i, pid, url in items},
-        specs=specs, gather_cfg=gather_cfg, max_recycles=max_recycles,
+        gather_cfg=gather_cfg, max_recycles=max_recycles,
         session_budget=session_budget, on_event=on_event,
         worker_log=worker_log)
 

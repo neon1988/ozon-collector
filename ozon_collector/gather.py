@@ -6,7 +6,6 @@ run_gather(cfg, sess) — единая точка для одиночного с
 """
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime, timezone
 

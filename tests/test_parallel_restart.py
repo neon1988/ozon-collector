@@ -90,8 +90,8 @@ def test_await_no_restart_when_limit_zero(monkeypatch):
     monkeypatch.setattr(PL, "_respawn", lambda *a, **k: called.append(1))
     deadline = time.monotonic() + 30
     out = PL._await_workers([ok, dead], deadline=deadline,
-                            join_timeout_s=30, max_worker_restarts=0,
-                            items_by_index={}, specs=[], gather_cfg={},
+                            max_worker_restarts=0,
+                            items_by_index={}, gather_cfg={},
                             max_recycles=2, session_budget=None)
     assert called == []          # при limit=0 перезапуска нет
     assert len(out) == 2
@@ -112,9 +112,9 @@ def test_await_restarts_dead_worker(monkeypatch):
     monkeypatch.setattr(PL, "_respawn", fake_respawn)
     deadline = time.monotonic() + 30
     out = PL._await_workers([ok, dead], deadline=deadline,
-                            join_timeout_s=30, max_worker_restarts=2,
+                            max_worker_restarts=2,
                             items_by_index={1: ("1001", "u")},
-                            specs=[], gather_cfg={},
+                            gather_cfg={},
                             max_recycles=2, session_budget=None,
                             poll=0.01)
     assert calls == [(2, [1, 3])]          # перезапущен именно упавший
@@ -160,8 +160,8 @@ def test_await_restart_carries_collected_products(monkeypatch):
     monkeypatch.setattr(PL, "_respawn", fake_respawn)
     deadline = time.monotonic() + 30
     out = PL._await_workers([ok, dead], deadline=deadline,
-                            join_timeout_s=30, max_worker_restarts=2,
-                            items_by_index={}, specs=[], gather_cfg={},
+                            max_worker_restarts=2,
+                            items_by_index={}, gather_cfg={},
                             max_recycles=2, session_budget=None, poll=0.01)
     repl = [w for w in out if w.worker_idx == 2][0]
     assert repl.carried_payload is not None
@@ -252,9 +252,9 @@ def test_await_stall_terminates_worker_no_restart(monkeypatch):
     monkeypatch.setattr(PL, "_cleanup_worker",
                         lambda wctx: cleaned.append(wctx.worker_idx))
     deadline = time.monotonic() + 5
-    out = PL._await_workers([w], deadline=deadline, join_timeout_s=5,
+    out = PL._await_workers([w], deadline=deadline,
                             max_worker_restarts=0, items_by_index={},
-                            specs=[], gather_cfg={}, max_recycles=2,
+                            gather_cfg={}, max_recycles=2,
                             session_budget=None, poll=0.05)
     assert cleaned == [1]            # stall → cleanup выполнен
     assert not w.deadline_halted     # stall — не «дедлайн», флаг не ставим
@@ -274,9 +274,9 @@ def test_await_stall_terminates_and_respawns(monkeypatch):
         return repl
     monkeypatch.setattr(PL, "_respawn", fake_respawn)
     deadline = time.monotonic() + 5
-    out = PL._await_workers([w], deadline=deadline, join_timeout_s=5,
+    out = PL._await_workers([w], deadline=deadline,
                             max_worker_restarts=2, items_by_index={},
-                            specs=[], gather_cfg={}, max_recycles=2,
+                            gather_cfg={}, max_recycles=2,
                             session_budget=None, poll=0.05)
     assert calls == [(1, [0, 1, 2, 3])]    # stall-воркер перезапущен с шардом
     assert any(x.worker_idx == 1 and x.done for x in out)
@@ -299,9 +299,9 @@ def test_await_no_stall_when_heartbeat_recent():
     t = threading.Thread(target=beat, daemon=True)
     t.start()
     deadline = time.monotonic() + 10   # большой дедлайн: завершение по done, не по времени
-    out = PL._await_workers([w], deadline=deadline, join_timeout_s=10,
+    out = PL._await_workers([w], deadline=deadline,
                             max_worker_restarts=0, items_by_index={},
-                            specs=[], gather_cfg={}, max_recycles=2,
+                            gather_cfg={}, max_recycles=2,
                             session_budget=None, poll=0.05)
     stop.set()
     t.join(1.0)

@@ -7,7 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+
 
 from playwright.sync_api import sync_playwright
 
@@ -17,9 +17,7 @@ from . import log
 from . import process as P
 
 
-def _cdp_port(cdp_url: str) -> int:
-    port = urlparse(cdp_url).port
-    return port if port else 9222
+
 
 
 def _window_for_pid(pid: int, require_visible: bool = True):
@@ -88,7 +86,7 @@ def _launch_browser(cdp_url: str, profile_path: str | None = None):
             f"sh scripts/launch_chrome.sh"
         )
     env = dict(os.environ)
-    env["PORT"] = str(_cdp_port(cdp_url))
+    env["PORT"] = str(P.cdp_port(cdp_url))
     if profile_path:
         env["PROFILE"] = profile_path
     cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
@@ -155,8 +153,6 @@ class Session:
         self.browser_owner = "external"   # external | collector (ADR §14.1)
         self.browser_pid = None
         self.browser_profile = P.profile_path(profile_token)
-        self.browser_started_at = None
-        self.ownership_token = profile_token
         self._playwright = None
         self._browser = None
         self.page = None
@@ -197,7 +193,6 @@ class Session:
                     pass
                 raise
         self.browser_pid = _browser_pid(self.cdp_url, self.profile_token)
-        self.browser_started_at = time.time()
         ctx = self._browser.contexts[0]
         if self.browser_owner == "external":
             # external: НЕ трогаем первую попавшуюся вкладку (может быть
@@ -242,7 +237,7 @@ class Session:
                 })
         except Exception as e:
             log.debug(f"minimize_window cdp: {type(e).__name__}: {e}")
-        self._minimize_window_native(_cdp_port(self.cdp_url))
+        self._minimize_window_native(P.cdp_port(self.cdp_url))
 
     @staticmethod
     def _minimize_window_native(port: int):
@@ -317,7 +312,7 @@ class Session:
                 })
         except Exception as e:
             log.debug(f"keep_window cdp: {type(e).__name__}: {e}")
-        self._restore_window_native(_cdp_port(self.cdp_url))
+        self._restore_window_native(P.cdp_port(self.cdp_url))
 
     @staticmethod
     def _restore_window_native(port: int):
@@ -575,9 +570,6 @@ class Session:
         self.close()
         self._connect()
         log.info("reconnect: done")
-
-    def screenshot(self, path: str):
-        self.page.screenshot(path=path)
 
     def close(self):
         """Закрыть лишние вкладки и завершить сессию Playwright.

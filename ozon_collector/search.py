@@ -694,6 +694,30 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
     return products
 
 
+def _links_from_pids(pids: list) -> list:
+    """Ссылки-товары из явного списка артикулов (общий для collect_search
+    и collect_parallel)."""
+    return [{"pid": str(p), "url": f"https://www.ozon.ru/product/{p}"}
+            for p in pids]
+
+
+def _filter_skip_pids(links: list, skip_pids: list | None) -> list:
+    """Отфильтровать уже обработанные артикулы (не пересобирать заново).
+
+    Общий для collect_search и collect_parallel. Возвращает links без ссылок
+    на skip_pids (с логом о числе пропущенных).
+    """
+    if not skip_pids:
+        return links
+    skip = set(str(p) for p in skip_pids)
+    before = len(links)
+    out = [it for it in links if str(it["pid"]) not in skip]
+    if len(out) < before:
+        log.info(f"[search] skip_pids: пропущено {before - len(out)} "
+                 f"уже обработанных (осталось {len(out)})")
+    return out
+
+
 def collect_search(sess, url: str, limit: int, gather_cfg: dict,
                    query: Optional[str] = None,
                    max_recycles: int = 2,
@@ -737,8 +761,7 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
     manager = B.BrowserProcessManager(
         cdp_url=getattr(sess, "cdp_url", "http://127.0.0.1:9222"))
     if pids:
-        links = [{"pid": str(p), "url": f"https://www.ozon.ru/product/{p}"}
-                 for p in pids]
+        links = _links_from_pids(pids)
     else:
         _warmup_to_category(sess, url)
         links = _collect_links_with_recovery(
@@ -748,13 +771,7 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
     # skip_pids: уже обработанные артикулы пропускаем (не пересобираем заново).
     # Позволяет full-run добрать только новые/FAIL товары, не пролистывая
     # уже собранные с cache=hit.
-    if skip_pids:
-        skip = set(str(p) for p in skip_pids)
-        before = len(links)
-        links = [it for it in links if str(it["pid"]) not in skip]
-        if len(links) < before:
-            log.info(f"[search] skip_pids: пропущено {before - len(links)} "
-                     f"уже обработанных (осталось {len(links)})")
+    links = _filter_skip_pids(links, skip_pids)
     selected = links[:limit]
     items = [(i, it["pid"], it["url"]) for i, it in enumerate(selected)]
     total = len(items)
