@@ -363,6 +363,30 @@ def _warmup_session(sess, label: str = "warmup") -> dict:
     return result
 
 
+def _stop_worker_browser(spec: dict) -> int:
+    """Гашение Chromium воркера по его профилю/порту (best-effort).
+
+    Используется в finally воркера и в родительском watchdog: чтобы браузер
+    воркера не висел после смерти воркера/демона. Возвращает число
+    остановленных процессов (0 — если браузера не было).
+    """
+    try:
+        records = [P.ProcessRecord(f"worker{spec['worker_id']}-stop", ident)
+                   for ident in P.browser_processes(
+                       spec["cdp_url"],
+                       profile_token=spec["profile_token"])]
+        if not records:
+            return 0
+        manager = BrowserProcessManager(cdp_url=spec["cdp_url"],
+                                        profile_token=spec["profile_token"])
+        manager.force_stop(records)
+        return len(records)
+    except Exception as e:
+        log.warning(f"worker{spec['worker_id']} stop browser: "
+                    f"{type(e).__name__}: {e}")
+        return 0
+
+
 def worker_main(spec: dict, task: dict, conn):
     """Точка входа воркер-процесса: свой браузер, свой шард, payload → pipe.
 
@@ -404,7 +428,12 @@ def worker_main(spec: dict, task: dict, conn):
             check_s = max(2.0, float(task.get("parent_watchdog_s") or 5.0))
             while not _stop_event.is_set():
                 if not P.pid_alive(parent_pid):
-                    log.error("parent (orchestrator) died — worker exits")
+                    # Демон умер: сначала гасим СВОЙ Chromium (иначе осиротевший
+                    # браузер воркера будет висеть до preflight-очистки),
+                    # затем завершаем воркер. finally здесь не выполнится.
+                    log.error("parent (orchestrator) died — killing own "
+                              "browser and exiting")
+                    _stop_worker_browser(spec)
                     os._exit(2)
                 time.sleep(check_s)
 
@@ -494,16 +523,9 @@ def worker_main(spec: dict, task: dict, conn):
         except Exception:
             pass
         if manager is not None:
-            try:
-                records = [P.ProcessRecord(f"worker{k}-stop", ident)
-                           for ident in P.browser_processes(
-                               spec["cdp_url"],
-                               profile_token=spec["profile_token"])]
-                if records:
-                    manager.force_stop(records)
-                    payload["browser_stopped"] = True
-            except Exception as e:
-                log.warning(f"stop browser: {type(e).__name__}: {e}")
+            stopped = _stop_worker_browser(spec)
+            if stopped:
+                payload["browser_stopped"] = True
         payload["finished"] = _now()
         try:
             _stop_event.set()

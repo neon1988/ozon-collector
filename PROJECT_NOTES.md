@@ -30,15 +30,18 @@
    вечно (наблюдалось: воркер 16792 выжил после смерти демона 11184). Добавлен
    родительский watchdog в `worker_main` (parallel.py): поток каждые 5с проверяет
    живость родителя (демона) через `process.pid_alive(os.getppid())`; при смерти
-   родителя — `os._exit(2)` (браузер потом уберёт preflight-очистка
-   `orphaned_worker_browser_processes`). Новый `process.pid_alive(pid)` на Windows
-   НЕ может опираться на OpenProcess (возвращает handle для недавно завершившегося
-   процесса) — используется `GetExitCodeProcess`: живой = STILL_ACTIVE (259).
-   Верифицировано live: kill демона 8388 → воркер 21956 самоубился
-   (в логе: `parent (orchestrator) died - worker exits`), все python-процессы
-   завершились. Также подтверждено: лог ОДИН (`logs/{campaign}_daemon.log`),
-   `wd_out.log` больше не создаётся после перезапуска демона через обновлённый
-   watchdog (`> NUL`).
+   родителя воркер **сначала гасит СВОЙ Chromium** (`_stop_worker_browser(spec)`,
+   force_stop по своему профилю/порту), затем `os._exit(2)`. Новый
+   `process.pid_alive(pid)` на Windows НЕ может опираться на OpenProcess
+   (возвращает handle для недавно завершившегося процесса) — используется
+   `GetExitCodeProcess`: живой = STILL_ACTIVE (259). Верифицировано live:
+   kill демона 10184 → воркер 16204 самоубился и убил свой браузер
+   (worker-profile chrome → 0), все python-процессы завершились. Общий хелпер
+   `_stop_worker_browser` используется и в finally воркера (штатное завершение).
+   Осиротевшие браузеры от принудительно убитого ВОРКЕРА (а не демона) убирает
+   preflight-очистка `orphaned_worker_browser_processes` при следующем запуске.
+   Также подтверждено: лог ОДИН (`logs/{campaign}_daemon.log`), `wd_out.log`
+   больше не создаётся после перезапуска демона через обновлённый watchdog.
 
  - **✅ Рефакторинг: костыли убраны, дубли схлопнуты (2026-09-02).** Без изменения
    функциональности и форматов (raw/combined/QA/отчёт):
