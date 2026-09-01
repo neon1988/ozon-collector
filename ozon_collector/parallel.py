@@ -365,7 +365,9 @@ def worker_main(spec: dict, task: dict, conn):
                 _s.reconfigure(encoding="utf-8", errors="backslashreplace")
             except Exception:
                 pass
-        log.attach_file(spec["log_path"], mode="a", prefix=prefix)
+        worker_log = task.get("worker_log") or spec["log_path"]
+        log.attach_file(worker_log, mode="a", prefix=prefix,
+                        rotate_max_bytes=5 * 1024 * 1024)
         os.environ["OZON_WORKER_ID"] = str(k)
         payload["started"] = _now()
         _send(conn, {"t": "start", "worker": k, "pid": os.getpid(),
@@ -566,7 +568,7 @@ def _needs_restart(wctx: WorkerContext, max_restarts: int) -> bool:
 def _respawn(wctx: WorkerContext, pending: list[int],
              items_by_index: dict, gather_cfg: dict,
              max_recycles: int, session_budget: dict | None,
-             on_event=None) -> WorkerContext:
+             on_event=None, worker_log: str | None = None) -> WorkerContext:
     """Поднять воркера-замену на том же worker_id с недоделанными индексами.
 
     Сначала чистим зависший Chromium воркера (fresh браузер), ждём
@@ -589,6 +591,7 @@ def _respawn(wctx: WorkerContext, pending: list[int],
         "max_recycles": max_recycles,
         "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
         "session_budget": dict(session_budget) if session_budget else None,
+        "worker_log": worker_log,
     }
     new = _spawn_ctx(spec, task2, on_event=on_event)
     new.restarts = wctx.restarts + 1
@@ -611,6 +614,7 @@ def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
                    max_worker_restarts: int, items_by_index: dict,
                    specs: list, gather_cfg: dict, max_recycles: int,
                    session_budget: dict | None, on_event=None,
+                   worker_log: str | None = None,
                    poll: float = 0.3) -> list:
     """Дождаться завершения воркеров, перезапуская аварийно упавших.
 
@@ -659,7 +663,7 @@ def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
             pending = list(wctx.pending_indexes)
             active.append(_respawn(
                 wctx, pending, items_by_index, gather_cfg,
-                max_recycles, session_budget, on_event))
+                max_recycles, session_budget, on_event, worker_log))
             # упавший воркер "заменён": убираем из finalized, чтобы не
             # перезапускать его повторно на каждой итерации while
             finalized.remove(wctx)
@@ -694,7 +698,8 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      no_bootstrap: bool = False,
                      session_budget: dict | None = None,
                      on_event=None,
-                     max_worker_restarts: int = 0) -> dict:
+                     max_worker_restarts: int = 0,
+                     worker_log: str | None = None) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
 
     pids — явный список артикулов вместо докрутки выдачи: main-сессия не
@@ -763,6 +768,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
             "max_recycles": max_recycles,
             "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
             "session_budget": dict(session_budget) if session_budget else None,
+            "worker_log": worker_log,
         }
         wctxs.append(_spawn_ctx(spec, task, on_event=on_event))
 
@@ -772,7 +778,8 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         max_worker_restarts=max_worker_restarts,
         items_by_index={i: (pid, url) for i, pid, url in items},
         specs=specs, gather_cfg=gather_cfg, max_recycles=max_recycles,
-        session_budget=session_budget, on_event=on_event)
+        session_budget=session_budget, on_event=on_event,
+        worker_log=worker_log)
 
     payloads = []
     for wctx in wctxs:

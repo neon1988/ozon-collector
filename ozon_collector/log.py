@@ -85,17 +85,20 @@ def set_prefix(prefix: str):
     _worker_prefix = prefix or ""
 
 
-def attach_file(path, mode: str = "a", prefix: str = ""):
-    """Присоединить файл лога воркера (БЕЗ ротации/перезаписи).
+def attach_file(path, mode: str = "a", prefix: str = "",
+                rotate_max_bytes: int = 0):
+    """Присоединить файл лога воркера (БЕЗ перезаписи; ротация — по размеру).
 
-    Используется воркерами ВМЕСТО setup(): setup() делает ротацию (w-режим) и
-    может затереть чужой лог. Здесь файл открывается в заданном режиме (по
-    умолчанию "a" — append), плюс ставится префикс [worker=k pid=N].
+    mode="a" (append) — не затирает чужой лог. prefix — [worker=k pid=N].
+    rotate_max_bytes>0: если файл уже крупнее лимита, он переименуется в
+    .log.1 перед открытием (единый общий лог воркеров не растёт бесконечно).
     """
     global _fh
     if prefix:
         set_prefix(prefix)
     p = Path(path)
+    if rotate_max_bytes and p.exists() and p.stat().st_size > rotate_max_bytes:
+        _rotate(p)
     p.parent.mkdir(parents=True, exist_ok=True)
     _fh = open(p, mode, encoding="utf-8")
     _write_file("INFO", "log", f"attach_file start pid={os.getpid()} at "

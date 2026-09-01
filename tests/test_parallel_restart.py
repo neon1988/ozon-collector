@@ -106,7 +106,7 @@ def test_await_restarts_dead_worker(monkeypatch):
                       payload={"fatal_error": None}, pending=[])
     calls = []
     def fake_respawn(wctx, pending, items_by_index, gather_cfg,
-                     max_recycles, session_budget, on_event):
+                     max_recycles, session_budget, on_event, worker_log=None):
         calls.append((wctx.worker_idx, sorted(pending)))
         return repl
     monkeypatch.setattr(PL, "_respawn", fake_respawn)
