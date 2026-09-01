@@ -1127,37 +1127,11 @@ def test_finalize_soft_stop_no_accepted_on_abandoned(tmp_path):
 
 
 # ============================================================================
-# Интеграционные тесты run_campaign через монку subprocess.Popen и qa_fn
+# Интеграционные тесты run_campaign через монку _inproc_collect и qa_fn
 # ============================================================================
 
 import json as _json
 from pathlib import Path as _Path
-
-
-class _FakeProc:
-    """Имитирует subprocess.Popen: пишет combined в --out-raw, отдаёт exit_code."""
-
-    def __init__(self, argv, combined_factory, **kwargs):
-        out_raw = None
-        for i, a in enumerate(argv):
-            if a == "--out-raw":
-                out_raw = argv[i + 1]
-        assert out_raw, f"FakeProc требует --out-raw в argv, got={argv}"
-        combined = combined_factory(argv)
-        _Path(out_raw).parent.mkdir(parents=True, exist_ok=True)
-        _Path(out_raw).write_text(_json.dumps(combined, ensure_ascii=False),
-                                  encoding="utf-8")
-        self._lines = iter(["ok"])
-
-    @property
-    def stdout(self):
-        return self
-
-    def __iter__(self):
-        return self._lines
-
-    def wait(self):
-        return 0
 
 
 def _run_campaign_integration(tmp_path, monkeypatch, target, min_valid,
@@ -1176,9 +1150,9 @@ def _run_campaign_integration(tmp_path, monkeypatch, target, min_valid,
     for i in range(n_pids):
         (data_dir / f"{i}_raw.json").write_text("{}", encoding="utf-8")
 
-    monkeypatch.setattr(k.subprocess, "Popen",
-                        lambda argv, **kw2: _FakeProc(argv, combined_factory,
-                                                      **kw2))
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: combined_factory(
+                            k.build_cli_args(progress, run_id, mode, targets)))
     monkeypatch.setattr(k.time, "sleep", lambda s: None)
 
     return k.run_campaign(
@@ -2099,8 +2073,9 @@ def test_integration_resume_uses_manifest_config(tmp_path, monkeypatch):
         return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
                 "per_pid": {p: "OK" for p in batch}}
 
-    monkeypatch.setattr(k.subprocess, "Popen",
-                        lambda argv, **kw2: _FakeProc(argv, fac, **kw2))
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: fac(
+                            k.build_cli_args(progress, run_id, mode, targets)))
     monkeypatch.setattr(k.time, "sleep", lambda s: None)
 
     prog = k.run_campaign(
@@ -2306,8 +2281,9 @@ def test_resume_without_url_ok(tmp_path, monkeypatch):
         return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
                 "per_pid": {p: "OK" for p in batch}}
 
-    monkeypatch.setattr(k.subprocess, "Popen",
-                        lambda argv, **kw2: _FakeProc(argv, fac, **kw2))
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: fac(
+                            k.build_cli_args(progress, run_id, mode, targets)))
     monkeypatch.setattr(k.time, "sleep", lambda s: None)
 
     prog = k.run_campaign(
@@ -2364,13 +2340,11 @@ def test_integration_unknown_failure_needs_attention(tmp_path, monkeypatch):
         return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
                 "per_pid": {p: "OK" for p in batch}}
 
-    class FakeFailProc(_FakeProc):
-        def wait(self):
-            return 2  # ненулевой exit при написанном combined
-
-    def fake_popen(argv, **kw2):
-        # пишем combined (как _FakeProc), но возвращаем exit=2
-        return FakeFailProc(argv, fac, **kw2)
+    def fake_inproc(progress, run_id, mode, targets=None):
+        # in-process сбор упал исключением → демон сам ставит combined
+        # «пуст, но есть» + exit=1 → UNKNOWN_FAILURE → NEEDS_ATTENTION
+        fac(k.build_cli_args(progress, run_id, mode, targets))
+        raise RuntimeError("simulated in-process failure")
 
     data_dir = tmp_path / "data"
     data_dir.mkdir(exist_ok=True)
@@ -2378,7 +2352,7 @@ def test_integration_unknown_failure_needs_attention(tmp_path, monkeypatch):
     monkeypatch.setattr(k, "DATA_DIR", tmp_path)
     monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
     monkeypatch.setattr(k, "PYTHON", "python")
-    monkeypatch.setattr(k.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(k, "_inproc_collect", fake_inproc)
     monkeypatch.setattr(k.time, "sleep", lambda s: None)
 
     prog = k.run_campaign(

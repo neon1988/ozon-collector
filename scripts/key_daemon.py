@@ -966,6 +966,119 @@ def build_cli_args(progress: dict, run_id: str, mode: str, targets=None) -> list
     return base
 
 
+def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
+    """gather_cfg для in-process сбора — эквивалент cli._gather_cfg_from_args.
+
+    Демон запускает CLI без большинства опций → действуют дефолты CLI
+    (см. cli.py search-парсер): те же значения здесь не должны разъехаться.
+    """
+    return {
+        "variant": "",
+        "max_pages": 12,
+        "min_reviews": cfg.get("min_reviews", 40),
+        "category": None,
+        "no_dom": False,
+        "no_variant_mode": False,
+        "sorts": ["published_at_desc", "score_asc"],  # DEFAULT_SORTS
+        "max_age_s": max_age_s,
+        "no_ocr": True,          # --ocr не передаётся демоном
+        "threads": 8,
+        "no_preproc": False,
+        "dedup_replies": True,   # без --no-dedup-replies
+        "overwrite": False,
+        "min_rating": None,
+        "window_mode": cfg.get("window_mode"),
+        "scroll_jitter_seed": None,
+    }
+
+
+def _inproc_collect(progress: dict, run_id: str, mode: str,
+                    targets=None) -> dict:
+    """In-process сбор через collect_parallel/collect_search (без subprocess CLI).
+
+    Полный эквивалент `cli.py search --out-raw combined_{run_id}.json`:
+    возвращает combined и пишет файл на диск (его потребляют classify_status,
+    QA, replay и status-API). Воркеры пишут в единый {campaign}_daemon.log
+    (worker_log) и отдают live-телеметрию через on_event.
+    """
+    import sys as _sys
+    if str(ROOT) not in _sys.path:
+        _sys.path.insert(0, str(ROOT))
+    from ozon_collector import cache as K
+    from ozon_collector import search as S
+
+    cfg = progress["run_cfg"]
+    camp = progress["campaign"]
+    parallel = max(1, int(cfg.get("parallel", 1)))
+    max_age_s = K.parse_max_age(cfg.get("max_age", "7d"))
+    gather_cfg = _inproc_gather_cfg(cfg, max_age_s)
+
+    session_budget = None
+    if cfg.get("session_budget_wall_clock"):
+        session_budget = dict(S.SESSION_BUDGET_DEFAULT)
+        session_budget["wall_clock_s"] = int(cfg["session_budget_wall_clock"])
+
+    if mode == "rescan":
+        pids = list(targets or [])
+        limit = len(pids)
+        # pids-режим: url не открывается, main-браузер не нужен
+        url = f"список из {limit} артикулов"
+        discovery = limit
+        skip_pids = None
+    else:
+        pids = None
+        url = progress["url"]
+        skip_pids = (list(dict.fromkeys(progress.get("valid_pids", [])))
+                     or None)
+        # полный прогон собирает с запасом target + reserve_count (как в CLI)
+        discovery = progress["target_count"] + int(cfg.get("reserve_count") or 0)
+        limit = discovery
+
+    worker_log = str(LOGS_DIR / f"{camp}_daemon.log")
+
+    def _on_event(wctx, msg):
+        k = getattr(wctx, "worker_idx", None)
+        if isinstance(msg, dict):
+            t = msg.get("t", "?")
+            detail = msg.get("detail") or None
+        else:
+            t = msg
+            detail = None
+        log(f"worker{k} [{t}]" + (f" {detail}" if detail else ""),
+            campaign=camp)
+
+    max_restarts = int(cfg.get("max_worker_restarts", 2))
+
+    if parallel > 1:
+        from ozon_collector.parallel import collect_parallel
+        combined = collect_parallel(
+            url, limit=limit, gather_cfg=gather_cfg, parallel=parallel,
+            query=None, max_recycles=2, join_timeout_s=43200.0,
+            pids=pids or None, skip_pids=skip_pids, no_bootstrap=False,
+            session_budget=session_budget, on_event=_on_event,
+            max_worker_restarts=max_restarts, worker_log=worker_log)
+    else:
+        from ozon_collector.cdp import Session
+        _wm = gather_cfg.get("window_mode")
+        sess = Session(
+            keep_window=None if _wm is None else (_wm == "visible"))
+        try:
+            combined = S.collect_search(
+                sess, url, limit=limit, gather_cfg=gather_cfg,
+                query=None, pids=pids or None, skip_pids=skip_pids,
+                session_budget=session_budget)
+        finally:
+            sess.close()
+
+    combined_file = CAMPAIGNS_DIR / camp / f"combined_{run_id}.json"
+    combined_file.parent.mkdir(parents=True, exist_ok=True)
+    if combined is not None:
+        combined_file.write_text(
+            json.dumps(combined, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    return combined
+
+
 def _fail_reason_recurring(progress: dict, pid: str, threshold: int = 2) -> bool:
     """FAIL-причина пида повторилась ≥threshold раз подряд.
 
@@ -1046,6 +1159,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  challenge_pause: int = CHALLENGE_RETRY_DELAY_S,
                  force_new: bool = False,
                  max_transient_retries: int = 3,
+                 max_worker_restarts: int = 2,
                  session_budget_wall_clock: Optional[int] = None,
                  window_mode: Optional[str] = None,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
@@ -1067,6 +1181,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         reserve_count=reserve_count, notify=notify_mode,
         challenge_pause=challenge_pause,
         max_transient_retries=max_transient_retries,
+        max_worker_restarts=max_worker_restarts,
         session_budget_wall_clock=session_budget_wall_clock,
         window_mode=window_mode)
 
@@ -1231,32 +1346,18 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                        run_id=run_id, mode=mode)
             _journal_stage(progress, run_id, "run_started")
 
-            log(f"[{run_id}] CLI ({mode}) старт", campaign=campaign)
-            cli_argv = build_cli_args(progress, run_id, mode, targets)
+            log(f"[{run_id}] in-process сбор ({mode}) старт", campaign=campaign)
             try:
-                proc = subprocess.Popen(
-                    [PYTHON, "-u", "-X", "utf8", *cli_argv],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
-                for raw in proc.stdout:
-                    line = raw.rstrip()
-                    if line:
-                        log(f"  cli> {line}", campaign=campaign)
-                exit_code = proc.wait()
-            except FileNotFoundError as exc:
-                log(f"не найден python/CLI: {exc}", "ERROR", campaign)
-                progress["final_state"] = "NEEDS_ATTENTION"
-                progress["final_reason"] = "cli_not_found"
-                progress["final_note"] = "не запускается CLI"
-                _journal_stage(progress, run_id, "run_completed",
-                               {"status": "CRASH", "exit_code": None})
-                _set_state(progress, "NEEDS_ATTENTION", "FATAL",
-                           run_id=run_id, reason="cli_not_found")
-                notify(progress, "NEEDS_ATTENTION: CLI не запускается")
-                save_json(progress_path, progress)
-                break
+                combined = _inproc_collect(progress, run_id, mode, targets)
+                exit_code = 0
+            except Exception as exc:
+                log(f"in-process сбор упал: {exc}", "ERROR", campaign)
+                # combined «пуст, но есть» + exit!=0 → UNKNOWN_FAILURE: прежнее
+                # поведение subprocess (combined записан, код ненулевой) →
+                # транзиентные ретраи → NEEDS_ATTENTION, а не тихий ABANDONED.
+                combined = {"products": [], "found": 0, "inproc_crash": str(exc)}
+                exit_code = 1
 
-            combined = load_json(CAMPAIGNS_DIR / campaign / f"combined_{run_id}.json")
             status = classify_status(exit_code, combined)
             _journal_stage(progress, run_id, "run_completed",
                            {"status": status, "exit_code": exit_code})
@@ -1707,6 +1808,9 @@ def parse_args(argv=None):
     ap.add_argument("--max-transient-retries", type=int, default=3,
                     help="сколько раз ретраить UNKNOWN_FAILURE (временные сбои "
                          "subprocess) до перехода в NEEDS_ATTENTION")
+    ap.add_argument("--max-worker-restarts", type=int, default=2,
+                    help="сколько раз перезапускать упавшего воркера за один "
+                         "run (0 — без перезапусков)")
     ap.add_argument("--session-budget-wall-clock", type=int, default=None,
                     help="лимит wall_clock (сек) одного run CLI (default 1800). "
                          "Поднять, чтобы run жил дольше без SESSION_EXHAUSTED")
@@ -1731,6 +1835,7 @@ def main(argv=None):
         reserve_count=args.reserve_count, notify_mode=args.notify,
         challenge_pause=args.challenge_pause, force_new=args.force_new,
         max_transient_retries=args.max_transient_retries,
+        max_worker_restarts=args.max_worker_restarts,
         session_budget_wall_clock=args.session_budget_wall_clock,
         window_mode=args.window_mode)
     print(json.dumps(summarize(progress), ensure_ascii=False, indent=2))
