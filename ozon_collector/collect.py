@@ -33,6 +33,7 @@ from . import VERSION, SCHEMA_VERSION, DEFAULT_CDP_URL
 from . import browser as B
 from . import cache as K
 from . import log
+from . import puzzle as _puzzle
 from .cdp import Session
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.34 Safari/537.36"
@@ -958,6 +959,16 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
     бросаем AccessChallengeError.
     """
     sig = detect_challenge(page)
+    if _puzzle.is_puzzle(sig):
+        # Слайдер-пазл (НЕ FAB-заглушка): сначала пытаемся РЕШИТЬ, а не
+        # перезагружать вслепую. Успех → пазл снят, никакого AccessChallenge
+        # (не тратим бюджет challenge/new_tab/recycle).
+        if _puzzle.solve_puzzle(page):
+            log.warning(f"[collect] пазл решён ({where})")
+            return
+        log.warning(f"[collect] пазл не решён за {_puzzle.failures()} "
+                    f"попыток ({where}) → FAB-reload fallback")
+        sig = detect_challenge(page)
     for _ in range(FAB_RELOAD_ATTEMPTS) if (sig and reload_on_fab) else range(0):
         log.warning(f"[collect] FAB-заглушка ({sig}) → reload для разблокировки")
         _reload_fn(page)

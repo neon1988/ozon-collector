@@ -21,6 +21,7 @@ from . import browser as B
 from . import collect as C
 from . import log
 from . import process as P
+from . import puzzle as _puzzle
 from .cdp import browser_tabs_count
 from .gather import run_gather
 
@@ -354,6 +355,7 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
     since_recycle = 0
     since_recovery = 0
     total = len(items)
+    _puzzle.reset()
     budget = recovery.get("session_budget") or SESSION_BUDGET_DEFAULT
     used = recovery.setdefault("session_used", {"challenge": 0, "new_tab": 0,
                                                 "browser_recycle": 0})
@@ -513,6 +515,17 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
                           f"SESSION_BLOCKED (abort run)", extra={"pid": pid})
                 recovery.setdefault("session_blocked", 0)
                 recovery["session_blocked"] += 1
+                if _puzzle.failures():
+                    # пазл решался и не снят — помечаем шторм как puzzle_persistent:
+                    # родитель (parallel) вернёт combined.aborted с all_workers/
+                    # workers_stormed, демон отличит нерешаемый пазл от «голого»
+                    # challenge (перезапуск/cooldown-логика строится по признаку).
+                    recovery.setdefault("challenge_storm", {})
+                    recovery["challenge_storm"]["puzzle_persistent"] = True
+                    recovery["challenge_storm"]["puzzle_failures"] = \
+                        _puzzle.failures()
+                    recovery["challenge_storm"]["streak"] = \
+                        recovery.get("session_blocked", 0)
                 break
 
             # ---- прочие recyclable (browser/renderer/variant_short) ----

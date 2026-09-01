@@ -24,6 +24,23 @@
 
 ## Статус и следующие шаги (последнее обновление: 2026-08-31)
 
+ - **✅ Слайдер-пазл: авто-решатель в check_challenge (2026-09-01).** Новый модуль
+   `ozon_collector/puzzle.py`: `is_puzzle(sig)` (маркеры «пазл»/«ползунок»), `solve_puzzle(page)`
+   (скачивание фона и кусочка → OpenCV `cv2.matchTemplate` находит выемку → drag слайдера мыши;
+   устойчив к ошибкам/обрыву CDP), счётчик неудач `PUZZLE_FAILURES` с `reset()`.
+   * **Интеграция:** в `collect.check_challenge` (collect.py:961-971) для слайдер-пазла СНАЧАЛА
+     РЕШАЕМ (`PUZZLE_MAX_ATTEMPTS=2`), а не перезагружаем вслепую. Успех → пазл снят без расхода
+     бюджета challenge/new_tab/recycle; неудача → старый FAB-reload fallback и FSM-лестница.
+   * **Телеметрия:** `_collect_shard` (search.py) при SESSION_BLOCKED + счётчик пазла>0 пишет
+     `recovery.challenge_storm` со `puzzle_persistent`/`puzzle_failures`/`streak` → parallel
+     вернёт `combined.aborted` с `workers_stormed`/`all_workers` (для parallel>1 строма теперь
+     видна корректно, а не только reason). `puzzle.reset()` — в начале каждого `_collect_shard`.
+   * **«Свежий браузер после пары попыток» уже даёт FSM:** решатель (2 попытки) → FAB-reload×3 →
+     new_tab×1 → recycle×1 (свежий браузер) → SESSION_BLOCKED. Отдельный перезапуск воркера
+     оркестратором для пазла НЕ добавлялся (редантный, пришлось бы менять семантику abort).
+   * ТЕСТЫ: `tests/test_puzzle.py` (9: маркеры, счётчик+reset, `_find_notch` на синтетике,
+     check_challenge решает/не решает). Search 49, parallel 52 — зелёные.
+
  - **✅ anti_bot_architecture.md: ревизия 2.7 по 4 волнам критики + 3 правки кода (2026-08-31).**
    КОД (P1/P2, реализовано):
    * **Базовый fingerprint в телеметрию (P1).** `cdp.py: Session._capture_fingerprint_once`
