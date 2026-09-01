@@ -1,9 +1,11 @@
 """Автономный супервизор кампаний сбора Ozon (key_daemon).
 
 Долгоживущий Python-процесс, сам управляющий кампанией сбора:
-итеративный дособор через `cli.py search`, контроль качества (qa_raw),
-recovery при challenge/crash (backoff + cooldown + авто-resume), защита от
-зацикливания на одной выдаче, контролируемый rescan бракованных PID.
+итеративный дособор (САМ ищет выдачу и рассылает товары воркерам —
+in-process через collect_parallel/collect_search, без subprocess cli.py),
+контроль качества (qa_raw), recovery при challenge/crash (backoff +
+cooldown + авто-resume), защита от зацикливания на одной выдаче,
+контролируемый rescan бракованных PID.
 
 Критерий завершения кампании — НЕ `collected` одного прогона, а рост числа
 ВАЛИДНЫХ canonical raw (`data/{pid}_raw.json`, прошедших QA без FAIL) до target
@@ -17,8 +19,7 @@ recovery при challenge/crash (backoff + cooldown + авто-resume), защи
   NEEDS_ATTENTION  — непредвиденная ошибка; требует человека (терминально)
 
 Атомарно ведёт manifest data/campaigns/{campaign}/progress.json и
-logs/{campaign}_daemon.log. Итог CLI читает из машиночитаемого combined JSON
-(--out-raw), а не парсит текст лога.
+logs/{campaign}_daemon.log. Итог сбора читает из машиночитаемого combined JSON.
 
 Использование:
     python scripts/key_daemon.py --campaign prezervativy \
@@ -53,7 +54,6 @@ CAMPAIGNS_DIR = DATA_DIR / "campaigns"
 _NO_COOLDOWN = bool(os.environ.get("KD_NO_COOLDOWN"))
 
 PYTHON = sys.executable
-CLI = str(ROOT / "cli.py")
 QA_RAW = str(ROOT / "scripts" / "qa_raw.py")
 
 DEFAULT_DATA_DIR = str(DATA_DIR)
@@ -117,7 +117,7 @@ COLLECTOR_VERSION = _COLLECTOR_VERSION
 # ---------------------------------------------------------------------------
 
 def classify_status(exit_code: int, combined: Optional[dict]) -> str:
-    """Классифицирует итог одного прогона CLI (по combined + exit-коду, не по логу)."""
+    """Классифицирует итог одного прогона сбора (по combined + exit-коду, не по логу)."""
     if combined and "aborted" in combined:
         return "CHALLENGE_STORM"
     if exit_code == 0:
@@ -591,7 +591,7 @@ def _journal_stage(progress: dict, run_id: str, stage: str,
 
 
 def _absorb_recovery_telemetry(progress: dict, combined: Optional[dict]) -> None:
-    """Переносит recovery-телеметрию CLI (combined.recovery) в progress.
+    """Переносит recovery-телеметрию сбора (combined.recovery) в progress.
 
     Этап 0 (ADR §14.6): только наблюдаемость, поведение не меняется. Из
     combined.recovery берём последние события (signature, last_url,
@@ -925,52 +925,13 @@ def classify_new_pids(progress: dict, candidates: Iterable[str],
 
 
 # ---------------------------------------------------------------------------
-# запуск CLI и обновление manifest
+# запуск сбора (in-process) и обновление manifest
 # ---------------------------------------------------------------------------
-
-def build_cli_args(progress: dict, run_id: str, mode: str, targets=None) -> list[str]:
-    cfg = progress["run_cfg"]
-    camp = progress["campaign"]
-    combined = CAMPAIGNS_DIR / camp / f"combined_{run_id}.json"
-    if mode == "rescan":
-        base = [CLI, "search", "--limit", str(len(targets or [])),
-                "--parallel", str(cfg.get("parallel", 1)),
-                "--max-age", cfg.get("max_age", "7d"),
-                "--out-raw", str(combined),
-                "--pids", ",".join(targets or [])]
-    else:
-        # Полный прогон собирает с ЗАПАСОМ target + reserve_count. Иначе выдача
-        # = первые N товаров (limit=target), valid_pids никогда не превысит
-        # target → резервный пул (campaign_reserve_pids) всегда пуст и замена
-        # брака при финальном QA невозможна.
-        discovery = progress["target_count"] + int(cfg.get("reserve_count") or 0)
-        base = [CLI, "search", "--limit", str(discovery),
-                "--parallel", str(cfg.get("parallel", 1)),
-                "--max-age", cfg.get("max_age", "7d"),
-                "--out-raw", str(combined),
-                "--out", progress["out"], "--url", progress["url"]]
-    if cfg.get("min_reviews"):
-        base += ["--min-reviews", str(cfg["min_reviews"])]
-    if cfg.get("session_budget_wall_clock"):
-        base += ["--session-budget-wall-clock", str(cfg["session_budget_wall_clock"])]
-    if cfg.get("window_mode"):
-        base += ["--window-mode", str(cfg["window_mode"])]
-    # full-режим: пропускаем УЖЕ ВАЛИДНЫЕ PID (не пересобираем подтверждённые).
-    # Excluded/невалидные пересматриваются каждый run (у них могут появиться
-    # отзывы/рейтинг — это и есть «досбор»). Если skip ВСЕ discovered, демон
-    # перестанет дособирать исключённые и просто замолотит без прогресса.
-    if mode == "full":
-        known = list(dict.fromkeys(progress.get("valid_pids", [])))
-        if known:
-            base += ["--skip-pids", ",".join(known)]
-    return base
-
-
 def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
-    """gather_cfg для in-process сбора — эквивалент cli._gather_cfg_from_args.
+    """gather_cfg для in-process сбора — дефолты прежнего CLI search.
 
-    Демон запускает CLI без большинства опций → действуют дефолты CLI
-    (см. cli.py search-парсер): те же значения здесь не должны разъехаться.
+    Демон запускал CLI без большинства опций → действовали дефолты CLI
+    search-парсера; те же значения задаём здесь явно, чтобы не разъехаться.
     """
     return {
         "variant": "",
@@ -996,7 +957,7 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
                     targets=None) -> dict:
     """In-process сбор через collect_parallel/collect_search (без subprocess CLI).
 
-    Полный эквивалент `cli.py search --out-raw combined_{run_id}.json`:
+    Эквивалент прежнего `cli.py search --out-raw combined_{run_id}.json`:
     возвращает combined и пишет файл на диск (его потребляют classify_status,
     QA, replay и status-API). Воркеры пишут в единый {campaign}_daemon.log
     (worker_log) и отдают live-телеметрию через on_event.
@@ -1030,7 +991,7 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
         url = progress["url"]
         skip_pids = (list(dict.fromkeys(progress.get("valid_pids", [])))
                      or None)
-        # полный прогон собирает с запасом target + reserve_count (как в CLI)
+        # полный прогон собирает с запасом target + reserve_count (как в прежнем CLI)
         discovery = progress["target_count"] + int(cfg.get("reserve_count") or 0)
         limit = discovery
 
@@ -1214,7 +1175,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
 
     try:
         # При resume конфиг берём из манифеста (источник истины), а не из текущих
-        # аргументов CLI — чтобы лимиты/дедлайны не менялись между запусками.
+        # аргументов запуска — чтобы лимиты/дедлайны не менялись между запусками.
         rcfg = progress.get("run_cfg", {})
         max_total_hours = rcfg.get("max_total_hours", max_total_hours)
         max_no_progress_runs = rcfg.get("max_no_progress_runs",
@@ -1222,7 +1183,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         max_rescans = rcfg.get("max_rescans", max_rescans)
         reserve_count = rcfg.get("reserve_count", reserve_count)
 
-        # session_budget_wall_clock: если передан CLI-аргументом, синхронизируем
+        # session_budget_wall_clock: если передан аргументом запуска, синхронизируем
         # в run_cfg (позволяет менять лимит run между запусками, сохраняя
         # остальные лимиты из манифеста).
         if session_budget_wall_clock is not None:
@@ -1529,13 +1490,13 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     datetime.now(timezone.utc) +
                     timedelta(seconds=crash_pause)).isoformat(
                         timespec="seconds")
-                log(f"crash CLI (exit!=0, нет combined), cooldown "
+                log(f"crash сбора (exit!=0, нет combined), cooldown "
                     f"{crash_pause}с", "WARN", campaign)
                 _set_state(progress, "COOLDOWN_CRASH", "CRASH",
                            run_id=run_id, exit_code=exit_code)
 
             elif status == "UNKNOWN_FAILURE":
-                # Транзиентный retry: временные ошибки subprocess (PermissionError,
+                # Транзиентный retry: временные ошибки сбора (PermissionError,
                 # IO, задержка combined, сбой отчёта) НЕ должны ронять 12-часовую
                 # кампанию в NEEDS_ATTENTION. Retry с коротким cooldown до
                 # max_transient_retries, затем — терминально. Малиформированный
@@ -1560,11 +1521,11 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 else:
                     progress["final_state"] = "NEEDS_ATTENTION"
                     progress["final_reason"] = "unknown_failure"
-                    progress["final_note"] = ("непредвиденная ошибка CLI после "
+                    progress["final_note"] = ("непредвиденная ошибка сбора после "
                                               f"{max_tr}+ транзиентных ретраев")
                     _set_state(progress, "NEEDS_ATTENTION", "FATAL",
                                run_id=run_id, reason="unknown_failure")
-                    notify(progress, "NEEDS_ATTENTION: непредвиденная ошибка CLI")
+                    notify(progress, "NEEDS_ATTENTION: непредвиденная ошибка сбора")
                     save_json(progress_path, progress)
                     break
 
@@ -1807,12 +1768,12 @@ def parse_args(argv=None):
                          "несовпадение identity (URL/схема) при resume")
     ap.add_argument("--max-transient-retries", type=int, default=3,
                     help="сколько раз ретраить UNKNOWN_FAILURE (временные сбои "
-                         "subprocess) до перехода в NEEDS_ATTENTION")
+                         "сбора) до перехода в NEEDS_ATTENTION")
     ap.add_argument("--max-worker-restarts", type=int, default=2,
                     help="сколько раз перезапускать упавшего воркера за один "
                          "run (0 — без перезапусков)")
     ap.add_argument("--session-budget-wall-clock", type=int, default=None,
-                    help="лимит wall_clock (сек) одного run CLI (default 1800). "
+                    help="лимит wall_clock (сек) одного прогона сбора (default 1800). "
                          "Поднять, чтобы run жил дольше без SESSION_EXHAUSTED")
     ap.add_argument("--window-mode", choices=["visible", "hidden"],
                     default=None,

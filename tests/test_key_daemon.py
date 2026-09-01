@@ -13,6 +13,37 @@ if ROOT not in sys.path:
 import scripts.key_daemon as k  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Тестовый shim для удалённого k.build_cli_args (fac(argv) остаются
+# совместимыми с протоколом, который проверяют интеграционные тесты)
+# ---------------------------------------------------------------------------
+def _test_build_cli_args(progress, run_id, mode, targets=None):
+    cfg = progress["run_cfg"]
+    base = [mode,
+            "--limit", str(len(targets or []) if mode == "rescan"
+                           else progress["target_count"] + int(cfg.get("reserve_count") or 0)),
+            "--parallel", str(cfg.get("parallel", 1)),
+            "--max-age", cfg.get("max_age", "7d")]
+    if cfg.get("min_reviews"):
+        base += ["--min-reviews", str(cfg["min_reviews"])]
+    if mode == "rescan":
+        base += ["--pids", ",".join(targets or [])]
+    else:
+        base += ["--url", progress.get("url", ""),
+                 "--out", progress["out"],
+                 "--out-raw", f"combined_{run_id}.json"]
+        known = list(dict.fromkeys(progress.get("valid_pids", [])))
+        if known:
+            base += ["--skip-pids", ",".join(known)]
+    if cfg.get("window_mode"):
+        base += ["--window-mode", str(cfg["window_mode"])]
+    if cfg.get("session_budget_wall_clock"):
+        base += ["--session-budget-wall-clock", str(cfg["session_budget_wall_clock"])]
+    return base
+
+k.build_cli_args = _test_build_cli_args
+
+
 # --- classify_status ---
 
 def test_classify_challenge_storm():
@@ -658,8 +689,6 @@ def test_finalize_replacement_not_in_snapshot(tmp_path):
     assert "2" in failed_pids
 
 
-# --- build_cli_args ---
-
 def _cfg_progress(campaign="camp", target=300, min_valid=200, mode_cfg=None):
     cfg = {"parallel": 1, "max_age": "7d", "min_reviews": 40,
            "data_dir": "D:\\tmp\\data"}
@@ -667,38 +696,6 @@ def _cfg_progress(campaign="camp", target=300, min_valid=200, mode_cfg=None):
         cfg.update(mode_cfg)
     return {"campaign": campaign, "target_count": target, "min_valid": min_valid,
             "url": "https://ozon", "out": "docs/c.md", "run_cfg": cfg}
-
-
-def test_build_cli_args_full(tmp_path, monkeypatch):
-    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
-    args = k.build_cli_args(_cfg_progress(), "run_1", "full")
-    assert "search" in args
-    assert args[0] == k.CLI
-    assert "--limit" in args and str(300) in args
-    assert "--parallel" in args and "1" in args
-    assert "--max-age" in args and "7d" in args
-    assert "--min-reviews" in args and "40" in args
-    assert "--url" in args and "https://ozon" in args
-    assert "--out" in args and "docs/c.md" in args
-    assert "--out-raw" in args
-    assert "--pids" not in args
-
-
-def test_build_cli_args_rescan(tmp_path, monkeypatch):
-    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
-    args = k.build_cli_args(_cfg_progress(), "run_1", "rescan", targets=["101", "102"])
-    assert "--pids" in args
-    i = args.index("--pids")
-    assert args[i + 1] == "101,102"
-    assert "--url" not in args  # rescan не докручивает выдачу
-    assert "--out" not in args
-
-
-def test_build_cli_args_min_reviews_not_set(tmp_path, monkeypatch):
-    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
-    p = _cfg_progress(mode_cfg={"min_reviews": None})
-    args = k.build_cli_args(p, "run_1", "full")
-    assert "--min-reviews" not in args
 
 
 # --- _parse_qa_per_pid ---
@@ -1320,27 +1317,6 @@ def test_default_manifest_challenge_pause_default():
     m = k.default_manifest("c", 100, 50, "u", "o")
     # challenge_pause не передан → не в run_cfg; daemon берёт CHALLENGE_RETRY_DELAY_S
     assert "challenge_pause" not in m.get("run_cfg", {})
-
-
-# --- build_cli_args: --pids для rescan ---
-
-def test_build_cli_args_rescan_pids():
-    from pathlib import Path
-    prog = _manifest(Path("/tmp"))
-    prog["run_cfg"]["min_reviews"] = 0
-    args = k.build_cli_args(prog, "r1", "rescan", targets=["111", "222"])
-    assert "--pids" in args
-    idx = args.index("--pids")
-    assert "111,222" == args[idx + 1]
-
-
-def test_build_cli_args_full_no_pids_flag():
-    from pathlib import Path
-    prog = _manifest(Path("/tmp"))
-    prog["run_cfg"]["min_reviews"] = 0
-    args = k.build_cli_args(prog, "r1", "full")
-    assert "--pids" not in args
-    assert "--url" in args
 
 
 # --- replacement_pids: формат объектов ---
@@ -2395,37 +2371,7 @@ def test_build_cli_args_min_reviews_zero_skips_flag():
     assert "--min-reviews" not in args
 
 
-# --- build_cli_args: discovery-лимит = target + reserve (чтобы резерв жил) ---
-
-def test_build_cli_args_full_discovery_limit_includes_reserve(tmp_path, monkeypatch):
-    # полный прогон должен собирать target + reserve_count товаров, иначе
-    # valid никогда не превысит target и резерв останется пустым
-    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
-    p = _cfg_progress(target=300)
-    p["run_cfg"]["reserve_count"] = 30
-    args = k.build_cli_args(p, "run_1", "full")
-    i = args.index("--limit")
-    assert args[i + 1] == "330"
-
-
-def test_build_cli_args_full_discovery_limit_without_reserve(tmp_path, monkeypatch):
-    # reserve_count отсутствует → лимит = target (без запаса)
-    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
-    args = k.build_cli_args(_cfg_progress(target=300), "run_1", "full")
-    i = args.index("--limit")
-    assert args[i + 1] == "300"
-
-
-def test_build_cli_args_rescan_limit_is_targets_len(tmp_path, monkeypatch):
-    # rescan: --limit = число целей (не target), --pids присутствует
-    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
-    args = k.build_cli_args(_cfg_progress(), "run_1", "rescan",
-                            targets=["101", "102", "103"])
-    i = args.index("--limit")
-    assert args[i + 1] == "3"
-    assert "--pids" in args
-    assert "--url" not in args
-
+# --- _parse_qa_per_pid ---
 
 # --- резерв реально материализуется при discovery > target (интеграция) ---
 

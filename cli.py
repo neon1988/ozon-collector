@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""CLI для однократного сбора данных с Ozon.
+"""CLI для однократного сбора данных с Ozon (отладочные/офлайновые команды).
+
+ПОИСК выдачи (query/url/pids) здесь НЕ запускается: его выполняет оркестратор
+(scripts/key_daemon.py, in-process _inproc_collect) и рассылает товары
+воркерам. Эта команда остаётся утилитой: offline-qa (ocr/report) и сбор
+конкретного товара (collect/gather).
 
 Примеры:
   python3 cli.py collect --pid 3627230434 --variant 'Цвет:белый' --category headphones
@@ -21,7 +26,6 @@ from ozon_collector import collect as C
 from ozon_collector import ocr as O
 from ozon_collector import report as R
 from ozon_collector import cache as K
-from ozon_collector import search as S
 from ozon_collector import log
 from ozon_collector.gather import run_gather
 
@@ -172,168 +176,6 @@ def cmd_gather(args):
         sys.stdout.write(md)
 
 
-def _gather_cfg_from_args(args, max_age_s):
-    """Базовый gather-конфиг из аргументов search (общий для всех товаров)."""
-    return {
-        "variant": args.variant,
-        "max_pages": args.max_pages,
-        "min_reviews": args.min_reviews,
-        "category": args.category,
-        "no_dom": args.no_dom,
-        "no_variant_mode": args.no_variant_mode,
-        "sorts": _parse_sorts(args.sorts),
-        "max_age_s": max_age_s,
-        "no_ocr": not args.ocr,
-        "threads": args.threads,
-        "no_preproc": args.no_preproc,
-        "dedup_replies": not args.no_dedup_replies,
-        "overwrite": args.overwrite,
-        "min_rating": getattr(args, "min_rating", None),
-        "window_mode": getattr(args, "window_mode", None),
-    }
-
-
-def cmd_search(args):
-    from ozon_collector.cdp import Session
-    from ozon_collector.parallel import collect_parallel
-
-    pids = []
-    if args.pids:
-        pids += parse_pids(args.pids.split(","))
-    if args.pids_file:
-        try:
-            with open(args.pids_file, encoding="utf-8") as f:
-                pids += parse_pids(f.read().splitlines())
-        except OSError as e:
-            print(f"Error: не могу прочитать --pids-file: {e}", file=sys.stderr)
-            sys.exit(1)
-    pids = parse_pids(pids)
-
-    skip_pids = []
-    if args.skip_pids:
-        skip_pids = parse_pids(args.skip_pids.split(","))
-
-    if pids:
-        limit = len(pids)
-        url = f"список из {limit} артикулов: " + ", ".join(pids)
-    else:
-        limit = args.limit
-        if args.url:
-            url = args.url
-        elif args.query:
-            url = S.search_url(args.query)
-        else:
-            print("Error: нужен --query, --url или --pids/--pids-file",
-                  file=sys.stderr)
-            sys.exit(1)
-    try:
-        max_age_s = K.parse_max_age(args.max_age)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    parallel = args.parallel
-    from ozon_collector import PARALLEL_MAX_WORKERS
-    if not (1 <= parallel <= PARALLEL_MAX_WORKERS):
-        print(f"Error: --parallel должен быть в 1..{PARALLEL_MAX_WORKERS}",
-              file=sys.stderr)
-        sys.exit(1)
-    if parallel > 1 and args.ocr and not args.allow_parallel_ocr:
-        print(f"Error: OCR в параллельном сборе требует --allow-parallel-ocr "
-              f"(или без --ocr)", file=sys.stderr)
-        sys.exit(1)
-    if not (5 <= args.worker_timeout <= 86400):
-        print("Error: --worker-timeout должен быть в 5..86400 секунд",
-              file=sys.stderr)
-        sys.exit(1)
-
-    seed = _apply_scroll_jitter_seed(args)
-    log.info(f"[cli] search: url={url} limit={limit} "
-             f"query={args.query!r} max_age_s={max_age_s} "
-             f"parallel={parallel} pids={len(pids)}")
-    gather_cfg = _gather_cfg_from_args(args, max_age_s)
-    gather_cfg["scroll_jitter_seed"] = seed
-    if args.pause_s > 0:
-        gather_cfg["pause_s"] = args.pause_s
-    session_budget = None
-    if args.session_budget_wall_clock is not None:
-        session_budget = dict(S.SESSION_BUDGET_DEFAULT)
-        session_budget["wall_clock_s"] = args.session_budget_wall_clock
-    if parallel > 1:
-        if args.allow_parallel_ocr:
-            import os as _os
-            gather_cfg["threads"] = max(2, (_os.cpu_count() or 2) // parallel)
-        combined = collect_parallel(
-            url, limit=limit, gather_cfg=gather_cfg,
-            parallel=parallel, query=args.query,
-            max_recycles=2, join_timeout_s=args.worker_timeout,
-            pids=pids or None, no_bootstrap=args.no_bootstrap_workers,
-            skip_pids=skip_pids or None,
-            session_budget=session_budget)
-    else:
-        _wm = gather_cfg.get("window_mode")
-        sess = Session(
-            keep_window=None if _wm is None else (_wm == "visible"))
-        try:
-            combined = S.collect_search(
-                sess, url, limit=limit,
-                gather_cfg=gather_cfg,
-                query=args.query,
-                pids=pids or None,
-                skip_pids=skip_pids or None,
-                session_budget=session_budget,
-            )
-        finally:
-            sess.close()
-
-    aborted = combined.get("aborted")
-    if aborted:
-        extra = ""
-        if "workers_stormed" in aborted:
-            extra = (f" (workers_stormed={aborted['workers_stormed']}, "
-                     f"all_workers={aborted.get('all_workers')})")
-        print(f"[search] ПРОГОН ОСТАНОВЛЕН: challenge storm{extra}. "
-              "Уйди в cooldown 2+ часа перед повторным запуском.",
-              file=sys.stderr)
-        log.error(f"[cli] search ABORTED: challenge storm "
-                  f"{aborted.get('reason')}: "
-                  f"streak={aborted.get('streak')}, "
-                  f"remaining_aborted={aborted.get('remaining_aborted')}")
-        if args.out:
-            print("[search] Не пишу md: прогон прерван challenge storm, "
-                  "данные неполные.", file=sys.stderr)
-    else:
-        if args.out:
-            paths = R.write_search_digest(
-                combined,
-                args.out,
-                reviews_per_product=args.reviews_per_product,
-                dedup_replies=not args.no_dedup_replies,
-                max_products_per_file=args.max_products_per_file)
-            for path in paths:
-                log.info(f"[cli] SAVED {path}")
-        else:
-            md = R.render_search_digest(
-                combined, reviews_per_product=args.reviews_per_product,
-                dedup_replies=not args.no_dedup_replies)
-            sys.stdout.write(md)
-
-    # combined (машиночитаемый итог) пишется всегда, когда задан --out-raw,
-    # включая challenge-storm (частичные данные с полем aborted) — это нужно
-    # супервизору (key_daemon) для классификации состояния без парсинга текста.
-    if args.out_raw:
-        os.makedirs(os.path.dirname(args.out_raw) or ".", exist_ok=True)
-        with open(args.out_raw, "w", encoding="utf-8") as f:
-            json.dump(combined, f, ensure_ascii=False, indent=2)
-        log.info(f"[cli] SAVED {args.out_raw}")
-
-    ok = sum(1 for p in combined["products"] if p["ok"])
-    excluded = sum(1 for p in combined["products"] if p.get("excluded"))
-    log.info(f"[cli] search DONE: found={combined['found']} "
-             f"limit={combined['limit']} collected={combined['collected']} "
-             f"ok={ok} excluded={excluded}")
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ozon-collector")
     p.add_argument("--log", default=None,
@@ -416,95 +258,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
                          "по умолчанию случайный)")
     pg.set_defaults(fn=cmd_gather)
-
-    ps = sub.add_parser(
-        "search",
-        help="сбор выдачи по запросу/URL → markdown-дайджест для LLM (CDP)")
-    ps.add_argument("--query", help="текстовый поисковый запрос")
-    ps.add_argument("--url", help="URL выдачи Ozon (/search/ или /category/…)")
-    ps.add_argument("--pids", default=None,
-                    help="артикулы через запятую (можно полные URL карточек "
-                         "'https://www.ozon.ru/product/<pid>'); гибрид: "
-                         "кеш + досбор без докрутки выдачи")
-    ps.add_argument("--pids-file", default=None,
-                    help="файл со списком артикулов/URL (по одному в строке; "
-                         "совместим с --pids)")
-    ps.add_argument("--skip-pids", default=None,
-                    help="артикулы через запятую, которые НЕ собирать заново "
-                         "(уже обработанные); выдача сканируется, но эти PID "
-                         "пропускаются")
-    ps.add_argument("--limit", type=int, default=5,
-                    help="макс. товаров для сбора (по умолч. 5)")
-    ps.add_argument("--reviews-per-product", type=int,
-                    default=R.DEFAULT_REVIEWS_PER_PRODUCT,
-                    help=f"макс. отзывов на товар в дайджесте "
-                         f"(по умолч. {R.DEFAULT_REVIEWS_PER_PRODUCT})")
-    ps.add_argument("--min-rating", type=float,
-                    default=S.DEFAULT_MIN_RATING,
-                    help="игнорировать товары с рейтингом ниже значения "
-                         "(по умолч. 4.7; 0 — отключить фильтр)")
-    ps.add_argument("--variant", default="", help="'200x90x6' или 'Цвет:белый'")
-    ps.add_argument("--max-pages", type=int, default=12)
-    ps.add_argument("--min-reviews", type=int, default=40)
-    ps.add_argument("--category", help="категория товара (сохраняется в product.category)")
-    ps.add_argument("--out", help="путь markdown-дайджеста (по умолчанию stdout); "
-                                "при >--max-products-per-file товаров файл разбивается "
-                                "на части out.part2, out.part3, …")
-    ps.add_argument("--max-products-per-file", type=int,
-                    default=R.DEFAULT_MAX_PRODUCTS_PER_FILE,
-                    help=f"макс. товаров в одном md-файле дайджеста "
-                         f"(по умолч. {R.DEFAULT_MAX_PRODUCTS_PER_FILE}; 0 — без разбиения)")
-    ps.add_argument("--out-raw", help="путь combined-json (схема 2.0)")
-    ps.add_argument("--threads", type=int, default=8,
-                    help="кол-во процессов OCR (по умолч. 8)")
-    ps.add_argument("--no-preproc", action="store_true",
-                    help="без cv2-предобработки (grayscale/upscale/CLAHE)")
-    ps.add_argument("--no-dom", action="store_true", help="не сохранять DOM-снимок")
-    ps.add_argument("--ocr", action="store_true",
-                    help="запустить OCR (tesseract) — по умолчанию выключен")
-    ps.add_argument("--parallel", type=int, default=1,
-                    help="кол-во воркер-процессов для search (1..N; "
-                         "по умолчанию лимит 2, выше — OZON_PARALLEL_MAX; "
-                         "каждый со своим Chromium)")
-    ps.add_argument("--allow-parallel-ocr",
-                    action="store_true",
-                    help="разрешить OCR в параллельном сборе "
-                         "(потоки OCR на воркера уменьшаются)")
-    ps.add_argument("--worker-timeout", type=float, default=43200.0,
-                    help="макс. время ожидания воркеров, сек (по умолч. 43200 = 12 ч)")
-    ps.add_argument("--pause-s", type=float, default=0.0,
-                    help="пауза между товарами в воркерах, сек "
-                         "(защита от rate-limit Ozon; по умолчанию 0)")
-    ps.add_argument("--no-bootstrap-workers", action="store_true",
-                    help="не сеять cookies из ozon-profile в холодные "
-                         "воркер-профили (по умолч. автоматически при --parallel>1)")
-    ps.add_argument("--no-variant-mode", action="store_true",
-                    help="не включать нативный фильтр «Этот вариант товара» (собрать все отзывы)")
-    ps.add_argument("--overwrite", action="store_true",
-                    help="разрешить перезапись существующего data/{pid}_raw.json "
-                         "(по умолчанию новый прогон пишется в data/{pid}_raw.<ts>.<i>.json)")
-    ps.add_argument("--sorts", default=DEFAULT_SORTS,
-                    help=f"сортировки отзывов через запятую: published_at_desc,score_desc,score_asc "
-                         f"(по умолчанию: {DEFAULT_SORTS} — новые и полезные + сначала низкие оценки)")
-    ps.add_argument("--max-age", default="7d",
-                    help="макс. возраст кеша raw: '7d', '1d', '12h', '6h'; '0' — кеш выключен (по умолч. 7d)")
-    ps.add_argument("--no-dedup-replies", action="store_true",
-                    help="показывать все ответы продавца, без дедупа повторяющихся (по умолч. дедуп включён)")
-    ps.add_argument("--scroll-jitter-seed", type=int, default=None,
-                    help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
-                         "по умолчанию случайный)")
-    ps.add_argument("--session-budget-wall-clock", type=int, default=None,
-                    help="жёсткий таймер сессии, сек (перекрывает дефолт "
-                         f"{S.SESSION_BUDGET_DEFAULT['wall_clock_s']}); "
-                         "для длинных --limit одиночных прогонов увеличь "
-                         "(по умолчанию берётся из SESSION_BUDGET_DEFAULT)")
-    ps.add_argument("--window-mode", choices=["visible", "hidden"],
-                    default=None,
-                    help="режим окна браузера коллектора: visible — окно "
-                         "развёрнуто и видимо наверху (NOACTIVATE), "
-                         "hidden — свёрнуто/не мешает работе. По умолчанию "
-                         "env OZON_KEEP_WINDOW=1 → visible.")
-    ps.set_defaults(fn=cmd_search)
 
     return p
 

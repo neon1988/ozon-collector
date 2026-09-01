@@ -39,43 +39,14 @@ def test_gather_default_max_age_7d():
     assert args.max_age == "7d"
 
 
-def test_search_default_max_age_7d():
-    args = cli.build_parser().parse_args(["search", "--limit", "10"])
-    assert args.max_age == "7d"
-
-
-def test_search_default_min_rating():
-    args = cli.build_parser().parse_args(["search", "--limit", "10"])
-    assert args.min_rating == 4.7
-
-
 def test_default_sorts_new_plus_negative():
     """Дефолт sorts: сначала «новые и полезные», потом «сначала низкие оценки»."""
     from cli import DEFAULT_SORTS
     assert DEFAULT_SORTS == "published_at_desc,score_asc"
-    for cmd in ("collect", "gather", "search"):
-        args = cli.build_parser().parse_args([cmd, "--pid", "123"]
-                                             if cmd != "search"
-                                             else [cmd, "--limit", "1"])
+    for cmd in ("collect", "gather"):
+        args = cli.build_parser().parse_args([cmd, "--pid", "123"])
         assert args.sorts == DEFAULT_SORTS
         assert cli._parse_sorts(args.sorts) == ["published_at_desc", "score_asc"]
-
-
-def test_search_min_rating_zero_disables():
-    args = cli.build_parser().parse_args(
-        ["search", "--limit", "10", "--min-rating", "0"])
-    assert args.min_rating == 0
-
-
-def test_search_default_session_budget_wall_clock_none():
-    args = cli.build_parser().parse_args(["search", "--limit", "10"])
-    assert args.session_budget_wall_clock is None
-
-
-def test_search_session_budget_wall_clock_override():
-    args = cli.build_parser().parse_args(
-        ["search", "--limit", "10", "--session-budget-wall-clock", "7200"])
-    assert args.session_budget_wall_clock == 7200
 
 
 def test_gather_has_no_min_rating():
