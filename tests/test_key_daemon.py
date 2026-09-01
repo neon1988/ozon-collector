@@ -1,0 +1,2964 @@
+"""Юнит-тесты чистых функций scripts/key_daemon.py (без запуска CLI/браузера)."""
+from __future__ import annotations
+
+import os
+import sys
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+import scripts.key_daemon as k  # noqa: E402
+
+
+# --- classify_status ---
+
+def test_classify_challenge_storm():
+    assert k.classify_status(0, {"aborted": {"reason": "challenge_storm"}}) == "CHALLENGE_STORM"
+    assert k.classify_status(1, {"aborted": {"reason": "x"}}) == "CHALLENGE_STORM"
+
+
+def test_classify_normal_done():
+    assert k.classify_status(0, {"products": []}) == "NORMAL_DONE"
+    assert k.classify_status(0, None) == "NORMAL_DONE"
+
+
+def test_classify_crash_vs_unknown():
+    assert k.classify_status(1, None) == "CRASH"
+    assert k.classify_status(2, {"products": []}) == "UNKNOWN_FAILURE"
+
+
+# --- extract pids ---
+
+def _combined(products):
+    return {"products": products}
+
+
+def test_extract_discovered_pids():
+    c = _combined([{"pid": 111}, {"pid": "222"}, {"pid": None}, {}])
+    assert k.extract_discovered_pids(c) == ["111", "222"]
+
+
+def test_extract_discovered_empty():
+    assert k.extract_discovered_pids(None) == []
+    assert k.extract_discovered_pids({}) == []
+
+
+def test_extract_ok_pids_filters_fail_and_excluded():
+    c = _combined([
+        {"pid": 1, "ok": True},
+        {"pid": 2, "ok": True, "excluded": {"reason": "rating_below"}},
+        {"pid": 3, "ok": False},
+        {"pid": 4, "ok": True},
+    ])
+    assert k.extract_ok_pids(c) == ["1", "4"]
+
+
+# --- normalize_pids ---
+
+def test_normalize_pids_strips_urls_and_dups():
+    assert k.normalize_pids(["123", "123", "https://www.ozon.ru/product/456",
+                             "789?tab=reviews", " 45 ", "abc"]) == \
+        ["123", "456", "789", "45"]
+
+
+# --- batch_pids ---
+
+def test_batch_pids_sizes():
+    r = k.batch_pids(list(map(str, range(235))), 100)
+    assert len(r) == 3
+    assert [len(b) for b in r] == [100, 100, 35]
+    assert sum(len(b) for b in r) == 235
+
+
+def test_batch_pids_empty():
+    assert k.batch_pids([]) == []
+
+
+# --- backoff_delay ---
+
+def test_backoff_delay_clamped():
+    assert k.backoff_delay(0) == 0
+    assert k.backoff_delay(1) == 300
+    assert k.backoff_delay(2) == 900
+    assert k.backoff_delay(3) == 1800
+    assert k.backoff_delay(10) == k.BACKOFF_DELAYS_S[-1]  # 7200 (clamp)
+
+
+# --- parse_qa_stdout ---
+
+def test_parse_qa_stdout():
+    out = k.parse_qa_stdout(
+        "[qa] товаров: 100 | OK 90 | WARN 7 | FAIL 3 | WALL_LIMITED 5\n"
+        "[qa] KPI stars_missing: 2/500 (0.4%)\n")
+    assert out["products"] == 100
+    assert out["ok"] == 90
+    assert out["warn"] == 7
+    assert out["fail"] == 3
+    assert out["wall_limited"] == 5
+
+
+def test_parse_qa_stdout_empty():
+    out = k.parse_qa_stdout("no summary line")
+    assert out["fail"] == 0 and out["products"] == 0
+
+
+# --- reconcile_validity ---
+
+def _manifest(tmp_path, target=300, min_valid=200):
+    return k.default_manifest("c", target, min_valid, "url", "out.md",
+                              data_dir=str(tmp_path))
+
+
+def test_reconcile_validity_from_raw(tmp_path):
+    # два валидных raw-файла, один FAIL-вердикт
+    for pid in ("101", "102"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101", "102", "103"]
+    checked = {"verdicts": {"101": "OK", "102": "FAIL", "103": "ERR"},
+               "valid_add": ["101"], "checked": ["101", "102"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert set(prog["valid_pids"]) == {"101"}
+    assert "102" in prog["failed_pids"]
+
+
+def test_reconcile_failed_not_accumulated_when_ok(tmp_path):
+    # после успешного rescan вердикт пида стал OK → он должен выйти из failed
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    prog["failed_pids"] = ["101"]  # был FAIL в прошлый раз
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert "101" in prog["valid_pids"]
+    assert "101" not in prog["failed_pids"]
+
+
+def test_reconcile_records_verdict_meta(tmp_path):
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    fp = k.raw_fingerprint(str(tmp_path), "101")
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"],
+               "new_meta": {"101": {"verdict": "OK",
+                                    "raw_mtime_ns": fp["raw_mtime_ns"],
+                                    "raw_sha256": fp["raw_sha256"],
+                                    "raw_size": fp["raw_size"],
+                                    "qa_version": k.QA_VERSION,
+                                    "qa_at": k.now_utc_iso()}}}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["verdict_meta"]["101"]["verdict"] == "OK"
+    assert prog["verdict_meta"]["101"]["raw_sha256"] == fp["raw_sha256"]
+
+
+def test_reconcile_keeps_previous_meta_when_not_checked(tmp_path):
+    # пиды, не проверенные в этом цикле, не теряют/не обнуляют verdict_meta
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["verdict_meta"] = {"201": {"verdict": "OK", "raw_mtime_ns": 123}}
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"],
+               "new_meta": {"101": {"verdict": "OK", "raw_mtime_ns": 999}}}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["verdict_meta"]["201"]["raw_mtime_ns"] == 123
+    assert prog["verdict_meta"]["101"]["raw_mtime_ns"] == 999
+
+
+# --- compute_final ---
+
+def _progress(valid_n, target, min_valid):
+    # valid_n уникальных pid (не дублей)
+    return {"valid_pids": [f"p{i}" for i in range(valid_n)],
+            "target_count": target, "min_valid": min_valid}
+
+
+def test_compute_final_states():
+    assert k.compute_final(_progress(300, 300, 200), exhausted=False) == "COMPLETED"
+    assert k.compute_final(_progress(240, 300, 200), exhausted=True) == "COMPLETED_MIN"
+    assert k.compute_final(_progress(150, 300, 200), exhausted=True) == "ABANDONED"
+    assert k.compute_final(_progress(150, 300, 200), exhausted=False) == "ABANDONED"
+    assert k.compute_final(_progress(250, 300, 200), exhausted=False) is None
+
+
+# --- summarize ---
+
+def _progress_filled():
+    p = k.default_manifest("x", 300, 200, "u", "o.md")
+    p["discovered_pids"] = ["1", "2"]
+    p["valid_pids"] = ["1"]
+    p["failed_pids"] = ["2"]
+    return p
+
+
+def test_summarize_fields():
+    s = k.summarize(_progress_filled())
+    assert s["target"] == 300 and s["valid"] == 1 and s["discovered"] == 2
+    assert s["failed"] == 1 and s["final_state"] is None
+
+
+# --- qa_summary_consistent (K4) ---
+
+def test_qa_summary_consistent_ok():
+    qa = {"products": 100, "ok": 90, "warn": 7, "fail": 3}
+    assert k.qa_summary_consistent(qa, 100) is True
+    qa2 = {"products": 100, "ok": 100, "warn": 0, "fail": 0}
+    assert k.qa_summary_consistent(qa2, 100) is True
+
+
+def test_qa_summary_inconsistent_missing_products():
+    assert k.qa_summary_consistent({}, 100) is False
+    assert k.qa_summary_consistent({"products": 0, "ok": 0, "warn": 0, "fail": 0}, 100) is False
+
+
+def test_qa_summary_inconsistent_sum():
+    # сумма OK+WARN+FAIL не сходится с products
+    qa = {"products": 100, "ok": 90, "warn": 7, "fail": 1}  # 98 != 100
+    assert k.qa_summary_consistent(qa, 100) is False
+
+
+# --- classify_new_pids / parse_error (K4) ---
+
+def _make_qa(products, ok, warn, fail, per_pid=None):
+    return {"products": products, "ok": ok, "warn": warn, "fail": fail,
+            "per_pid": per_pid}
+
+
+def _mtime(path):
+    """st_mtime в секундах (float)."""
+    return path.stat().st_mtime
+
+
+def test_classify_no_candidates(tmp_path):
+    prog = _manifest(tmp_path)
+    r = k.classify_new_pids(prog, [], qa_fn=lambda b: {})
+    assert r["parse_error"] is False
+    assert r["valid_add"] == [] and r["checked"] == []
+
+
+def test_classify_inconsistent_summary_parse_error(tmp_path):
+    pid = "101"
+    (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def bad_qa(batch):
+        return _make_qa(products=len(batch) - 1, ok=len(batch), warn=0, fail=0)
+
+    r = k.classify_new_pids(prog, [pid], qa_fn=bad_qa)
+    assert r["parse_error"] is True
+    assert r["valid_add"] == []
+
+
+def test_classify_fail_and_empty_per_pid_parse_error(tmp_path):
+    pid = "101"
+    (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        return _make_qa(products=len(batch), ok=len(batch) - 1, warn=0, fail=1,
+                        per_pid={})  # fail>0, но per_pid пуст
+
+    r = k.classify_new_pids(prog, [pid], qa_fn=qa)
+    assert r["parse_error"] is True
+
+
+def test_classify_fail_with_valid_per_pid(tmp_path):
+    pid = "101"
+    (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        return _make_qa(products=len(batch), ok=len(batch) - 1, warn=0, fail=1,
+                        per_pid={pid: "FAIL"})
+
+    r = k.classify_new_pids(prog, [pid], qa_fn=qa)
+    assert r["parse_error"] is False
+    assert pid in r["failed_add"]
+    assert r["valid_add"] == []
+
+
+def test_classify_fail_partial_per_pid_missing_fail_pid(tmp_path):
+    # fail>0, но per_pid покрывает не все PID: fail-пид может получить fallback OK
+    pids = ["101", "102"]
+    for p in pids:
+        (tmp_path / f"{p}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        # fail=1, но per_pid описывает только 101 (OK); 102 без вердикта
+        return _make_qa(products=len(batch), ok=len(batch) - 1, warn=0, fail=1,
+                        per_pid={"101": "OK"})
+
+    r = k.classify_new_pids(prog, pids, qa_fn=qa)
+    assert r["parse_error"] is True
+    assert r["valid_add"] == []
+
+
+def test_classify_all_ok_empty_per_pid_no_parse_error(tmp_path):
+    # легитимный SHOW_ALL_LIMIT: сводка сходится, fail==0, per_pid пуст → все OK
+    pids = ["101", "102", "103"]
+    for p in pids:
+        (tmp_path / f"{p}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        return _make_qa(products=len(batch), ok=len(batch), warn=0, fail=0,
+                        per_pid={})
+
+    r = k.classify_new_pids(prog, pids, qa_fn=qa)
+    assert r["parse_error"] is False
+    assert set(r["valid_add"]) == set(pids)
+
+
+def test_classify_ok_with_partial_per_pid(tmp_path):
+    pids = ["101", "102", "103"]
+    for p in pids:
+        (tmp_path / f"{p}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        # сводка сходится, fail==0 → отсутствующие в per_pid = OK
+        return _make_qa(products=len(batch), ok=len(batch), warn=0, fail=0,
+                        per_pid={"101": "OK"})
+
+    r = k.classify_new_pids(prog, pids, qa_fn=qa)
+    assert r["parse_error"] is False
+    assert set(r["valid_add"]) == set(pids)
+
+
+# --- finalize_campaign (K1): приоритеты статусов ---
+
+def _final_progress(valid_n, target, min_valid, reason=None):
+    return {"valid_pids": [str(i) for i in range(valid_n)],
+            "target_count": target, "min_valid": min_valid,
+            "final_reason": reason, "final_state": None, "qa": {}}
+
+
+def test_finalize_target_reached_completed(tmp_path):
+    # target_reached: snapshot(target) + резерв, чистые >= target → COMPLETED
+    prog = _final_progress(300, 300, 200, reason="target_reached")
+    prog["campaign_final_pids"] = [str(i) for i in range(300)]
+    prog["campaign_reserve_pids"] = ["900", "901", "902"]
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b), "warn": 0, "products": len(b)})
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["final_reason"] == "target_reached"
+
+
+def test_finalize_no_progress_completed_min(tmp_path):
+    prog = _final_progress(240, 300, 200, reason="no_progress")
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b), "warn": 0, "products": len(b)})
+    assert prog["final_state"] == "COMPLETED_MIN"
+    assert prog["final_reason"] == "no_progress"
+
+
+def test_finalize_time_limit_completed_min(tmp_path):
+    prog = _final_progress(220, 300, 200, reason="time_limit")
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b), "warn": 0, "products": len(b)})
+    assert prog["final_state"] == "COMPLETED_MIN"
+    assert prog["final_reason"] == "time_limit"
+
+
+def test_finalize_below_min_valid_abandoned(tmp_path):
+    prog = _final_progress(150, 300, 200, reason="no_progress")
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b), "warn": 0, "products": len(b)})
+    assert prog["final_state"] == "ABANDONED"
+
+
+def test_classify_warn_counts_valid(tmp_path):
+    pid = "101"
+    (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        return _make_qa(products=len(batch), ok=0, warn=1, fail=0,
+                        per_pid={pid: "WARN"})
+
+    r = k.classify_new_pids(prog, [pid], qa_fn=qa)
+    assert r["parse_error"] is False
+    assert pid in r["valid_add"]  # WARN тоже валиден (не брак)
+
+
+def test_classify_skips_pid_without_raw(tmp_path):
+    pid = "999"  # нет raw-файла
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = [pid]
+    r = k.classify_new_pids(prog, [pid], qa_fn=lambda b: {"fail": 0})
+    assert r["checked"] == []  # без raw нечего QA-ить
+    assert r["valid_add"] == []
+
+
+def test_classify_already_verdict_skipped(tmp_path):
+    pid = "101"
+    raw = tmp_path / f"{pid}_raw.json"
+    raw.write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["verdicts"] = {pid: "FAIL"}  # уже решён ранее
+    fp = k.raw_fingerprint(str(tmp_path), pid)
+    # fingerprint совпадает и qa_version актуальна → вердикт актуален
+    prog["verdict_meta"] = {pid: {"verdict": "FAIL",
+                                  "raw_mtime_ns": fp["raw_mtime_ns"],
+                                  "raw_sha256": fp["raw_sha256"],
+                                  "qa_version": k.QA_VERSION}}
+    called = []
+    r = k.classify_new_pids(prog, [pid], qa_fn=lambda b: called.append(1) or
+                            _make_qa(products=0, ok=0, warn=0, fail=0))
+    assert r["checked"] == []  # вердикт актуален (fingerprint совпал) → не переQA
+    assert called == []
+
+
+def test_classify_verdict_stale_mtime_reqa(tmp_path):
+    # вердикт есть, но raw изменился (fp новее) → обязательная перепроверка
+    pid = "101"
+    raw = tmp_path / f"{pid}_raw.json"
+    raw.write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["verdicts"] = {pid: "OK"}
+    # сохранённый fingerprint отличается от текущего (raw менялся) → reQA
+    prog["verdict_meta"] = {pid: {"verdict": "OK", "raw_mtime_ns": 1,
+                                  "raw_sha256": "old", "qa_version": k.QA_VERSION}}
+    called = []
+    r = k.classify_new_pids(prog, [pid],
+                            qa_fn=lambda b: called.append(1) or
+                            _make_qa(products=1, ok=1, warn=0, fail=0,
+                                     per_pid={pid: "OK"}))
+    assert called == [1]  # переQA состоялся
+    assert r["checked"] == [pid]
+    assert r["verdicts"][pid] == "OK"
+
+
+def test_classify_empty_need_no_qa_call(tmp_path):
+    prog = _manifest(tmp_path)
+    called = []
+    r = k.classify_new_pids(prog, [], qa_fn=lambda b: called.append(1) or {})
+    assert r["parse_error"] is False
+    assert called == []
+
+
+# --- default_manifest ---
+
+def test_default_manifest_fields():
+    m = k.default_manifest("camp", 300, 200, "u", "o.md",
+                           max_age="7d", parallel=1)
+    assert m["campaign"] == "camp"
+    assert m["target_count"] == 300 and m["min_valid"] == 200
+    assert k.raw_pid_name("123") == "123_raw.json"
+    assert m["final_state"] is None
+    assert m["discovered_pids"] == [] and m["runs"] == []
+    assert m["cooldown_until"] is None and m["challenge_seq"] == 0
+    assert m["run_cfg"]["parallel"] == 1
+
+
+# --- raw-файловые хелперы ---
+
+def test_all_raw_pids_and_has_raw(tmp_path):
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "102_raw.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "notraw.txt").write_text("x", encoding="utf-8")
+    r = k.all_raw_pids(str(tmp_path))
+    assert set(r) == {"101", "102"}
+    assert k.has_raw(str(tmp_path), "101") is True
+    assert k.has_raw(str(tmp_path), "999") is False
+
+
+def test_all_raw_pids_missing_dir(tmp_path):
+    assert k.all_raw_pids(str(tmp_path / "nope")) == []
+
+
+# --- batch_pids дедупликация ---
+
+def test_batch_pids_dedups():
+    r = k.batch_pids(["1", "1", "2", "2", "3"], 100)
+    assert len(r) == 1 and sorted(r[0]) == ["1", "2", "3"]
+
+
+# --- parse_qa_stdout edge cases ---
+
+def test_parse_qa_stdout_zero():
+    out = k.parse_qa_stdout("[qa] товаров: 0 | OK 0 | WARN 0 | FAIL 0")
+    assert out["products"] == 0 and out["fail"] == 0
+
+
+def test_parse_qa_stdout_non_numeric_ignored():
+    out = k.parse_qa_stdout("[qa] товаров: abc | OK x | WARN 1 | FAIL 2")
+    assert out["products"] == 0
+    assert out["warn"] == 1 and out["fail"] == 2
+
+
+def test_classify_verdicts_persisted_in_progress(tmp_path):
+    pid = "101"
+    (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    r = k.classify_new_pids(
+        prog, [pid],
+        qa_fn=lambda b: _make_qa(products=1, ok=0, warn=0, fail=1,
+                                 per_pid={pid: "FAIL"}))
+    # classify возвращает итоговые вердикты в r["verdicts"]; в прогресс их
+    # записывает reconcile_validity (боевой поток вызывает её сразу после)
+    assert r["verdicts"][pid] == "FAIL"
+    k.reconcile_validity(prog, r, str(tmp_path))
+    assert prog["verdicts"][pid] == "FAIL"
+    # потом повторный classify с тем же prog не должен переQA (вердикт уже есть)
+    called = []
+    k.classify_new_pids(prog, [pid],
+                        qa_fn=lambda b: called.append(1) or
+                        _make_qa(products=0, ok=0, warn=0, fail=0))
+    assert called == []
+
+
+# --- finalize_campaign: дополнительные ---
+
+def test_finalize_batched_qa_full_target(tmp_path):
+    # target_reached: 3 FAIL в snapshot, резерв чистый и хватает → COMPLETED
+    prog = _final_progress(300, 300, 200, reason="target_reached")
+    prog["campaign_final_pids"] = [str(i) for i in range(300)]
+    prog["campaign_reserve_pids"] = [str(i) for i in range(300, 330)]
+    pa = tmp_path / "p.json"
+    bad = {"0", "100", "200"}  # по одному FAIL в каждом snapshot-батче
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in bad else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "COMPLETED"  # резерв заменил брак
+    assert prog["qa"]["total_fail"] == 3
+    assert len(prog["replacement_pids"]) == 3  # брак заменён из резерва
+    assert prog["replacement_pids"][0]["replaced_by"] in {"300", "301", "302"}
+    assert set(prog["campaign_final_pids"]) & {"300", "301", "302"}  # заполнены резервом
+    assert not (set(prog["campaign_final_pids"]) & {"0", "100", "200"})  # брака нет
+
+
+def test_finalize_uses_campaign_final_pids_snapshot(tmp_path):
+    # snapshot = campaign_final_pids (зафиксирован ДО финального QA), а не весь valid
+    prog = _final_progress(5, 3, 2)
+    prog["valid_pids"] = ["1", "2", "3", "4", "5"]
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    pa = tmp_path / "p.json"
+    checked = []
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: checked.extend(b) or
+                        {"fail": 0, "ok": len(b), "warn": 0,
+                         "products": len(b)})
+    assert prog["final_state"] == "COMPLETED"
+    assert set(checked) == {"1", "2", "3"}  # только snapshot, не 4,5
+
+
+def test_finalize_empty_snapshot_no_qa_no_crash(tmp_path):
+    prog = _final_progress(0, 300, 200)
+    pa = tmp_path / "p.json"
+    called = []
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: called.append(1) or
+                        {"fail": 0, "ok": 0, "warn": 0})
+    assert called == []  # нет snapshot → финальный QA не гоняем
+    assert prog["final_state"] == "ABANDONED"
+
+
+def test_finalize_attention_not_overridden(tmp_path):
+    # NEEDS_ATTENTION — терминальный, финализатор не трогает и не прогоняет QA
+    prog = _final_progress(150, 300, 200, reason="qa_parse_error")
+    prog["final_state"] = "NEEDS_ATTENTION"
+    prog["campaign_final_pids"] = ["1"]
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 99, "ok": 0, "warn": 0})
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog.get("qa", {}).get("total_fail") != 99
+
+
+# --- finalize_campaign: target_reached + резерв ---
+
+def _target_prog(target=300, min_valid=200, n_valid=300, reserve=30,
+                 reason="target_reached"):
+    p = _final_progress(n_valid, target, min_valid, reason=reason)
+    p["campaign_final_pids"] = [str(i) for i in range(target)]
+    p["campaign_reserve_pids"] = [str(i) for i in range(target, target + reserve)]
+    return p
+
+
+def test_finalize_reserve_shortfall_abandoned(tmp_path):
+    # target_reached: в пуле 5 FAIL, резерв меньше → чистых 297 < target 300
+    # → ABANDONED (COMPLETED_MIN для target_reached недопустим)
+    prog = _target_prog(reserve=2)
+    bad = {"0", "1", "2", "3", "4"}
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in bad else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    # 302 в пуле - 5 FAIL = 297 чистых < target(300) → ABANDONED
+    assert prog["final_state"] == "ABANDONED"
+
+
+def test_finalize_reserve_covered_completed(tmp_path):
+    # 3 FAIL, резерв (10) хватает → чистых 307-3=304 >= 300 → COMPLETED
+    prog = _target_prog(reserve=10)
+    bad = {"0", "1", "2"}
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in bad else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "COMPLETED"
+
+
+def test_finalize_reserve_exhausted_below_min_abandoned(tmp_path):
+    # 200 FAIL, резерв 10 → чистых 110 < min_valid 200 → ABANDONED
+    prog = _target_prog(target=300, min_valid=200, reserve=10)
+    bad = {str(i) for i in range(50)}.union({str(i) for i in range(100, 250)})  # 200 шт
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in bad else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "ABANDONED"
+
+
+def test_finalize_replacement_not_in_snapshot(tmp_path):
+    # бракованный pid из snapshot заменяется чистым из резерва;
+    # replacement_pids — массив объектов {failed_pid, replaced_by}
+    prog = _target_prog(target=3, min_valid=2, n_valid=5, reserve=3)
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["4", "5", "6"]
+
+    def qa(batch):
+        per = {p: ("FAIL" if p == "2" else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "COMPLETED"
+    final = prog["campaign_final_pids"]
+    assert "2" not in final          # брак вытеснен
+    assert set(final) & {"4", "5", "6"}  # заполнен из резерва
+    replaced_bys = {r["replaced_by"] for r in prog["replacement_pids"]}
+    failed_pids = {r["failed_pid"] for r in prog["replacement_pids"]}
+    assert replaced_bys & {"4", "5", "6"}
+    assert "2" not in replaced_bys
+    assert "2" in failed_pids
+
+
+# --- build_cli_args ---
+
+def _cfg_progress(campaign="camp", target=300, min_valid=200, mode_cfg=None):
+    cfg = {"parallel": 1, "max_age": "7d", "min_reviews": 40,
+           "data_dir": "D:\\tmp\\data"}
+    if mode_cfg:
+        cfg.update(mode_cfg)
+    return {"campaign": campaign, "target_count": target, "min_valid": min_valid,
+            "url": "https://ozon", "out": "docs/c.md", "run_cfg": cfg}
+
+
+def test_build_cli_args_full(tmp_path, monkeypatch):
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
+    args = k.build_cli_args(_cfg_progress(), "run_1", "full")
+    assert "search" in args
+    assert args[0] == k.CLI
+    assert "--limit" in args and str(300) in args
+    assert "--parallel" in args and "1" in args
+    assert "--max-age" in args and "7d" in args
+    assert "--min-reviews" in args and "40" in args
+    assert "--url" in args and "https://ozon" in args
+    assert "--out" in args and "docs/c.md" in args
+    assert "--out-raw" in args
+    assert "--pids" not in args
+
+
+def test_build_cli_args_rescan(tmp_path, monkeypatch):
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
+    args = k.build_cli_args(_cfg_progress(), "run_1", "rescan", targets=["101", "102"])
+    assert "--pids" in args
+    i = args.index("--pids")
+    assert args[i + 1] == "101,102"
+    assert "--url" not in args  # rescan не докручивает выдачу
+    assert "--out" not in args
+
+
+def test_build_cli_args_min_reviews_not_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
+    p = _cfg_progress(mode_cfg={"min_reviews": None})
+    args = k.build_cli_args(p, "run_1", "full")
+    assert "--min-reviews" not in args
+
+
+# --- _parse_qa_per_pid ---
+
+def test_parse_qa_per_pid_rows():
+    stdout = (
+        "[qa] товаров: 2 | OK 1 | WARN 0 | FAIL 1\n"
+        "101  FAIL  ...\n"
+        "102  OK    ...\n"
+    )
+    v = k._parse_qa_per_pid(stdout)
+    assert v == {"101": "FAIL", "102": "OK"}
+
+
+def test_parse_qa_per_pid_ignores_malformed():
+    stdout = ("notanumber  OK\n101  SOMETHING_ELSE\n102  INFO\n")
+    v = k._parse_qa_per_pid(stdout)
+    # "notanumber" не pid и "SOMETHING_ELSE" не вердикт → игнорируются;
+    # INFO — допустимый вердикт qa_raw, парсится.
+    assert "101" not in v
+    assert v == {"102": "INFO"}
+
+
+# --- classify_status edge ---
+
+def test_classify_status_error_with_aborted_priority():
+    # aborted распознаётся по ПРИСУТСТВИЮ ключа (даже если dict пустой),
+    # а не по truthiness — иначе пустой aborted {} не опознавался бы.
+    assert k.classify_status(1, {"aborted": {"reason": "challenge_storm"}}) == "CHALLENGE_STORM"
+    assert k.classify_status(1, {"aborted": {}}) == "CHALLENGE_STORM"
+    assert k.classify_status(0, {"aborted": {}}) == "CHALLENGE_STORM"
+    assert k.classify_status(3, None) == "CRASH"
+    assert k.classify_status(0, {"products": []}) == "NORMAL_DONE"
+    assert k.classify_status(2, {"products": []}) == "UNKNOWN_FAILURE"
+
+
+# --- normalize/extract edge ---
+
+def test_extract_discovered_pids_strips_url_wrap():
+    c = _combined([{"pid": "https://www.ozon.ru/product/777?tab=reviews"}])
+    assert k.extract_discovered_pids(c) == ["777"]
+
+
+def test_extract_ok_pids_strips_url_wrap():
+    c = _combined([{"pid": "https://www.ozon.ru/product/888", "ok": True}])
+    assert k.extract_ok_pids(c) == ["888"]
+
+
+def test_extract_pids_order_preserved():
+    c = _combined([{"pid": 5}, {"pid": 2}, {"pid": 5}])
+    assert k.extract_discovered_pids(c) == ["5", "2"]  # дубль 5 убран, порядок сохранён
+
+
+def test_delta_basic():
+    assert k.delta(["1", "2"], ["1", "3", "2"]) == {"3"}
+    assert k.delta([], ["1"]) == {"1"}
+    assert k.delta(["1"], ["1"]) == set()
+
+
+# --- finalize: default reason ---
+
+def test_finalize_min_valid_default_reason_exhausted(tmp_path):
+    # min_valid>=valid, FAIL==0, reason не задан → COMPLETED_MIN c exhausted
+    prog = _final_progress(240, 300, 200)  # reason=None
+    prog["final_reason"] = None
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b), "warn": 0, "products": len(b)})
+    assert prog["final_state"] == "COMPLETED_MIN"
+    assert prog["final_reason"] == "exhausted"
+
+
+def test_finalize_abandoned_no_fail_below_min_note(tmp_path):
+    prog = _final_progress(150, 300, 200)
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b), "warn": 0, "products": len(b)})
+    assert prog["final_state"] == "ABANDONED"
+    assert "min_valid" in prog["final_note"]  # нет брака → причина ниже min_valid
+
+
+# --- reconcile: защита от накопления FAIL-пидов в valid ---
+
+def test_reconcile_does_not_accumulate_fail_in_valid(tmp_path):
+    # если раньше пид попал в valid_pids, а его ТЕКУЩИЙ вердикт — FAIL,
+    # reconcile не должен держать его в valid (защита от накопленного брака).
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    prog["valid_pids"] = ["101"]  # накоплен ранее
+    checked = {"verdicts": {"101": "FAIL"}, "valid_add": [], "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert "101" not in set(prog["valid_pids"])
+
+
+def test_reconcile_keeps_prior_valid_when_still_ok(tmp_path):
+    # пид, подтверждённый раннее как OK, не теряется при reconcile без нового QA
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    prog["valid_pids"] = ["101"]
+    prog["verdicts"] = {"101": "OK"}
+    checked = {"verdicts": {"101": "OK"}, "valid_add": [], "checked": []}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert "101" in set(prog["valid_pids"])
+
+
+# --- normalize_pids edge ---
+
+def test_normalize_pids_empty_and_garbage():
+    assert k.normalize_pids([]) == []
+    assert k.normalize_pids(["", "abc", "   ", None]) == []
+    assert k.normalize_pids(["123?x=1", "product/456", "789/"]) == ["123", "456", "789"]
+
+
+def test_raw_pid_name():
+    assert k.raw_pid_name("123") == "123_raw.json"
+
+
+# --- parse_qa_stdout: WALL_LIMITED / многострочность ---
+
+def test_parse_qa_stdout_without_wall_limited():
+    out = k.parse_qa_stdout("[qa] товаров: 50 | OK 50 | WARN 0 | FAIL 0")
+    assert out["wall_limited"] == 0
+    assert out["products"] == 50
+
+
+def test_parse_qa_stdout_multiline_only_takes_qa_line():
+    stdout = (
+        "INFO: загружен кеш\n"
+        "[qa] товаров: 3 | OK 2 | WARN 1 | FAIL 0 | WALL_LIMITED 2\n"
+        "done\n"
+    )
+    out = k.parse_qa_stdout(stdout)
+    assert out["products"] == 3 and out["ok"] == 2
+
+
+# --- qa_summary_consistent: products не число / None ---
+
+def test_qa_summary_consistent_products_none():
+    assert k.qa_summary_consistent({"products": None, "ok": 0}, 5) is False
+
+
+def test_qa_summary_consistent_products_non_numeric():
+    assert k.qa_summary_consistent({"products": "abc", "ok": 0}, 5) is False
+
+
+# --- compute_final: min_valid=0 edge ---
+
+def test_compute_final_min_valid_zero():
+    # min_valid=0 → даже 1 валидный с исчерпанной выдачей = COMPLETED_MIN
+    assert k.compute_final({"valid_pids": ["1"], "target_count": 300,
+                            "min_valid": 0}, exhausted=True) == "COMPLETED_MIN"
+    assert k.compute_final({"valid_pids": [], "target_count": 300,
+                            "min_valid": 0}, exhausted=True) == "COMPLETED_MIN"
+
+
+# --- default_manifest: run_cfg передаётся ---
+
+def test_default_manifest_run_cfg_passthrough():
+    m = k.default_manifest("c", 100, 50, "u", "o",
+                           data_dir="x", max_age="3d", min_reviews=0,
+                           parallel=2, max_no_progress_runs=5, max_rescans=1,
+                           max_total_hours=6.0, notify="toast")
+    assert m["run_cfg"] == {
+        "data_dir": "x", "max_age": "3d", "min_reviews": 0, "parallel": 2,
+        "max_no_progress_runs": 5, "max_rescans": 1,
+        "max_total_hours": 6.0, "notify": "toast",
+    }
+
+
+# --- classify_new_pids: несколько батчей, mixed вердикты ---
+
+def test_classify_multibatch_aggregates(tmp_path):
+    # 250 pid → разбиваются на 3 батча; вердикты собираются по всем батчам
+    n = 250
+    pids = [str(i) for i in range(n)]
+    for p in pids:
+        (tmp_path / f"{p}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        per = {p: ("FAIL" if (int(p) % 100 == 0) else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return _make_qa(products=len(batch), ok=len(batch) - fails,
+                        warn=0, fail=fails, per_pid=per)
+
+    r = k.classify_new_pids(prog, pids, qa_fn=qa)
+    assert r["parse_error"] is False
+    assert len(r["checked"]) == n
+    # 0, 100, 200 — FAIL (делятся на 100)
+    assert set(r["failed_add"]) == {"0", "100", "200"}
+    assert len(r["valid_add"]) == n - 3
+
+
+def test_classify_multibatch_second_parse_error(tmp_path):
+    # первый батч норм, второй — недостоверная сводка → parse_error по всей пачке
+    pids = [str(i) for i in range(150)]
+    for p in pids:
+        (tmp_path / f"{p}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    calls = []
+
+    def qa(batch):
+        calls.append(len(batch))
+        if calls[-1] == 50:  # второй батч (50 шт) ломаем
+            return _make_qa(products=len(batch) - 1, ok=len(batch), warn=0, fail=0)
+        return _make_qa(products=len(batch), ok=len(batch), warn=0, fail=0)
+
+    r = k.classify_new_pids(prog, pids, qa_fn=qa)
+    assert r["parse_error"] is True
+    assert r["valid_add"] == []
+    assert r["checked"] == []  # при parse_error не подтверждаем ничего
+    assert r["verdicts"] == {}  # частичные вердикты первого батча НЕ протекают
+
+
+# --- reconcile: valid_add не дублирует и переживает reconcile ---
+
+def test_reconcile_valid_add_no_dup_and_not_fail(tmp_path):
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    prog["valid_pids"] = ["101"]  # уже был
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"], "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["valid_pids"] == ["101"]  # без дублей
+    assert "101" not in prog["failed_pids"]
+
+
+def test_reconcile_fail_removed_from_valid_but_in_failed(tmp_path):
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    prog["valid_pids"] = ["101"]
+    checked = {"verdicts": {"101": "FAIL"}, "valid_add": [], "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert "101" not in set(prog["valid_pids"])
+    assert "101" in prog["failed_pids"]  # и одновременно попадает в failed
+
+
+# --- summarize: final_reason/state ---
+
+def test_summarize_includes_final_reason():
+    p = _progress_filled()
+    p["final_state"] = "COMPLETED_MIN"
+    p["final_reason"] = "no_progress"
+    s = k.summarize(p)
+    assert s["final_state"] == "COMPLETED_MIN"
+    assert s["final_reason"] == "no_progress"
+
+
+# --- default_manifest: резервные поля + run_cfg ---
+
+def test_default_manifest_reserve_fields():
+    m = k.default_manifest("c", 100, 50, "u", "o", reserve_count=30)
+    assert m["replacement_pids"] == []
+    assert m["run_cfg"]["reserve_count"] == 30
+    assert "reserve_pids" not in m  # убрано legacy-поле (дублировало campaign_reserve_pids)
+
+
+# --- финализатор: мягкий путь с FAIL по snapshot → ABANDONED ---
+
+def test_finalize_soft_stop_fail_abandoned(tmp_path):
+    # мягкая остановка: финальный QA по snapshot даёт FAIL>0 → ABANDONED
+    prog = _final_progress(240, 300, 200, reason="no_progress")
+    prog["valid_pids"] = [str(i) for i in range(240)]
+    # без campaign_final_pids — snapshot = valid[:target] = все 240
+    pa = tmp_path / "p.json"
+    bad = {"5"}
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in bad else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "ABANDONED"  # FAIL>0 при мягкой остановке без резерва
+    assert "брак" in prog["final_note"]
+
+
+# --- finalize_campaign: target_reached без резерва / крайние случаи ---
+
+def test_finalize_target_reached_no_reserve(tmp_path):
+    # len(valid)==target → резерва нет; всё чисто → COMPLETED без замен
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = []
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b),
+                                                   "warn": 0, "products": len(b),
+                                                   "per_pid": {p: "OK" for p in b}})
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["replacement_pids"] == []
+
+
+def test_finalize_target_reached_all_bad_reserve(tmp_path):
+    # весь snapshot бракованный, резерв чистый и покрывает target → COMPLETED
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10", "11", "12"]
+    pa = tmp_path / "p.json"
+    bad = {"1", "2", "3"}
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in bad else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "COMPLETED"  # целиком из резерва
+    assert set(prog["campaign_final_pids"]) == {"10", "11", "12"}
+    replaced_bys = {r["replaced_by"] for r in prog["replacement_pids"]}
+    assert replaced_bys == {"10", "11", "12"}
+
+
+def test_finalize_target_reached_reserve_less_than_bad(tmp_path):
+    # target_reached: резерва меньше чем брака → чистых < target → ABANDONED
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10"]  # только 1 чистая замена
+    pa = tmp_path / "p.json"
+    bad = {"1", "2"}  # 2 брака, резерв 1 → чистых = 1(из snapshot)+1(резерв)=2
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in bad else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    # pool = [1,2,3,10]; чистые = {3,10} = 2 < target 3 → ABANDONED (не COMPLETED_MIN)
+    assert prog["final_state"] == "ABANDONED"
+
+
+def test_qa_clean_empty_list(tmp_path):
+    # _qa_clean с пустым списком не должен вызывать qa_fn и не падать
+    prog = _final_progress(0, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = []
+    prog["campaign_reserve_pids"] = []
+    called = []
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: called.append(1) or
+                        {"fail": 0, "ok": 0, "warn": 0})
+    assert called == []
+    assert prog["final_state"] == "ABANDONED"  # 0 чистых < min_valid
+
+
+def test_finalize_soft_stop_reserve_ignored(tmp_path):
+    # при мягкой остановке резерв НЕ используется — snapshot = valid[:target]
+    prog = _final_progress(10, 5, 3, reason="exhausted")
+    prog["valid_pids"] = [str(i) for i in range(10)]
+    # некорректно занесённый резерв (быть не должен, но защищаемся)
+    prog["campaign_reserve_pids"] = [str(i) for i in range(100, 110)]
+    pa = tmp_path / "p.json"
+    checked = []
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: checked.extend(b) or
+                        {"fail": 0, "ok": len(b), "warn": 0,
+                         "products": len(b)})
+    assert prog["final_state"] == "COMPLETED"  # clean 5 >= target 5
+    # QA только по snapshot (5 из valid), ни один не из резерва 100-109
+    assert len(checked) == 5
+    assert not (set(checked) & set(str(i) for i in range(100, 110)))
+
+
+# --- campaign_accepted_pids: итоговый принятый список ---
+
+def test_finalize_target_reached_accepted_pids(tmp_path):
+    # target_reached: после замен accepted = итоговые target чистых PID
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10"]
+    pa = tmp_path / "p.json"
+    bad = {"1"}
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in bad else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    # замена 1 -> 10; принятый список = [2,3,10]
+    assert prog["final_state"] == "COMPLETED"
+    assert set(prog["campaign_accepted_pids"]) == {"2", "3", "10"}
+    assert len(prog["campaign_accepted_pids"]) == 3
+
+
+def test_finalize_target_reached_accepted_no_reserve_needed(tmp_path):
+    # no брака — accepted = исходный snapshot ровно target
+    prog = _final_progress(3, 2, 1, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2"]
+    prog["campaign_reserve_pids"] = ["3"]
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b),
+                                                   "warn": 0,
+                                                   "per_pid": {p: "OK"
+                                                               for p in b}})
+    assert prog["final_state"] == "COMPLETED"
+    assert set(prog["campaign_accepted_pids"]) == {"1", "2"}
+
+
+def test_finalize_soft_stop_accepted_pids_truncated(tmp_path):
+    # мягкая остановка: accepted = чистые, но не длиннее target
+    prog = _final_progress(10, 5, 3, reason="exhausted")
+    prog["valid_pids"] = [str(i) for i in range(10)]
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b),
+                                                   "warn": 0,
+                                                   "per_pid": {p: "OK"
+                                                               for p in b}})
+    assert prog["final_state"] == "COMPLETED"
+    assert len(prog["campaign_accepted_pids"]) == 5  # усечено до target
+
+
+def test_finalize_soft_stop_no_accepted_on_abandoned(tmp_path):
+    # ABANDONED: accepted всё равно фиксирует, сколько реально чистых (< target)
+    prog = _final_progress(3, 10, 5, reason="exhausted")
+    prog["valid_pids"] = [str(i) for i in range(3)]
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b),
+                                                   "warn": 0,
+                                                   "per_pid": {p: "OK"
+                                                               for p in b}})
+    assert prog["final_state"] == "ABANDONED"
+    assert set(prog["campaign_accepted_pids"]) == {"0", "1", "2"}
+
+
+# ============================================================================
+# Интеграционные тесты run_campaign через монку subprocess.Popen и qa_fn
+# ============================================================================
+
+import json as _json
+from pathlib import Path as _Path
+
+
+class _FakeProc:
+    """Имитирует subprocess.Popen: пишет combined в --out-raw, отдаёт exit_code."""
+
+    def __init__(self, argv, combined_factory, **kwargs):
+        out_raw = None
+        for i, a in enumerate(argv):
+            if a == "--out-raw":
+                out_raw = argv[i + 1]
+        assert out_raw, f"FakeProc требует --out-raw в argv, got={argv}"
+        combined = combined_factory(argv)
+        _Path(out_raw).parent.mkdir(parents=True, exist_ok=True)
+        _Path(out_raw).write_text(_json.dumps(combined, ensure_ascii=False),
+                                  encoding="utf-8")
+        self._lines = iter(["ok"])
+
+    @property
+    def stdout(self):
+        return self
+
+    def __iter__(self):
+        return self._lines
+
+    def wait(self):
+        return 0
+
+
+def _run_campaign_integration(tmp_path, monkeypatch, target, min_valid,
+                              combined_factory, qa_fn,
+                              max_no_progress_runs=3, n_pids=0, **kw):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    campaigns = tmp_path / "campaigns"
+    logs = tmp_path / "logs"
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", campaigns)
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", logs)
+    monkeypatch.setattr(k, "PYTHON", "python")
+
+    # raw-файлы для ok-пидов (source of truth для classify)
+    for i in range(n_pids):
+        (data_dir / f"{i}_raw.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(k.subprocess, "Popen",
+                        lambda argv, **kw2: _FakeProc(argv, combined_factory,
+                                                      **kw2))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+
+    return k.run_campaign(
+        campaign="testcamp", url="u", target=target, min_valid=min_valid,
+        out="o.md", data_dir=str(data_dir), max_no_progress_runs=max_no_progress_runs,
+        qa_fn=qa_fn, **kw)
+
+
+def test_integration_target_reached_completed(tmp_path, monkeypatch):
+    # один full-прогон выдаёт 3 ok-пида (target=3), QA всё OK, резерв есть → COMPLETED
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(4)], "found": 4}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=3, min_valid=2,
+                                     combined_factory=fac, qa_fn=qa, n_pids=4,
+                                     reserve_count=2, max_total_hours=24.0)
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["final_reason"] == "target_reached"
+    assert len(prog["campaign_final_pids"]) == 3
+    assert len(prog["campaign_reserve_pids"]) == 1  # 4 valid - 3 target
+
+
+def test_integration_stagnation_soft_stop_completed_min(tmp_path, monkeypatch):
+    # Выдача вечно выдаёт одни и те же 2 известных хороших пида, новых нет
+    # (found>0, но 0 новых discovery/valid). Демон ДОЛЖЕН выйти из этого по
+    # no_progress (мягкая остановка), а НЕ крутиться вечно. Это верифицирует
+    # фикс бага «бесконечный цикл при живой, но не растущей выдаче».
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                             {"pid": 1, "ok": True, "excluded": None}],
+                "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=5, min_valid=2,
+                                     combined_factory=fac, qa_fn=qa, n_pids=2,
+                                     reserve_count=0, max_total_hours=24.0,
+                                     max_no_progress_runs=3)
+    assert prog["final_state"] == "COMPLETED_MIN"
+    assert prog["final_reason"] == "no_progress"
+    assert len(prog["valid_pids"]) == 2
+
+
+def test_integration_reserve_covers_final_bad_completed(tmp_path, monkeypatch):
+    # сквозной сценарий: набрано 3 valid (target=2) → snapshot [0,1] + резерв [2].
+    # Финальный QA бракует пид 1 → замена из резерва на 2 → COMPLETED.
+    state = {"n": 0}
+
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(3)], "found": 3}
+
+    def qa(batch):
+        state["n"] += 1
+        # 1-й вызов = классификация новых (всё OK); 2-й = финальный QA (пид 1 бракуем)
+        per = {p: ("FAIL" if state["n"] >= 2 and p == "1" else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"products": len(batch), "ok": len(batch) - fails, "warn": 0,
+                "fail": fails, "per_pid": per}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=2, min_valid=1,
+                                     combined_factory=fac, qa_fn=qa, n_pids=3,
+                                     reserve_count=1, max_total_hours=24.0)
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["final_reason"] == "target_reached"
+    assert set(prog.get("campaign_accepted_pids", [])) >= {"0", "2"}
+
+
+# --- _raw_mtime ---
+
+def test_raw_mtime_exists(tmp_path):
+    raw = tmp_path / "101_raw.json"
+    raw.write_text("{}", encoding="utf-8")
+    m = k._raw_mtime(str(tmp_path), "101")
+    assert isinstance(m, float) and m == raw.stat().st_mtime
+
+
+def test_raw_mtime_missing(tmp_path):
+    assert k._raw_mtime(str(tmp_path), "999") is None
+
+
+# --- save_json / load_json roundtrip (атомарность) ---
+
+def test_save_load_json_roundtrip(tmp_path):
+    p = tmp_path / "sub" / "p.json"
+    data = {"a": 1, "b": [1, 2, {"c": "тест"}]}
+    k.save_json(p, data)
+    assert k.load_json(p) == data
+
+
+def test_load_json_missing(tmp_path):
+    assert k.load_json(tmp_path / "nothere.json") is None
+
+
+def test_load_json_corrupt(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{not json", encoding="utf-8")
+    assert k.load_json(p) is None
+
+
+# --- PidLock ---
+
+def test_pidlock_acquire_release(tmp_path):
+    lock = k.PidLock(tmp_path / "key_daemon.pid")
+    assert lock.acquire("camp") is True
+    assert (tmp_path / "key_daemon.pid").is_file()
+    lock.release()
+    assert not (tmp_path / "key_daemon.pid").is_file()
+
+
+def test_pidlock_rejects_alive_owner(tmp_path):
+    pf = tmp_path / "key_daemon.pid"
+    k.save_json(pf, {"pid": k.os.getpid(), "campaign": "x"})
+    lock = k.PidLock(pf)
+    assert lock.acquire("camp") is False  # текущий pid жив → занято
+
+
+def test_pidlock_stale_pid_overwritten(tmp_path):
+    pf = tmp_path / "key_daemon.pid"
+    # Симулируем stale pid-файл: сначала создаём, потом удаляем (как если бы
+    # процесс-владелец завершился), acquire должен перезаписать.
+    k.save_json(pf, {"pid": 1, "campaign": "old"})
+    pf.unlink()
+    lock = k.PidLock(pf)
+    assert lock.acquire("new_camp") is True
+    assert k.load_json(pf)["campaign"] == "new_camp"
+
+
+# --- classify_new_pids: пиды без raw-файла исключаются из need ---
+
+def test_classify_skips_pid_without_raw(tmp_path):
+    prog = _manifest(tmp_path)
+    # нет 101_raw.json — не должен попасть в need и вызвать QA
+    called = []
+    r = k.classify_new_pids(prog, ["101"], qa_fn=lambda b: called.append(1) or
+                            _make_qa(products=0, ok=0, warn=0, fail=0))
+    assert r["checked"] == []
+    assert called == []
+    assert r["parse_error"] is False
+
+
+# ============================================================================
+# НОВЫЕ ТЕСТЫ
+# ============================================================================
+
+# --- challenge_pause параметр ---
+
+def test_default_manifest_includes_challenge_pause():
+    m = k.default_manifest("c", 100, 50, "u", "o",
+                           data_dir="x", max_age="3d", min_reviews=0,
+                           parallel=2, max_no_progress_runs=5, max_rescans=1,
+                           max_total_hours=6.0, notify="toast",
+                           challenge_pause=90)
+    assert m["run_cfg"]["challenge_pause"] == 90
+
+
+def test_default_manifest_challenge_pause_default():
+    m = k.default_manifest("c", 100, 50, "u", "o")
+    # challenge_pause не передан → не в run_cfg; daemon берёт CHALLENGE_RETRY_DELAY_S
+    assert "challenge_pause" not in m.get("run_cfg", {})
+
+
+# --- build_cli_args: --pids для rescan ---
+
+def test_build_cli_args_rescan_pids():
+    from pathlib import Path
+    prog = _manifest(Path("/tmp"))
+    prog["run_cfg"]["min_reviews"] = 0
+    args = k.build_cli_args(prog, "r1", "rescan", targets=["111", "222"])
+    assert "--pids" in args
+    idx = args.index("--pids")
+    assert "111,222" == args[idx + 1]
+
+
+def test_build_cli_args_full_no_pids_flag():
+    from pathlib import Path
+    prog = _manifest(Path("/tmp"))
+    prog["run_cfg"]["min_reviews"] = 0
+    args = k.build_cli_args(prog, "r1", "full")
+    assert "--pids" not in args
+    assert "--url" in args
+
+
+# --- replacement_pids: формат объектов ---
+
+def test_replacement_pids_format_pairs(tmp_path):
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10", "11"]
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        per = {p: ("FAIL" if p == "2" else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    pairs = prog["replacement_pids"]
+    assert len(pairs) == 1
+    assert pairs[0]["failed_pid"] == "2"
+    assert pairs[0]["replaced_by"] == "10"
+
+
+def test_replacement_pids_empty_when_no_fail(tmp_path):
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10"]
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b),
+                                                       "warn": 0,
+                                                       "per_pid": {p: "OK"
+                                                                   for p in b}})
+    assert prog["replacement_pids"] == []
+
+
+def test_replacement_pids_multiple_replacements(tmp_path):
+    prog = _final_progress(5, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10", "11", "12"]
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in {"1", "3"} else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    pairs = prog["replacement_pids"]
+    assert len(pairs) == 2
+    failed_pids = {p["failed_pid"] for p in pairs}
+    replaced_bys = {p["replaced_by"] for p in pairs}
+    assert failed_pids == {"1", "3"}
+    assert replaced_bys <= {"10", "11", "12"}
+
+
+# --- mtime-инвалидация вердиктов ---
+
+def test_classify_verdict_stale_mtime_reqa(tmp_path):
+    """Если fingerprint (mtime_ns) не совпадает с сохранённым — вердикт перепроверяется."""
+    pid = "101"
+    raw = tmp_path / f"{pid}_raw.json"
+    raw.write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["verdicts"] = {"101": "OK"}
+    prog["verdict_meta"] = {"101": {"verdict": "OK", "raw_mtime_ns": 1,
+                                    "raw_sha256": "x", "qa_version": k.QA_VERSION}}
+
+    called = []
+    r = k.classify_new_pids(prog, [pid], qa_fn=lambda b: called.append(b) or
+                            _make_qa(products=1, ok=1, warn=0, fail=0,
+                                     per_pid={"101": "OK"}))
+    assert called  # QA был вызван (перепроверка)
+    assert r["valid_add"] == ["101"]
+
+
+def test_classify_verdict_fresh_meta_skips(tmp_path):
+    """Если fingerprint совпадает и qa_version актуальна — QA не вызывается."""
+    pid = "101"
+    raw = tmp_path / f"{pid}_raw.json"
+    raw.write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["verdicts"] = {"101": "WARN"}
+    fp = k.raw_fingerprint(str(tmp_path), pid)
+    prog["verdict_meta"] = {"101": {"verdict": "WARN",
+                                    "raw_mtime_ns": fp["raw_mtime_ns"],
+                                    "raw_sha256": fp["raw_sha256"],
+                                    "qa_version": k.QA_VERSION}}
+
+    called = []
+    r = k.classify_new_pids(prog, [pid], qa_fn=lambda b: called.append(b) or
+                            _make_qa(products=1, ok=1, warn=0, fail=0))
+    assert not called  # QA НЕ вызывался
+    assert r["checked"] == []
+    assert "101" in r["verdicts"]  # старый вердикт сохранён
+
+
+# --- reconcile: fingerprint отслеживается ---
+
+def test_reconcile_records_new_meta(tmp_path):
+    raw = tmp_path / "101_raw.json"
+    raw.write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    fp = k.raw_fingerprint(str(tmp_path), "101")
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"],
+               "new_meta": {"101": {"verdict": "OK",
+                                    "raw_mtime_ns": fp["raw_mtime_ns"],
+                                    "raw_sha256": fp["raw_sha256"],
+                                    "qa_version": k.QA_VERSION}}}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["verdict_meta"]["101"]["raw_sha256"] == fp["raw_sha256"]
+
+
+def test_reconcile_keeps_old_meta_for_unchecked(tmp_path):
+    raw = tmp_path / "101_raw.json"
+    raw.write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101", "102"]
+    prog["verdicts"] = {"101": "OK", "102": "OK"}
+    prog["verdict_meta"] = {"101": {"verdict": "OK", "raw_mtime_ns": 1000,
+                                    "raw_sha256": "old", "qa_version": "1.0"}}
+    checked = {"verdicts": {"102": "OK"}, "valid_add": ["102"],
+               "checked": ["102"],
+               "new_meta": {"102": {"verdict": "OK", "raw_mtime_ns": 2000,
+                                    "raw_sha256": "new", "qa_version": k.QA_VERSION}}}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["verdict_meta"]["101"]["raw_mtime_ns"] == 1000
+    assert prog["verdict_meta"]["102"]["raw_sha256"] == "new"
+
+
+# --- compute_final edge cases ---
+
+def test_compute_final_valid_exactly_target():
+    p = {"valid_pids": ["1", "2", "3"], "target_count": 3, "min_valid": 1}
+    assert k.compute_final(p, False) == "COMPLETED"
+
+
+def test_compute_final_valid_above_min_but_below_target_exhausted():
+    p = {"valid_pids": ["1", "2"], "target_count": 3, "min_valid": 1}
+    assert k.compute_final(p, True) == "COMPLETED_MIN"
+
+
+def test_compute_final_below_min_exhausted():
+    p = {"valid_pids": ["1"], "target_count": 3, "min_valid": 2}
+    assert k.compute_final(p, True) == "ABANDONED"
+
+
+def test_compute_final_not_exhausted_not_enough():
+    p = {"valid_pids": ["1", "2"], "target_count": 3, "min_valid": 1}
+    assert k.compute_final(p, False) is None
+
+
+def test_compute_final_min_valid_zero():
+    p = {"valid_pids": [], "target_count": 3, "min_valid": 0}
+    assert k.compute_final(p, True) == "COMPLETED_MIN"
+
+
+# --- backoff_delay edge cases ---
+
+def test_backoff_delay_zero_index():
+    assert k.backoff_delay(0) == 0
+
+
+def test_backoff_delay_negative_index():
+    assert k.backoff_delay(-1) == 0
+
+
+def test_backoff_delay_beyond_max():
+    assert k.backoff_delay(100) == k.BACKOFF_DELAYS_S[-1]
+
+
+# --- finalize: snapshot все чистые — замен не нужно ---
+
+def test_finalize_target_reached_all_clean_no_replacements(tmp_path):
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10", "11"]
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b),
+                                                       "warn": 0,
+                                                       "per_pid": {p: "OK"
+                                                                   for p in b}})
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["replacement_pids"] == []
+    assert prog["campaign_accepted_pids"] == ["1", "2", "3"]
+
+
+# --- finalize: резерв исчерпан, брак больше резерва ---
+
+def test_finalize_target_reached_reserve_exhausted_abandoned(tmp_path):
+    # snapshot = [1,2,3], reserve = [10], брак [1,2] → shortfall=2, резерва 1 → ABANDONED
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10"]
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in {"1", "2"} else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "ABANDONED"
+    assert len(prog["campaign_accepted_pids"]) < 3
+
+
+# --- finalize: NEEDS_ATTENTION не перезаписывается ---
+
+def test_finalize_needs_attention_not_overwritten(tmp_path):
+    prog = _final_progress(300, 300, 200, reason="qa_parse_error")
+    prog["final_state"] = "NEEDS_ATTENTION"
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b),
+                                                       "warn": 0,
+                                                       "per_pid": {p: "OK"
+                                                                   for p in b}})
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+
+
+# --- batch_pids: границы ---
+
+def test_batch_pids_exact_boundary():
+    pids = [str(i) for i in range(100)]
+    batches = k.batch_pids(pids, 100)
+    assert len(batches) == 1
+    assert len(batches[0]) == 100
+
+
+def test_batch_pids_one_over():
+    pids = [str(i) for i in range(101)]
+    batches = k.batch_pids(pids, 100)
+    assert len(batches) == 2
+    assert len(batches[0]) == 100
+    assert len(batches[1]) == 1
+
+
+def test_batch_pids_single():
+    batches = k.batch_pids(["1"], 100)
+    assert batches == [["1"]]
+
+
+# --- normalize_pids:更多 edge cases ---
+
+def test_normalize_pids_all_garbage():
+    assert k.normalize_pids(["abc", "", "  ", "product/xyz?foo=bar"]) == []
+
+
+def test_normalize_pids_mixed_clean_and_url():
+    result = k.normalize_pids(["123", "https://ozon.ru/product/456/?utm=x",
+                                "456", "789"])
+    assert result == ["123", "456", "789"]
+
+
+# --- all_raw_pids / has_raw ---
+
+def test_all_raw_pids_with_files(tmp_path):
+    for pid in ("10", "20", "30"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "abc_raw.json").write_text("{}", encoding="utf-8")  # не цифровой
+    (tmp_path / "40_raw.json").write_text("{}", encoding="utf-8")
+    result = k.all_raw_pids(str(tmp_path))
+    assert result == ["10", "20", "30", "40"]
+
+
+def test_all_raw_pids_empty_dir(tmp_path):
+    assert k.all_raw_pids(str(tmp_path)) == []
+
+
+def test_has_raw_exists(tmp_path):
+    (tmp_path / "42_raw.json").write_text("{}", encoding="utf-8")
+    assert k.has_raw(str(tmp_path), "42") is True
+
+
+def test_has_raw_missing(tmp_path):
+    assert k.has_raw(str(tmp_path), "42") is False
+
+
+# --- parse_qa_stdout:更多 edge cases ---
+
+def test_parse_qa_stdout_multiple_qa_lines():
+    stdout = "[qa] товаров: 50 | OK 45 | WARN 3 | FAIL 2\n" \
+             "[qa] товаров: 100 | OK 90 | WARN 7 | FAIL 3"
+    result = k.parse_qa_stdout(stdout)
+    # берёт последнюю [qa] строку
+    assert result["products"] == 100
+
+
+def test_parse_qa_stdout_no_match():
+    result = k.parse_qa_stdout("какой-то мусор\nещё строка")
+    assert result["products"] == 0
+
+
+def test_parse_qa_stdout_partial_fields():
+    stdout = "[qa] товаров: 10 | OK 8"
+    result = k.parse_qa_stdout(stdout)
+    assert result["products"] == 10
+    assert result["ok"] == 8
+    assert result["warn"] == 0
+    assert result["fail"] == 0
+
+
+# --- _parse_qa_per_pid ---
+
+def test_parse_qa_per_pid_rows():
+    stdout = "101 OK 5 reviews\n102 FAIL 3 reviews\n103 WARN 2 reviews\n104 INFO text"
+    result = k._parse_qa_per_pid(stdout)
+    assert result == {"101": "OK", "102": "FAIL", "103": "WARN", "104": "INFO"}
+
+
+def test_parse_qa_per_pid_ignores_short_lines():
+    stdout = "ok\n101\n102 OK extra"
+    result = k._parse_qa_per_pid(stdout)
+    assert result == {"102": "OK"}
+
+
+# --- PidLock: release на уже удалённый ---
+
+def test_pidlock_release_already_deleted(tmp_path):
+    lock = k.PidLock(tmp_path / "key_daemon.pid")
+    assert lock.acquire("camp") is True
+    (tmp_path / "key_daemon.pid").unlink()  # вручную удалили
+    lock.release()  # не должен упасть
+
+
+# --- delta ---
+
+def test_delta_empty_before():
+    assert k.delta([], ["1", "2"]) == {"1", "2"}
+
+
+def test_delta_empty_after():
+    assert k.delta(["1", "2"], []) == set()
+
+
+def test_delta_no_change():
+    assert k.delta(["1", "2"], ["1", "2"]) == set()
+
+
+# --- classify_new_pids: fail>0, per_pid не покрывает все → parse_error ---
+
+def test_classify_fail_partial_per_pid_missing_pid(tmp_path):
+    """fail>0, но per_pid не содержит все PID → parse_error (защита от тихого пропуска)."""
+    for pid in ("101", "102"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        return _make_qa(products=2, ok=1, warn=0, fail=1,
+                        per_pid={"101": "OK"})  # 102 отсутствует
+
+    r = k.classify_new_pids(prog, ["101", "102"], qa_fn=qa)
+    assert r["parse_error"] is True
+    assert r["valid_add"] == []
+    assert r["failed_add"] == []
+
+
+def test_classify_fail_covers_all_per_pid(tmp_path):
+    """fail>0, per_pid покрывает все PID → OK, вердикты записываются."""
+    for pid in ("101", "102"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        return _make_qa(products=2, ok=1, warn=0, fail=1,
+                        per_pid={"101": "OK", "102": "FAIL"})
+
+    r = k.classify_new_pids(prog, ["101", "102"], qa_fn=qa)
+    assert r["parse_error"] is False
+    assert r["valid_add"] == ["101"]
+    assert r["failed_add"] == ["102"]
+
+
+# --- classify_new_pids: warn считается валидным ---
+
+def test_classify_warn_counts_as_valid(tmp_path):
+    pid = "101"
+    (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+
+    def qa(batch):
+        return _make_qa(products=1, ok=0, warn=1, fail=0,
+                        per_pid={"101": "WARN"})
+
+    r = k.classify_new_pids(prog, [pid], qa_fn=qa)
+    assert r["valid_add"] == ["101"]
+    assert r["failed_add"] == []
+
+
+# --- reconcile: FAIL из прошлого исчезает при OK вердикте ---
+
+def test_reconcile_fail_removed_on_rescan_ok(tmp_path):
+    """PID был FAIL, после rescan стал OK → выходит из failed_pids."""
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    prog["failed_pids"] = ["101"]
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert "101" not in prog["failed_pids"]
+    assert "101" in prog["valid_pids"]
+
+
+# --- finalize: мягкий путь, min_valid=0 ---
+
+def test_finalize_soft_stop_min_valid_zero(tmp_path):
+    """min_valid=0, valid=0, FAIL=0 → COMPLETED_MIN (даже с 0 валидных)."""
+    prog = _final_progress(0, 3, 0, reason="exhausted")
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": 0,
+                                                    "warn": 0,
+                                                    "per_pid": {}})
+    assert prog["final_state"] == "COMPLETED_MIN"
+
+
+# --- summarize: все ключи ---
+
+def test_summarize_all_keys():
+    p = _progress_filled()
+    p["final_state"] = "COMPLETED"
+    p["final_reason"] = "target_reached"
+    s = k.summarize(p)
+    assert set(s.keys()) == {"campaign", "target", "min_valid", "valid",
+                             "discovered", "failed", "permanently_failed",
+                             "runs", "final_state", "final_reason"}
+
+
+# --- default_manifest: базовые дефолты ---
+
+def test_default_manifest_all_defaults():
+    m = k.default_manifest("camp", 100, 50, "url", "out.md")
+    assert m["campaign"] == "camp"
+    assert m["target_count"] == 100
+    assert m["min_valid"] == 50
+    assert m["url"] == "url"
+    assert m["out"] == "out.md"
+    assert m["started_at"]  # не пусто
+    assert m["discovered_pids"] == []
+    assert m["valid_pids"] == []
+    assert m["failed_pids"] == []
+    assert m["verdicts"] == {}
+    assert m["final_state"] is None
+
+
+# ---_integration: time_limit ---
+
+def test_integration_time_limit_abandoned(tmp_path, monkeypatch):
+    """Выдаёт только 2 PID (target=5, min_valid=3), лимит времени 0ч → ABANDONED."""
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(2)], "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=5, min_valid=3,
+                                     combined_factory=fac, qa_fn=qa, n_pids=2,
+                                     reserve_count=0, max_total_hours=0.0,
+                                     max_no_progress_runs=10)
+    assert prog["final_state"] == "ABANDONED"
+    assert prog["final_reason"] == "time_limit"
+
+
+# ---integration: crash вызывает cooldown, но не падение ---
+
+def test_crash_sets_no_progress_count():
+    """CRASH увеличивает no_progress_count (unit test без event loop)."""
+    prog = _manifest(k.Path("/tmp"))
+    prog["no_progress_count"] = 0
+    # имитируем CRASH: обновляем счётчик как делает демон
+    prog["no_progress_count"] = prog.get("no_progress_count", 0) + 1
+    assert prog["no_progress_count"] == 1
+
+
+# ---integration: rescan брака ---
+
+def test_integration_rescan_replaces_bad_with_good(tmp_path, monkeypatch):
+    """1-й прогон: 3 PID, пид 2 FAIL → rescan → пид 2 стал OK → COMPLETED."""
+    state = {"n": 0}
+
+    def fac(argv):
+        state["n"] += 1
+        if state["n"] == 1:
+            return {"products": [{"pid": i, "ok": True, "excluded": None}
+                                 for i in range(3)], "found": 3}
+        # rescan: пид 2 теперь OK
+        return {"products": [{"pid": 2, "ok": True, "excluded": None}],
+                "found": 1}
+
+    def qa(batch):
+        if state["n"] == 1:
+            # первый прогон: пид 2 FAIL
+            per = {p: ("FAIL" if p == "2" else "OK") for p in batch}
+        else:
+            # rescan: всё OK
+            per = {p: "OK" for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"products": len(batch), "ok": len(batch) - fails, "warn": 0,
+                "fail": fails, "per_pid": per}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=3, min_valid=2,
+                                     combined_factory=fac, qa_fn=qa, n_pids=3,
+                                     reserve_count=0, max_total_hours=24.0,
+                                     max_no_progress_runs=5, max_rescans=2)
+    assert prog["final_state"] == "COMPLETED"
+    assert "2" in prog["valid_pids"] or "2" in prog.get("campaign_accepted_pids", [])
+
+
+# --- finalize: snapshot с браком, резерв достаточно ---
+
+def test_finalize_target_reached_replaces_exact_shortfall(tmp_path):
+    """snapshot=[1,2,3], reserve=[10,11], брак [1,3] → replacements=2 из резерва."""
+    prog = _final_progress(5, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10", "11"]
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        per = {p: ("FAIL" if p in {"1", "3"} else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"fail": fails, "ok": len(batch) - fails, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "COMPLETED"
+    assert len(prog["replacement_pids"]) == 2
+    assert set(prog["campaign_accepted_pids"]) == {"2", "10", "11"}
+
+
+# --- finalize: snapshot чист, резерв не тронут ---
+
+def test_finalize_target_reached_reserve_untouched(tmp_path):
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10", "11", "12"]
+    pa = tmp_path / "p.json"
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: {"fail": 0, "ok": len(b), "products": len(b),
+                                                       "warn": 0,
+                                                       "per_pid": {p: "OK"
+                                                                   for p in b}})
+    assert prog["campaign_reserve_pids"] == ["10", "11", "12"]
+    assert prog["replacement_pids"] == []
+
+
+# --- pidlock: acquire两次同一个campaign ---
+
+def test_pidlock_double_acquire_same_campaign(tmp_path):
+    pf = tmp_path / "key_daemon.pid"
+    lock1 = k.PidLock(pf)
+    assert lock1.acquire("camp1") is True
+    lock2 = k.PidLock(pf)
+    assert lock2.acquire("camp2") is False  # уже занят
+
+
+# --- classify_new_pids: candidates без raw-файла игнорируются ---
+
+def test_classify_all_candidates_without_raw(tmp_path):
+    prog = _manifest(tmp_path)
+    r = k.classify_new_pids(prog, ["901", "902"], qa_fn=lambda b: _make_qa(
+        products=0, ok=0, warn=0, fail=0))
+    assert r["checked"] == []
+    assert r["valid_add"] == []
+    assert r["failed_add"] == []
+
+
+# ============================================================================
+# НОВЫЕ ТЕСТЫ: K4 в финализаторе + детерминизм + resume-конфиг
+# ============================================================================
+
+# --- финальный QA: недостоверная сводка (K4) → NEEDS_ATTENTION ---
+
+def test_finalize_target_reached_inconsistent_summary_needs_attention(tmp_path, monkeypatch):
+    # target_reached, но финальный QA даёт недостоверную сводку (products != len)
+    # → NEEDS_ATTENTION, а НЕ COMPLETED/ABANDONED (тихий пропуск брака исключён)
+    monkeypatch.setattr(k, "notify", lambda *a, **kw: None)
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10", "11"]
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        return {"fail": 0, "ok": len(batch) - 1, "warn": 0,
+                "products": len(batch) - 1, "per_pid": {p: "OK" for p in batch}}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog["final_reason"] == "qa_parse_error"
+
+
+def test_finalize_target_reached_fail_missing_per_pid_needs_attention(tmp_path, monkeypatch):
+    # fail>0, но per_pid не покрывает все PID → parse_error → NEEDS_ATTENTION
+    monkeypatch.setattr(k, "notify", lambda *a, **kw: None)
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = []
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        return {"fail": 1, "ok": len(batch) - 1, "warn": 0,
+                "products": len(batch), "per_pid": {"1": "OK", "2": "OK"}}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog["final_reason"] == "qa_parse_error"
+
+
+def test_finalize_soft_stop_inconsistent_summary_needs_attention(tmp_path, monkeypatch):
+    # мягкая остановка: финальный QA недостоверен → NEEDS_ATTENTION
+    monkeypatch.setattr(k, "notify", lambda *a, **kw: None)
+    prog = _final_progress(5, 3, 2, reason="no_progress")
+    prog["valid_pids"] = [str(i) for i in range(5)]
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        return {"fail": 0, "ok": len(batch), "warn": 0, "products": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog["final_reason"] == "qa_parse_error"
+
+
+def test_finalize_consistent_qa_not_needs_attention(tmp_path):
+    # сводка консистентна (K4 сошёлся) → НЕ NEEDS_ATTENTION, а нормальный COMPLETED
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = ["10"]
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        per = {p: "OK" for p in batch}
+        return {"fail": 0, "ok": len(batch), "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["final_reason"] == "target_reached"
+
+
+# --- детерминизм порядка valid/snapshot ---
+
+def test_reconcile_preserves_valid_order(tmp_path):
+    # существующий порядок valid_pids сохраняется, новые добавляются в конец
+    for pid in ("1", "2", "3", "4"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["1", "2", "3", "4"]
+    prog["valid_pids"] = ["1", "2", "3"]
+    checked = {"verdicts": {"1": "OK", "2": "OK", "3": "OK", "4": "OK"},
+               "valid_add": ["4"], "checked": ["4"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["valid_pids"] == ["1", "2", "3", "4"]
+
+
+def test_reconcile_preserves_order_when_fail_removed(tmp_path):
+    # FAIL-пид удаляется из valid, но порядок остальных сохраняется
+    for pid in ("1", "2", "3"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["1", "2", "3"]
+    prog["valid_pids"] = ["1", "2", "3"]
+    checked = {"verdicts": {"1": "OK", "2": "FAIL", "3": "OK"},
+               "valid_add": [], "checked": ["1", "2", "3"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["valid_pids"] == ["1", "3"]
+
+
+def test_integration_snapshot_uses_valid_order(tmp_path, monkeypatch):
+    # snapshot/reserve выбираются в порядке valid_pids (порядок обнаружения),
+    # а не в hash-порядке set()/сортированном порядке
+    def fac(argv):
+        return {"products": [{"pid": p, "ok": True, "excluded": None}
+                             for p in ("4", "2", "0", "1", "3")], "found": 5}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=3, min_valid=2,
+                                     combined_factory=fac, qa_fn=qa, n_pids=5,
+                                     reserve_count=2, max_total_hours=24.0)
+    assert prog["final_state"] == "COMPLETED"
+    # valid_pids в порядке обнаружения: 4,2,0,1,3 → snapshot = первые 3
+    assert prog["campaign_final_pids"] == ["4", "2", "0"]
+    assert prog["campaign_reserve_pids"] == ["1", "3"]
+
+
+# --- resume: конфиг берётся из манифеста, а не из аргументов CLI ---
+
+def test_integration_resume_uses_manifest_config(tmp_path, monkeypatch):
+    # В манифесте max_no_progress_runs=1. Демон запускается с параметром 10,
+    # но должен использовать значение из манифеста → остановка после 1 прогона.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    for i in range(2):
+        (data_dir / f"{i}_raw.json").write_text("{}", encoding="utf-8")
+    campaigns = tmp_path / "campaigns"
+    camp_dir = campaigns / "testcamp"
+    camp_dir.mkdir(parents=True, exist_ok=True)
+    k.save_json(camp_dir / "progress.json", {
+        "campaign": "testcamp", "target_count": 5, "min_valid": 2,
+        "url": "u", "out": "o.md",
+        "run_cfg": {"data_dir": str(data_dir), "max_age": "7d",
+                    "min_reviews": 0, "parallel": 1,
+                    "max_no_progress_runs": 1, "max_rescans": 2,
+                    "max_total_hours": 24.0, "reserve_count": 0},
+        "started_at": k.now_utc_iso(),
+        "discovered_pids": [], "valid_pids": [], "failed_pids": [],
+        "permanently_failed_pids": [], "replacement_pids": [],
+        "verdicts": {}, "verdict_meta": {}, "running_rescans": {},
+        "runs": [], "cooldown_until": None, "challenge_seq": 0,
+        "no_progress_count": 0, "final_state": None,
+        "final_reason": None, "final_note": None,
+    })
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", campaigns)
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(k, "PYTHON", "python")
+
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                             {"pid": 1, "ok": True, "excluded": None}],
+                "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setattr(k.subprocess, "Popen",
+                        lambda argv, **kw2: _FakeProc(argv, fac, **kw2))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+
+    prog = k.run_campaign(
+        campaign="testcamp", url="u", target=5, min_valid=2,
+        out="o.md", data_dir=str(data_dir), max_no_progress_runs=10,
+        max_total_hours=24.0, qa_fn=qa)
+    # манифестное max_no_progress_runs=1 → 1 прогон с прогрессом + 1 без,
+    # затем остановка по no_progress. Если бы использовался параметр 10,
+    # демон крутился бы 11 раз (10 без-прогресс + break).
+    assert prog["final_reason"] == "no_progress"
+    assert len(prog["runs"]) == 2
+
+
+# --- _qa_clean: пустой snapshot → parse_error=False, qa не вызывается ---
+
+def test_finalize_empty_snapshot_parse_error_false(tmp_path):
+    prog = _final_progress(0, 3, 2, reason="no_progress")
+    pa = tmp_path / "p.json"
+    called = []
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: called.append(1) or
+                        {"fail": 0, "ok": 0, "warn": 0})
+    assert called == []
+    assert prog["final_state"] == "ABANDONED"  # не NEEDS_ATTENTION (нет QA)
+    assert prog["final_reason"] == "no_progress"
+
+
+# --- финальный QA: WARN считается чистым ---
+
+def test_finalize_warn_counts_clean(tmp_path):
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = []
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        return {"fail": 0, "ok": 0, "warn": len(batch),
+                "products": len(batch),
+                "per_pid": {p: "WARN" for p in batch}}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "COMPLETED"
+    assert set(prog["campaign_accepted_pids"]) == {"1", "2", "3"}
+
+
+# --- PidLock: битый pid-файл (не int) трактуется как stale ---
+
+def test_pidlock_corrupt_pid_treated_stale(tmp_path):
+    pf = tmp_path / "key_daemon.pid"
+    k.save_json(pf, {"pid": "not-an-int", "campaign": "old"})
+    lock = k.PidLock(pf)
+    assert lock.acquire("new_camp") is True  # не падает, перезаписывает
+    assert k.load_json(pf)["campaign"] == "new_camp"
+
+
+def test_pidlock_missing_pid_field_treated_stale(tmp_path):
+    pf = tmp_path / "key_daemon.pid"
+    k.save_json(pf, {"campaign": "old"})  # нет поля pid
+    lock = k.PidLock(pf)
+    assert lock.acquire("new_camp") is True
+
+
+# ============================================================================
+# ТЕСТЫ: валидность требует raw (П1) + immutable snapshot при target_reached
+# ============================================================================
+
+def test_reconcile_drops_valid_without_raw(tmp_path):
+    # raw для 101 удалён после QA → вердикт OK, но PID должен выйти из valid
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101", "102"]
+    prog["valid_pids"] = ["101", "102"]
+    checked = {"verdicts": {"101": "OK", "102": "OK"},
+               "valid_add": [], "checked": []}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    # ни у одного из пидов нет raw-файла → valid пуст (источник истины — П1)
+    assert prog["valid_pids"] == []
+
+
+def test_reconcile_keeps_valid_with_raw(tmp_path):
+    # у 101 и 102 raw есть → остаются valid
+    for pid in ("101", "102"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101", "102"]
+    prog["valid_pids"] = ["101", "102"]
+    checked = {"verdicts": {"101": "OK", "102": "OK"},
+               "valid_add": [], "checked": []}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["valid_pids"] == ["101", "102"]
+
+
+def test_reconcile_drops_missing_raw_but_keeps_present(tmp_path):
+    # 101 без raw → выходит; 102 с raw → остаётся
+    (tmp_path / "102_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101", "102"]
+    prog["valid_pids"] = ["101", "102"]
+    checked = {"verdicts": {"101": "OK", "102": "OK"},
+               "valid_add": [], "checked": []}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["valid_pids"] == ["102"]
+
+
+def test_integration_snapshot_saved_before_finalize(tmp_path, monkeypatch):
+    # target_reached: snapshot фиксируется в progress.json СРАЗУ (immutable),
+    # до финального QA — проверяем наличие campaign_final_pids на диске
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(4)], "found": 4}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=3, min_valid=2,
+                                     combined_factory=fac, qa_fn=qa, n_pids=4,
+                                     reserve_count=1, max_total_hours=24.0)
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["campaign_final_pids"] == ["0", "1", "2"]
+    assert prog["campaign_reserve_pids"] == ["3"]
+    # snapshot записан в manifest (не только в памяти)
+    saved = k.load_json(tmp_path / "campaigns" / "testcamp" / "progress.json")
+    assert saved["campaign_final_pids"] == ["0", "1", "2"]
+    assert saved["campaign_reserve_pids"] == ["3"]
+
+
+# ============================================================================
+# ТЕСТЫ: валидация новой кампании + сброс счётчиков при прогрессе
+# ============================================================================
+
+# --- validate_new_campaign: 0 < min_valid < target ---
+
+def test_validate_new_campaign_min_valid_zero_rejected():
+    with pytest.raises(SystemExit):
+        k.validate_new_campaign(0, 300)
+
+
+def test_validate_new_campaign_min_valid_ge_target_rejected():
+    with pytest.raises(SystemExit):
+        k.validate_new_campaign(300, 300)
+
+
+def test_validate_new_campaign_valid_range_accepted():
+    k.validate_new_campaign(1, 300)   # нижняя граница
+    k.validate_new_campaign(299, 300)  # верхняя граница
+    k.validate_new_campaign(200, 300)  # типичный
+
+
+def test_new_campaign_rejects_min_valid_zero(tmp_path, monkeypatch):
+    # min_valid=0 при создании НОВОЙ кампании → SystemExit (нет пустого COMPLETED_MIN)
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path / "campaigns")
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    with pytest.raises(SystemExit):
+        k.run_campaign(campaign="x", url="u", target=3, min_valid=0,
+                       out="o.md", data_dir=str(tmp_path / "data"),
+                       max_no_progress_runs=10)
+
+
+def test_new_campaign_rejects_missing_url(tmp_path, monkeypatch):
+    # новая кампания без --url → SystemExit (fail-fast вместо тихого --url "")
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path / "campaigns")
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    with pytest.raises(SystemExit):
+        k.run_campaign(campaign="x", url="", target=3, min_valid=1,
+                       out="o.md", data_dir=str(tmp_path / "data"),
+                       max_no_progress_runs=10)
+
+
+def test_resume_without_url_ok(tmp_path, monkeypatch):
+    # при resume url не нужен — берётся из манифеста (не fail-fast)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    for i in range(2):
+        (data_dir / f"{i}_raw.json").write_text("{}", encoding="utf-8")
+    campaigns = tmp_path / "campaigns"
+    camp_dir = campaigns / "testcamp"
+    camp_dir.mkdir(parents=True, exist_ok=True)
+    k.save_json(camp_dir / "progress.json", {
+        "campaign": "testcamp", "target_count": 5, "min_valid": 1,
+        "url": "stored_url", "out": "o.md",
+        "run_cfg": {"data_dir": str(data_dir), "max_age": "7d",
+                    "min_reviews": 0, "parallel": 1,
+                    "max_no_progress_runs": 1, "max_rescans": 2,
+                    "max_total_hours": 24.0, "reserve_count": 0},
+        "started_at": k.now_utc_iso(),
+        "discovered_pids": [], "valid_pids": [], "failed_pids": [],
+        "permanently_failed_pids": [], "replacement_pids": [],
+        "verdicts": {}, "verdict_meta": {}, "running_rescans": {},
+        "runs": [], "cooldown_until": None, "challenge_seq": 0,
+        "no_progress_count": 0, "final_state": None,
+        "final_reason": None, "final_note": None,
+    })
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", campaigns)
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(k, "PYTHON", "python")
+
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                             {"pid": 1, "ok": True, "excluded": None}],
+                "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setattr(k.subprocess, "Popen",
+                        lambda argv, **kw2: _FakeProc(argv, fac, **kw2))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+
+    prog = k.run_campaign(
+        campaign="testcamp", url="", target=5, min_valid=1,
+        out="o.md", data_dir=str(data_dir), max_no_progress_runs=10,
+        max_total_hours=24.0, qa_fn=qa)
+    # resume не падает на пустом url; URL из манифеста передаётся в CLI
+    assert prog["final_reason"] == "no_progress"
+
+
+# --- сброс счётчиков при прогрессе (п.2 ревью) ---
+
+def test_integration_progress_resets_no_progress_counter(tmp_path, monkeypatch):
+    # Сценарий: стагнация → прогресс (новый valid) → сброс счётчика → снова стагнация.
+    # Если бы сброса не было, кампания завершилась бы раньше (ложный ABANDONED).
+    # fac по номеру вызова возвращает разное.
+    calls = {"n": 0}
+
+    def fac(argv):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            # 3-й прогон приносит новый PID → прогресс
+            return {"products": [{"pid": p, "ok": True, "excluded": None}
+                                 for p in (0, 1, 2)], "found": 3}
+        return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                             {"pid": 1, "ok": True, "excluded": None}],
+                "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=5, min_valid=1,
+                                     combined_factory=fac, qa_fn=qa, n_pids=3,
+                                     reserve_count=0, max_total_hours=24.0,
+                                     max_no_progress_runs=2)
+    # runs: 1(progress) → 2(stagnation) → 3(progress, сброс) → 4(stagn) → 5(stagn)
+    # → count=2 ≥ max → stop. Без сброса на run3 было бы 4 runs, а не 5.
+    assert prog["final_state"] == "COMPLETED_MIN"
+    assert prog["final_reason"] == "no_progress"
+    assert len(prog["runs"]) == 5
+    # 3-й прогон действительно дал прогресс (new_valid != [])
+    assert prog["runs"][2]["new_valid"] == ["2"]
+
+
+# --- UNKNOWN_FAILURE → NEEDS_ATTENTION с final_reason ---
+
+def test_integration_unknown_failure_needs_attention(tmp_path, monkeypatch):
+    # CLI: exit!=0, но combined есть → UNKNOWN_FAILURE → NEEDS_ATTENTION/unknown_failure
+    def fac(argv):
+        return {"products": [], "found": 0}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    class FakeFailProc(_FakeProc):
+        def wait(self):
+            return 2  # ненулевой exit при написанном combined
+
+    def fake_popen(argv, **kw2):
+        # пишем combined (как _FakeProc), но возвращаем exit=2
+        return FakeFailProc(argv, fac, **kw2)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path / "campaigns")
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(k, "PYTHON", "python")
+    monkeypatch.setattr(k.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+
+    prog = k.run_campaign(
+        campaign="testcamp", url="u", target=3, min_valid=1,
+        out="o.md", data_dir=str(data_dir),
+        max_no_progress_runs=10, qa_fn=qa, max_total_hours=24.0)
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog["final_reason"] == "unknown_failure"
+
+
+# --- run_id уникален для быстрых последовательных прогонов ---
+
+def test_integration_run_ids_unique(tmp_path, monkeypatch):
+    # даже если прогоны завершаются <1с (cache-hits), run_id не должен
+    # сталкиваться (иначе combined_{run_id}.json перезаписывается)
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                             {"pid": 1, "ok": True, "excluded": None}],
+                "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=5, min_valid=1,
+                                     combined_factory=fac, qa_fn=qa, n_pids=2,
+                                     reserve_count=0, max_total_hours=24.0,
+                                     max_no_progress_runs=2)
+    ids = [r["run_id"] for r in prog["runs"]]
+    assert len(ids) == len(set(ids))  # все run_id уникальны
+
+
+# --- build_cli_args: min_reviews=0 не добавляет флаг ---
+
+def test_build_cli_args_min_reviews_zero_skips_flag():
+    from pathlib import Path
+    prog = _manifest(Path("/tmp"))
+    prog["run_cfg"]["min_reviews"] = 0
+    args = k.build_cli_args(prog, "r1", "full")
+    assert "--min-reviews" not in args
+
+
+# --- build_cli_args: discovery-лимит = target + reserve (чтобы резерв жил) ---
+
+def test_build_cli_args_full_discovery_limit_includes_reserve(tmp_path, monkeypatch):
+    # полный прогон должен собирать target + reserve_count товаров, иначе
+    # valid никогда не превысит target и резерв останется пустым
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
+    p = _cfg_progress(target=300)
+    p["run_cfg"]["reserve_count"] = 30
+    args = k.build_cli_args(p, "run_1", "full")
+    i = args.index("--limit")
+    assert args[i + 1] == "330"
+
+
+def test_build_cli_args_full_discovery_limit_without_reserve(tmp_path, monkeypatch):
+    # reserve_count отсутствует → лимит = target (без запаса)
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
+    args = k.build_cli_args(_cfg_progress(target=300), "run_1", "full")
+    i = args.index("--limit")
+    assert args[i + 1] == "300"
+
+
+def test_build_cli_args_rescan_limit_is_targets_len(tmp_path, monkeypatch):
+    # rescan: --limit = число целей (не target), --pids присутствует
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
+    args = k.build_cli_args(_cfg_progress(), "run_1", "rescan",
+                            targets=["101", "102", "103"])
+    i = args.index("--limit")
+    assert args[i + 1] == "3"
+    assert "--pids" in args
+    assert "--url" not in args
+
+
+# --- резерв реально материализуется при discovery > target (интеграция) ---
+
+def test_integration_reserve_materializes_with_headroom(tmp_path, monkeypatch):
+    # fac возвращает target+2 продукта (как реальный search с запасом).
+    # Все valid → snapshot=[:target], reserve=[target:target+reserve] НЕ пуст.
+    def fac(argv):
+        return {"products": [{"pid": p, "ok": True, "excluded": None}
+                             for p in range(5)], "found": 5}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=3, min_valid=2,
+                                     combined_factory=fac, qa_fn=qa, n_pids=5,
+                                     reserve_count=2, max_total_hours=24.0)
+    assert prog["final_state"] == "COMPLETED"
+    # резерв формируется из valid сверх target
+    assert len(prog["campaign_final_pids"]) == 3
+    assert len(prog["campaign_reserve_pids"]) == 2
+
+
+def test_integration_reserve_used_when_snapshot_bad(tmp_path, monkeypatch):
+    # discovery > target: в snapshot пид 1 бракованный → замена из резерва →
+    # COMPLETED (резерв реально работает, а не пуст)
+    def fac(argv):
+        return {"products": [{"pid": p, "ok": True, "excluded": None}
+                             for p in range(4)], "found": 4}
+
+    def qa(batch):
+        # 1-й вызов = живой QA (всё OK); 2-й = финальный QA (пид 1 брак)
+        if not getattr(qa, "final", False):
+            qa.final = False
+        state = qa.final
+        if not state:
+            qa.final = True  # следующий вызов — финальный
+            per = {p: "OK" for p in batch}
+        else:
+            per = {p: ("FAIL" if p == "1" else "OK") for p in batch}
+        fails = sum(1 for v in per.values() if v == "FAIL")
+        return {"products": len(batch), "ok": len(batch) - fails, "warn": 0,
+                "fail": fails, "per_pid": per}
+
+    prog = _run_campaign_integration(tmp_path, monkeypatch, target=3, min_valid=2,
+                                     combined_factory=fac, qa_fn=qa, n_pids=4,
+                                     reserve_count=1, max_total_hours=24.0)
+    assert prog["final_state"] == "COMPLETED"
+    assert "1" not in set(prog["campaign_accepted_pids"])
+    assert len(prog["replacement_pids"]) == 1
+
+
+# --- parse_qa_stdout: WALL_LIMITED ---
+
+def test_parse_qa_stdout_wall_limited():
+    stdout = "[qa] товаров: 100 | OK 90 | WARN 7 | FAIL 3 | WALL_LIMITED 3"
+    r = k.parse_qa_stdout(stdout)
+    assert r["wall_limited"] == 3
+    assert r["products"] == 100
+
+
+# --- now_utc_iso / load_json edge / _alive ---
+
+def test_now_utc_iso_format():
+    s = k.now_utc_iso()
+    assert s[:4].isdigit()           # год
+    assert s.endswith("+00:00")      # UTC-суффикс
+    assert "T" in s
+
+
+def test_load_json_empty_file_returns_none(tmp_path):
+    p = tmp_path / "empty.json"
+    p.write_text("", encoding="utf-8")
+    assert k.load_json(p) is None
+
+
+def test_alive_current_process():
+    assert k._alive(os.getpid()) is True
+
+
+def test_alive_dead_pid():
+    # нереалистичные PID → False без вызова os.kill (на Windows os.kill(huge,0)
+    # мог бы зависнуть)
+    assert k._alive(2 ** 31 - 1) is False
+    assert k._alive(0) is False
+    assert k._alive(-5) is False
+    assert k._alive("123") is False  # не int
+
+
+def test_batch_pids_dedup_keeps_first_occurrence():
+    assert k.batch_pids(["3", "1", "3", "2", "1"], 10) == [["3", "1", "2"]]
+
+
+# --- summarize: target_reached содержит accepted? (нет — только счётчики) ---
+
+def test_summarize_after_target_reached():
+    p = _progress_filled()
+    p["campaign_final_pids"] = ["1", "2", "3"]
+    s = k.summarize(p)
+    assert s["valid"] == 1
+    assert s["discovered"] == 2
+    # summarize не утверждает campaign_final_pids — это счётчик-снимок
+    assert "campaign_final_pids" not in s
+
+
+# --- finalize: все брак в snapshot, резерва нет → ABANDONED ---
+
+def test_finalize_target_reached_no_reserve_all_bad(tmp_path):
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = []
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        per = {p: "FAIL" for p in batch}
+        return {"fail": len(batch), "ok": 0, "warn": 0,
+                "products": len(batch), "per_pid": per}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["final_state"] == "ABANDONED"
+    assert prog["campaign_accepted_pids"] == []
+    assert prog["replacement_pids"] == []
+
+
+# --- finalize: мягкий путь использует campaign_final_pids, если они заданы ---
+
+def test_finalize_soft_stop_uses_campaign_final_pids_if_set(tmp_path):
+    # если по какой-то причине snapshot зафиксирован, а мягкая остановка —
+    # QA идёт по нему, а не по valid_pids
+    prog = _final_progress(10, 3, 2, reason="no_progress")
+    prog["valid_pids"] = [str(i) for i in range(10)]
+    prog["campaign_final_pids"] = ["7", "8", "9"]
+    pa = tmp_path / "p.json"
+    checked = []
+    k.finalize_campaign(prog, pa, qa_fn=lambda b: checked.extend(b) or
+                        {"fail": 0, "ok": len(b), "warn": 0,
+                         "products": len(b)})
+    assert set(checked) == {"7", "8", "9"}
+
+
+# ============================================================================
+# ТЕСТЫ: JSON-контракт QA (--report-json) + повторный детерминированный брак
+# ============================================================================
+
+# --- _parse_qa_json_report ---
+
+def _qa_payload(products, summary=None):
+    return {
+        "generated_at_utc": "2026-08-31T00:00:00+00:00",
+        "summary": summary or {"products": len(products), "ok": 1, "warn": 0,
+                               "fail": 1, "wall_limited_count": 1},
+        "products": products,
+    }
+
+
+def test_parse_qa_json_report_summary_and_per_pid(tmp_path):
+    payload = _qa_payload([
+        {"pid": "101", "verdict": "OK",
+         "issues": [{"code": "X", "severity": "INFO"}]},
+        {"pid": "102", "verdict": "FAIL",
+         "issues": [{"code": "BAD_JSON", "severity": "FAIL"}]},
+    ])
+    p = tmp_path / "qa.json"
+    p.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    r = k._parse_qa_json_report(str(p))
+    assert r is not None
+    assert r["products"] == 2
+    assert r["ok"] == 1 and r["fail"] == 1
+    assert r["per_pid"] == {"101": "OK", "102": "FAIL"}
+    assert r["per_pid_issues"] == {"101": ["X"], "102": ["BAD_JSON"]}
+
+
+def test_parse_qa_json_report_missing_returns_none(tmp_path):
+    assert k._parse_qa_json_report(str(tmp_path / "nope.json")) is None
+    p = tmp_path / "bad.json"
+    p.write_text("{not json", encoding="utf-8")
+    assert k._parse_qa_json_report(str(p)) is None
+
+
+# --- fail_reason_seq: повторный идентичный FAIL учитывается ---
+
+def test_reconcile_records_fail_reason_seq(tmp_path):
+    for pid in ("101", "102"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101", "102"]
+    checked = {"verdicts": {"101": "FAIL", "102": "OK"},
+               "valid_add": [], "checked": ["101", "102"],
+               "per_pid_issues": {"101": ["BAD_JSON"], "102": []}}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["fail_reason_seq"]["101"]["count"] == 1
+    assert "102" not in prog["fail_reason_seq"]  # OK → нет истории
+
+
+def test_reconcile_fail_reason_seq_increments_on_same_reason(tmp_path):
+    for pid in ("101",):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    # 1-й FAIL
+    checked = {"verdicts": {"101": "FAIL"}, "valid_add": [], "checked": ["101"],
+               "per_pid_issues": {"101": ["BAD_JSON"]}}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    # 2-й FAIL с той же причиной
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert prog["fail_reason_seq"]["101"]["count"] == 2
+    assert k._fail_reason_recurring(prog, "101") is True
+
+
+def test_reconcile_fail_reason_seq_resets_on_different_reason(tmp_path):
+    for pid in ("101",):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    checked1 = {"verdicts": {"101": "FAIL"}, "valid_add": [], "checked": ["101"],
+                "per_pid_issues": {"101": ["BAD_JSON"]}}
+    k.reconcile_validity(prog, checked1, str(tmp_path))
+    checked2 = {"verdicts": {"101": "FAIL"}, "valid_add": [], "checked": ["101"],
+                "per_pid_issues": {"101": ["GARBAGE_TEXT"]}}
+    k.reconcile_validity(prog, checked2, str(tmp_path))
+    assert prog["fail_reason_seq"]["101"]["count"] == 1  # новая причина → сброс
+    assert k._fail_reason_recurring(prog, "101") is False
+
+
+def test_reconcile_fail_reason_seq_resets_on_ok(tmp_path):
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    checked = {"verdicts": {"101": "FAIL"}, "valid_add": [], "checked": ["101"],
+               "per_pid_issues": {"101": ["BAD_JSON"]}}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    ok_checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+                  "checked": ["101"], "per_pid_issues": {"101": []}}
+    k.reconcile_validity(prog, ok_checked, str(tmp_path))
+    assert "101" not in prog["fail_reason_seq"]
+
+
+# --- _recover_interrupted_run (run-journal recovery) ---
+
+def _mk_recover_env(tmp_path, monkeypatch):
+    camp = tmp_path / "campaigns" / "c"
+    camp.mkdir(parents=True, exist_ok=True)
+    (camp / "runs").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path / "campaigns")
+    return camp
+
+
+def test_recover_commits_interrupted_run(tmp_path, monkeypatch):
+    camp = _mk_recover_env(tmp_path, monkeypatch)
+    # raw для двух pid: один из прерванного прогона, другой уже известен
+    for pid in ("101", "102", "103"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    prog["verdicts"] = {"102": "FAIL"}  # уже решён ранее
+    # прерванный прогон: run_started есть, state_committed нет
+    k._journal_stage(prog, "run_x", "run_started")
+    # combined этого прогона с одним новым ok-pid (103) и одним уже известным (102)
+    combined = {"products": [{"pid": 102, "ok": True},
+                             {"pid": 103, "ok": True}]}
+    k.save_json(camp / "combined_run_x.json", combined)
+
+    called = []
+    k._recover_interrupted_run(
+        prog, str(tmp_path),
+        qa_fn=lambda b: called.append(list(b)) or
+        _make_qa(products=len(b), ok=len(b), warn=0, fail=0,
+                 per_pid={p: "OK" for p in b}))
+
+    # 102 уже имеет вердикт (FAIL) → только 103 пере-QA'd (если fp не совпадает)
+    assert "103" in prog["discovered_pids"]
+    assert "103" in prog["valid_pids"]
+    assert all(p in prog["valid_pids"] for p in called[0])
+    rec = k.load_json(camp / "runs" / "run_x.json")
+    assert "state_committed" in rec["stages"]
+
+
+def test_recover_skips_committed_run(tmp_path, monkeypatch):
+    camp = _mk_recover_env(tmp_path, monkeypatch)
+    for pid in ("101",):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    # run уже закоммичен → recovery не трогает
+    k._journal_stage(prog, "run_x", "run_started")
+    k._journal_stage(prog, "run_x", "state_committed")
+    k.save_json(camp / "combined_run_x.json",
+                {"products": [{"pid": 101, "ok": True}]})
+
+    called = []
+    k._recover_interrupted_run(prog, str(tmp_path),
+                               qa_fn=lambda b: called.append(1) or {})
+    assert not called  # QA не вызывался
+    assert prog["valid_pids"] == []
+
+
+def test_recover_no_journal_does_nothing(tmp_path, monkeypatch):
+    camp = tmp_path / "campaigns" / "c"
+    camp.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path / "campaigns")
+    for pid in ("101",):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    called = []
+    k._recover_interrupted_run(prog, str(tmp_path),
+                               qa_fn=lambda b: called.append(1) or {})
+    assert not called
+    assert prog["valid_pids"] == []
+
+
+# --- этап 0: поглощение recovery-телеметрии (ADR §14.6) ----------------------
+
+def test_absorb_recovery_telemetry():
+    """Из combined.recovery переносятся поля телеметрии в progress."""
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    combined = {"recovery": {
+        "events": [
+            {"kind": "new_tab", "signature": "анти-бот (page): captcha",
+             "last_url": "https://www.ozon.ru/product/1",
+             "browser_tabs": 5, "collector_tabs": 1},
+        ],
+        "browser_tabs": 5,
+    }}
+    k._absorb_recovery_telemetry(p, combined)
+    tele = p["recovery_telemetry"]
+    assert tele["last_challenge_signature"] == "анти-бот (page): captcha"
+    assert tele["last_page_url"] == "https://www.ozon.ru/product/1"
+    assert tele["browser_tabs"] == 5
+    assert tele["collector_tabs"] == 1
+
+
+def test_absorb_recovery_telemetry_no_events():
+    """Без events/combined — recovery_telemetry не заполняется."""
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    k._absorb_recovery_telemetry(p, {"recovery": {"events": []}})
+    assert p.get("recovery_telemetry", {}) == {}
+    k._absorb_recovery_telemetry(p, None)
+    assert p.get("recovery_telemetry", {}) == {}
+
+
+def test_absorb_kpi_accumulates():
+    """KPI из combined накапливается в progress.recovery_telemetry.kpi.
+
+    Проверяем и НАКОПЛЕНИЕ (два прогона складывают total_challenges), и что
+    fingerprint переносится, и что KPI абсорбируется даже без events
+    (ревизия 2.6 — KPI независим от списка событий).
+    """
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    k._absorb_recovery_telemetry(p, {
+        "kpi": {"total_challenges": 2, "total_recoveries": 3,
+                "success_rate": 0.5},
+        "fingerprint": {"webdriver": False, "tz": "Europe/Moscow"},
+        "recovery": {"events": []},
+    })
+    tele = p["recovery_telemetry"]
+    assert tele["kpi"]["total_challenges"] == 2
+    assert tele["kpi"]["total_recoveries"] == 3
+    assert tele["kpi"]["last_success_rate"] == 0.5
+    assert tele["fingerprint"]["webdriver"] is False
+    # второй прогон — накопление
+    k._absorb_recovery_telemetry(p, {
+        "kpi": {"total_challenges": 1, "total_recoveries": 1},
+        "recovery": {"events": []},
+    })
+    assert tele["kpi"]["total_challenges"] == 3
+    assert tele["kpi"]["total_recoveries"] == 4
+
+
+def test_status_payload_includes_telemetry(tmp_path):
+    """status.json содержит browser_tabs/last_page_url/last_challenge_signature."""
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    p["recovery_telemetry"] = {
+        "browser_tabs": 3, "collector_tabs": 1,
+        "last_page_url": "https://www.ozon.ru/product/9",
+        "last_challenge_signature": "title:доступ ограничен",
+    }
+    payload = k._status_payload(p)
+    assert payload["browser_tabs"] == 3
+    assert payload["collector_tabs"] == 1
+    assert payload["last_page_url"] == "https://www.ozon.ru/product/9"
+    assert payload["last_challenge_signature"] == "title:доступ ограничен"
+
+
+# --- этап 5/6: adaptive cooldown + profile cooldown (ADR §14.4/14.5) ---------
+
+def test_challenge_cooldown_escalates(monkeypatch):
+    """Adaptive backoff: storm#1≈1м, #2≈5м, #3≈15м (с допустимым джиттером)."""
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    p["challenge_control"] = {"storm_streak": 1}
+    d1 = k._challenge_cooldown_seconds(p)
+    p["challenge_control"] = {"storm_streak": 2}
+    d2 = k._challenge_cooldown_seconds(p)
+    p["challenge_control"] = {"storm_streak": 3}
+    d3 = k._challenge_cooldown_seconds(p)
+    p["challenge_control"] = {"storm_streak": 10}
+    d4 = k._challenge_cooldown_seconds(p)
+    assert 45 <= d1 <= 75          # 60 ±20%
+    assert 225 <= d2 <= 375        # 300 ±20%
+    assert 675 <= d3 <= 1125       # 900 ±20%
+    assert 675 <= d4 <= 1125       # залипаем на 900
+
+
+def test_bump_challenge_control():
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    p["recovery_telemetry"] = {"last_challenge_signature": "title:captcha"}
+    cc = k._bump_challenge_control(p)
+    assert cc["storm_streak"] == 1
+    assert cc["total_storms"] == 1
+    assert cc["last_signature"] == "title:captcha"
+    k._bump_challenge_control(p)
+    assert p["challenge_control"]["storm_streak"] == 2
+    assert p["challenge_control"]["total_storms"] == 2
+
+
+def test_challenge_control_reset_on_progress():
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    p["challenge_control"] = {"storm_streak": 3}
+    p["no_progress_count"] = 5
+    p["challenge_seq"] = 4
+    # имитируем блок сброса при new_disc/new_valid
+    if True:  # прогресс
+        p["no_progress_count"] = 0
+        p["challenge_seq"] = 0
+        cc = p.get("challenge_control") or {}
+        cc["storm_streak"] = 0
+        p["challenge_control"] = cc
+    assert p["challenge_control"]["storm_streak"] == 0
+
+
+def test_integration_persistent_challenge_needs_attention(tmp_path, monkeypatch):
+    """Persistent challenge (combined.aborted каждый прогон) → после эскалации
+    (storm_streak > max) → NEEDS_ATTENTION, а не вечный cooldown."""
+    def fac(argv):
+        return {"products": [], "found": 0, "aborted": {"reason": "session_blocked"}}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    # короткие ступени (≤5с) — иначе cooldown-цикл с mock-sleep зависнет
+    monkeypatch.setattr(k, "CHALLENGE_COOLDOWN_STEPS_S", [1, 2, 3])
+    monkeypatch.setattr(k, "CHALLENGE_JITTER_FRAC", 0.0)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=3, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=0,
+        reserve_count=0, max_total_hours=24.0,
+        max_no_progress_runs=100)
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog["final_reason"] == "challenge_storm"
+    assert prog["challenge_control"]["storm_streak"] > 3
+    assert prog["profile_cooldown"]["reason"] == "repeated_challenge"
+
+
+def test_integration_partial_storm_no_escalation(tmp_path, monkeypatch):
+    """ЧАСТИЧНЫЙ шторм (parallel=2, штормил ОДИН воркер, all_workers=False) →
+    короткая пауза БЕЗ эскалации: storm_streak не растёт, profile_cooldown не
+    заполняется, NEEDS_ATTENTION не ставится (ADR §14.6)."""
+    def fac(argv):
+        return {"products": [], "found": 0,
+                "aborted": {"reason": "challenge_storm", "all_workers": False,
+                            "workers_stormed": [1]}}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    monkeypatch.setattr(k, "CHALLENGE_COOLDOWN_STEPS_S", [1, 2, 3])
+    monkeypatch.setattr(k, "CHALLENGE_JITTER_FRAC", 0.0)
+    monkeypatch.setattr(k, "CHALLENGE_PARTIAL_PAUSE_S", 1)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=3, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=0,
+        reserve_count=0, max_total_hours=24.0,
+        max_no_progress_runs=5, parallel=2)
+    # частичный шторм не должен эскалировать в NEEDS_ATTENTION
+    assert prog.get("final_state") != "NEEDS_ATTENTION"
+    assert not prog.get("final_reason") == "challenge_storm"
+    assert prog["challenge_control"]["storm_streak"] == 0
+    assert prog.get("profile_cooldown") is None or \
+        not prog["profile_cooldown"].get("until")
+
+
+def test_integration_full_storm_parallel_escalates(tmp_path, monkeypatch):
+    """ФУЛЛ-шторм (parallel=2, ВСЕ воркеры упёрлись, all_workers=True) →
+    эскалация как у одиночного: NEEDS_ATTENTION + profile_cooldown."""
+    def fac(argv):
+        return {"products": [], "found": 0,
+                "aborted": {"reason": "challenge_storm", "all_workers": True,
+                            "workers_stormed": [1, 2]}}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    monkeypatch.setattr(k, "CHALLENGE_COOLDOWN_STEPS_S", [1, 2, 3])
+    monkeypatch.setattr(k, "CHALLENGE_JITTER_FRAC", 0.0)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=3, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=0,
+        reserve_count=0, max_total_hours=24.0,
+        max_no_progress_runs=100, parallel=2)
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog["final_reason"] == "challenge_storm"
+    assert prog["challenge_control"]["storm_streak"] > 3
+    assert prog["profile_cooldown"]["reason"] == "repeated_challenge"

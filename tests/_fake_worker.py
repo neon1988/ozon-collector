@@ -60,13 +60,27 @@ def _ok(pid: str) -> dict:
 
 
 def fake_run_shard(spec, sess, manager, items, gather_cfg,
-                   max_recycles, recovery, on_recovery) -> list[dict]:
+                   max_recycles, recovery, on_recovery,
+                   on_progress=None) -> list[dict]:
     """Детерминированный шард-цикл по сценарию из env OZON_WORKER_TEST_SCENARIO."""
     k = spec["worker_id"]
     scenario = os.environ.get("OZON_WORKER_TEST_SCENARIO", "ok")
     if scenario == "hang":
         time.sleep(3600)
         raise RuntimeError("unreachable: hang worker вернулся")
+    if scenario == "hang_after_progress":
+        results = []
+        for idx, pid, _url in items:
+            results.append(_ok(pid))
+            if on_progress is not None:
+                try:
+                    on_progress(results, len(results), len(items))
+                except Exception:
+                    pass
+            if len(results) >= 5:
+                break
+        time.sleep(3600)
+        raise RuntimeError("unreachable: hang_after_progress worker вернулся")
     if scenario == "raise":
         raise RuntimeError("boom in worker")
     results = []
@@ -77,4 +91,9 @@ def fake_run_shard(spec, sess, manager, items, gather_cfg,
             recovery["events"].append(ev)
             on_recovery(ev)
         results.append(_ok(pid))
+        if on_progress is not None:
+            try:
+                on_progress(results, len(results), len(items))
+            except Exception:
+                pass
     return results

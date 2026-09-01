@@ -13,8 +13,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 
 from . import SCHEMA_VERSION, VERSION
@@ -57,6 +59,49 @@ def _parse_utc(s: str) -> datetime | None:
 def raw_path(pid: str, data_dir: str = "data") -> str:
     """Путь raw.json для pid: data/{pid}_raw.json."""
     return os.path.join(data_dir, f"{pid}_raw.json")
+
+
+def atomic_write_text(path: str, text: str) -> None:
+    """Атомарная запись текстового файла: tmp в той же директории + os.replace.
+
+    Канонический файл всегда либо старый целиком, либо новый целиком —
+    читатель никогда не увидит частично записанный файл.
+    """
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=parent, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def atomic_write_json(path: str, raw: dict) -> None:
+    """Атомарная запись JSON (с indent=2) — см. atomic_write_text."""
+    atomic_write_text(path, json.dumps(raw, ensure_ascii=False, indent=2))
+
+
+def raw_sha256(path: str) -> str | None:
+    """SHA256 содержимого canonical raw, или None если файла нет/не читается.
+
+    Fingerprint версии raw: более строгий, чем mtime. Используется для
+    инвалидации QA-кэша и фиксации immutable snapshot'а (shared bytes).
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def raw_save_path(pid: str, data_dir: str = "data",

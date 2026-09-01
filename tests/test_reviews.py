@@ -716,11 +716,15 @@ def test_expand_comments_trusted_clicks(browser):
 
 
 def test_is_sticky_intercept():
-    """_is_sticky_intercept отличает перекрытие sticky-блоком от прочих ошибок:
-    только сообщение «intercepts pointer events» должно давать True (это НЕ
-    renderer_failure — сбор должен продолжаться, а не падать)."""
+    """_is_sticky_intercept отличает перекрытие sticky-блоком/нестабильность
+    элемента от прочих ошибок: сообщения «intercepts pointer events» и
+    «element is not stable» должны давать True (это НЕ renderer_failure —
+    сбор должен продолжаться, а не падать)."""
     assert collect_mod._is_sticky_intercept(
         Exception("Timeout 4000ms exceeded. ... subtree intercepts pointer events ...")
+    ) is True
+    assert collect_mod._is_sticky_intercept(
+        Exception("Timeout 4000ms exceeded. ... element is not stable ...")
     ) is True
     assert collect_mod._is_sticky_intercept(
         Exception("Timeout 30000ms exceeded")
@@ -755,7 +759,58 @@ def test_expand_comments_sticky_fallback(browser):
         page.close()
 
 
-# ---- Multi-sort: сбор отзывов в нескольких сортировках -----------------------
+def test_expand_comments_timeout_falls_back_to_js(browser, monkeypatch):
+    """Trusted-клик Playwright таймаутит (не sticky, просто медленный рендер) —
+    JS-fallback el.click() раскрывает комментарий, а прогон НЕ падает как
+    renderer_failure (если сам JS-fallback жив)."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+    calls = {"js_clicks": 0, "trusted": 0}
+    marked = [1]
+
+    class _FakeHandle:
+        def evaluate(self, *a, **kw):
+            calls["js_clicks"] += 1
+            marked[0] = 0   # карточка помечена data-comments-clicked
+
+        def scroll_into_view_if_needed(self, *a, **kw):
+            pass
+
+        def click(self, *a, **kw):
+            calls["trusted"] += 1
+            raise PWTimeout("Timeout 8000ms exceeded")
+
+    class _FakeLocator:
+        def __getattr__(self, name):
+            return lambda *a, **kw: None
+
+        @property
+        def first(self):
+            return _FakeLocator()
+
+        def count(self):
+            return marked[0]
+
+        def element_handle(self):
+            return _FakeHandle()
+
+    class _FakePage:
+        def locator(self, *a, **kw):
+            return _FakeLocator()
+
+        def evaluate(self, js, *a, **kw):
+            if js is collect_mod.MARK_COMMENT_CARDS_JS:
+                return marked[0]
+            return 0
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    page = _FakePage()
+    n = collect_mod._expand_review_comments(page)
+    assert n == 1
+    assert calls["trusted"] == 1
+    assert calls["js_clicks"] >= 1
+
 
 class _RecordingPage:
     """Страница, записывающая URL каждого goto; REVIEWS_JS отдаёт данные по URL.
@@ -858,6 +913,45 @@ def test_collect_reviews_unknown_sort_raises(monkeypatch):
     with pytest.raises(ValueError):
         collect_mod.collect_reviews(page, page.url, {}, min_reviews=1, sorts=["nonsense"])
     assert page.gotos == []
+
+
+def test_collect_reviews_small_variant_skips_remaining_sorts(monkeypatch):
+    """vc=5 <= 100 и первый проход собрал все 5 — score_asc не запускается:
+    тот же набор в другом порядке, второй проход не нужен."""
+    _patch_variant_collect(monkeypatch, used=True)
+    base = "https://www.ozon.ru/product/test-123/?tab=reviews"
+    page = _RecordingPage({
+        base: {"ok": True,
+               "reviews": [_rev(f"u{i}", "общий") for i in range(5)]},
+    })
+    reviews, _, page_log, vm = collect_mod.collect_reviews(
+        page, page.url, {"Цвет": "белый"}, min_reviews=1,
+        sorts=["published_at_desc", "score_asc"],
+    )
+    assert page.gotos == [base]
+    assert len(reviews) == 5
+    assert len(page_log) == 1
+    assert vm["variant_count"] == 5
+
+
+def test_collect_reviews_incomplete_small_variant_runs_all_sorts(monkeypatch):
+    """vc=5, но первый проход собрал только 3 — вторая сортировка нужна
+    (докрутить недостающее), пропуск НЕ срабатывает."""
+    _patch_variant_collect(monkeypatch, used=True)
+    base = "https://www.ozon.ru/product/test-123/?tab=reviews"
+    a_url = base + "&sort=score_asc"
+    page = _RecordingPage({
+        base: {"ok": True,
+               "reviews": [_rev(f"u{i}", "общий") for i in range(3)]},
+        a_url: {"ok": True,
+                "reviews": [_rev(f"u{i}", "общий") for i in range(5)]},
+    })
+    reviews, *_ = collect_mod.collect_reviews(
+        page, page.url, {"Цвет": "белый"}, min_reviews=1,
+        sorts=["published_at_desc", "score_asc"],
+    )
+    assert page.gotos == [base, a_url]
+    assert len(reviews) == 5
 
 
 def test_collect_reviews_legacy_no_sort_tagging(monkeypatch):

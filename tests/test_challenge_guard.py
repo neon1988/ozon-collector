@@ -93,6 +93,16 @@ def test_check_challenge_raises_access_challenge():
         check_challenge(page, "product_page")
 
 
+def test_check_challenge_marks_page_invalid():
+    """ADR §14.1: после детекта challenge страница помечается INVALID (K4)."""
+    page = _Page(title="Похоже, нет соединения")
+    try:
+        check_challenge(page, "product_page")
+    except B.AccessChallengeError:
+        pass
+    assert page.is_invalid is True
+
+
 def test_check_challenge_passes_on_normal_page():
     check_challenge(_Page(title="Робот-пылесос Xiaomi X"), "product_page")
 

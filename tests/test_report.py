@@ -18,8 +18,8 @@ def _c(text, author="Продавец", reply_to="Иван"):
             "date": "2026-08-01", "text": text, "like": 0, "dislike": 0}
 
 
-def _review(author, comments, text="отзыв"):
-    return {"author": author, "date": "2026-08-01", "stars": 5,
+def _review(author, comments, text="отзыв", stars=5):
+    return {"author": author, "date": "2026-08-01", "stars": stars,
             "text": text, "comments": comments}
 
 
@@ -143,6 +143,46 @@ def test_render_no_dedup_flag():
     ]), dedup_replies=False)
     assert md.count("спасибо за заказ") == 2
     assert "пропущено" not in md
+
+
+def test_render_rating_and_opinion_omitted():
+    """Рейтинг и «По мнению покупателей» не выводятся в карточке md (это данные
+    обо всех вариантах и мешают оценке; в raw/кеше остаются)."""
+    raw = _raw([])
+    raw["product"]["rating"] = 4.9
+    raw["product"]["rating_count"] = 3045
+    raw["product"]["rating_source"] = "webSingleProductScore"
+    raw["product"]["customer_opinion"] = {
+        "recommend_percent": 92,
+        "stars": {"5": "81", "4": "12", "3": "4", "2": "2", "1": "1"},
+    }
+    md = render(raw)
+    assert "Рейтинг:" not in md
+    assert "webSingleProductScore" not in md
+    assert "По мнению покупателей" not in md
+    assert "92% рекомендуют" not in md
+
+
+def test_render_no_rating_opinion_lines():
+    """Без рейтинга/opinion в raw — строки не выводятся, карточка цела."""
+    md = render(_raw([]))
+    assert "Рейтинг:" not in md
+    assert "По мнению покупателей" not in md
+    assert "Средний рейтинг по отзывам" not in md
+
+
+def test_render_avg_review_rating():
+    """Средний балл по оценкам собранных отзывов выводится в карточке."""
+    raw = _raw([
+        _review("A", [], stars=5),
+        _review("B", [], stars=4),
+        _review("C", [], stars=3),
+        _review("D", [], stars=3),
+    ])
+    md = render(raw)
+    assert "Средний рейтинг по отзывам:** 3.750 / 5 (4 оценки)" in md
+    md2 = render(_raw([_review("A", [], stars=5)]))
+    assert "Средний рейтинг по отзывам:** 5.000 / 5 (1 оценка)" in md2
 
 
 def _combined(products):

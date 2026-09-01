@@ -19,6 +19,19 @@ def plural(n: int, forms=("отзыв", "отзыва", "отзывов")) -> st
     return forms[2]
 
 
+def _avg_review_rating(reviews: list) -> float | None:
+    """Средний балл по оценкам собранных отзывов (stars 1–5), None — отзывов нет."""
+    vals = [r.get("stars") for r in (reviews or [])]
+    vals = [v for v in vals if isinstance(v, (int, float)) and 1 <= v <= 5]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def _num(v):
+    return float(v) if isinstance(v, str) else v
+
+
 def _price_block(product: dict) -> list:
     """Строки секции цены: price (webPrice, точная) / price_parsed / price_parts."""
     lines = []
@@ -181,14 +194,10 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
     L.append("## 1. Карточка товара")
     L.append("")
     L.append(f"- **Товар:** {product.get('title', '—')}")
-    rating = product.get("rating")
-    rc = product.get("rating_count")
-    rsrc = product.get("rating_source")
-    rsrc_txt = f" (источник: {rsrc})" if rsrc else ""
-    if isinstance(rating, (int, float)):
-        L.append(f"- **Рейтинг:** {rating} / 5 ({rc if rc is not None else '—'} оценок){rsrc_txt}")
-    elif rating:
-        L.append(f"- **Рейтинг:** {rating}{rsrc_txt}")
+    avg = _avg_review_rating(reviews)
+    if avg is not None:
+        L.append(f"- **Средний рейтинг по отзывам:** {avg:.3f} / 5 "
+                 f"({len(reviews)} {plural(len(reviews), ('оценка', 'оценки', 'оценок'))})")
     if product.get("category"):
         L.append(f"- **Категория:** {product['category']}")
     variant_str = _variant_str(target)

@@ -98,7 +98,8 @@ class TestSessionAutoLaunch:
         monkeypatch.setattr(cdp, "browser_alive", lambda url: alive())
 
         class FakeBrowser:
-            contexts = [type("FakeCtx", (), {"pages": [object()]})()]
+            contexts = [type("FakeCtx", (), {"pages": [object()],
+                                             "new_page": lambda self=0: object()})()]
 
         class FakeChromium:
             def __init__(self):
@@ -148,7 +149,8 @@ class TestSessionAutoLaunch:
                 fail["flag"] = False
                 raise RuntimeError("TargetClosedError")
             return type("FakeBrowser", (),
-                        {"contexts": [type("FakeCtx", (), {"pages": [object()]})()]})()
+                        {"contexts": [type("FakeCtx", (), {"pages": [object()],
+                                                           "new_page": lambda self=0: object()})()]})()
 
         launches = self._install(monkeypatch, lambda: True, connect=connect)
         s = cdp.Session("http://127.0.0.1:9999")
@@ -235,6 +237,25 @@ class TestSessionWatchdogGuard:
         s.close()
         assert s._watchdog is None
 
+    def test_guard_blocks_extract_on_invalid_page(self, monkeypatch):
+        """ADR §14.1: INVALID-страница блокирует извлечение (K4).
+
+        После challenge страница помечается is_invalid; любые eval/goto/scroll/
+        wait на ней бросают AccessChallengeError ДО обращения к page."""
+        s = self._session(monkeypatch)
+        s.page.is_invalid = True
+        with pytest.raises(B.AccessChallengeError):
+            s.eval("1+1")
+        assert s.page.evals == 0          # DOM не читался
+        with pytest.raises(B.AccessChallengeError):
+            s.scroll(100)
+        with pytest.raises(B.AccessChallengeError):
+            s.wait(10)
+        # новая вкладка снимает INVALID
+        s.page = _FakePage()
+        s.eval("1+1")
+        assert s.page.evals == 1
+
 
 class _TabPage:
     """Мини-фейк вкладки: close + init_script для Session.new_page."""
@@ -245,6 +266,9 @@ class _TabPage:
 
     def close(self):
         self.closed = True
+
+    def is_closed(self):
+        return self.closed
 
     def add_init_script(self, js):
         self.init_scripts.append(js)
@@ -272,7 +296,10 @@ class TestSessionNewPage:
         assert new is not old
         assert ctx.new_tabs == [new]
         assert old.closed is True
-        assert new.init_scripts != []      # анти-детект init_script на вкладке
+        # анти-детект init_script БОЛЬШЕ не ставится: подмена navigator.webdriver
+        # делает свойство геттером (вместо data-свойства false) и Ozon отслеживает
+        # это как признак бота → «нет соединения». Проверено эмпирически.
+        assert new.init_scripts == []
 
     def test_new_page_keeps_old_when_close_false(self):
         s, ctx = self._session()
@@ -287,3 +314,54 @@ class TestSessionNewPage:
         s.page = None
         with pytest.raises(RuntimeError):
             s.new_page()
+
+
+# ---- этап 1: ownership (ADR §14.1) -------------------------------------------
+
+def test_launch_marker_detects_collector_profile(tmp_path):
+    """launch_chrome ставит маркер → Session считает профиль collector'ским."""
+    assert cdp._launch_marker(str(tmp_path)) is False
+    (tmp_path / ".ozon_collector_launched").write_text("2026-08-31", encoding="utf-8")
+    assert cdp._launch_marker(str(tmp_path)) is True
+
+
+class TestEnsureSingleWorkerTab:
+    """ensure_single_worker_tab: закрывает только свои managed, чужие не трогает."""
+
+    def _session_with_pages(self, n_managed=2, n_foreign=1):
+        ctx = type("Ctx", (), {"new_tabs": []})()
+        ctx.new_page = lambda: ctx.new_tabs.append(_TabPage()) or ctx.new_tabs[-1]
+        browser = type("Browser", (),
+                       {"contexts": [ctx]})()
+        s = cdp.Session.__new__(cdp.Session)
+        s.cdp_url = "http://127.0.0.1:9222"
+        s._browser = browser
+        # managed: несколько «своих»; foreign: чужая вкладка пользователя
+        managed = [_TabPage() for _ in range(n_managed)]
+        foreign = [_TabPage() for _ in range(n_foreign)]
+        s._managed_pages = list(managed)
+        s.page = managed[0]
+        ctx.foreign = foreign
+        return s, managed, foreign
+
+    def test_closes_only_managed_and_keeps_one(self):
+        s, managed, foreign = self._session_with_pages()
+        cur = s.ensure_single_worker_tab()
+        # все старые managed закрыты, кроме рабочей
+        assert managed[0].closed is True
+        assert managed[1].closed is True
+        assert cur.closed is False
+        assert s.page is cur
+        assert s.collector_tabs() == 1
+        # чужие вкладки НЕ тронуты
+        assert all(f.closed is False for f in foreign)
+
+    def test_new_page_failure_keeps_old(self):
+        s, managed, _foreign = self._session_with_pages()
+        # new_page упадёт: _browser.contexts пустой → RuntimeError
+        s._browser = type("Browser", (), {"contexts": []})()
+        s.page = managed[0]
+        with pytest.raises(RuntimeError):
+            s.ensure_single_worker_tab()
+        # старая рабочая вкладка НЕ уничтожена
+        assert managed[0].closed is False

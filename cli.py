@@ -94,8 +94,6 @@ def cmd_collect(args):
         apply_variant_mode=not args.no_variant_mode,
         sorts=_parse_sorts(args.sorts),
     )
-    print(f"DONE. reviews={raw['reviews_collected']}, "
-          f"out=data/{C.pid_from_url(url)}_raw.json")
     log.info(f"[cli] DONE. reviews={raw['reviews_collected']}, "
              f"out=data/{C.pid_from_url(url)}_raw.json")
 
@@ -109,8 +107,6 @@ def cmd_ocr(args):
     O.ocr_gallery(raw, gdir, threads=args.threads, preproc=not args.no_preproc)
     with open(args.raw, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
-    print("OCR:", raw.get("gallery_stats_text"))
-    print("DONE. raw обновлён:", args.raw)
     log.info(f"[cli] OCR: {raw.get('gallery_stats_text')}; "
              f"DONE. raw обновлён: {args.raw}")
 
@@ -123,7 +119,6 @@ def cmd_report(args):
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(md)
-        print(f"SAVED {args.out}")
         log.info(f"[cli] SAVED {args.out}")
     else:
         sys.stdout.write(md)
@@ -151,7 +146,7 @@ def cmd_gather(args):
         "no_variant_mode": args.no_variant_mode,
         "sorts": _parse_sorts(args.sorts),
         "max_age_s": max_age_s,
-        "no_ocr": args.no_ocr,
+        "no_ocr": not args.ocr,
         "threads": args.threads,
         "no_preproc": args.no_preproc,
         "gallery_dir": args.gallery_dir,
@@ -159,14 +154,12 @@ def cmd_gather(args):
     }
     log.info(f"[cli] gather: pid={pid} variant={args.variant!r} "
              f"sorts={cfg['sorts']!r} max_age_s={max_age_s} "
-             f"no_ocr={args.no_ocr}")
+             f"ocr={args.ocr}")
     res = run_gather(cfg)
     if not res["ok"]:
-        print(f"Error: {res['error']}", file=sys.stderr)
-        log.error(f"[cli] gather FAILED pid={pid}: {res['error']} "
+        log.error(f"[cli] Error: {res['error']} "
                   f"(kind={res.get('error_kind')})", stderr=True)
         sys.exit(1)
-    print(f"[gather] {pid}: cache={res['cache']} ocr={res['ocr']}")
     log.info(f"[cli] gather OK pid={pid}: cache={res['cache']} "
              f"ocr={res['ocr']}")
     md = res["markdown"]
@@ -174,7 +167,6 @@ def cmd_gather(args):
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(md)
-        print(f"SAVED {args.out}")
         log.info(f"[cli] SAVED {args.out}")
     else:
         sys.stdout.write(md)
@@ -191,12 +183,13 @@ def _gather_cfg_from_args(args, max_age_s):
         "no_variant_mode": args.no_variant_mode,
         "sorts": _parse_sorts(args.sorts),
         "max_age_s": max_age_s,
-        "no_ocr": args.no_ocr,
+        "no_ocr": not args.ocr,
         "threads": args.threads,
         "no_preproc": args.no_preproc,
         "dedup_replies": not args.no_dedup_replies,
         "overwrite": args.overwrite,
         "min_rating": getattr(args, "min_rating", None),
+        "window_mode": getattr(args, "window_mode", None),
     }
 
 
@@ -215,6 +208,10 @@ def cmd_search(args):
             print(f"Error: не могу прочитать --pids-file: {e}", file=sys.stderr)
             sys.exit(1)
     pids = parse_pids(pids)
+
+    skip_pids = []
+    if args.skip_pids:
+        skip_pids = parse_pids(args.skip_pids.split(","))
 
     if pids:
         limit = len(pids)
@@ -241,12 +238,12 @@ def cmd_search(args):
         print(f"Error: --parallel должен быть в 1..{PARALLEL_MAX_WORKERS}",
               file=sys.stderr)
         sys.exit(1)
-    if parallel > 1 and not args.no_ocr and not args.allow_parallel_ocr:
+    if parallel > 1 and args.ocr and not args.allow_parallel_ocr:
         print(f"Error: OCR в параллельном сборе требует --allow-parallel-ocr "
-              f"(или --no-ocr)", file=sys.stderr)
+              f"(или без --ocr)", file=sys.stderr)
         sys.exit(1)
-    if not (5 <= args.worker_timeout <= 3600):
-        print("Error: --worker-timeout должен быть в 5..3600 секунд",
+    if not (5 <= args.worker_timeout <= 86400):
+        print("Error: --worker-timeout должен быть в 5..86400 секунд",
               file=sys.stderr)
         sys.exit(1)
 
@@ -256,6 +253,12 @@ def cmd_search(args):
              f"parallel={parallel} pids={len(pids)}")
     gather_cfg = _gather_cfg_from_args(args, max_age_s)
     gather_cfg["scroll_jitter_seed"] = seed
+    if args.pause_s > 0:
+        gather_cfg["pause_s"] = args.pause_s
+    session_budget = None
+    if args.session_budget_wall_clock is not None:
+        session_budget = dict(S.SESSION_BUDGET_DEFAULT)
+        session_budget["wall_clock_s"] = args.session_budget_wall_clock
     if parallel > 1:
         if args.allow_parallel_ocr:
             import os as _os
@@ -264,49 +267,24 @@ def cmd_search(args):
             url, limit=limit, gather_cfg=gather_cfg,
             parallel=parallel, query=args.query,
             max_recycles=2, join_timeout_s=args.worker_timeout,
-            pids=pids or None, no_bootstrap=args.no_bootstrap_workers)
+            pids=pids or None, no_bootstrap=args.no_bootstrap_workers,
+            skip_pids=skip_pids or None,
+            session_budget=session_budget)
     else:
-        sess = Session()
+        _wm = gather_cfg.get("window_mode")
+        sess = Session(
+            keep_window=None if _wm is None else (_wm == "visible"))
         try:
             combined = S.collect_search(
                 sess, url, limit=limit,
                 gather_cfg=gather_cfg,
                 query=args.query,
                 pids=pids or None,
+                skip_pids=skip_pids or None,
+                session_budget=session_budget,
             )
         finally:
             sess.close()
-
-    if args.out:
-        paths = R.write_search_digest(
-            combined,
-            args.out,
-            reviews_per_product=args.reviews_per_product,
-            dedup_replies=not args.no_dedup_replies,
-            max_products_per_file=args.max_products_per_file)
-        for path in paths:
-            print(f"SAVED {path}")
-            log.info(f"[cli] SAVED {path}")
-    else:
-        md = R.render_search_digest(
-            combined, reviews_per_product=args.reviews_per_product,
-            dedup_replies=not args.no_dedup_replies)
-        sys.stdout.write(md)
-
-    if args.out_raw:
-        os.makedirs(os.path.dirname(args.out_raw) or ".", exist_ok=True)
-        with open(args.out_raw, "w", encoding="utf-8") as f:
-            json.dump(combined, f, ensure_ascii=False, indent=2)
-        print(f"SAVED {args.out_raw}")
-        log.info(f"[cli] SAVED {args.out_raw}")
-
-    ok = sum(1 for p in combined["products"] if p["ok"])
-    excluded = sum(1 for p in combined["products"] if p.get("excluded"))
-    print(f"[search] found={combined['found']} limit={combined['limit']} "
-          f"collected={combined['collected']} ok={ok} excluded={excluded}")
-    log.info(f"[cli] search DONE: found={combined['found']} "
-             f"limit={combined['limit']} collected={combined['collected']} "
-             f"ok={ok} excluded={excluded}")
 
     aborted = combined.get("aborted")
     if aborted:
@@ -321,6 +299,39 @@ def cmd_search(args):
                   f"{aborted.get('reason')}: "
                   f"streak={aborted.get('streak')}, "
                   f"remaining_aborted={aborted.get('remaining_aborted')}")
+        if args.out:
+            print("[search] Не пишу md: прогон прерван challenge storm, "
+                  "данные неполные.", file=sys.stderr)
+    else:
+        if args.out:
+            paths = R.write_search_digest(
+                combined,
+                args.out,
+                reviews_per_product=args.reviews_per_product,
+                dedup_replies=not args.no_dedup_replies,
+                max_products_per_file=args.max_products_per_file)
+            for path in paths:
+                log.info(f"[cli] SAVED {path}")
+        else:
+            md = R.render_search_digest(
+                combined, reviews_per_product=args.reviews_per_product,
+                dedup_replies=not args.no_dedup_replies)
+            sys.stdout.write(md)
+
+    # combined (машиночитаемый итог) пишется всегда, когда задан --out-raw,
+    # включая challenge-storm (частичные данные с полем aborted) — это нужно
+    # супервизору (key_daemon) для классификации состояния без парсинга текста.
+    if args.out_raw:
+        os.makedirs(os.path.dirname(args.out_raw) or ".", exist_ok=True)
+        with open(args.out_raw, "w", encoding="utf-8") as f:
+            json.dump(combined, f, ensure_ascii=False, indent=2)
+        log.info(f"[cli] SAVED {args.out_raw}")
+
+    ok = sum(1 for p in combined["products"] if p["ok"])
+    excluded = sum(1 for p in combined["products"] if p.get("excluded"))
+    log.info(f"[cli] search DONE: found={combined['found']} "
+             f"limit={combined['limit']} collected={combined['collected']} "
+             f"ok={ok} excluded={excluded}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -387,8 +398,8 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--no-preproc", action="store_true",
                     help="без cv2-предобработки (grayscale/upscale/CLAHE)")
     pg.add_argument("--no-dom", action="store_true", help="не сохранять DOM-снимок")
-    pg.add_argument("--no-ocr", action="store_true",
-                    help="пропустить OCR (быстрый прогон, без tesseract)")
+    pg.add_argument("--ocr", action="store_true",
+                    help="запустить OCR (tesseract) — по умолчанию выключен")
     pg.add_argument("--no-variant-mode", action="store_true",
                     help="не включать нативный фильтр «Этот вариант товара» (собрать все отзывы)")
     pg.add_argument("--overwrite", action="store_true",
@@ -418,6 +429,10 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--pids-file", default=None,
                     help="файл со списком артикулов/URL (по одному в строке; "
                          "совместим с --pids)")
+    ps.add_argument("--skip-pids", default=None,
+                    help="артикулы через запятую, которые НЕ собирать заново "
+                         "(уже обработанные); выдача сканируется, но эти PID "
+                         "пропускаются")
     ps.add_argument("--limit", type=int, default=5,
                     help="макс. товаров для сбора (по умолч. 5)")
     ps.add_argument("--reviews-per-product", type=int,
@@ -445,8 +460,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--no-preproc", action="store_true",
                     help="без cv2-предобработки (grayscale/upscale/CLAHE)")
     ps.add_argument("--no-dom", action="store_true", help="не сохранять DOM-снимок")
-    ps.add_argument("--no-ocr", action="store_true",
-                    help="пропустить OCR (быстрый прогон, без tesseract)")
+    ps.add_argument("--ocr", action="store_true",
+                    help="запустить OCR (tesseract) — по умолчанию выключен")
     ps.add_argument("--parallel", type=int, default=1,
                     help="кол-во воркер-процессов для search (1..N; "
                          "по умолчанию лимит 2, выше — OZON_PARALLEL_MAX; "
@@ -455,8 +470,11 @@ def build_parser() -> argparse.ArgumentParser:
                     action="store_true",
                     help="разрешить OCR в параллельном сборе "
                          "(потоки OCR на воркера уменьшаются)")
-    ps.add_argument("--worker-timeout", type=float, default=3600.0,
-                    help="макс. время ожидания воркеров, сек (по умолч. 3600)")
+    ps.add_argument("--worker-timeout", type=float, default=43200.0,
+                    help="макс. время ожидания воркеров, сек (по умолч. 43200 = 12 ч)")
+    ps.add_argument("--pause-s", type=float, default=0.0,
+                    help="пауза между товарами в воркерах, сек "
+                         "(защита от rate-limit Ozon; по умолчанию 0)")
     ps.add_argument("--no-bootstrap-workers", action="store_true",
                     help="не сеять cookies из ozon-profile в холодные "
                          "воркер-профили (по умолч. автоматически при --parallel>1)")
@@ -475,6 +493,17 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--scroll-jitter-seed", type=int, default=None,
                     help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
                          "по умолчанию случайный)")
+    ps.add_argument("--session-budget-wall-clock", type=int, default=None,
+                    help="жёсткий таймер сессии, сек (перекрывает дефолт "
+                         f"{S.SESSION_BUDGET_DEFAULT['wall_clock_s']}); "
+                         "для длинных --limit одиночных прогонов увеличь "
+                         "(по умолчанию берётся из SESSION_BUDGET_DEFAULT)")
+    ps.add_argument("--window-mode", choices=["visible", "hidden"],
+                    default=None,
+                    help="режим окна браузера коллектора: visible — окно "
+                         "развёрнуто и видимо наверху (NOACTIVATE), "
+                         "hidden — свёрнуто/не мешает работе. По умолчанию "
+                         "env OZON_KEEP_WINDOW=1 → visible.")
     ps.set_defaults(fn=cmd_search)
 
     return p

@@ -314,8 +314,7 @@ def download_tessdata_best(target_dir: str = "data/tessdata_best",
         if os.path.exists(fp) and os.path.getsize(fp) > 100 * 1024:
             installed.append(lang)
             continue
-        print(f"[ocr] download tessdata_best {lang}...")
-        log.info(f"download tessdata_best {lang}...")
+        log.info(f"[ocr] download tessdata_best {lang}...")
         data = _fetch(TESSDATA_BEST_URL.format(lang=lang), timeout=60)
         tmp = fp + ".download"
         with open(tmp, "wb") as f:
@@ -348,8 +347,7 @@ def download_gallery(urls: List[str], gallery_dir: str,
         try:
             data = _fetch(_upgrade_url(url))
         except Exception as e:
-            print(f"[ocr] fail fetch {url}: {e}")
-            log.warning(f"fail fetch {url}: {type(e).__name__}: {e}")
+            log.warning(f"[ocr] fail fetch {url}: {type(e).__name__}: {e}")
             return "failed", url, None
         if len(data) < MIN_BYTES:
             print(f"[ocr] skip small ({len(data)}B): {url}")
@@ -467,9 +465,8 @@ def ocr_gallery(raw: dict, gallery_dir: str, cache_dir: str = "data/ocr_cache",
             try:
                 download_tessdata_best(bundled)
             except Exception as e:
-                print(f"[ocr] tessdata_best download failed, use system: {e}")
-                log.warning(f"tessdata_best download failed, use system: "
-                            f"{type(e).__name__}: {e}")
+                log.warning(f"[ocr] tessdata_best download failed, use system: "
+                        f"{type(e).__name__}: {e}")
                 bundled = None
         tessdata_dir = bundled if bundled and os.path.exists(
             os.path.join(bundled, "rus.traineddata")) else None

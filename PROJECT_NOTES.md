@@ -2,8 +2,366 @@
 
 > Память проекта. Вся история, статус и решения по `~/ozon-collector` фиксируются
 > ТОЛЬКО здесь (и в `README.md`/`docs/`). В `AGENTS.md` — только ссылка на этот файл.
+>
+> **Кодировка (зафиксировано 2026-08-18): ВСЕ файлы проекта (PROJECT_NOTES.md,
+> README.md, docs/*.md, raw/прочие) пишутся и читаются только в UTF-8.**
+> Прошлые cp1251-вставки перекодированы в UTF-8 2026-08-18 (9 строк). Никогда
+> не писать и не читать эти файлы как cp1251/другие кодировки.
 
-## Статус и следующие шаги (последнее обновление: 2026-08-17)
+ - **OCR по умолчанию ВЫКЛЮЧЕН (2026-08-17).** Флаг --no-ocr заменён на --ocr (включает tesseract); в конфигах no_ocr = not args.ocr. Параллельный OCR требует --allow-parallel-ocr (проверка: args.ocr and not args.allow_parallel_ocr). Сбор 300 без OCR ускоряется в разы. test_gather.py 16 passed.
+
+ - **Новое поле: По мнению покупателей (customer_opinion) (2026-08-17).** В PRODUCT_JS добавлено извлечение блока: % рекомендуют (по всей странице) + гистограмма оценок по звёздам (строки N звёзд, процент из style=width, количество отзывов в конце строки). Поля: recommend_percent, stars {5..1: %}, counts {5..1: N}, text. Рендер в report.py: строка По мнению покупателей в карточке товара, напр. 92% рекомендуют 5? 88% (4527) · 4? 7.3% (374) .... Тесты test_extractors.py + test_report.py добавлены. Примечание: реальная разметка Ozon - проценты в атрибуте style=width строки N звёзд (webReviewProductScore), а не текст NN%.
+
+ - **Итог: `element is not stable` ? renderer_failure (2026-08-17).** В полном прогоне 300 (18:27+) на товаре 3103801574 клик по кнопке комментария падал: `TimeoutError: ElementHandle.click: Timeout 4000ms exceeded ... element is not stable` > ложно классифицировался как renderer_failure > recycle браузера (потеря прогресса). Это НЕ hang renderer: элемент просто двигался (lazy-load/анимация), renderer жив. Фикс в `collect.py`: `_is_sticky_intercept` теперь ловит и паттерн `element is not stable` (в дополнение к `intercepts pointer events`) > вместо recycle срабатывает fallback JS-клик `el.click()`, сбор продолжается. Тесты: `test_is_sticky_intercept` расширен, test_reviews.py 53 passed. Защита для следующих прогонов (текущий процесс работал со старым кодом).
+
+ - **Итог полного прогона 300 (18:27>19:28): обрыв по таймауту, данные в raw сохранены.** Воркеры собрали 25/300 товаров (13+12), но на 19:28:53 были принудительно terminate по дефолтному `--worker-timeout 3600` (1 ч) — раньше завершения. Итог `collected=0 ok=0`, отчёт пустой, ВСЕ товары в merge помечены `worker terminated/failed`, хотя `data/*_raw.*.json` записаны на диск (валидны, 70–192 отзывов). Причина: 300 товаров с OCR + 2 сортировками ? 2–5 мин/товар > нужно 6–12 ч, а лимит был 3600 сек.
+ **Фиксы (2026-08-17, для следующих прогонов):**
+ * `cli.py`: лимит `--worker-timeout` поднят 3600 > 86400 сек, дефолт 3600 > 43200 (12 ч).
+ * `collect.py _expand_review_comments`: max_passes 6>4, таймаут клика 4000>2000 мс, паузы 400>200 мс / 2500>1500 мс (комментарии — главный пожиратель времени, 4 мин на 62 кнопки).
+ * `parallel.py` + `search.py`: периодический progress-снимок (каждые PROGRESS_EVERY=5 товаров) — воркер шлёт частичный payload по pipe; при hang/terminate родитель берёт последний снимок, собранные товары НЕ теряются (вместо пустого отчёта). New: `WorkerContext.done`, `_reader_loop` t=progress, hang-детекция по `done` вместо `payload is None`. Тест `test_worker_hang_after_progress_keeps_partial` (42 passed в test_parallel.py).
+
+ - **Параллельность: дефолтный лимит 2 > 8 воркеров (2026-08-17).** `PARALLEL_MAX_WORKERS` в `__init__.py` по умолчанию теперь 8 (env `OZON_PARALLEL_MAX` по-прежнему переопределяет). Порты воркеров назначаются динамически (9222+k > 9223–9230), профили — `worker_profile_token(k)`, конфликтов нет. Тест `test_parallel_validation_bounds` обновлён (дефолт 8, env 16). Внимание: 8 одновременных сессий Ozon — выше нагрузка на FAB, следить за challenge-штормом.
+
+## Статус и следующие шаги (последнее обновление: 2026-08-31)
+
+ - **✅ anti_bot_architecture.md: ревизия 2.7 по 4 волнам критики + 3 правки кода (2026-08-31).**
+   КОД (P1/P2, реализовано):
+   * **Базовый fingerprint в телеметрию (P1).** `cdp.py: Session._capture_fingerprint_once`
+     снимает однократный снимок при первом `goto` каждой сессии — UA, `navigator.webdriver`,
+     languages, platform, hardwareConcurrency, deviceMemory, chrome, timezone, locale, viewport,
+     screen. Пишется в `combined.fingerprint` и в `status.json` (`recovery_telemetry.fingerprint`).
+     Только наблюдение (diff manual vs daemon), поведение не меняет. Полный fingerprint-probe —
+     по-прежнему P2 (§18.5).
+   * **`--session-budget-wall-clock` (P1).** CLI-параметр перекрывает `wall_clock_s` из
+     `SESSION_BUDGET_DEFAULT`; пробрасывается в `collect_search(..., session_budget=...)` и в
+     воркеры `--parallel` (через `collect_parallel(..., session_budget=...)` → task → worker
+     `recovery_metrics`). Длинные одиночные `--limit>100` прогоны больше не «намертво» 1800с.
+   * **Базовый KPI в `combined` + `status.json` (P2).** `combined.kpi`:
+     `total_challenges` (access_stats.challenges), `total_recoveries` (recycles+new_tab_attempts),
+     `products_since_recovery`, `success_rate`. Демон аккумулирует в
+     `recovery_telemetry.kpi` (копится по прогонам, абсорбируется даже без events).
+     В `status.json` — `kpi` и `fingerprint`.
+   ДОКУМЕНТ (честные контракты/исправления):
+   * §9 — пример бюджета пошагово (каждый `+=1`); исправлена опечатка «линмита»; отрезок
+     SESSION_BLOCKED vs SESSION_EXHAUSTED переписан честно: **в коде оба → profile_observed и
+     оба → CHALLENGE_STORM** (soft-эскалация EXHAUSTED — НЕ реализовано, кандидат в backlog).
+   * §9 — `wall_clock_s` настраиваемый (ревизия 2.6).
+   * §3 — базовый fingerprint реализован; полный probe остаётся P2.
+   * §5 — добавлен честный «слепой угол» CDP-аномалий (cdc_*, Runtime.enable): не маскируем
+     «стелс-паком», страховка = recovery/budget/cooldown.
+   * §6 — контракт «warmup new_tab => бесплатный» (не расходует session_used), лимит только
+     wall_clock.
+   * §10 — canary-fail => SESSION_BLOCKED немедленно, `canary_fails` — телеметрия, не бюджет.
+   * §11 — честно: `profile_cooldown.until` = тот же `until`, что storm (не независимый таймер);
+     canary после cooldown на главной даёт ложное «можно идти» (до P1 canary-на-товар);
+     риск хронического partial storm (soft-сигнал — задача §18.6).
+   * §13 — внешняя лестница: recycle на external = ещё одна свежая вкладка в ТОМ ЖЕ контексте,
+     не снимает контекстные блокировки; после него осознанный SESSION_BLOCKED.
+   * §18 — докрутка НЕ расходует session_used (только wall_clock общий); KPI частично
+     реализован (остались block_rate/scope-гистограмма/partial-сигнал).
+   ТЕСТЫ: key_daemon 211 (+1: absorb KPI аккумулируется), search 49 (+3: wall_clock override,
+   KPI+fingerprint, KPI counts), cli 13 (+2: wall_clock param), parallel 45. Совместный прогон
+   с browser-fixture виснет (pre-existing, артефакт teardown) — по отдельности всё зелёное.
+   Клиент-выбор: НЕ реализовывал (ввиду объёма/боевости) — canary-на-товар (P1, блокер), CDP-
+   нейтрализацию cdc_* (L2, противоречит «не стелс»), soft-эскалацию EXHAUSTED, partial-сигнал.
+
+ - **✅ key_daemon: ревизия кода + 12 новых багфиксов (2026-08-31).** Сессия аудита `scripts/key_daemon.py`:
+   * **K4-проверка в финализаторе (ВАЖНО).** `_qa_clean` финального QA НЕ проверял K4-инварианты —
+     недостоверная сводка давала fallback `OK` и тихо пропускала брак (в `classify_new_pids` проверка была,
+     а в финализаторе нет). Теперь `_qa_clean` возвращает `parse_error` → `NEEDS_ATTENTION`/`qa_parse_error`
+     (и при fail>0 с неполным per_pid — тоже).
+   * **Детерминизм snapshot/reserve.** `list(set(valid_pids))` давал hash-порядок (PYTHONHASHSEED-зависимый) →
+     на resume snapshot выбирался по-другому. Теперь `dict.fromkeys` сохраняет порядок обнаружения
+     (и в `reconcile_validity`, и в target_reached, и в мягком пути, и в `discovered_pids`).
+   * **Resume читает конфиг из манифеста.** `max_total_hours/max_no_progress_runs/max_rescans/reserve_count`
+     теперь берутся из `run_cfg` (источник истины), а не из аргументов CLI при рестарте.
+   * **PidLock:** битый pid-файл (не int / нет поля pid) → трактуется как stale, не падает.
+   * **П1 в reconcile:** `reconcile_validity` теперь выбрасывает из `valid_pids` пиды, чей raw-файл
+     исчез (источник истины — наличие canonical raw), а не только по вердикту FAIL.
+   * **Immutable snapshot:** при target_reached `campaign_final_pids`/`campaign_reserve_pids` сразу
+     сохраняются в манифест (до финального QA) — при resume не пересобираются.
+   * **`validate_new_campaign`:** для НОВОЙ кампании обязательно `1 ≤ min_valid < target` (иначе
+     SystemExit); `--min-valid` дефолт изменён 0 → 1. min_valid=0 давал бы пустой `COMPLETED_MIN`.
+   * **`reserve_pids`** (legacy-поле, дублировало `campaign_reserve_pids`) — удалено из манифеста.
+   * **`find_running_cli_pids`** (мёртвый код с `wmic`) — удалён.
+   * **UNKNOWN_FAILURE** теперь ставит `final_reason="unknown_failure"` (раньше оставался None).
+   * **Новая кампания без `--url`** → SystemExit (fail-fast вместо тихого `--url ""`); при resume url не нужен (из манифеста).
+   * **run_id** получил счётчик `run_{ts}_{n}` — исключает коллизию `combined_*.json` при быстрых (<1с) последовательных прогонах.
+   * **JSON-контракт демон↔QA (P0 из ревью архитектуры):** `qa_raw --report-json <path>`
+     пишет `{summary, products:[{pid, verdict, issues}]}`; демон читает JSON вместо regex по stdout
+     (stdout — fallback). Бонус: из issues демон детектирует детерминированный брак.
+   * **Детерминированный брак → без бесполезного rescan:** `fail_reason_seq` (pid → набор кодов
+     issues + сколько раз подряд тот же). 2× идентичный FAIL → сразу `permanently_failed`,
+     бюджет rescan не сжигается; причина сменилась/стал OK → история сброса.
+   * **`_alive`-гард:** нереалистичные PID (0, отрицательные, ≥2^24) → False без `os.kill`
+     (на Windows `os.kill(huge,0)` зависал — сломало бы демон на старте при битом pid-файле).
+   * **`qa_raw`: баг без `--pids`** — `args.pids.replace` падал на None; исправлено
+     `(args.pids or "")`. 6 падений `test_qa_raw` — предсуществующие (OLD_DATA по старым фикстурам).
+   * **`test_baseline_matches_source_raw`** помечен `@pytest.mark.xfail(strict=False)` —
+     известный дрейф baseline, не регрессия кода; CI не красный.
+   * Тесты: **192 → 209** (JSON-парсер, fail_reason_seq, _alive-гард, discovery-лимит,
+     WALL_LIMITED parse, validate_new_campaign, сброс счётчиков, UNKNOWN_FAILURE, run_id-уникальность).
+   * **Контракт rescan подтверждён:** `cli.py search --pids A,B --out-raw` реально существует,
+     собирает конкретные PID без докрутки и пишет `combined.products` (тесты `test_collect_search_pids_*`).
+   * У тестов, вызывающих `notify` из финализатора, замьючен `k.notify` (нет записи в реальный `data/`).
+* Документация: `docs/key_daemon_architecture.md` — полное описание (K4 в обоих местах, П1,
+      immutable snapshot, validate_new_campaign, кроссплатформенность, PID-reuse limitation, контракт --pids).
+   * **✅ P0/P1-рефакторинг (2026-08-31):** доведён до зелёного (201 тест key_daemon, 212 всего).
+      * **Atomic raw-write:** `gather.py`/`collect.py` пишут raw через `atomic_write_json`
+        (tmp → `os.replace`) из `ozon_collector/cache.py` (+ `atomic_write_text`, `raw_sha256`).
+      * **QA-кэш → `verdict_meta`** вместо `verdict_mtime`: fingerprint = `raw_mtime_ns`
+        (быстрый фильтр) + `raw_sha256` (строгий) + `qa_version`. Race-защита: fingerprint
+        до/после QA (если raw менялся во время QA — вердикт недействителен).
+        Ключ инвалидации — `QA_VERSION="1.5"`.
+      * **Run-journal:** `runs/{run_id}.json` со стадиями `run_started / run_completed /
+        qa_completed / state_committed`. `_recover_interrupted_run` при resume находит
+        последний прогон без `state_committed` и повторно применяет discovery + QA + reconcile.
+      * **Runtime API:** `status.json` (state-переходы через `_set_state`, `DAEMON_STATES`)
+        + `events.jsonl` (append-only лог событий).
+      * **`campaign_identity`** (url_sha256 + schema_version + collector_version) — защита от
+        смены категории при resume; `--force-new` для обхода. `run_cfg_hash` + `run_cfg_modified`.
+      * **Transient-retry UNKNOWN_FAILURE:** до `--max-transient-retries` (дефолт 3) с короткой
+        паузой `TRANSIENT_RETRY_BACKOFF_S=4`, затем NEEDS_ATTENTION/unknown_failure.
+        (Фикс зависания: раньше ставился cooldown 300с, тест с mock-sleep крутился вечно.)
+      * **`no_progress_count`** разделён на `progress` и `stall` по типам.
+      * Docs обновлены (`key_daemon_architecture.md`: verdict_meta, run_cfg, journal, status/events;
+        `architecture.md`: файлы на диске).
+
+   * **✅ Анти-бот: ADR + Этап 0 (телеметрия, 2026-08-31).** Утверждён контракт
+     `docs/anti_bot_architecture.md §14` (мини-ADR): challenge = стоп-сигнал, а не
+     лавина recovery; 4 контракта (collector_tabs, browser-ownership, типы сбоев,
+     INVALID-страница); FSM + observed_scope; без health-score/stealth/ротации.
+     Реализован **Этап 0** (только наблюдаемость, поведение не менялось):
+     * `cdp.py`: `browser_tabs_count()` (HTTP /json/list, диагностика) +
+       `Session._managed_pages`/`collector_tabs()` (источник истины для
+       collector_tabs — свои страницы, не чужие вкладки).
+     * `search.py`: `_recovery_meta()` обогащает каждое recovery-событие
+       (signature, last_url, browser_tabs, collector_tabs, duration_ms,
+       products_since_recovery); счётчик `since_recovery` сбрасывается при
+       любом recovery.
+     * `key_daemon.py`: `_absorb_recovery_telemetry()` переносит recovery-метрики
+       из combined в progress; `_status_payload` +4 поля (browser_tabs,
+       collector_tabs, last_page_url, last_challenge_signature).
+     * Тесты: +6 (search: 2, key_daemon: 3, cdp-фиксы). Прогоны зелёные:
+       key_daemon 204, search 38, cli/baseline/collect_topup 31, cache/gather/
+       browser/parallel 179, cdp/challenge 35.
+     * **Известный артефакт:** совместный pytest key_daemon+search даёт hang
+       browser-fixture (предсуществующий, не от телеметрии); по отдельности всё
+       зелёное.
+     * Следующие этапы ADR: 1 ownership/lifecycle → 2 challenge FSM.
+
+   * **✅ Анти-бот: Этап 1 (ownership + lifecycle, 2026-08-31).** По ADR §14:
+     * `cdp.py Session`: поля `browser_owner` (external|collector), `browser_pid`,
+       `browser_profile`, `browser_started_at`, `ownership_token`. Определение:
+       если `auto_launch` поднял браузер → collector; иначе по маркеру
+       `{profile}/.ozon_collector_launched` (ставит launch_chrome.*) → collector,
+       при отсутствии → external. При external НЕ берём `ctx.pages[0]` (чужую
+       вкладку пользователя), а создаём свою `ctx.new_page()`.
+     * `Session.ensure_single_worker_tab()`: безопасный порядок (create →
+       init_script → rebind → close только свои managed → assert collector_tabs==1);
+       при ошибке создания новую вкладку старая НЕ уничтожается. Вызов — вне
+       critical section collect.
+     * `search.py _recycle_browser`: external → только ensure_single_worker_tab
+       (kill/restart ЗАПРЕЩЁН); collector → manager.restart + reconnect (как было).
+     * `launch_chrome.ps1/.sh`: пишут маркер `.ozon_collector_launched` в профиль.
+     * Тесты: +5 (cdp: launch_marker, ensure_single_worker_tab×2; search:
+       external-no-kill, collector-restart). Прогоны зелёные по отдельности:
+       key_daemon 204, search 40, cdp 20, browser 56, cli/baseline/collect_topup/
+       challenge 49 (1 xfail), cache/gather/parallel 123.
+     * **Pre-existing hang:** совместный pytest файлов с playwright browser-fixture
+       (key_daemon+search, key_daemon+browser) виснет на teardown браузера.
+       По отдельности всё зелёное. Чинить отдельной задачей, этапу не блокирует.
+     * Следующий этап: 2 challenge FSM + observed_scope.
+
+   * **✅ Анти-бот: Этап 2 (challenge FSM + observed_scope, 2026-08-31).** По ADR §14:
+     * **FSM «один challenge-инцидент»** (search.py `_collect_shard`): лестница
+       `reload×3 (внутри check_challenge) → new_tab×1 → recycle×1 → SESSION_BLOCKED`.
+       Лестница НЕ крутится; после исчерпания — abort run (остаток aborted,
+       error_kind=session_blocked, failure_type=session_failure, PID не штрафуется).
+       Заменён старый CHALLENGE_STORM_LIMIT (3 подряд → aborted).
+     * **`page.is_invalid` (K4):** `collect.check_challenge` при детекте помечает
+       страницу INVALID; `Session._guard_check` бросает AccessChallengeError на
+       любой eval/goto/scroll/wait INVALID-страницы (заглушка не попадает в raw).
+       Новая вкладка (new_page/ensure_single_worker_tab/reconnect) снимает флаг.
+     * **`Classification.failure_type`** (browser.py): access_failure (challenge),
+       browser_failure (crash/CDP/target), product_failure (structure/variant_short),
+       unknown. run_gather пишет `res["failure_type"]`.
+     * **`observed_scope`** (наблюдение, не вывод): session_blocked →
+       profile_observed; ok после new_tab → tab_observed; ok после recycle →
+       browser_observed; иначе unknown.
+     * **combined.aborted** → `{reason: "session_blocked", count}`.
+     * Тесты обновлены под FSM (storm→SESSION_BLOCKED, лестница не цикл,
+       transient→ok) + новые (INVALID guard, failure_type, observed_scope).
+       Прогоны зелёные: key_daemon 204, search 40, browser/cdp/challenge 97,
+       gather 34, cache/parallel/cli/baseline/collect_topup 120 (1 xfail),
+       reviews/extractors/process/report/raw_shape/digest 116 (4 skip).
+     * Следующие этапы ADR: 3 session budget → 4 canary.
+
+   * **✅ Анти-бот: Этапы 3-8 (2026-08-31).** Все этапы ADR §14 реализованы:
+     * **3. Session budget** (search.py): `session_budget {challenge, new_tab,
+       browser_recycle, wall_clock_s}` на сессию (run); `session_used` счётчики;
+       исчерпание → `SESSION_EXHAUSTED` (abort run, aborted session_failure).
+       `product_retries` отдельно (max_recycles на товар). Default: 3/3/2/1800.
+     * **4. Canary** (search.py): `run_canary` — фиксированный CANARY_URL,
+       `check_challenge` + минимальная DOM-проверка, состояния
+       `CANARY_OK/CHALLENGE/ERROR`. После recovery событий доступа (new_tab/
+       recycle по challenge, флаг `access_recovery`), НЕ после профилактического.
+       Canary-fail → SESSION_BLOCKED (счётчик `canary_fails`, НЕ жжёт PID/
+       recycle budget). 
+     * **5. Adaptive cooldown** (key_daemon): `challenge_control {storm_streak,
+       total_storms, last_storm_at, cooldown_until, last_signature}` в progress.json
+       (persistent). Эскалация 1м→5м→15м→NEEDS_ATTENTION (storm_streak > max),
+       джиттер ±20% (CHALLENGE_JITTER_FRAC, `KD_RANDOM_SEED` в тестах).
+       storm_streak растёт только после исчерпанного инцидента; сброс при
+       прогрессе (new_disc/new_valid). `--challenge-pause` больше не фикс-пауза.
+     * **6. Profile cooldown** (key_daemon): `profile_cooldown {until, reason,
+       challenge_count, last_signature}` отдельно от storm (repeated_challenge).
+       В `_status_payload` добавлены challenge_control/profile_cooldown.
+     * **7. Browser stability** (search.py): recycle ТОЛЬКО по browser_stats
+       (renderer_errors ≥ RENDERER_RECYCLE_THRESHOLD=2 или safety-ceiling
+       RECYCLE_EVERY=40), НЕ по challenge. `browser_stats`/`access_stats`
+       раздельно (challenge не трогает stability-recycle). После recycle
+       renderer_errors сбрасываются.
+     * **Заменено:** CHALLENGE_STORM_LIMIT (3 подряд → storm) удалён — заменён
+       SESSION_BLOCKED (лестница) + adaptive эскалацией; `challenge_storm`-reason
+       в combined → `session_blocked`/`session_exhausted`.
+     * Тесты: +10 (budget 2, canary 2, adaptive 3, persistent-challenge 1,
+       stability 1, gather failure_type 1) + переписаны storm/new_tab под FSM.
+       Прогоны зелёные по отдельности: key_daemon 208, search 45,
+       cdp_launch+gather+search 100, browser/challenge 76,
+       cache/parallel/cli/baseline/collect_topup/reviews/extractors/process/
+       report/raw_shape/digest 236 (4 skip, 1 xfail).
+     * Доки: `docs/anti_bot_architecture.md §14.6` — все этапы ✅.
+
+   * **✅ Ревизия анти-бот кода (2026-08-31):** найден и исправлен баг в canary:
+     при canary-fail после успешного recovery-сбора перезаписывался уже собранный
+     товар (`products[-1]` = session_blocked, raw=None) — терялись валидные данные
+     и нарушался принцип «session_failure не штрафует PID» (ADR §14.1). Теперь
+     canary-fail останавливает ТОЛЬКО дальнейший сбор (остаток aborted), собранный
+     товар сохраняется (ok=True, raw на месте). Тест `test_canary_challenge_blocks_session`
+     обновлён под это поведение.
+     * **Известные упрощения (не блокеры):** докрутка выдачи
+       (`_collect_links_with_recovery`) использует старую модель new_tab×2/recycle
+       без session budget/canary — несоответствие ADR-лестнице, но не критично
+       (докрутка собирает только ссылки, не товары). `--challenge-pause` остаётся
+       в run_cfg как legacy-параметр, но storm-реакция теперь adaptive
+       (не использует его).
+     * Ревизия прогонов зелёные: search 45, cdp_launch+gather+browser+challenge
+       131, collect_topup+cli+baseline+parallel+cache 120 (1 xfail), key_daemon 208.
+
+   * **✅ Ревизия архитектуры по фидбеку (2026-08-31, правки по ревизии):**
+     * **Докрутка выдачи** (`_collect_links_with_recovery`) приведена к той же
+       FSM-лестнице, что и сбор товаров: `new_tab×1 → recycle×1 → raise`.
+       Удалена константа `NEW_TAB_ATTEMPTS=2` (больше не нужна).
+     * **Canary** теперь вызывается ТОЛЬКО после recycle по доступу (новая
+       сессия — чистота не доказана), НЕ после new_tab (challenge уже снят на
+       товарном URL и товар собран через check_challenge — canary избыточен,
+       лишний заход на Qrator). Тесты canary переведены на recycle-путь.
+     * **Warmup** (`_warmup_to_category`): challenge на главной → НЕ тащим на
+       первый PID — переходим на свежую вкладку (new_page) до категории.
+     * **Profile cooldown читается в цикле демона**: эффективный cooldown =
+       max(cooldown_until, profile_cooldown.until); оба блокируют старт run.
+     * **Документ выровнен с кодом**: §3 честно фиксирует, что fingerprint
+       snapshot НЕ собирается (только recovery-метрики) — планируется
+       `scripts/fingerprint_probe.py`; §8 уточнён multi-incident vs per-run
+       budget; §10 canary после recycle; §11 приоритет cooldown; §18 legacy/
+       backlog (challenge-pause deprecated, KPI обхода, параллелизм per-session).
+      * Тесты: search 46 (вкл. warmup-challenge → new_tab), key_daemon 208,
+        cdp/gather/browser/challenge 131. Все зелёные.
+
+   * **✅ Финальная ревизия по 3-м волнам критики (2026-08-31, P0/P1 итог):**
+     * **🔴 P1 (реализовано код+тесты): агрегация storm при параллелизме
+       (ADR §14.6).** `key_daemon` разделил ФУЛЛ-шторм (`parallel==1` или
+       `all_workers=True`) и частичный шторм: ФУЛЛ → `storm_streak++` +
+       `profile_cooldown` + эскалация `[60,300,900]` + NEEDS_ATTENTION;
+       частичный (часть воркеров штормит) → короткая пауза
+       `CHALLENGE_PARTIAL_PAUSE_S=20` БЕЗ эскалации, чтобы один воркер не
+       сжигал cooldown кампании. Тесты: `test_integration_partial_storm_
+       no_escalation`, `test_integration_full_storm_parallel_escalates`
+       (key_daemon 210 passed; ранее 208 — ФУЛЛ-шторм retro одиночного на
+       parallel=1 сохранён).
+     * **Документ `docs/anti_bot_architecture.md` обновлён по критике:**
+       - **§9**: «canary НЕ расходует `session_used{challenge,new_tab,
+         browser_recycle}`» + таблица «событие → счётчики → состояние».
+       - **§10**: canary на главной — слабое место (теневой бан на товары);
+         P1-решение — canary на лёгкий товар/категорию (backlog §18.4);
+         canary не влияет на session_used.
+       - **§11**: ТОЧНЫЙ триггер `profile_cooldown` (CHALLENGE_STORM →
+         ФУЛЛ-шторм); агрегация storm при параллелизме (ADR §14.6).
+       - **§13**: поведение при потере external-браузера (browser_failure,
+         НЕ перезапуск чужого процесса).
+       - **§6**: warmup-challenge на main → new_page до категории (не тащим
+         на первый PID), страница main → INVALID.
+       - **§16**: анти-паттерн «автоподбор по observed_scope»;
+         `--headless=new` — эксперимент в backlog (§18.8).
+       - **§18**: ВОЗВРАЩЁН статус докрутки выдачи (приведена к FSM);
+         canary->P1, fingerprint->P2, KPI->P2, пул профилей->P3,
+         headless->P3, ранломизация входа->P3; wall_clock_s=1800 note.
+       - Мелочи: canary §10 L5→«L5/L7»; «копия профиля»→«свой профиль
+         ozon-profile-worker-k» в §2.1.
+     * **Регресс:** key_daemon 210 (отдельно, pre-existing hang при совместном
+       прогоне с browser-fixture), search+parallel 91, остальные не-browser
+       файлы 413 passed + 4 skipped + 1 xfailed. Все зелёные.
+     * **Не реализовано (в backlog сознательно):** пул профилей с ротацией —
+       требует пересмотра ownership и прогрева профилей (профиль без истории
+       с мин. Trust Score провоцирует первичный challenge, §1); fingerprint-
+       probe; KPI агрегаты; headless=new; ранломизация точки входа (L3).
+
+
+
+> ⚠️ **ГЛАВНОЕ ПРАВИЛО СБОРА (установлено пользователем 2026-08-20, НЕ ЗАБЫВАТЬ):**
+> отзывы собираются **ВСЕГДА для выбранного варианта товара** («Этот вариант
+> товара»), а не для всего товара. Фильтр включается автоматически
+> (`_activate_variant_mode`); `--no-variant-mode` не использовать для дайджестов.
+> После каждого сбора проверять `raw.reviews_variant_mode`:
+> `used == true`, `variant_count` = сколько отзывов у варианта, и **число собранных
+> отзывов должно равняться `variant_count`** (если собрано меньше и разница не
+> объясняется ограничением «дальше доступно только после регистрации» — сбор
+> неполный, пересобирать). История бага: до фикса `window.scrollBy` не триггерил
+> догрузку в режиме варианта → собиралось 3–30 из 63–412 (см. запись ниже);
+> после фикса `scrollIntoView` — ровно `variant_count`.
+
+ - **✅ ФИКС: «Этот вариант товара» + scrollIntoView (2026-08-20).** Два бага сбора
+   отзывов варианта (заметил пользователь на 5354898200, 5275165581, 888568232):
+   1) Виджет `webReviewsVariantMode` рендерится лениво (после прокрутки к отзывам),
+      а `_activate_variant_mode` вызывался ДО скролла → `no_widget`, фильтр не
+      применялся (у 5354898200 собирались отзывы всех вариантов, 19 вместо 0).
+      Фикс: в `_activate_variant_mode` перед первым evaluate скроллим
+      `SCROLL_TO_LAST_REVIEW_JS` до появления виджета (≤3 скроллов после появления
+      списка отзывов = товар без тумблера).
+   2) В режиме «Этот вариант товара» `window.scrollBy` НЕ триггерит догрузку отзывов
+      (застревало на 3–24 при variant_count 63–412); в обычном режиме scrollBy работал.
+      Причина: Ozon грузит лениво по scrollIntoView последнего отзыва, а не по шагу.
+      Фикс: `_scroll_to_converge`, финальная докрутка и `_activate_variant_mode`
+      используют `SCROLL_TO_LAST_REVIEW_JS` (scrollIntoView последнего `[data-review-uuid]`,
+      fallback — scrollBy 1500). Проверено live: 5275165581 → 64/64, 888568232 → 96
+      (остальные из 412 доступны только после регистрации), 5354898200 → 0 (верно,
+      у варианта действительно 0). Тесты test_reviews.py + test_cdp_launch.py 71 passed.
+ - **✅ ПАЛАТКИ 100 (2026-08-20).** `search --url ".../category/palatki-11426/?...seatsquantl=37727..37733&text=Палатка" --limit 100 --parallel 1 --out docs/palatki.md`:
+   found=104 collected=91 ok=100 excluded=9, файл 2.1МБ. Прогон ~7ч, 4 TimeoutError (renderer_failure) на товарах
+   5279701501, 4041068293, 1504781999, 4905861818, 4479860768, 4366983927 — все восстановлены recycle, ни одного
+   зависания. Средний рейтинг по отзывам — до тысячных (`.3f`): `Средний рейтинг по отзывам:** 4.433 / 5 (100 оценок)`,
+   общий рейтинг/opinion по-прежнему не выводятся.
+ - **✅ БЛЕНДЕРЫ 200+300 И FAB-БЛОК ПРОФИЛЯ (2026-08-19/20).** Два полных прогона
+   `search --url .../category/pogruzhnoy-blender-31638/ --parallel 1 --out docs/blender.md`:
+   limit 200 → found=200 collected=196 ok=200 excluded=4; limit 300 → found=304 collected=295 ok=300 excluded=5
+   (файлы blender.md 2.5МБ + part2 + part3). Без единого access_challenge.
+   **Первопричина FAB за ночь:** Ozon давал «Похоже, нет соединения» (fab_chlg_...) на ВСЕХ страницах
+   (даже главной) со старого профиля `ozon-profile`. IP рабочий (пользователь заходит из обычного Chrome),
+   куки валидны (access-token 16:04), fingerprint чистый (webdriver=None, chrome=True, GPU реальный),
+   воспроизводилось и на системном Chrome (НЕ Playwright-сборке) с тем же профилем. **Решение без изменения кода:**
+   скопирован залогиненный профиль `Profile 1` (11 ozon-куки, os_crypt-key из Local State) → `ozon-profile-copy` →
+   содержимым заменён `ozon-profile`. FAB исчез, работает Playwright-chromium + goto через CDP.
+   Бэкап старого: `ozon-profile-BLOCKED-backup`. Вывод: Ozon метит сам профиль (fingerprint устройства
+   внутри профиля), а не только IP/браузер.
+   **Фиксы кода в этой сессии:** (1) UnicodeEncodeError `→` в cp1251 stdout — `log.py setup()` вызывает
+   `_reconfigure_streams()` (stdout/stderr → utf-8 errors=backslashreplace, аналог worker-фикса parallel.py);
+   (2) access_challenge на докрутке выдачи ронял весь search — добавлен new_tab-recovery в
+   `_collect_links_with_recovery` (NEW_TAB_ATTEMPTS=2, паттерн из `_collect_shard`).
+   **Техника успешных ночных прогонов:** kill старого Chrome перед стартом; Start-Process python -u cli.py ...
+   с RedirectStandardOutput → D:\Temp\opencode\*.log (stdout в cp1251!); `--parallel` требует аргумент в PS (1).
+
+ - **✅ Фикс «тихого» нуля отзывов на проходе sort (2026-08-18).** Ozon разово не отдаёт блок отзывов при навигации на карточку (рате-лимит/флак): _scroll_to_converge возвращает 0 без исключения → проход считал «отзывов нет» и рекавери (recycle) не срабатывал. Проявилось на проходе «сначала низкие оценки» (сорт score_asc): негативные отзывы товара 2446440373 не собирались. Фикс в collect.py: на первой странице прохода при count==0 — до EMPTY_RETRY_PASSES=2 reload страницы + повторная прокрутка; в page_tel/page_log пишется empty_retries. Проверка: свежий сбор 2446440373 — 192 отзыва (96 published + 96 score_asc: 7×0★, 89×1★, 2×3★); ранее score_asc давал 0. Тесты: 379 passed, 4 skipped, 1 pre-existing fail (test_baseline).
 
  - **✅ ПРОГРЕВ СЕССИИ ВОРКЕРА (2026-08-17, коммит `5298523`).** По аналитике обхода антибота Ozon
    (IP-репутация, fingerprint, cookie-сессии, JS-челлендж, rate-limit): главная защита — «прогрев» сессии.
@@ -2225,3 +2583,72 @@ regression = ручной гейт после пересбора.
   - **Артефакт:** `docs/papa_headphones.md` — бесполезный (все 200 = AccessChallengeError); файл в gitignore.
   - **ПРАВИЛО (усилено):** после повторного шторма — **стоп 12–24ч, без дальнейших попыток** (см. §19.2/§19.3). Большой прогон (limit ≥ 100): только после паузы 12–24ч + smoke, начинать с `--parallel 1 --limit ≤50`, поднимать до `--parallel 2` только после чистого прогона.
   - **Вопрос пользователя «поможет ли смена IP»:** кратко — да, но это НЕ первый инструмент (см. выводы ниже в анализе шторма; детальный разбор — в диалоге 2026-08-16 вечер).
+
+
+## 2026-08-21: Ночной прогон палаток — зависание evaluate + сторож
+
+- **Инцидент:** прогон (PID 25072, старт 00:50) завис на товаре 33/100
+  (2069397474, sort=score_asc) в 03:47:34 после «раскрыто «Читать полностью»:
+  7 кнопок» — page.evaluate без таймаута заблокирован навсегда (вкладка
+  замёрзла), BrowserWatchdog видел живой процесс браузера и не срабатывал.
+  Простоял 7.5 ч, убит вручную; 32 товара за сегодня сохранены в data/.
+- **Фикс 1 — сторож простоя в collect.py:** _StallWatchdog (daemon-поток,
+  STALL_TIMEOUT_S=480, проверка раз в 10с). Touch-точки на каждом шаге:
+  итерации докрутки, страницы пагинации, expand-фазы, извлечение REVIEWS_JS.
+  При простое >8 мин убивает Chromium CDP-сессии (P.browser_processes +
+  P.kill_records) — заблокированный evaluate получает TargetClosedError,
+  что классифицируется как renderer_failure (recyclable), штатный recovery
+  перезапускает браузер. Арминг в collect(), остановка в finally
+  (_active_watchdog глобально).
+- **Фикс 2 — внешний монитор** D:/Temp/opencode/palatki_monitor.py: цикл
+  5 мин; тишина лога >20 мин при живом процессе или смерть без маркера
+  «[cli] search DONE:» -> hard kill + рестарт search --max-age 1d (кеш
+  сохраняется). После завершения: верификация всех товаров (used==true;
+  vc<=100 -> n==vc; vc>100 -> n>=90), пересбор брака (gather --max-age 0
+  --overwrite, до 2 раундов), ребилд дайджеста (живой search --max-age 1d,
+  фолбэк scripts/digest_from_raw.py --pids ...). Логи: palatki_monitor.log,
+  отчёт palatki_verify_report.md.
+
+
+## 2026-08-21 (день): v1.16.0 — проверка брака на лету + оптимизация сортировок
+
+- **Проверка брака сразу после сбора каждого товара** (gather.run_gather):
+  - новая функция collect.variant_review_problems(raw): used==False с reason
+    из VM_BAD_REASONS (click_error/click_no_effect/timeout/disabled) = брак;
+    no_widget/no_variant_opt — легитимно; vc<=100 -> собрано ровно vc;
+    vc>100 -> собрано >=90 И КАЖДАЯ сортировка >=90 (per-sort по полю
+    review_sorts; недобор одной сортировки не маскируется суммой);
+  - брак на свежем сборе: битый raw удаляется + VariantShortError
+    (recyclable, browser.py) -> recovery новой вкладкой/recycle и повтор;
+  - брак на кеш-хите: кеш игнорируется, живой пересбор.
+- **v1.15.0 -> 1.16.0:** дофиксовый кеш (до утра 21.08) содержал дыру —
+  записи с no_widget и variant_count=null (виджет не находился старым кодом)
+  проходили проверку с 9 отзывами при 176 у варианта (4041068293). Бамп
+  версии инвалидирует весь старый кеш: cache=miss (old_version).
+- **Оптимизация сортировок** (collect.collect_reviews): если variant_count
+  <= 100 и проход собрал вариант целиком (len(order) >= vc), остальные
+  сортировки пропускаются — тот же набор в другом порядке. Полезно только
+  при vc>100 (стена логина режет список, сортировки дают разные подмножества).
+- **Сторож простоя** _StallWatchdog в collect() (см. запись о ночном
+  инциденте выше) + внешний монитор D:/Temp/opencode/palatki_monitor.py.
+- Тесты: test_gather.py (variant_problems, VariantShortError, кеш-брак),
+  test_reviews.py (skip/incomplete sorts), test_cache.py (фикс getattr
+  cdp_url для фейк-сессий). Прогон палаток перезапускается монитором
+  автоматически, кеш v1.16.0 сохраняется между рестартами.
+
+ - **Fix: key_daemon _alive() падал на Windows СистемError (2026-08-31).** При повторном запуске после Stop-Process -Force демона оставался stale pid-lock; os.kill(pid,0) по мёртвому PID на Windows кидал SystemError: OSError returned a result with an exception set (WinError 87), который не ловился (except OSError) -> крэш на старте до состояния RUNNING. Фикс в scripts/key_daemon.py::_alive: добавлен except SystemError: return False (такой PID трактуется как мёртвый -> stale-lock корректно удаляется). Проверено: _alive(99999)=False, _alive(текущий)=True. Предыдущая фиксация этого семейства (битый pid-файл -> stale) была 2026-08-31 раньше. 
+aushniki: снобран cooldown_until в progress.json и старт с тёплой сессии (браузер открыт вручную, без капчи).
+
+ - **STALL_TIMEOUT_S 480 -> 120 (2026-08-31).** На прогоне naushniki рендерер периодически клинился на товарах с комментариями: page.evaluate(REVIEWS_JS) (collect.py:1804) блокировался на 4-6 мин, т.к. клинненый CDP-транспорт игнорирует даже 30с-дефолт Playwright (set_default_timeout не задан). Сторож срабатывал на 480с - слишком поздно. Снижен до 120с: сторож теперь убивает Chromium на 2-мин простое -> TargetClosedError -> штатный recovery (renderer_failure -> recycle). Фикс применился без перезапуска демона - каждый run = новый CLI-субпроцесс, загрузивший обновлённый модуль. Трейдофф: иногда теряется тёплая сессия (возможен FAB при холодном старте), но мёртвое время сокращено с ~8 мин до ~2 мин. Согласовано с пользователем (выбрал вариант 'снизить порог'). test_parallel+test_cli 58 passed.
+
+ - **Режим KD_NO_COOLDOWN=1 (2026-08-31, по запросу пользователя).** Демон больше НЕ спит в cooldown: (1) старт-проверка cooldown_until/profile_cooldown пропускается и сбрасывается; (2) challenge-шторм -> пауза 1с вместо adaptive 1м/5м/15м, profile_cooldown НЕ ставится; (3) эскалация шторма в NEEDS_ATTENTION отключена (не останавливаем); (4) crash -> 1с вместо 300с; (5) лимит no-progress-подряд не останавливает. Смысл: непрерывный обход защиты (тёплая сессия + retry), а не паузы. Флаг в key_daemon.py через _NO_COOLDOWN = os.environ KD_NO_COOLDOWN. Тесты test_key_daemon 211 passed. Применено к naushniki: cooldown сброшен, run 5 стартовал.
+
+ - **Окно браузера коллектора: всегда видимое + поверх всех + без кражи фокуса (2026-08-31).** В scripts/launch_chrome.ps1 функция Invoke-MinimizeNoActivate теперь: WS_EX_NOACTIVATE + SW_RESTORE (гарантирует WS_VISIBLE) + HWND_TOPMOST (SetWindowPos с SWP_NOACTIVATE). Окно Chrome коллектора ВСЕГДА видимо, прижато поверх других окон, но фокус не перехватывает (остаётся у активного окна пользователя). Служебные/скрытые окна тоже показываются. Только профиль коллектора (ozon-profile); ЧУЖИЕ окна (обычный Chrome, Edge WebView) НЕ трогаются — по явному требованию пользователя. Было исправление: ранее случайно ставился WS_EX_NOACTIVATE на пользовательский Chrome (pid 19044) и Edge WebView — откачено, снят флаг.
+
+ - **Fix: ложный stall-watchdog при раскрытии отзывов/комментариев (2026-08-31).** Баг: _expand_review_texts и _expand_review_comments (collect.py) при большом числе комментариев/«Читать полностью» легитимно работали >120с, но НЕ вызывали _touch_watchdog() -> сторож (STALL_TIMEOUT_S=120) считал это «нет прогресса» и убивал браузер посреди раскрытия -> recovery -> повтор -> до 3 kills на одном товаре (кейс 1883409893: 18-22 комментария, 3 зависания подряд). Фикс: добавлен _touch_watchdog() после каждой паузы в обоих циклах (сброс таймера при реальном прогрессе). Страница при этом открывалась нормально (пользователь подтвердил) — это был ложный стопор, не настоящий hang. Проверено: test_parallel 45 passed, collect.py syntax OK. Применён к живому демону: run 7 стартовал с обновлённым кодом (kill зависшего CLI run 6 -> CRASH -> cooldown 1с -> новый run).
+
+ - **Fix: 'сессия выдыхает' — wall_clock_s бюджет run (2026-09-01).** Каждый run CLI жил дефолтные 1800с (30 мин) -> SESSION_EXHAUSTED -> демон запускал новый run заново (пересканирование с нуля). Причина: build_cli_args не передавал --session-budget-wall-clock, а при resume демон берёт run_cfg из манифеста и игнорировал CLI-аргумент. Фиксы в key_daemon.py: (1) build_cli_args передаёт --session-budget-wall-clock из run_cfg; (2) при resume CLI-аргумент --session-budget-wall-clock синхронизируется в progress.run_cfg (разрешено менять между запусками, остальные лимиты — из манифеста); (3) добавлен CLI-флаг демона --session-budget-wall-clock. Для naushniki установлен 14400с (4 часа) — run больше не 'выдыхается' каждые 30 мин. Проверено: CLI-строка субпроцесса содержит --session-budget-wall-clock 14400, test_key_daemon 211 passed.
+
+ - **Fix: full-run заново обходил каталог с товара 1 (2026-09-01).** Демон в full-режиме каждый run сканировал каталог заново и пролистывал все товары (cache=hit быстро, но визуально 'заново', и при SESSION_EXHAUSTED/краше начинался обход с начала). Фикс: (1) search.py/parallel.py добавили skip_pids (список уже обработанных PID пропускается в выдаче); (2) cli.py --skip-pids; (3) key_daemon build_cli_args в full-режиме передаёт --skip-pids со всеми discovered_pids. Теперь full-run добирает ТОЛЬКО новые/FAIL товары, не пролистывая собранные; FAIL-товары пересобираются через rescan (как и раньше). Бюджет сессии --session-budget-wall-clock также поддержан (4ч/12ч). Тесты: 318 passed (search+parallel+key_daemon+cli).
+
+ - **Fix: 'дичь' — бесконечное молотьё пустых full-runs (2026-09-01).** Две ошибки в моём же фиксе skip_pids: (1) skip_pids брался из discovered_pids (351) вместо valid_pids (56) — демон пропускал ВСЁ, включая excluded/невалидные, которые надо дособирать, и гонял runs каждые ~1.5 мин по 0-1 новому товару; (2) _NO_COOLDOWN отключил и no-progress стоп, поэтому демон молотил до лимита 12ч. Исправлено: skip_pids = valid_pids (только подтверждённые), excluded пересматриваются каждый run (досбор); no-progress стоп возвращён ВО ВСЕХ режимах (это честное завершение 'каталог исчерпан', а не кулдаун). Теперь при 3 runs без новых валидных демон завершается. Проверено: skip_pids count=56, test_key_daemon 211 passed.

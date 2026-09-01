@@ -23,6 +23,7 @@ import json
 import os
 import random as _random
 import re
+import threading
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -44,6 +45,159 @@ SCROLL_PAUSE_MS = 400           # базовая пауза скролла, мс
 SCROLL_PAUSE_JITTER = 0.15      # ±15% случайная вариация паузы (антибот)
 MAX_SCROLL_STABLE = 6          # плато без роста → конец загрузки (было 4; A/B: см. PROJECT_NOTES)
 MAX_SCROLL_BOTTOM = 3          # финальная докрутка к низу (не менялось)
+MAX_TOPUP_STEPS = 40           # шагов top-up в каждой фазе (вверх/вниз)
+# «Тихий» ноль отзывов: Ozon разово не отдаёт блок отзывов при навигации на
+# карточку (rate-limit/флак), скролл возвращает 0 без исключения, и проход
+# считает товар «без отзывов». Такой 0 на ПЕРВОЙ странице прохода — подозрителен:
+# reload страницы даёт второй шанс (докрутка повторяется до RETRY_EMPTY_PASSES).
+EMPTY_RETRY_PASSES = 2         # reload-попыток при 0 отзывов на стр. 1 (0 — выключено)
+EMPTY_RETRY_WAIT_MS = 4000     # пауза после reload перед повторной прокруткой
+
+# Сторож зависания вкладки (2026-08-21): page.evaluate не имеет таймаута и при
+# замёрзшем renderer'е может блокировать сбор часами (инцидент 03:47:34 на
+# товаре 2069397474 — «раскрыто 7 кнопок», дальше 7.5ч тишины). Демон-поток
+# следит за heartbeat; если сбор не двигается дольше STALL_TIMEOUT_S, сторож
+# убивает Chromium нашей CDP-сессии: заблокированный evaluate получает
+# TargetClosedError → renderer_failure (recyclable) → штатный recovery
+# перезапускает браузер и повторяет товар.
+STALL_TIMEOUT_S = 120          # 2 мин без прогресса = зависание (было 480/8 мин)
+STALL_CHECK_S = 10             # период проверки сторожем
+
+_active_watchdog = None        # текущий сторож (сбор однопоточный на процесс)
+
+
+def _touch_watchdog():
+    """Отметить прогресс сбора (сброс таймера простоя сторожа)."""
+    if _active_watchdog is not None:
+        _active_watchdog.touch()
+
+
+class _StallWatchdog:
+    """Kill Chromium при простое сбора дольше STALL_TIMEOUT_S (см. выше)."""
+
+    def __init__(self, cdp_url: str):
+        self._cdp_url = cdp_url
+        self._last = time.monotonic()
+        self._stop = threading.Event()
+        self.fired = False
+
+    def touch(self):
+        self._last = time.monotonic()
+
+    def start(self):
+        t = threading.Thread(target=self._loop, daemon=True,
+                             name="stall-watchdog")
+        t.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.wait(STALL_CHECK_S):
+            idle = time.monotonic() - self._last
+            if idle <= STALL_TIMEOUT_S:
+                continue
+            self.fired = True
+            log.warning(f"[stall-watchdog] нет прогресса {int(idle)}s "
+                        f"(> {STALL_TIMEOUT_S}s) — kill Chromium сессии, "
+                        f"заблокированный evaluate получит TargetClosedError "
+                        f"и уйдёт в recovery")
+            try:
+                from . import process as P
+                idents = P.browser_processes(self._cdp_url)
+                recs = [P.ProcessRecord(f"stall-{int(idle)}s", i)
+                        for i in idents]
+                killed = P.kill_records(recs)
+                log.warning(f"[stall-watchdog] убито процессов браузера: "
+                            f"{len(killed)}")
+            except Exception as e:
+                log.error(f"[stall-watchdog] kill failed: "
+                          f"{type(e).__name__}: {e}")
+            return
+
+
+# Порог «полных» variant_count: до 100 отзывов Ozon отдаёт все и без логина,
+# собранное должно совпасть точно; выше — без логина видно ~96-100, требуем >=90.
+VARIANT_COUNT_FULL_LIMIT = 100
+VARIANT_COUNT_MIN_LARGE = 90
+# Допуск недобора при vc<=100: стена логина «плавает» (~96-99) и на границе
+# vc≈100 может отрезать 1-3 последних карточки (пример: 4483627458, 98/100).
+# Зеркалит TOLERANCE_RATIO из scripts/qa_raw.py (UNDER_TOLERANCE).
+VARIANT_TOLERANCE_RATIO = 0.03
+
+# Per-sort: стена логина плавает по сортировкам (на одном товаре наблюдали
+# published_at_desc=96 и score_asc=89), поэтому абсолютный порог даёт ложный
+# брак с разницей в 1 отзыв. Оборванный проход ловим относительно лучшей
+# сортировки: < 70% от неё — пассива залипла на полпути (15-30 против 96).
+SORT_DEVIATION_RATIO = 0.7
+
+# used=False с этими reason — реальный сбой активации варианта (брак);
+# no_widget/no_variant_opt — легитимно (тумблера нет, список и так варианта).
+VM_BAD_REASONS = {"click_error", "click_no_effect", "timeout", "disabled"}
+
+
+def variant_review_problems(raw) -> list:
+    """Брак варианта/числа отзывов по правилу «собранное = Этот вариант (N)».
+
+    Возвращает список проблем ([] = ок):
+    - reviews_variant_mode.used == False с reason из VM_BAD_REASONS;
+    - variant_count <= 100 и собрано меньше с учётом допуска 3%
+      (стена логина на границе vc≈100 отрезает ~1-3 карточки; пример:
+      4483627458 — собрано 98/100, в DOM без логина доступно 96);
+    - явный variant_count=0 при used=True — вариант без отзывов, не брак
+      (кейс 5575856356: rating_count=370 принадлежит другим вариантам);
+    - variant_count > 100 и собрано < 90 (кап без логина ~96-100);
+    - variant_count > 100 и сортировка собрала < 70% от лучшей (каждый
+      проход докручивается до стены логина; стена плавает по сортировкам,
+      поэтому сравнение относительное, а не по абсолютному порогу).
+    Если тумблера варианта нет (variant_count=null) — товар одновариантный,
+    все отзывы его: ориентир берётся из карточки товара (rating_count).
+    """
+    if not isinstance(raw, dict):
+        return ["raw_not_dict"]
+    vm = raw.get("reviews_variant_mode") or {}
+    n = len(raw.get("reviews") or [])
+    vc = vm.get("variant_count")
+    if isinstance(vc, int) and vc == 0 and vm.get("used"):
+        # Явный ноль от виджета варианта: у выбранного варианта отзывов нет.
+        # Подставлять rating_count всего товара нельзя — это чужие отзывы
+        # других вариантов (ложный short(0/370, cap~100), кейс 5575856356).
+        return []
+    if not (isinstance(vc, int) and vc > 0):
+        # Нет виджета варианта -> ожидаемый объём = число отзывов товара.
+        rc = (raw.get("product") or {}).get("rating_count")
+        if isinstance(rc, int) and rc > 0:
+            vc = rc
+    problems = []
+    if not vm.get("used"):
+        reason = vm.get("reason")
+        if reason in VM_BAD_REASONS:
+            problems.append(f"filter_not_used(reason={reason})")
+    if isinstance(vc, int) and vc > 0:
+        if vc <= VARIANT_COUNT_FULL_LIMIT:
+            tol = max(1, round(vc * VARIANT_TOLERANCE_RATIO))
+            if n < vc - tol:
+                problems.append(f"short({n}/{vc})")
+        elif n < VARIANT_COUNT_MIN_LARGE:
+            problems.append(f"short({n}/{vc}, cap~100)")
+        if vc > VARIANT_COUNT_FULL_LIMIT:
+            per_sort: dict = {}
+            for r in raw.get("reviews") or []:
+                if not isinstance(r, dict):
+                    continue
+                ss = r.get("review_sorts")
+                keys = ss if isinstance(ss, list) else [r.get("review_sort")]
+                for s in keys:
+                    if s:
+                        per_sort[s] = per_sort.get(s, 0) + 1
+            if len(per_sort) > 1:
+                best = max(per_sort.values())
+                for s in sorted(per_sort):
+                    if per_sort[s] < best * SORT_DEVIATION_RATIO:
+                        problems.append(
+                            f"short_sort({s}={per_sort[s]}, best={best}, "
+                            f"min {int(best * SORT_DEVIATION_RATIO)})")
+    return problems
 
 _scroll_rng = _random.Random()
 SCROLL_JITTER_SEED: int | None = None
@@ -361,6 +515,54 @@ PRODUCT_JS = r"""
 
   const ratingData = rating();
 
+  // ---- «По мнению покупателей»: % рекомендуют + разбивка оценок по звёздам ----
+  const customerOpinion = () => {
+    const out = { recommend_percent: null, stars: {}, counts: {}, text: null };
+    const starRe = /^([1-5])\s*зв[её]зд[а-я]*$/i;
+    const rows = [];
+    for (const el of document.querySelectorAll('div, span')) {
+      const t = (el.innerText || '').trim();
+      const m = starRe.exec(t);
+      if (m && t.length <= 20) {
+        const row = el.parentElement;
+        if (row) rows.push([parseInt(m[1], 10), row]);
+      }
+    }
+    rows.forEach(([star, row]) => {
+      // процент из style="width: N%" внутри строки гистограммы
+      const wEl = row.querySelector('[style*="width"]');
+      const wm = wEl && (wEl.getAttribute('style') || '').match(/width:\s*([\d.]+)%/);
+      if (wm) out.stars[star] = parseFloat(wm[1]);
+      // количество отзывов — число в конце текста строки
+      const t2 = (row.innerText || '').replace(/\s+/g, ' ').trim();
+      const cm = t2.match(/(\d[\d\s\u00a0]*)$/);
+      if (cm) out.counts[star] = parseInt(cm[1].replace(/[\s\u00a0]/g, ''), 10);
+    });
+    // «N% покупателей рекомендуют» / «N% рекомендуют» по всей странице
+    if (!Object.keys(out.stars).length || out.recommend_percent === null) {
+      const pageTxt = document.body ? (document.body.innerText || '') : '';
+      const rec = pageTxt.match(/(\d{1,3})\s*%\s*покупател/i)
+              || pageTxt.match(/покупател[^\n%]{0,25}\s*(\d{1,3})\s*%/i)
+              || pageTxt.match(/(\d{1,3})\s*%\s*рекомендуют/i);
+      if (rec) out.recommend_percent = parseInt(rec[1], 10);
+    }
+    // fallback: пары «N» + «M%» подряд (гистограмма без слов «звезда»)
+    if (!Object.keys(out.stars).length) {
+      const allEls = Array.from(document.querySelectorAll(
+        'span, div, [class*="score"], [class*="bar"], [class*="percent"]'));
+      const texts = allEls.map((n) => (n.innerText || '').trim()).filter(Boolean);
+      for (let i = 0; i + 1 < texts.length; i++) {
+        const star = /^([1-5])$/.exec(texts[i]);
+        const pct = /^(\d{1,3})\s*%$/.exec(texts[i + 1]);
+        if (star && pct) out.stars[parseInt(star[1], 10)] = parseInt(pct[1], 10);
+      }
+    }
+    out.text = (document.body ? (document.body.innerText || '') : '')
+      .match(/По\s+мнению\s+покупателей[\s\S]{0,1200}/)?.[0]
+      || '';
+    return out;
+  };
+
   return {
     title: title(),
     rating: ratingData ? ratingData.value : null,
@@ -374,6 +576,7 @@ PRODUCT_JS = r"""
     gallery: gallery(),
     descriptions: descriptions(),
     infographics: infographics(),
+    customer_opinion: customerOpinion(),
   };
 }
 """
@@ -487,7 +690,7 @@ REVIEWS_JS = r"""
     });
     return out;
   };
-  const reviews = cards.map(extract).filter((r) => r.uuid && r.text);
+  const reviews = cards.map(extract).filter((r) => r.uuid);
   let pag = null;
   for (let i = lists.length - 1; i >= 0 && !pag; i--) {
     const c = lists[i].children[2];
@@ -515,6 +718,40 @@ REVIEW_IDS_JS = r"""
   return Array.from(document.querySelectorAll('[data-review-uuid]'))
     .map((c) => (c.getAttribute('data-review-uuid') || '').trim())
     .filter(Boolean);
+}
+"""
+
+
+SCROLL_TO_LAST_REVIEW_JS = r"""
+() => {
+  const els = document.querySelectorAll('[data-review-uuid]');
+  if (els.length) {
+    els[els.length - 1].scrollIntoView({ block: 'center' });
+  } else {
+    window.scrollBy(0, 1500);
+  }
+}
+"""
+
+
+SCROLL_STEP_UP_JS = r"""
+/*step-up*/
+() => {
+  const before = window.scrollY;
+  window.scrollBy({ top: -Math.round(window.innerHeight * 2.2), behavior: 'instant' });
+  return window.scrollY <= 0 || window.scrollY === before;
+}
+"""
+
+
+SCROLL_STEP_DOWN_JS = r"""
+/*step-down*/
+() => {
+  const before = window.scrollY;
+  window.scrollBy({ top: Math.round(window.innerHeight * 2.2), behavior: 'instant' });
+  return window.scrollY === before
+      || window.scrollY + window.innerHeight
+      >= document.documentElement.scrollHeight - 2;
 }
 """
 
@@ -657,11 +894,16 @@ CHALLENGE_TITLE_MARKERS = (
     "подтвердите, что вы не робот",
     "подтвердите, что вы человек",
     "проверка, что вы не робот",
+    "antibot captcha",
+    "captcha",
 )
 
 CHALLENGE_BODY_MARKERS = (
     "fab_chlg_",
+    "fab_cp_",
     "выключите vpn",
+    "сопоставьте пазл",
+    "двигая ползунок",
 )
 
 
@@ -691,11 +933,91 @@ def detect_challenge(page) -> str | None:
     return None
 
 
-def check_challenge(page, where: str) -> None:
-    """Поднять AccessChallengeError, если страница — анти-бот-заглушка."""
+FAB_RELOAD_ATTEMPTS = 3
+FAB_RELOAD_DELAY_MS = 2500
+
+
+def _reload_fn(page):
+    """Перезагрузить страницу (FAB-заглушка снимается обычным reload)."""
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        try:
+            page.reload(timeout=60000)
+        except Exception:
+            return False
+    return True
+
+
+def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
+    """Поднять AccessChallengeError, если страница — анти-бот-заглушка.
+
+    reload_on_fab=True: FAB-заглушка Ozon («Похоже, нет соединения») снимается
+    простым обновлением страницы (подтверждено вручную: reload открывает Ozon).
+    Делаем до FAB_RELOAD_ATTEMPTS перезагрузок с паузой; если FAB остаётся —
+    бросаем AccessChallengeError.
+    """
     sig = detect_challenge(page)
+    for _ in range(FAB_RELOAD_ATTEMPTS) if (sig and reload_on_fab) else range(0):
+        log.warning(f"[collect] FAB-заглушка ({sig}) → reload для разблокировки")
+        _reload_fn(page)
+        time.sleep(FAB_RELOAD_DELAY_MS / 1000.0)
+        sig = detect_challenge(page)
+        if not sig:
+            break
     if sig:
+        # INVALID (ADR §14.1): страница-заглушка не годится для извлечения.
+        # Любые evaluate/scroll/goto на ней блокируются (Session._guard_check).
+        try:
+            page.is_invalid = True
+        except Exception:
+            pass
         raise B.AccessChallengeError(f"анти-бот ({where}): {sig}")
+
+
+_AGE_GATE_PROBE_JS = (
+    "() => /Подтвердите возраст/.test(document.body.innerText || '')"
+)
+
+
+def _pass_age_gate(page) -> bool:
+    """Пройти модалку «Подтвердите возраст» (18+ категории).
+
+    Маска даты ДД.ММ.ГГГГ не принимает программный value — вводим
+    дату рождения посимвольно и жмём «Подтвердить». Возвращает True,
+    если гейт был обнаружен и пройден.
+    """
+    try:
+        if not page.evaluate(_AGE_GATE_PROBE_JS):
+            return False
+        inp = page.locator("input:visible").first
+        inp.click()
+        try:
+            inp.press_sequentially("01011990", delay=40)
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
+            log.warning(f"[collect] age-gate press_sequentially warn: {e}")
+            inp.type("01011990", delay=40)
+        btn = page.get_by_role("button", name="Подтвердить")
+        try:
+            btn.wait_for(state="visible", timeout=5000)
+        except Exception as e:
+            if B.is_renderer_failure(e):
+                raise
+            log.warning(f"[collect] age-gate button wait warn: {e}")
+        if btn.is_enabled():
+            btn.click()
+            page.wait_for_timeout(1500)
+            log.info("[collect] возрастной гейт 18+ пройден")
+            return True
+        log.warning("[collect] age-gate: кнопка Подтвердить осталась disabled")
+        return False
+    except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
+        log.warning(f"[collect] age-gate warn: {e}")
+        return False
 
 
 def collect_product(page, product_url: str, category: str | None = None) -> dict:
@@ -894,6 +1216,7 @@ def _scroll_to_converge(page, target_min: int = 40, max_iters: int = 90,
     stable_iterations = 0
     last_growth_iteration = 0
     for it in range(max_iters):
+        _touch_watchdog()
         n = unique_count()
         tel["progression"].append(n)
         if n > last:
@@ -908,7 +1231,7 @@ def _scroll_to_converge(page, target_min: int = 40, max_iters: int = 90,
             log.debug(f"converge done: stable плато {MAX_SCROLL_STABLE}, unique={n}")
             break
         try:
-            page.evaluate(f"() => window.scrollBy(0, {SCROLL_STEP_PX})")
+            page.evaluate(SCROLL_TO_LAST_REVIEW_JS)
         except Exception as e:
             if B.is_renderer_failure(e):
                 raise
@@ -919,8 +1242,9 @@ def _scroll_to_converge(page, target_min: int = 40, max_iters: int = 90,
         page.wait_for_timeout(pause)
     resumed = False
     for _ in range(MAX_SCROLL_BOTTOM):
+        _touch_watchdog()
         try:
-            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            page.evaluate(SCROLL_TO_LAST_REVIEW_JS)
             pause = scroll_pause_ms()
             tel["scroll_wait_seconds"] += pause / 1000.0
             page.wait_for_timeout(pause)
@@ -964,25 +1288,30 @@ def _expand_review_texts(page, max_passes: int = 8) -> int:
             page.wait_for_timeout(800)
         except Exception:
             time.sleep(0.8)
+        _touch_watchdog()  # долгий легитимный прогресс — сброс таймера сторожа
     return total
 
 
 _COMMENT_BTN_RE = re.compile(r'[1-9]\d*\s*комментар', re.IGNORECASE)
 
 _STICKY_INTERCEPT_HINT = "intercepts pointer events"
+_UNSTABLE_ELEMENT_HINT = "element is not stable"
 
 
 def _is_sticky_intercept(exc) -> bool:
-    """True, если клик не прошёл из-за перекрытия элемента sticky-блоком.
+    """True, если клик не прошёл из-за перекрытия/нестабильности элемента.
 
     Playwright сообщает об этом в тексте ошибки: «... subtree intercepts
-    pointer events». Это НЕ hang renderer: клик таймаутит, а renderer жив.
-    Такую ошибку нельзя пробрасывать как renderer_failure — надо продолжить
-    сбор (карточка уже помечена data-comments-clicked и больше не тронется)."""
-    return _STICKY_INTERCEPT_HINT in str(exc)
+    pointer events» или «... element is not stable» (элемент двигается:
+    lazy-load, анимация, реклама). Это НЕ hang renderer: клик таймаутит,
+    а renderer жив. Такую ошибку нельзя пробрасывать как renderer_failure —
+    надо продолжить сбор (карточка уже помечена data-comments-clicked и
+    больше не тронется)."""
+    msg = str(exc)
+    return _STICKY_INTERCEPT_HINT in msg or _UNSTABLE_ELEMENT_HINT in msg
 
 
-def _expand_review_comments(page, max_passes: int = 6) -> int:
+def _expand_review_comments(page, max_passes: int = 4) -> int:
     """Раскрывает комментарии к отзывам («N комментарий»).
 
     Каждый клик дёргает API rpGetCommentsByReviewUuid и подгружает блок
@@ -1016,18 +1345,25 @@ def _expand_review_comments(page, max_passes: int = 6) -> int:
                     "(el) => { const c = el.closest('[data-review-uuid]');"
                     " if (c) c.setAttribute('data-comments-clicked', '1'); }"
                 )
-                h.scroll_into_view_if_needed(timeout=3000)
                 try:
-                    h.click(timeout=4000)
+                    h.scroll_into_view_if_needed(timeout=5000)
+                    h.click(timeout=8000)
                 except Exception as e:
                     if B.is_renderer_failure(e) and not _is_sticky_intercept(e):
-                        raise
-                    try:
-                        h.evaluate("(el) => el.click()")
-                    except Exception:
-                        pass
+                        try:
+                            h.evaluate("(el) => el.click()",
+                                       timeout=8000)
+                        except Exception as e2:
+                            if B.is_renderer_failure(e2):
+                                raise
+                    else:
+                        try:
+                            h.evaluate("(el) => el.click()")
+                        except Exception:
+                            pass
                 clicked += 1
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(300)
+                _touch_watchdog()  # долгий прогресс — сброс таймера сторожа
         except Exception as e:
             if B.is_renderer_failure(e) and not _is_sticky_intercept(e):
                 raise
@@ -1039,6 +1375,7 @@ def _expand_review_comments(page, max_passes: int = 6) -> int:
             page.wait_for_timeout(2500)
         except Exception:
             time.sleep(2.5)
+        _touch_watchdog()  # завершение прохода — сброс таймера сторожа
     return total
 
 
@@ -1101,11 +1438,121 @@ def _dedupe_reviews(reviews: list, seen: set) -> list:
     return out
 
 
+def _merge_topup(data_reviews, seen: set, index: dict, reviews: list,
+                 target_variant: dict) -> tuple[int, int]:
+    """Сливает выдачу шага top-up.
+
+    Три случая: (1) uid в seen и в index — уже собран, дозаполняем поля
+    (текст длиннее, счётчики больше); (2) uid в seen, но НЕТ в index —
+    карточка была видна converge при прокрутке, но размонтировалась к моменту
+    экстракции: это и есть добираемый дефицит — добавляем; (3) uid новый.
+    Добавление идёт через вариантный фильтр. Возвращает (added, refreshed)."""
+    added = refreshed = 0
+    for r in data_reviews or []:
+        uid = _review_key(r)
+        if uid in seen:
+            dst = index.get(uid)
+            if dst is None:
+                pass  # seen-но-не-собран: добираем как новое ниже
+            else:
+                v = r.get("text")
+                if v and len(v) > len(dst.get("text") or ""):
+                    dst["text"] = v
+                    refreshed += 1
+                for k in ("helpful_yes", "helpful_no", "comments_count"):
+                    v = r.get(k)
+                    if isinstance(v, int) and v > (dst.get(k) or 0):
+                        dst[k] = v
+                        refreshed += 1
+                vc = r.get("comments")
+                if isinstance(vc, list) \
+                        and len(vc) > len(dst.get("comments") or []):
+                    dst["comments"] = vc
+                    refreshed += 1
+                continue
+        else:
+            seen.add(uid)
+        ok_v = True
+        for key, val in (target_variant or {}).items():
+            if val and str(val) not in normalize_text(r.get("variant", "")):
+                ok_v = False
+                break
+        if ok_v:
+            reviews.append(r)
+            index[uid] = r
+            added += 1
+    return added, refreshed
+
+
+def _topup_virtualized(page, target_count: int, seen: set, index: dict,
+                       reviews: list, target_variant: dict, page_no: int,
+                       max_steps: int | None = None) -> int:
+    """Добирает карточки, размонтированные виртуализацией infinite-scroll.
+
+    Converge считает uuid за всё время прокрутки, а REVIEWS_JS снимает DOM
+    в один момент: в нижней позиции окна часть верхних карточек размонтирована
+    (пример: converge unique=34, экстракция 30 -> VariantShortError).
+    Фаза 1: подъём к началу списка БЕЗ досрочных стопов — пропавшие карточки
+    сидят у вершины, лимит «без роста» рубил подъём на полпути.
+    Фаза 2 (если дефицит остался): спуск вниз для срединных случаев.
+    В конце дораскрытие текстов и финальный пересъём. Возвращает число
+    добавленных отзывов."""
+    steps = MAX_TOPUP_STEPS if max_steps is None else max_steps
+    added_total = 0
+
+    def _sweep(step_js: str, label: str) -> bool:
+        nonlocal added_total
+        for step in range(1, steps + 1):
+            _touch_watchdog()
+            try:
+                edge = page.evaluate(step_js)
+                page.wait_for_timeout(scroll_pause_ms())
+                data = page.evaluate(REVIEWS_JS)
+            except Exception as e:
+                if B.is_renderer_failure(e):
+                    raise
+                log.warning(f"[collect] стр. {page_no}: top-up {label} "
+                            f"шаг {step} warn: {e}")
+                break
+            added, _ = _merge_topup((data or {}).get("reviews"), seen, index,
+                                    reviews, target_variant)
+            added_total += added
+            log.info(f"[collect] стр. {page_no}: top-up {label} шаг {step}: "
+                     f"+{added}, собрано {len(reviews)}/{target_count}")
+            if len(reviews) >= target_count:
+                return True
+            if edge:
+                break
+        return False
+
+    done = _sweep(SCROLL_STEP_UP_JS, "вверх")
+    if not done and len(reviews) < target_count:
+        _sweep(SCROLL_STEP_DOWN_JS, "вниз")
+    try:
+        _touch_watchdog()
+        n_exp = _expand_review_texts(page)
+        n_com = _expand_review_comments(page)
+        data = page.evaluate(REVIEWS_JS) if (n_exp or n_com) else None
+    except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
+        data = None
+    if data and data.get("ok"):
+        _, refreshed = _merge_topup(data.get("reviews"), seen, index,
+                                    reviews, target_variant)
+        if refreshed:
+            log.info(f"[collect] стр. {page_no}: top-up дозаполнил полей: "
+                     f"{refreshed}")
+    return added_total
+
+
 def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
     """Включает нативный фильтр «Этот вариант товара» (webReviewsVariantMode).
 
     Управление фильтром происходит серверно: URL-параметр reviewsVariantMode=1
     показывает тумблер активным. Клик по опции — только если параметра ещё нет.
+    Виджет webReviewsVariantMode рендерится лениво (после прокрутки к отзывам),
+    поэтому перед первым evaluate делается скролл, если виджет ещё не появился.
     Возвращает диагностику:
       used       — фильтр был активен в момент сбора (True/False)
       clicked    — был ли выполнен клик по «Этот вариант товара»
@@ -1118,8 +1565,37 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
     except Exception as e:
         if B.is_renderer_failure(e):
             raise
-        print(f"[variant_mode] evaluate warn: {e}")
         log.warning(f"[variant_mode] evaluate warn: {e}")
+    if not snap or not snap.get("found"):
+        # Виджет рендерится после прокрутки к отзывам: скроллим до его появления,
+        # но не более 3 скроллов после появления списка отзывов (товар без
+        # тумблера — не тратим время на бесконечную прокрутку).
+        scrolled_after_reviews = 0
+        for _ in range(60):
+            try:
+                page.evaluate(SCROLL_TO_LAST_REVIEW_JS)
+            except Exception as e:
+                if B.is_renderer_failure(e):
+                    raise
+                break
+            page.wait_for_timeout(scroll_pause_ms())
+            try:
+                snap = page.evaluate(VARIANT_MODE_JS)
+            except Exception as e:
+                if B.is_renderer_failure(e):
+                    raise
+                snap = None
+            if snap and snap.get("found"):
+                break
+            try:
+                has_reviews = page.evaluate(
+                    "() => !!document.querySelector('div[data-widget=\"webListReviews\"]')")
+            except Exception:
+                has_reviews = False
+            if has_reviews:
+                scrolled_after_reviews += 1
+                if scrolled_after_reviews >= 3:
+                    break
     if not snap or not snap.get("found"):
         return {"used": False, "clicked": False, "variant_present": False,
                 "variant_count": None, "active": None, "total_count": None,
@@ -1148,7 +1624,6 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
             }"""
         )
     except Exception as e:
-        print(f"[variant_mode] click warn: {e}")
         log.warning(f"[variant_mode] click warn: {e}")
         return {**base, "used": False, "clicked": True, "reason": "click_error"}
     deadline = time.monotonic() + timeout_s
@@ -1165,7 +1640,6 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
             break
         time.sleep(0.8)
     if not active:
-        print("[variant_mode] клик не применился, собираем без нативного фильтра")
         log.warning("[variant_mode] клик не применился, собираем без нативного фильтра")
         return {**base, "used": False, "clicked": True, "reason": "click_no_effect"}
     try:
@@ -1184,10 +1658,23 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
     return {**final, "used": True, "clicked": True, "reason": "click_ok"}
 
 
+_CARDS_COUNT_JS = "() => document.querySelectorAll('[data-review-uuid]').length"
+
+
+def _count_review_cards(page):
+    """Число карточек отзывов в DOM сейчас; None при ошибке evaluate."""
+    try:
+        return page.evaluate(_CARDS_COUNT_JS)
+    except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
+        return None
+
+
 def _collect_reviews_pass(
     page, page_url: str, sort: str | None, target_variant: dict,
     max_pages: int = 12, min_reviews: int = 40, apply_variant_mode: bool = True,
-    telemetry: dict | None = None,
+    telemetry: dict | None = None, no_count_hint: bool = False,
 ) -> tuple[List[dict], int, List[dict], dict | None]:
     """Один проход сбора отзывов по одной сортировке (см. collect_reviews).
 
@@ -1213,69 +1700,114 @@ def _collect_reviews_pass(
     tel.setdefault("extract_time", 0.0)
     tel.setdefault("pages", [])
     for p in range(1, max_pages + 1):
+        _touch_watchdog()
         try:
             page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(6000)
         except Exception as e:
             if B.is_renderer_failure(e):
                 raise
-            print(f"[collect] page {p} goto warn: {e}")
             log.warning(f"[collect] page {p} goto warn: {e}")
             page.wait_for_timeout(3000)
         check_challenge(page, f"reviews_page p{p}")
+        _pass_age_gate(page)
         if apply_variant_mode:
             vm = _activate_variant_mode(page)
             if variant_mode is None or vm.get("used"):
                 variant_mode = vm
+            if vm.get("used") and vm.get("variant_count") == 0:
+                # Виджет варианта явно говорит «Отзывы 0»: прокручивать
+                # нечего — ни converge с релоадами, ни остальные сортировки.
+                # Экономия ~70с на пустой вариант (кейсы 5274359430,
+                # 5575856356).
+                log.info(f"[collect] стр. {p}: у варианта 0 отзывов — "
+                         f"пропускаю прокрутку (sort={sort})")
+                page_log.append({"page": p, "n_found": 0, "n_matched": 0,
+                                 "ok": True,
+                                 "stop_reason": "variant_zero_reviews",
+                                 "sort": sort})
+                return [], 1, page_log, variant_mode
+        if no_count_hint and p == 1:
+            # Товар без явных счётчиков (rating_count/variant_count = None):
+            # если на странице отзывов нет ни одной карточки (двойная
+            # проверка с паузой), прокрутка и релоады бесполезны — кейс
+            # 4551551032: нет ни рейтинга, ни виджета варианта, раздел пуст.
+            n_cards = _count_review_cards(page)
+            if n_cards == 0:
+                page.wait_for_timeout(2500)
+                n_cards = _count_review_cards(page)
+            if n_cards == 0:
+                log.info(f"[collect] стр. {p}: карточек нет, счётчиков нет "
+                         f"— пропускаю проход (sort={sort})")
+                page_log.append({"page": p, "n_found": 0, "n_matched": 0,
+                                 "ok": True,
+                                 "stop_reason": "no_cards_no_count_hint",
+                                 "sort": sort})
+                return [], 1, page_log, variant_mode
         page_tel: dict = {}
         _t0 = time.monotonic()
-        count, resumed = _scroll_to_converge(
-            page, target_min=min_reviews, telemetry=page_tel)
-        if resumed:
-            count, _ = _scroll_to_converge(
+        empty_retries = 0
+        while True:
+            _touch_watchdog()
+            count, resumed = _scroll_to_converge(
                 page, target_min=min_reviews, telemetry=page_tel)
+            if resumed:
+                count, _ = _scroll_to_converge(
+                    page, target_min=min_reviews, telemetry=page_tel)
+            if count > 0 or p > 1 or empty_retries >= EMPTY_RETRY_PASSES:
+                break
+            empty_retries += 1
+            log.warning(f"page {p}: 0 отзывов при прокрутке — "
+                        f"reload ({empty_retries}/{EMPTY_RETRY_PASSES})")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(EMPTY_RETRY_WAIT_MS)
+            except Exception as e:
+                if B.is_renderer_failure(e):
+                    raise
+                log.warning(f"page {p}: reload при пустой выдаче warn: {e}")
+            check_challenge(page, f"reviews_page p{p} retry{empty_retries}")
         page_tel["count"] = count
         page_tel["resumed"] = resumed
+        page_tel["empty_retries"] = empty_retries
         page_tel["page"] = p
         page_tel["sort"] = sort
         tel["scroll_time"] += time.monotonic() - _t0
         tel["pages"].append(page_tel)
         if count == 0:
-            print(f"[collect] page {p}: отзывы не появились при прокрутке, стоп")
             log.warning(f"[collect] page {p}: отзывы не появились при прокрутке, стоп")
             page_log.append({"page": p, "n_found": 0, "n_matched": 0, "ok": False,
-                             "stop_reason": "no_scroll", "sort": sort})
+                             "stop_reason": "no_scroll", "sort": sort,
+                             "empty_retries": empty_retries})
             break
         if variant_mode is None:
             variant_mode = {}
         if "pagination_type" not in variant_mode:
             variant_mode["pagination_type"] = _detect_pagination(page, grew=count > 0)
         _et0 = time.monotonic()
+        _touch_watchdog()
         try:
             n_expanded = _expand_review_texts(page)
             if n_expanded:
-                print(f"[collect] стр. {p}: раскрыто «Читать полностью»: {n_expanded} кнопок")
                 log.info(f"[collect] стр. {p}: раскрыто «Читать полностью»: {n_expanded} кнопок")
         except Exception as e:
             if B.is_renderer_failure(e):
                 raise
-            print(f"[collect] стр. {p}: раскрытие отзывов warn: {e}")
             log.warning(f"[collect] стр. {p}: раскрытие отзывов warn: {e}")
         try:
+            _touch_watchdog()
             n_comment = _expand_review_comments(page)
             if n_comment:
-                print(f"[collect] стр. {p}: раскрыто комментариев к отзывам: {n_comment} кнопок")
                 log.info(f"[collect] стр. {p}: раскрыто комментариев к отзывам: {n_comment} кнопок")
         except Exception as e:
             if B.is_renderer_failure(e):
                 raise
-            print(f"[collect] стр. {p}: раскрытие комментариев warn: {e}")
             log.warning(f"[collect] стр. {p}: раскрытие комментариев warn: {e}")
+        _touch_watchdog()
         data = page.evaluate(REVIEWS_JS)
         tel["extract_time"] += time.monotonic() - _et0
         ok = bool(data and data.get("ok"))
         if not ok:
-            print(f"[collect] page {p}: пустая выдача, стоп")
             log.warning(f"[collect] page {p}: пустая выдача, стоп")
             page_log.append({"page": p, "n_found": 0, "n_matched": 0, "ok": False,
                              "stop_reason": "empty", "sort": sort})
@@ -1301,11 +1833,30 @@ def _collect_reviews_pass(
               f"под вариант {len(reviews)} (виден {len(seen)})")
         log.debug(f"стр. {p}: всего на странице {len(data['reviews'])}, "
                   f"под вариант {len(reviews)} (виден {len(seen)})")
+        # Виртуализация infinite-scroll: REVIEWS_JS видит только смонтированное
+        # окно карточек, а converge насчитал count за всё время прокрутки.
+        # Дефицит меряем по СОБРАННЫМ отзывам: seen после converge уже содержит
+        # все uuid (в т.ч. размонтированные), поэтому len(seen) тут не годится.
+        log.info(f"[collect][topup-check] стр. {p}: "
+                 f"pt={(variant_mode or {}).get('pagination_type')!r} "
+                 f"count={count} собрано={len(reviews)} видно={len(seen)}")
+        if ((variant_mode or {}).get("pagination_type") == "infinite_scroll"
+                and count > len(reviews)):
+            idx0 = max(len(reviews) - matched_this, 0)
+            pass_index = {_review_key(r): r for r in reviews[idx0:]}
+            added = _topup_virtualized(page, count, seen, pass_index,
+                                       reviews, target_variant, p)
+            print(f"[collect] стр. {p}: top-up завершён: +{added} "
+                  f"(собрано {len(reviews)}/{count})")
+            log.info(f"стр. {p}: top-up завершён: +{added} "
+                     f"(собрано {len(reviews)}/{count})")
+            if added:
+                matched_this += added
+                page_tel["topup_added"] = page_tel.get("topup_added", 0) + added
         nxt = _next_page(page)
         if nxt and sort is not None:
             nxt = _sort_url(nxt, SORT_PARAMS.get(sort))
         if not nxt:
-            print(f"[collect] стр. {p}: пагинации нет, стоп")
             log.warning(f"[collect] стр. {p}: пагинации нет, стоп")
             page_log.append({
                 "page": p, "n_found": len(data["reviews"]), "n_matched": matched_this,
@@ -1354,7 +1905,6 @@ def _finalize_variant_mode(variant_mode: dict | None, reviews: list,
         if variant_mode.get("used") is True and matched_variant == 0:
             warning = "native_filter_active_no_matching_reviews"
             variant_mode["warning"] = warning
-            print(f"[collect] warning: {warning}")
             log.warning(f"[collect] warning: {warning}")
         return variant_mode
     base = {"used": False, "variant_present": False, "active": None,
@@ -1369,6 +1919,7 @@ def collect_reviews(
     page, reviews_url: str, target_variant: dict, max_pages: int = 12,
     min_reviews: int = 40, apply_variant_mode: bool = True,
     sorts: Optional[List[str]] = None, telemetry: dict | None = None,
+    no_count_hint: bool = False,
 ) -> tuple[List[dict], int, List[dict], dict]:
     """Собирает отзывы варианта. Возвращает (reviews, total_pages, page_log, variant_mode).
 
@@ -1402,6 +1953,7 @@ def collect_reviews(
             page, reviews_url, None, target_variant,
             max_pages=max_pages, min_reviews=min_reviews,
             apply_variant_mode=apply_variant_mode, telemetry=tel,
+            no_count_hint=no_count_hint,
         )
         variant_mode = _finalize_variant_mode(variant_mode, reviews, apply_variant_mode)
         if telemetry is not None:
@@ -1420,12 +1972,12 @@ def collect_reviews(
     variant_mode: dict | None = None
     for sort in sorts:
         start_url = _sort_url(reviews_url, SORT_PARAMS[sort])
-        print(f"[collect] сортировка «{SORT_LABELS.get(sort, sort)}» (sort={sort}): {start_url}")
         log.info(f"[collect] сортировка «{SORT_LABELS.get(sort, sort)}» (sort={sort}): {start_url}")
         pass_reviews, tp, pl, vm = _collect_reviews_pass(
             page, start_url, sort, target_variant,
             max_pages=max_pages, min_reviews=min_reviews,
             apply_variant_mode=apply_variant_mode, telemetry=tel,
+            no_count_hint=no_count_hint,
         )
         page_log.extend(pl)
         total_pages = max(total_pages, tp)
@@ -1434,10 +1986,37 @@ def collect_reviews(
         ):
             variant_mode = vm
         _merge_review_sorts(pass_reviews, merged, order, sort)
-        print(f"[collect] сортировка «{SORT_LABELS.get(sort, sort)}»: собрано {len(pass_reviews)}"
-              f", всего уникальных {len(order)}")
         log.info(f"[collect] сортировка «{SORT_LABELS.get(sort, sort)}»: "
                  f"собрано {len(pass_reviews)}, всего уникальных {len(order)}")
+        # Оптимизация (2026-08-21): если вариант небольшой (variant_count <= 100)
+        # и проход собрал его целиком, остальные сортировки вернут тот же
+        # набор в другом порядке — пропускаем их (экономия ~минуты на товар
+        # и меньше контакта с анти-ботом). Имеет смысл только когда список
+        # обрезан стеной логина (vc > 100): там разные сортировки дают
+        # разные подмножества.
+        remaining = sorts[sorts.index(sort) + 1:]
+        if remaining and not order and (
+                no_count_hint
+                or (variant_mode or {}).get("variant_count") == 0):
+            log.info(f"[collect] отзывов у варианта нет — "
+                     f"пропускаю сортировки: {remaining}")
+            break
+        vc_now = (variant_mode or {}).get("variant_count")
+        if not isinstance(vc_now, int):
+            # Фолбэк (2026-08-21): variant_count бывает None. Берём счётчик
+            # converge последней страницы прохода — на небольших списках он
+            # равен полному размеру выдачи. Граница 60 — заведомо ниже зоны
+            # логин-стены (~100), где сортировки дают разные подмножества.
+            pages_tel = tel.get("pages") or []
+            c = (pages_tel[-1] or {}).get("count") if pages_tel else None
+            if isinstance(c, int) and 0 < c <= 60:
+                vc_now = c
+        if (remaining and isinstance(vc_now, int)
+                and 0 < vc_now <= VARIANT_COUNT_FULL_LIMIT
+                and len(order) >= vc_now):
+            log.info(f"[collect] вариант полный ({len(order)}/{vc_now}) — "
+                     f"пропускаю сортировки: {remaining}")
+            break
     reviews = [merged[uid] for uid in order]
     variant_mode = _finalize_variant_mode(variant_mode, reviews, apply_variant_mode)
     if telemetry is not None:
@@ -1484,9 +2063,14 @@ def collect(
         sess = Session(cdp_url)
     dom_html = None
     telemetry: dict = {}
+    global _active_watchdog
+    wd = _StallWatchdog(getattr(sess, "cdp_url", cdp_url))
+    _active_watchdog = wd
+    wd.start()
     try:
         sess.goto(product_url)
         check_challenge(sess.page, "product_page")
+        _pass_age_gate(sess.page)
         requested_pid = pid_from_url(product_url)
         actual_pid = pid_from_url(sess.page.url)
         if (requested_pid and actual_pid and requested_pid != "unknown"
@@ -1498,8 +2082,6 @@ def collect(
         product = collect_product(sess.page, product_url, category=category)
         chars = product.get("characteristics") or {}
         if "Артикул" in chars and str(chars["Артикул"]) != str(requested_pid):
-            print(f"[collect] warning: артикул в характеристиках ({chars['Артикул']}) "
-                  f"отличается от PID {requested_pid}")
             log.warning(f"[collect] warning: артикул в характеристиках "
                         f"({chars['Артикул']}) отличается от PID {requested_pid}")
         if save_dom:
@@ -1508,16 +2090,30 @@ def collect(
             except Exception as e:
                 if B.is_renderer_failure(e):
                     raise
-                print(f"[collect] dom snapshot warn: {e}")
                 log.warning(f"[collect] dom snapshot warn: {e}")
                 dom_html = None
         rurl = reviews_url or product_url + "?tab=reviews"
-        reviews, total_pages, page_log, variant_mode = collect_reviews(
-            sess.page, rurl, target_variant, max_pages=max_pages,
-            min_reviews=min_reviews, apply_variant_mode=apply_variant_mode,
-            sorts=sorts, telemetry=telemetry,
-        )
+        rc = product.get("rating_count")
+        no_count_hint = not (isinstance(rc, int) and rc > 0)
+        if isinstance(rc, int) and rc <= 0:
+            # У товара 0 отзывов целиком (кейс 4551551032: нет тумблера
+            # варианта и пустой раздел) — прокручивать нечего, сортировки
+            # и релоады бесполезны. Явный ноль из карточки доверяем.
+            log.info("[collect] у товара 0 отзывов (rating_count=0) — "
+                     "пропускаю сбор отзывов")
+            reviews, total_pages, page_log = [], 1, []
+            variant_mode = {"used": False, "reason": "no_reviews_product",
+                            "variant_count": 0}
+        else:
+            reviews, total_pages, page_log, variant_mode = collect_reviews(
+                sess.page, rurl, target_variant, max_pages=max_pages,
+                min_reviews=min_reviews, apply_variant_mode=apply_variant_mode,
+                sorts=sorts, telemetry=telemetry,
+                no_count_hint=no_count_hint,
+            )
     finally:
+        wd.stop()
+        _active_watchdog = None
         if sess_owned:
             sess.close()
 
@@ -1573,9 +2169,6 @@ def collect(
         print(f"[collect] {K.raw_path(pid_from_url(product_url))} уже "
               f"существует — сохраняю в {os.path.basename(out_path)} "
               f"(перезапись только с --overwrite)")
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
-    print(f"[collect] сохранено: {out_path} ({len(reviews)} отзывов)")
+    K.atomic_write_json(out_path, raw)
     log.info(f"[collect] сохранено: {out_path} ({len(reviews)} отзывов)")
     return raw

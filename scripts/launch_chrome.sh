@@ -8,6 +8,11 @@ CHROME="${CHROME:-$HOME/.cache/ms-playwright/chromium-*/chrome-linux64/chrome}"
 PORT="${PORT:-9222}"
 PROFILE="${PROFILE:-/tmp/opencode/ozon-profile}"
 
+# Маркер запуска коллектором (ADR §14.1, ownership): Session по нему отличает
+# наш запуск (browser_owner=collector) от ручного/чужого (external).
+mkdir -p "$PROFILE"
+date -Is > "$PROFILE/.ozon_collector_launched"
+
 ls $CHROME >/dev/null 2>&1 || {
   echo "Chromium не найден. Установи: python3 -m playwright install chromium" >&2
   exit 1

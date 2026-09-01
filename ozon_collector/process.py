@@ -483,14 +483,34 @@ def _linux_iter_chromium_processes():
         base = os.path.basename(argv[0]).lower()
         if "chrome" not in base and "chromium" not in base:
             continue
-        yield pid, argv
+        ppid = _linux_ppid(pid)
+        yield pid, argv, ppid
+
+
+def _linux_ppid(pid: int) -> int | None:
+    """Родительский PID процесса на Linux (из /proc/<pid>/stat)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        # формат: pid (comm) state ppid ... — comm может содержать пробелы/скобки
+        rpar = raw.rfind(b")")
+        if rpar < 0:
+            return None
+        fields = raw[rpar + 2:].split()
+        return int(fields[1])
+    except (ValueError, IndexError):
+        return None
 
 
 def _win_iter_chromium_processes():
     cmd = [
         "powershell", "-NoProfile", "-Command",
         ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-         "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"),
+         "Select-Object ProcessId,ParentProcessId,CommandLine | "
+         "ConvertTo-Json -Compress"),
     ]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -505,10 +525,12 @@ def _win_iter_chromium_processes():
     items = data if isinstance(data, list) else [data]
     for it in items:
         pid = it.get("ProcessId")
+        ppid = it.get("ParentProcessId")
         cmdline = it.get("CommandLine")
         if pid is None or not cmdline:
             continue
-        yield int(pid), _tokenize_cmdline(cmdline)
+        yield int(pid), _tokenize_cmdline(cmdline), (
+            int(ppid) if ppid is not None else None)
 
 
 def _iter_chromium_processes():
@@ -527,13 +549,115 @@ def browser_processes(cdp_url: str = "http://127.0.0.1:9222",
     """
     port = cdp_port(cdp_url)
     out: list[ProcessIdentity] = []
-    for pid, argv in _iter_chromium_processes():
+    for pid, argv, _ppid in _iter_chromium_processes():
         if not _matches_browser(argv, port, profile_token=profile_token):
             continue
         ident = process_identity(pid)
         if ident is not None:
             out.append(ident)
     return out
+
+
+def _matches_profile_token(args, profile_token: str) -> bool:
+    """Chromium-процесс на нашем профиле (main или дочерний --type=...)."""
+    user_data_dir: str | None = None
+    for a in args:
+        if a.startswith("--user-data-dir="):
+            user_data_dir = a.split("=", 1)[1].strip("\"'")
+    if not user_data_dir:
+        return False
+    name = os.path.basename(user_data_dir.rstrip("/\\"))
+    return name == profile_token
+
+
+def orphaned_worker_browser_processes(
+        cdp_url: str, profile_token: str) -> list[ProcessIdentity]:
+    """Все Chromium-процессы воркера на профиле, чей владелец мёртв.
+
+    Воркер (python-процесс) запускает СВОЙ Chromium. Если воркер был убит
+    принудительно (kill/Ctrl+C/таймаут), его `finally` не выполняется и
+    браузер остаётся жить — это осиротевший зомби. Здесь такой Chromium
+    идентифицируется по родителю: родитель main chrome-процесса обязан быть
+    python-процессом воркера. Родитель мёртв/не python → осиротевший.
+
+    Если main-браузер на (порт, профиль) осиротел — возвращаем ВСЕ
+    chromium-процессы этого профиля (main + дочерние renderer/gpu/utility).
+    Убить только main нельзя: дочерние переживают и Chrome перезапускает
+    main. Вернувшийся список можно force_stop (это не чужие процессы —
+    профиль наш, а владельца-воркера больше нет).
+    """
+    port = cdp_port(cdp_url)
+    orphans: list[ProcessIdentity] = []
+    for pid, argv, ppid in _iter_chromium_processes():
+        if not _matches_browser(argv, port, profile_token=profile_token):
+            continue
+        if _parent_owner_alive(ppid):
+            continue
+        ident = process_identity(pid)
+        if ident is not None:
+            orphans.append(ident)
+    if not orphans:
+        return []
+    # main осиротел → собрать ВЕСЬ дочерний лес этого браузера
+    # (renderer/gpu/utility/crashpad-handler наследуют --user-data-dir, но не
+    # порт; их PPID-цепочка уходит к осиротевшему main). Дочерние процессы
+    # своего профиля и ДРУГОГО живого браузера не трогаем.
+    descendant_pids: set[int] = set()
+    frontier = {i.pid for i in orphans}
+    while frontier:
+        nxt: set[int] = set()
+        for pid, argv, ppid in _iter_chromium_processes():
+            if not _matches_profile_token(argv, profile_token):
+                continue
+            if pid in descendant_pids or pid in frontier:
+                continue
+            if ppid in frontier:
+                descendant_pids.add(pid)
+                nxt.add(pid)
+        frontier = nxt
+    out = list(orphans)
+    for pid in sorted(descendant_pids):
+        ident = process_identity(pid)
+        if ident is not None:
+            out.append(ident)
+    return out
+
+
+def _parent_owner_alive(ppid: int | None) -> bool:
+    """Жив ли родительский python-процесс воркера (по PPID).
+
+    None (PPID не определился) трактуем как «родителя нет» → осиротевший
+    (консервативно для preflight: лишний force_stop безвреден, а вот
+    заблокированный запуск из-за зомби — вреден).
+    """
+    if ppid is None:
+        return False
+    try:
+        if os.name == "nt":
+            # Недостаточно проверить «есть ли процесс»: PID-reuse может дать
+            # чужой живой процесс с тем же PID. Имя процесса обязано быть
+            # python/pythonw (воркер-процесс). Читаем через WMI по PPID.
+            cmd = [
+                "powershell", "-NoProfile", "-Command",
+                (f"(Get-CimInstance Win32_Process -Filter "
+                 f"\"ProcessId={int(ppid)}\").Name"),
+            ]
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=15)
+            if out.returncode != 0 or not out.stdout.strip():
+                return False
+            name = out.stdout.strip().lower()
+            return name.startswith("python")
+        else:
+            # Linux: жив ли python-процесс с данным PPID (родитель воркера)
+            try:
+                with open(f"/proc/{int(ppid)}/comm", "rb") as f:
+                    comm = f.read().decode("utf-8", "replace").strip().lower()
+            except OSError:
+                return False
+            return comm.startswith("python")
+    except Exception:
+        return False
 
 
 # ---- Linux: pidfd (exit detection + сигналы) -------------------------------

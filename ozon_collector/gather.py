@@ -19,10 +19,21 @@ from . import ocr as O
 from . import report as R
 
 
+def _delete_raw_file(path):
+    """Удалить битый (короткий) raw, чтобы не попал в кеш/дайджест."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _save_raw(raw, path):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
+    """Атомарная запись raw (tmp→os.replace): canonical всегда целый файл.
+
+    Читатель (QA-demon, cache) никогда не увидит частично записанный raw —
+    исчезает race «CLI пишет raw / демон QA читает raw» (raw ownership).
+    """
+    K.atomic_write_json(path, raw)
 
 
 def assert_raw_structure(raw, pid) -> None:
@@ -72,11 +83,9 @@ def run_gather(cfg: dict, sess=None) -> dict:
     out_raw = cfg.get("out_raw") or K.raw_save_path(pid, overwrite=overwrite)
     canon = K.raw_path(pid)
     if out_raw != canon and os.path.exists(canon):
-        print(f"[gather] pid={pid}: {canon} уже существует — "
-              f"новый прогон в {os.path.basename(out_raw)} "
-              f"(перезапись только с --overwrite)")
-        log.warning(f"pid={pid}: перезапись запрещена, "
-                    f"новый raw: {out_raw}")
+        log.warning(f"[gather] pid={pid}: {canon} уже существует — "
+                    f"новый прогон в {os.path.basename(out_raw)} "
+                    f"(перезапись только с --overwrite)")
     result = {
         "pid": pid,
         "ok": False,
@@ -98,25 +107,28 @@ def run_gather(cfg: dict, sess=None) -> dict:
                 age = f", age={int((datetime.now(timezone.utc) - dt).total_seconds() // 60)}m"
             src = (raw.get("collected_at_utc") or "?")[:19]
             revs = int(raw.get("reviews_collected") or 0)
-            print(f"[gather] pid={pid}: cache=hit (v{ver}, reviews={revs}, from={src}{age})")
-            log.info(f"pid={pid}: cache=hit (v{ver}, reviews={revs}, from={src}{age})")
+            log.info(f"[gather] pid={pid}: cache=hit (v{ver}, reviews={revs}, from={src}{age})")
         elif max_age_s <= 0:
-            print(f"[gather] pid={pid}: cache=off (--max-age 0)")
-            log.info(f"pid={pid}: cache=off (--max-age 0)")
+            log.info(f"[gather] pid={pid}: cache=off (--max-age 0)")
         elif reason == "old_version":
             ver = K.cached_version(pid)
-            print(f"[gather] pid={pid}: cache=miss (old_version {ver or '—'} < {VERSION})")
-            log.info(f"pid={pid}: cache=miss (old_version {ver or '—'} < {VERSION})")
+            log.info(f"[gather] pid={pid}: cache=miss (old_version {ver or '—'} < {VERSION})")
         elif reason == "newer_version":
             ver = K.cached_version(pid)
-            print(f"[gather] pid={pid}: cache=miss (newer_version {ver or '—'} > {VERSION})")
-            log.info(f"pid={pid}: cache=miss (newer_version {ver or '—'} > {VERSION})")
+            log.info(f"[gather] pid={pid}: cache=miss (newer_version {ver or '—'} > {VERSION})")
         elif reason == "incompatible":
-            print(f"[gather] pid={pid}: cache=miss (schema != {SCHEMA_VERSION})")
-            log.info(f"pid={pid}: cache=miss (schema != {SCHEMA_VERSION})")
+            log.info(f"[gather] pid={pid}: cache=miss (schema != {SCHEMA_VERSION})")
         else:
-            print(f"[gather] pid={pid}: cache=miss ({reason})")
-            log.info(f"pid={pid}: cache=miss ({reason})")
+            log.info(f"[gather] pid={pid}: cache=miss ({reason})")
+
+        if raw is not None:
+            problems = C.variant_review_problems(raw)
+            if problems:
+                log.warning(f"[gather] pid={pid}: кеш-хит с браком "
+                            f"({'; '.join(problems)}) — игнорирую кеш, "
+                            f"пересобираю живьём")
+                raw = None
+                result["cache"] = "miss"
 
         if raw is None:
             raw = C.collect(
@@ -132,23 +144,25 @@ def run_gather(cfg: dict, sess=None) -> dict:
                 sorts=cfg.get("sorts"),
                 sess=sess,
             )
-            print(f"[gather] pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
-            log.info(f"pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
+            log.info(f"[gather] pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
+            problems = C.variant_review_problems(raw)
+            if problems:
+                _delete_raw_file(out_raw)
+                raise B.VariantShortError(
+                    f"брак числа отзывов: {'; '.join(problems)}")
         result["raw"] = raw
         assert_raw_structure(raw, pid)
 
         if not cfg.get("no_ocr"):
             if raw.get("gallery_ocr"):
                 result["ocr"] = "hit"
-                print(f"[gather] pid={pid}: ocr=hit (в кеше)")
-                log.info(f"pid={pid}: ocr=hit (в кеше)")
+                log.info(f"[gather] pid={pid}: ocr=hit (в кеше)")
             else:
                 urls = (raw.get("product", {}).get("gallery")
                         or raw.get("product", {}).get("infographics"))
                 if not urls:
                     result["ocr"] = "error"
-                    print(f"[gather] pid={pid}: ocr=error (нет галереи/инфографики)")
-                    log.warning(f"pid={pid}: ocr=error (нет галереи/инфографики)")
+                    log.warning(f"[gather] pid={pid}: ocr=error (нет галереи/инфографики)")
                 else:
                     pid_ = raw.get("pid") or pid
                     gdir = cfg.get("gallery_dir") or os.path.join(
@@ -158,12 +172,10 @@ def run_gather(cfg: dict, sess=None) -> dict:
                     _save_raw(raw, out_raw)
                     result["ocr"] = "ran"
                     n_img = len(raw.get("gallery_ocr") or []) or len(urls)
-                    print(f"[gather] pid={pid}: ocr=ran ({n_img} картинок)")
-                    log.info(f"pid={pid}: ocr=ran ({n_img} картинок)")
+                    log.info(f"[gather] pid={pid}: ocr=ran ({n_img} картинок)")
         else:
             result["ocr"] = "off"
-            print(f"[gather] pid={pid}: ocr=off")
-            log.info(f"pid={pid}: ocr=off")
+            log.info(f"[gather] pid={pid}: ocr=off")
 
         result["markdown"] = R.render(
             raw, dedup_replies=cfg.get("dedup_replies", True))
@@ -172,13 +184,12 @@ def run_gather(cfg: dict, sess=None) -> dict:
         result["error"] = f"{type(e).__name__}: {e}"
         cls = B.classify_error(e, sess=sess)
         result["error_kind"] = cls.error_kind
+        result["failure_type"] = cls.failure_type
         result["error_probe_state"] = cls.probe_state
         result["error_probe_attempts"] = cls.probe_attempts
         result["error_signature"] = cls.signature
         result["recyclable"] = cls.should_recycle
-        print(f"[gather] pid={pid}: error: {result['error']} "
-              f"(kind={cls.error_kind})")
-        log.error(f"pid={pid}: error: {result['error']} "
+        log.error(f"[gather] pid={pid}: error: {result['error']} "
                   f"(kind={cls.error_kind}, probe={cls.probe_state}, "
                   f"recyclable={cls.should_recycle})")
     return result

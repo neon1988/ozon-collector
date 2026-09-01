@@ -95,3 +95,67 @@ def test_gallery_only_product_widgets(evaluate):
         assert "7777777777" not in u and "8888888888" not in u, \
             f"чужой товар попал в gallery: {u}"
     assert len(g) == 2, f"ожидал 2 (webGallery+desc), получил: {g}"
+
+
+def test_customer_opinion_recommend_and_stars(evaluate):
+    """«По мнению покупателей»: % рекомендуют + разбивка оценок по звёздам.
+    Реальная разметка Ozon: строки «N звёзд», процент в style=width, кол-во в конце."""
+    html = '''<html><body>
+      <div data-widget="webReviewProductScore">
+        <div class="yk0_25">
+          <div class="ky2_25">
+            <div class="ky3_25">5 звёзд</div>
+            <div class="k2y_25"><div class="yk2_25"><div class="y2k_25" style="width: 87.9883%;"></div></div></div>
+            <div class="k3y_25">4527</div>
+          </div>
+          <div class="ky2_25">
+            <div class="ky3_25">4 звезды</div>
+            <div class="k2y_25"><div class="yk2_25"><div class="y2k_25" style="width: 7.26919%;"></div></div></div>
+            <div class="k3y_25">374</div>
+          </div>
+          <div class="ky2_25">
+            <div class="ky3_25">3 звезды</div>
+            <div class="k2y_25"><div class="yk2_25"><div class="y2k_25" style="width: 1.4966%;"></div></div></div>
+            <div class="k3y_25">77</div>
+          </div>
+          <div class="ky2_25">
+            <div class="ky3_25">2 звезды</div>
+            <div class="k2y_25"><div class="yk2_25"><div class="y2k_25" style="width: 0.738581%;"></div></div></div>
+            <div class="k3y_25">38</div>
+          </div>
+          <div class="ky2_25">
+            <div class="ky3_25">1 звезда</div>
+            <div class="k2y_25"><div class="yk2_25"><div class="y2k_25" style="width: 2.50729%;"></div></div></div>
+            <div class="k3y_25">129</div>
+          </div>
+        </div>
+      </div>
+    </body></html>'''
+    d = evaluate(html=html)
+    op = d.get("customer_opinion") or {}
+    stars = {int(k): v for k, v in (op.get("stars") or {}).items()}
+    assert abs(stars.get(5) - 87.9883) < 0.001, f"5★={stars.get(5)!r}"
+    assert abs(stars.get(4) - 7.26919) < 0.001, f"4★={stars.get(4)!r}"
+    assert abs(stars.get(1) - 2.50729) < 0.001, f"1★={stars.get(1)!r}"
+    counts = {int(k): v for k, v in (op.get("counts") or {}).items()}
+    assert counts.get(5) == 4527, f"counts={counts!r}"
+    assert counts.get(1) == 129, f"counts={counts!r}"
+
+
+def test_customer_opinion_live_markup(evaluate):
+    """Гистограмма извлекается с реальной сохранённой страницы товара."""
+    d = evaluate(name="xiaomi")
+    op = d.get("customer_opinion") or {}
+    stars = {int(k): v for k, v in (op.get("stars") or {}).items()}
+    assert len(stars) == 5, f"ожидал 5 звёзд, получил: {stars!r}"
+    assert 0 < stars.get(5, 0) <= 100, f"5★ вне диапазона: {stars!r}"
+    assert sum(stars.values()) >= 95, f"сумма процентов < 95: {stars!r}"
+
+
+def test_customer_opinion_absent_when_no_widget(evaluate):
+    """Нет виджета «По мнению покупателей» → customer_opinion пустой, без краша."""
+    d = evaluate(html='<html><body><p>товара нет</p></body></html>')
+    op = d.get("customer_opinion") or {}
+    assert op.get("recommend_percent") is None
+    assert not op.get("stars")
+    assert not op.get("text")

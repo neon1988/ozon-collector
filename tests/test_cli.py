@@ -67,6 +67,17 @@ def test_search_min_rating_zero_disables():
     assert args.min_rating == 0
 
 
+def test_search_default_session_budget_wall_clock_none():
+    args = cli.build_parser().parse_args(["search", "--limit", "10"])
+    assert args.session_budget_wall_clock is None
+
+
+def test_search_session_budget_wall_clock_override():
+    args = cli.build_parser().parse_args(
+        ["search", "--limit", "10", "--session-budget-wall-clock", "7200"])
+    assert args.session_budget_wall_clock == 7200
+
+
 def test_gather_has_no_min_rating():
     args = cli.build_parser().parse_args(["gather", "--pid", "123"])
     assert not hasattr(args, "min_rating")

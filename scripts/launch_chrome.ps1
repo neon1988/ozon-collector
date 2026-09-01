@@ -15,16 +15,7 @@ if (-not $Port) { $Port = "9222" }
 if (-not $Profile) { $Profile = Join-Path $env:LOCALAPPDATA "opencode\ozon-profile" }
 
 function Find-Chrome {
-    # 1) Playwright chromium (как в launch_chrome.sh)
-    $pwDirs = @(
-        (Join-Path $env:LOCALAPPDATA "ms-playwright\chromium-*\chrome-win64\chrome.exe"),
-        (Join-Path $env:LOCALAPPDATA "ms-playwright\chromium-*\chrome-win\chrome.exe")
-    )
-    foreach ($pat in $pwDirs) {
-        $hit = Get-ChildItem $pat -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($hit) { return $hit.FullName }
-    }
-    # 2) Системный Chrome (установленный)
+    # 1) Системный Chrome (реальный отпечаток браузера) — Ozon не блочит.
     $candidates = @(
         (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
         (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
@@ -32,6 +23,15 @@ function Find-Chrome {
     )
     foreach ($c in $candidates) {
         if (Test-Path $c) { return $c }
+    }
+    # 2) Playwright chromium (запасной — отпечаток чаще блочится Ozon)
+    $pwDirs = @(
+        (Join-Path $env:LOCALAPPDATA "ms-playwright\chromium-*\chrome-win64\chrome.exe"),
+        (Join-Path $env:LOCALAPPDATA "ms-playwright\chromium-*\chrome-win\chrome.exe")
+    )
+    foreach ($pat in $pwDirs) {
+        $hit = Get-ChildItem $pat -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
     }
     return $null
 }
@@ -46,6 +46,11 @@ if (-not $Chrome) {
 # тогда полагаемся на уже запущенный инстанс.
 New-Item -ItemType Directory -Force -Path $Profile | Out-Null
 
+# Маркер запуска коллектором (ADR §14.1, ownership): Session по нему отличает
+# наш запуск (browser_owner=collector) от ручного/чужого (external).
+Set-Content -Path (Join-Path $Profile ".ozon_collector_launched") `
+    -Value (Get-Date -Format "o") -Encoding UTF8 | Out-Null
+
 $chromeArgs = @(
     "--remote-debugging-port=$Port",
     "--user-data-dir=$Profile",
@@ -53,7 +58,14 @@ $chromeArgs = @(
     "--no-default-browser-check",
     "--disable-features=OptimizationHints,MediaRouter",
     "--window-size=1440,900",
-    "--no-sandbox",
+    # Не показывать баббл «Восстановить страницы?» после насильственного
+    # завершения Chrome (kill коллектором) и инфобар WebDriver — они мешают.
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    # Маскировка автоматизации: прячем признаки webdriver/automation от антибота.
+    # НЕ ставим --no-sandbox (сильный сигнал automation; системному Chrome не нужен).
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
     "about:blank"
 )
 
@@ -168,6 +180,15 @@ public class LaunchChromeMin {
         }, IntPtr.Zero);
         return found;
     }
+
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(
+        IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    // Прижать окно поверх всех (HWND_TOPMOST), не активируя (SWP_NOACTIVATE).
+    public static bool SetTopmost(IntPtr hWnd) {
+        return SetWindowPos(hWnd, new IntPtr(-1), 0, 0, 0, 0,
+                            0x0002 | 0x0001 | 0x0010);  // NOMOVE|NOSIZE|NOACTIVATE
+    }
 }
 "@
 $GWL_EXSTYLE = -20
@@ -188,11 +209,11 @@ public class FocusSave {
 "@
 $prevFg = [FocusSave]::GetForegroundWindow()
 
-function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowMin = $true) {
-    # Сворачивает окно (SW_SHOWMINNOACTIVE=7) и ставит WS_EX_NOACTIVATE,
-    # чтобы дальнейшие разворачивания Chromium не крали фокус.
-    # Окно ищем через EnumWindows (для скрытых окон MainWindowHandle = 0).
-    # $ShowMin=$false — только ставим WS_EX_NOACTIVATE, не показывая окно.
+function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowWindow = $true) {
+    # Показывает окно БЕЗ активации и прижимает поверх всех (HWND_TOPMOST):
+    # окно ВИДИМО и не перехватывает фокус. SW_RESTORE выставляет WS_VISIBLE
+    # (иначе окно остаётся «видимым» для EnumWindows, но не на экране).
+    # $ShowWindow=$false — только ставим WS_EX_NOACTIVATE, не показывая окно.
     $deadline = (Get-Date).AddMilliseconds($WaitMs)
     while ((Get-Date) -lt $deadline) {
         $win = Get-Process -Id $PidToWatch -ErrorAction SilentlyContinue
@@ -200,7 +221,10 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowMin = $true)
         if ($h -ne [IntPtr]::Zero) {
             $style = [LaunchChromeMin]::GetWindowLong($h, $GWL_EXSTYLE)
             [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $style -bor $WS_EX_NOACTIVATE) | Out-Null
-            if ($ShowMin) { [LaunchChromeMin]::ShowWindow($h, 7) | Out-Null }
+            if ($ShowWindow) {
+                [LaunchChromeMin]::ShowWindow($h, 9) | Out-Null          # SW_RESTORE (WS_VISIBLE)
+                [void][LaunchChromeMin]::SetTopmost($h)                  # поверх всех, без активации
+            }
             return $true
         }
         Start-Sleep -Milliseconds 30
@@ -254,9 +278,8 @@ if (-not $ready) {
 }
 
 # Контрольные проходы ПОСЛЕ полного старта: повторно применяем стиль
-# WS_EX_NOACTIVATE и показываем окно свёрнутым (SW_SHOWMINNOACTIVE=7),
-# затем возвращаем фокус. Chrome больше не активируется сам — готово к
-# подключению CDP (которое разворачивает окно, но без активации).
+# WS_EX_NOACTIVATE, показываем окно (SW_RESTORE) и прижимаем поверх всех
+# (HWND_TOPMOST), затем возвращаем фокус. Окно ВИДИМО всегда, фокус не крадёт.
 if (-not $minimized) {
     $minimized = Invoke-MinimizeNoActivate $targetPid 3000 $false
 }
@@ -265,7 +288,7 @@ for ($i = 0; $i -lt 3; $i++) {
     Restore-Focus -PrevFg $prevFg -Verbose ($i -eq 0)
 }
 if ($minimized) {
-    Write-Host "OK: окно PID $targetPid свёрнуто, активация отключена"
+    Write-Host "OK: окно PID $targetPid показано поверх всех (TOPMOST), фокус не крадётся"
 } else {
-    Write-Warning "не удалось найти окно PID $targetPid для сворачивания"
+    Write-Warning "не удалось найти окно PID $targetPid для показа"
 }

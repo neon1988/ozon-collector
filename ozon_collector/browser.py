@@ -70,6 +70,15 @@ class StructureError(Exception):
     """
 
 
+class VariantShortError(Exception):
+    """Собрано меньше отзывов, чем обещает variant_count (брак по правилу
+    «собранное = Этот вариант товара (N)»).
+
+    Recyclable: короткий сбор обычно значит залипшую ленивую догрузку или
+    подвисший renderer — recycle браузера + повтор сбора исправляет.
+    """
+
+
 def _launch_script_name() -> str:
     return "launch_chrome.ps1" if os.name == "nt" else "launch_chrome.sh"
 
@@ -164,7 +173,25 @@ class Classification:
     @property
     def should_recycle(self) -> bool:
         return self.error_kind in ("browser", "renderer_failure",
-                                   "access_challenge")
+                                   "access_challenge", "variant_short")
+
+    @property
+    def failure_type(self) -> str:
+        """Тип сбоя для разделения product/session/browser/access (ADR §14.1).
+
+        product_failure — проблема товара (структура/variant_short): штрафует
+          PID (rescan/retry товара).
+        browser_failure — краш renderer/CDP: НЕ штрафует PID (recycle браузера).
+        access_failure — challenge/капча: НЕ штрафует PID, идёт по FSM-лестнице.
+        unknown — не классифицировано.
+        """
+        if self.error_kind in ("access_challenge",):
+            return "access_failure"
+        if self.error_kind in ("browser", "renderer_failure", "target"):
+            return "browser_failure"
+        if self.error_kind in ("structure", "variant_short"):
+            return "product_failure"
+        return "unknown"
 
 
 class BrowserProbe:
@@ -256,7 +283,7 @@ def _classify_hang(sess, signature: bool) -> Classification:
     if page is None:
         return Classification("unknown", signature=signature)
     try:
-        page.evaluate("1+1", timeout=4000)
+        page.evaluate("1+1", timeout=8000)
     except Exception:
         return Classification("renderer_failure", probe_state="renderer_hang",
                               signature=signature)
@@ -277,6 +304,8 @@ def classify_error(exc, sess=None) -> Classification:
         return Classification("access_challenge", signature=signature)
     if isinstance(exc, StructureError):
         return Classification("structure", signature=signature)
+    if isinstance(exc, VariantShortError):
+        return Classification("variant_short", signature=signature)
     from playwright.sync_api import Error as PWError
     if not isinstance(exc, PWError):
         return Classification("unknown", signature=signature)

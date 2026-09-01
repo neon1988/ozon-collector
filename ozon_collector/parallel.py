@@ -93,6 +93,39 @@ def preflight_check(specs: list[dict]) -> list[str]:
     all_paths = [s["profile_path"] for s in specs]
     if len(set(all_paths)) != len(all_paths):
         errs.append("profile_path воркеров не попарно различны")
+
+    # Автоочистка осиротевших браузеров воркеров: после аварийной гибели
+    # родителя (kill/Ctrl+C/таймаут) воркер не выполняет finally и его
+    # Chromium остаётся висеть. Идентифицируем по мёртвому родителю (PPID
+    # воркера) и гасим — иначе следующий прогон навсегда упирается в
+    # preflight. Живой воркер (реально идущий прогон) не трогаем.
+    for s in specs:
+        w = s["worker_id"]
+        orphans = P.orphaned_worker_browser_processes(
+            s["cdp_url"], s["profile_token"])
+        if not orphans:
+            continue
+        try:
+            manager = BrowserProcessManager(cdp_url=s["cdp_url"],
+                                            profile_token=s["profile_token"])
+            records = [P.ProcessRecord(f"worker{w}-orphan", ident)
+                       for ident in orphans]
+            manager.force_stop(records)
+            log.warning(f"[parallel] worker{w}: убран осиротевший Chromium "
+                        f"({len(records)} процесс(ов), родитель мёртв)")
+        except Exception as e:
+            errs.append(f"worker{w}: не удалось убрать осиротевший "
+                        f"Chromium: {type(e).__name__}: {e}")
+        # процесс убит, но CDP-порт/профиль освобождаются не мгновенно —
+        # ждём, пока исчезнут все matching-процессы и порт перестанет отвечать
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not P.browser_processes(s["cdp_url"],
+                                       profile_token=s["profile_token"]) \
+                    and not cdp.browser_alive(s["cdp_url"]):
+                break
+            time.sleep(0.3)
+
     for s in specs:
         w = s["worker_id"]
         if not _port_free(s["port"]):
@@ -125,6 +158,7 @@ class WorkerContext:
         self.started: bool = False
         self.recovery_events: list[dict] = []
         self.payload: dict | None = None
+        self.done: bool = False
         self.reader: threading.Thread | None = None
         self.exitcode: int | None = None
 
@@ -147,8 +181,11 @@ def _reader_loop(wctx: WorkerContext):
                 wctx.started = True
             elif t == "recovery":
                 wctx.recovery_events.append(msg)
+            elif t == "progress":
+                wctx.payload = msg.get("payload") or {}
             elif t == "done":
                 wctx.payload = msg.get("payload") or {}
+                wctx.done = True
                 break
     except Exception:
         pass
@@ -209,7 +246,9 @@ def _make_session(spec: dict):
     if os.environ.get("OZON_WORKER_DOUBLES") == "1":
         from tests._fake_worker import fake_session
         return fake_session(spec)
-    return cdp.Session(spec["cdp_url"], profile_token=spec["profile_token"])
+    _wm = spec.get("window_mode")
+    return cdp.Session(spec["cdp_url"], profile_token=spec["profile_token"],
+                       keep_window=None if _wm is None else (_wm == "visible"))
 
 
 def _make_manager(spec: dict):
@@ -222,20 +261,24 @@ def _make_manager(spec: dict):
 
 
 def _run_shard(spec: dict, sess, manager, items, gather_cfg: dict,
-               max_recycles: int, recovery: dict, on_recovery):
+               max_recycles: int, recovery: dict, on_recovery,
+               on_progress=None):
     """Шард-цикл воркера (тест-дубль при OZON_WORKER_DOUBLES=1)."""
     if os.environ.get("OZON_WORKER_DOUBLES") == "1":
         from tests._fake_worker import fake_run_shard
         return fake_run_shard(spec, sess, manager, items, gather_cfg,
-                              max_recycles, recovery, on_recovery)
+                              max_recycles, recovery, on_recovery,
+                              on_progress=on_progress)
     return S._collect_shard(sess, manager, items, gather_cfg,
                             max_recycles=max_recycles, recovery=recovery,
-                            on_recovery=on_recovery,
+                            on_recovery=on_recovery, on_progress=on_progress,
                             label=f"worker{spec['worker_id']}")
 
 
 WARMUP_URL = "https://www.ozon.ru/"
 WARMUP_WAIT_MS = 4000
+
+PROGRESS_EVERY = 5  # каждые N товаров воркер шлёт частичный payload (защита от потери при terminate)
 
 
 def _warmup_session(sess, label: str = "warmup") -> dict:
@@ -309,16 +352,38 @@ def worker_main(spec: dict, task: dict, conn):
         gather_cfg = dict(task.get("gather_cfg") or {})
         max_recycles = int(task.get("max_recycles", 2))
         recovery = payload["recovery_metrics"]
+        tb = task.get("session_budget")
+        if tb:
+            recovery["session_budget"] = tb
+            recovery.setdefault("session_started_ts", time.time())
 
         def on_recovery(ev: dict):
             # recovery-метрики накапливает сам _collect_shard (в payload);
             # сюда — только телеметрия по pipe родителю.
             _send(conn, {"t": "recovery", "worker": k, **ev})
 
+        def on_progress(products, n, total):
+            # периодическая передача частичных результатов: при terminate
+            # родитель берёт последний progress-снимок, и собранные товары
+            # не теряются (без этого payload уходит только в конце и всё
+            # падает в "worker terminated/failed").
+            if n % PROGRESS_EVERY != 0:
+                return
+            partial = {
+                "products": [
+                    {"index": idx, "result": res}
+                    for (idx, _pid, _url), res in zip(items, products)],
+                "processed_indexes": [idx for idx, _p, _u in items[:len(products)]],
+                "failed_indexes": [
+                    idx for (idx, _p, _u), res in zip(items, products)
+                    if not res["ok"]],
+            }
+            _send(conn, {"t": "progress", "worker": k, "payload": partial})
+
         results = _run_shard(
             spec, sess, manager, items, gather_cfg,
             max_recycles=max_recycles, recovery=recovery,
-            on_recovery=on_recovery)
+            on_recovery=on_recovery, on_progress=on_progress)
 
         payload["products"] = [
             {"index": idx, "result": res}
@@ -453,7 +518,9 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      query: str | None = None, max_recycles: int = 2,
                      join_timeout_s: float = 1800.0,
                      pids: list | None = None,
-                     no_bootstrap: bool = False) -> dict:
+                     skip_pids: list | None = None,
+                     no_bootstrap: bool = False,
+                     session_budget: dict | None = None) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
 
     pids — явный список артикулов вместо докрутки выдачи: main-сессия не
@@ -471,7 +538,9 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                  for p in pids]
         recovery_main = {"recycles": 0, "events": []}
     else:
-        sess = cdp.Session()
+        _wm_main = gather_cfg.get("window_mode")
+        sess = cdp.Session(
+            keep_window=None if _wm_main is None else (_wm_main == "visible"))
         recovery_main = {"recycles": 0, "events": []}
         try:
             manager_main = BrowserProcessManager(cdp_url=sess.cdp_url)
@@ -485,18 +554,22 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
             _stop_main_browser()
 
     found = len(links)
+    if skip_pids:
+        skip = set(str(p) for p in skip_pids)
+        before = len(links)
+        links = [it for it in links if str(it["pid"]) not in skip]
+        if len(links) < before:
+            log.info(f"[search] skip_pids: пропущено {before - len(links)} "
+                     f"уже обработанных (осталось {len(links)})")
     selected = links[:limit]
     items = [(i, it["pid"], it["url"]) for i, it in enumerate(selected)]
     total = len(items)
-    print(f"[search] найдено {found} товаров в выдаче, "
-          f"собираю {total} через {parallel} воркер(ов)")
-    log.info(f"найдено {found} товаров в выдаче, собираю {total} "
-             f"через {parallel} воркер(ов)")
+    log.info(f"[search] найдено {found} товаров в выдаче, "
+             f"собираю {total} через {parallel} воркер(ов)")
 
     if not no_bootstrap:
         bs = P.bootstrap_worker_profiles(range(1, parallel + 1))
         for k, st in bs.items():
-            print(f"[parallel] bootstrap worker-{k}: {st}")
             log.info(f"[parallel] bootstrap worker-{k}: {st}")
 
     shards = shard_items(items, parallel)
@@ -506,12 +579,16 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         raise RuntimeError("preflight FAILED:\n" + "\n".join(errs))
 
     wctxs = []
+    _wm = gather_cfg.get("window_mode")
     for k, spec in enumerate(specs, 1):
+        # window_mode: visible/hidden для воркер-браузеров (spec видит Session)
+        spec["window_mode"] = _wm
         task = {
             "items": shards[k - 1],
             "gather_cfg": gather_cfg,
             "max_recycles": max_recycles,
             "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
+            "session_budget": dict(session_budget) if session_budget else None,
         }
         wctxs.append(_spawn_ctx(spec, task))
 
@@ -522,7 +599,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
             wctx.proc.join(remain)
 
     for wctx in wctxs:
-        if wctx.proc.is_alive() and wctx.payload is None:
+        if wctx.proc.is_alive() and not wctx.done:
             log.warning(f"worker{wctx.worker_idx} hang: terminate()")
             wctx.proc.terminate()
             wctx.proc.join(2)

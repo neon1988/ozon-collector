@@ -95,6 +95,20 @@ def test_classification_should_recycle():
     assert B.Classification("unknown").should_recycle is False
 
 
+def test_classification_failure_type():
+    """ADR §14.1: разделение product/session/browser/access failure."""
+    assert B.Classification("access_challenge").failure_type == "access_failure"
+    assert B.Classification("browser").failure_type == "browser_failure"
+    assert B.Classification("renderer_failure").failure_type == "browser_failure"
+    assert B.Classification("target").failure_type == "browser_failure"
+    assert B.Classification("structure").failure_type == "product_failure"
+    assert B.Classification("variant_short").failure_type == "product_failure"
+    assert B.Classification("unknown").failure_type == "unknown"
+    # access_failure ≠ product_failure (не штрафует PID)
+    assert (B.Classification("access_challenge").failure_type
+            != B.Classification("variant_short").failure_type)
+
+
 # ---- классификация ошибок ---------------------------------------------------
 
 def test_classify_browser_closed():

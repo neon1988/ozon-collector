@@ -203,7 +203,7 @@ def test_browser_processes_token_matching(monkeypatch):
         "--remote-debugging-port=9223",
     ]
     monkeypatch.setattr(P, "_iter_chromium_processes",
-                        lambda: [(111, argv)])
+                        lambda: [(111, argv, 42)])
     monkeypatch.setattr(P, "process_identity",
                         lambda pid: P.ProcessIdentity(pid, "k"))
     ids = P.browser_processes("http://127.0.0.1:9223",
@@ -215,6 +215,30 @@ def test_browser_processes_token_matching(monkeypatch):
     # другой порт не матчится
     assert P.browser_processes("http://127.0.0.1:9224",
                                profile_token="ozon-profile-worker-1") == []
+
+
+def test_orphaned_worker_browser_detects_dead_parent(monkeypatch):
+    """Браузер воркера с мёртвым родителем считается осиротевшим и
+    подлежит автоочистке; с живым python-родителем — НЕ осиротевший."""
+    base = P.profile_base_dir()
+    argv = [
+        "C:/Program Files/Chrome/chrome.exe",
+        f"--user-data-dir={base}\\ozon-profile-worker-1",
+        "--remote-debugging-port=9223",
+    ]
+    fake = [
+        (111, argv, 555),   # родитель 555 (мёртв/не python) → осиротевший
+        (222, argv, 666),   # родитель 666 — живой python → не осиротевший
+    ]
+    monkeypatch.setattr(P, "_iter_chromium_processes", lambda: iter(fake))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid, f"k{pid}"))
+    # 555 мёртв, 666 живой
+    monkeypatch.setattr(P, "_parent_owner_alive",
+                        lambda ppid: ppid == 666)
+    ids = P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1")
+    assert [i.pid for i in ids] == [111]
 
 
 # ---- preflight -----------------------------------------------------------------
@@ -266,6 +290,48 @@ def test_preflight_profile_collision_with_main(monkeypatch, profile_base):
     spec = dict(PL.worker_spec(1), profile_token=P.PROFILE_TOKEN)
     errs = PL.preflight_check([spec])
     assert any("не попарно различны" in e for e in errs)
+
+
+def test_preflight_cleans_orphaned_browser(monkeypatch, profile_base, capsys):
+    """preflight при обнаружении осиротевшего браузера воркера убивает его
+    автоматически и НЕ падает (после очистки порт/профиль свободны)."""
+    _free_ports(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
+    monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
+    orphan_id = P.ProcessIdentity(pid=111, start_key="k111")
+    monkeypatch.setattr(
+        P, "orphaned_worker_browser_processes",
+        lambda cdp_url, profile_token:
+        [orphan_id] if profile_token == "ozon-profile-worker-1" else [])
+    stopped = []
+    manager = object.__new__(PL.BrowserProcessManager)
+
+    def _force_stop(self, owned, wait_s=None):
+        stopped.append(owned)
+
+    monkeypatch.setattr(PL.BrowserProcessManager, "force_stop", _force_stop)
+    errs = PL.preflight_check([PL.worker_spec(1), PL.worker_spec(2)])
+    assert len(stopped) == 1
+    assert [r.identity for r in stopped[0]] == [orphan_id]
+    assert errs == []
+    out = capsys.readouterr().out
+    assert "убран осиротевший Chromium" in out
+
+
+def test_preflight_cleanup_failure_reports_error(monkeypatch, profile_base):
+    """Не удалось убрать осиротевший браузер → ошибка preflight (не тихий skip)."""
+    _free_ports(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
+    monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
+    orphan_id = P.ProcessIdentity(pid=111, start_key="k111")
+    monkeypatch.setattr(
+        P, "orphaned_worker_browser_processes",
+        lambda cdp_url, profile_token: [orphan_id])
+    monkeypatch.setattr(PL.BrowserProcessManager, "force_stop",
+                        lambda self, owned, wait_s=None: (_ for _ in ()).throw(
+                            RuntimeError("boom")))
+    errs = PL.preflight_check([PL.worker_spec(1)])
+    assert any("не удалось убрать осиротевший" in e for e in errs)
 
 
 # ---- worker-макет (spawn) -------------------------------------------------------
@@ -391,19 +457,46 @@ def test_worker_hang_terminated(monkeypatch, tmp_path):
     assert w.payload is None or w.payload["fatal_error"] is not None
 
 
+def test_worker_hang_after_progress_keeps_partial(monkeypatch, tmp_path):
+    """Воркер прислал частичный progress (≥5 товаров, кратно PROGRESS_EVERY)
+    и завис → при terminate последний progress-снимок остаётся в payload
+    (собранное не теряется)."""
+    monkeypatch.setenv("OZON_PROFILE_BASE", str(tmp_path))
+    monkeypatch.setenv("OZON_WORKER_DOUBLES", "1")
+    monkeypatch.setenv("OZON_WORKER_TEST_SCENARIO", "hang_after_progress")
+    monkeypatch.setenv("OZON_COLLECTOR_LOG", str(tmp_path / "main.log"))
+    spec = PL.worker_spec(1)
+    items = _items(10)
+    task = {"items": items, "gather_cfg": {},
+            "max_recycles": 2, "scroll_jitter_seed": 1}
+    w = PL._spawn_ctx(spec, task)
+    w.proc.join(6)
+    assert w.proc.is_alive()          # всё ещё виснет после прогресса
+    w.proc.terminate()
+    w.proc.join(3)
+    assert not w.proc.is_alive()
+    PL._cleanup_worker(w)
+    pl = w.payload
+    assert pl is not None
+    prods = pl.get("products") or []
+    assert len(prods) == 5            # последний progress-снимок сохранён
+    assert [p["index"] for p in prods] == [i[0] for i in items[:5]]
+    assert all(p["result"]["ok"] for p in prods)
+
+
 # ---- CLI валидация (через helpers) --------------------------------------------
 
 def test_parallel_validation_bounds(monkeypatch):
     monkeypatch.delenv("OZON_PARALLEL_MAX", raising=False)
     from ozon_collector import PARALLEL_MAX_WORKERS
-    assert PARALLEL_MAX_WORKERS == 2
-    monkeypatch.setenv("OZON_PARALLEL_MAX", "8")
+    assert PARALLEL_MAX_WORKERS == 8
+    monkeypatch.setenv("OZON_PARALLEL_MAX", "16")
     from importlib import reload
     import ozon_collector as oc
     reload(oc)
     from ozon_collector import PARALLEL_MAX_WORKERS as PMW2
-    assert PMW2 == 8
-    monkeypatch.setenv("OZON_PARALLEL_MAX", "2")
+    assert PMW2 == 16
+    monkeypatch.setenv("OZON_PARALLEL_MAX", "8")
     reload(oc)
     with pytest.raises(ZeroDivisionError):
         PL.shard_items(_items(3), 0)

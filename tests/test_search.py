@@ -5,7 +5,9 @@ from __future__ import annotations
 import gzip
 import os
 
-from ozon_collector.search import SEARCH_JS, search_url, collect_search
+from ozon_collector.search import (
+    SEARCH_JS, search_url, collect_search, _recovery_meta)
+from ozon_collector import browser as B
 from ozon_collector import report as R
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -100,6 +102,28 @@ class _FakeSess:
         self.scrolls = 0
         self.called_pids = []
         self.new_pages = 0
+        self.cdp_url = "http://127.0.0.1:9222"
+        self._managed = 1
+        self._page_url = "https://www.ozon.ru/product/1"
+
+    @property
+    def page(self):
+        if getattr(self, "_page_override", None) is not None:
+            return self._page_override
+        class _P:
+            url = self._page_url
+            def title(self):
+                return "Ozon"
+            def evaluate(self, js, *args, **kwargs):
+                return ""
+        return _P()
+
+    @page.setter
+    def page(self, value):
+        self._page_override = value
+
+    def collector_tabs(self):
+        return self._managed
 
     def goto(self, url, wait_ms=None):
         self.gotos += 1
@@ -247,7 +271,7 @@ def test_collect_search_one_session():
     with mock.patch("ozon_collector.search.run_gather",
                     side_effect=lambda cfg, sess=None: _ok_result(cfg["pid"])):
         collect_search(sess, "u", limit=5, gather_cfg={})
-    assert sess.gotos == 1  # ровно один goto (одна CDP-сессия)
+    assert sess.gotos == 3  # warmup (главная + категория) + одна докрутка (одна CDP-сессия)
 
 
 def test_collect_search_progress_output(monkeypatch, capsys):
@@ -401,8 +425,8 @@ def test_collect_search_recycle_until_success_or_limit(monkeypatch):
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
     c = collect_search(sess, "u", limit=5, gather_cfg={},
                        max_recycles=2)
-    assert len(recycled) == 2              # 2 попытки рецикла
-    assert c["recovery"]["recycles"] == 2
+    assert len(recycled) == 3              # 2 recycle + 1 preventive (stability)
+    assert c["recovery"]["recycles"] == 3
     assert c["products"][0]["ok"] is False
     assert c["products"][0]["recycle_attempts"] == 3
 
@@ -449,13 +473,15 @@ def test_collect_search_preventive_recycle(monkeypatch):
     assert c["collected"] == 5
 
 
-# ---- challenge storm (абort при персистентном access_challenge) ------------
+# ---- SESSION_BLOCKED (ADR §14.2: лестница одного challenge-инцидента) -------
 
 def test_collect_search_challenge_storm_aborts(monkeypatch):
-    """3 access_challenge подряд → прогон останавливается, остаток aborted.
+    """Персистентный challenge → лестница (new_tab×1 → recycle×1) исчерпана →
+    SESSION_BLOCKED, остаток aborted (session_failure, без штрафа PID).
 
-    Никакого агрессивного retry-loop: после шторма не пытаемся собирать
-    дальше, remaining помечается error_kind=challenge_storm, combined.aborted."""
+    Никакого агрессивного retry-loop: лестница не крутится, после исчерпания
+    run останавливается, remaining помечается error_kind=session_blocked,
+    combined.aborted."""
     links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 6)]
     sess = _FakeSess(links)
     recycled = []
@@ -465,55 +491,88 @@ def test_collect_search_challenge_storm_aborts(monkeypatch):
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
     c = collect_search(sess, "u", limit=5, gather_cfg={})
-    assert len(recycled) == 3 * 2               # 3 товара × max_recycles=2
+    assert len(recycled) == 1               # 1 recycle (лестница инцидента)
+    assert sess.new_pages == 1              # 1 new_tab (лестница инцидента)
     kinds = [p["error_kind"] for p in c["products"]]
-    assert kinds == (["access_challenge"] * 3
-                     + ["challenge_storm"] * 2)
-    aborted = [p for p in c["products"]
-               if p["error_kind"] == "challenge_storm"]
-    assert len(aborted) == 2
-    assert all("cooldown" in p["error"] for p in aborted)
-    assert all(p["recyclable"] is False for p in aborted)
-    storm = c["recovery"]["challenge_storm"]
-    assert storm["streak"] == 3
-    assert storm["remaining_aborted"] == 2
-    assert c["aborted"]["reason"] == "challenge_storm"
+    assert kinds == ["session_blocked"] * 5
+    assert all(p["failure_type"] == "session_failure" for p in c["products"])
+    assert all(p["recyclable"] is False for p in c["products"])
+    assert all("cooldown" in p["error"] for p in c["products"][1:])
+    assert c["aborted"]["reason"] == "session_blocked"
     assert c["collected"] == 0
 
 
-def test_collect_search_challenge_storm_resets_on_ok(monkeypatch):
-    """Успешный товар сбрасывает счётчик шторма; срабатывание на последнем
-    товаре фиксирует storm, но остаток aborted = 0."""
-    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 7)]
+def test_collect_search_pause_between_products(monkeypatch):
+    """gather_cfg['pause_s'] > 0 → time.sleep вызывается между товарами,
+    но не после последнего (нет бесполезного ожидания)."""
+    import time
+    links = [{"pid": f"{i}", "url": f"u{i}"} for i in range(1, 4)]
     sess = _FakeSess(links)
     monkeypatch.setattr("ozon_collector.search.run_gather",
-                        lambda cfg, sess=None:
-                        _ok_result(cfg["pid"]) if cfg["pid"] == "3"
-                        else _challenge_fail(cfg["pid"]))
-    monkeypatch.setattr("ozon_collector.search._recycle_browser",
-                        lambda sess, manager, launch_id: None)
-    c = collect_search(sess, "u", limit=6, gather_cfg={})
-    kinds = [p.get("error_kind") for p in c["products"]]
-    assert kinds == (["access_challenge", "access_challenge", None]
-                     + ["access_challenge"] * 3)
-    assert c["collected"] == 1
-    storm = c["recovery"]["challenge_storm"]
-    assert storm["streak"] == 3
-    assert storm["remaining_aborted"] == 0
-    assert c["aborted"]["reason"] == "challenge_storm"
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+    sleeps = []
+    monkeypatch.setattr("ozon_collector.search.time.sleep",
+                        lambda s: sleeps.append(s))
+    collect_search(sess, "u", limit=3,
+                   gather_cfg={"pause_s": 2.5})
+    assert sleeps == [2.5, 2.5]   # 3 товара → 2 паузы
 
 
-def test_collect_search_two_challenges_no_storm(monkeypatch):
-    """2 access_challenge (< лимита 3) → шторма нет, прогон продолжается."""
+def test_collect_search_pause_zero_no_sleep(monkeypatch):
+    """pause_s отсутствует/0 → time.sleep не вызывается вовсе."""
+    import time
+    links = [{"pid": f"{i}", "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+    sleeps = []
+    monkeypatch.setattr("ozon_collector.search.time.sleep",
+                        lambda s: sleeps.append(s))
+    collect_search(sess, "u", limit=2, gather_cfg={})
+    assert sleeps == []
+
+
+def test_collect_search_challenge_transient_ok_continues(monkeypatch):
+    """Transient challenge (снят new_tab) → товар ok, прогон продолжается,
+    SESSION_BLOCKED не наступает."""
     links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
     sess = _FakeSess(links)
-    monkeypatch.setattr("ozon_collector.search.run_gather",
-                        lambda cfg, sess=None: _challenge_fail(cfg["pid"]))
+    seen = set()
+
+    def fake_run_gather(cfg, sess=None):
+        if cfg["pid"] not in seen:
+            seen.add(cfg["pid"])
+            return _challenge_fail(cfg["pid"])
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id: None)
     c = collect_search(sess, "u", limit=2, gather_cfg={})
     assert "aborted" not in c
-    assert c["recovery"].get("challenge_storm") is None
+    assert c["collected"] == 2
+    assert c["recovery"].get("session_blocked") is None
+    # оба товара собраны через new_tab-снятие (tab_observed)
+    assert all(p["observed_scope"] == "tab_observed" for p in c["products"])
+
+
+def test_collect_search_challenge_ladder_not_a_loop(monkeypatch):
+    """Лестница одного инцидента не крутится: после new_tab→recycle challenge
+    → SESSION_BLOCKED (abort), а не бесконечный retry."""
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 2)]
+    sess = _FakeSess(links)
+    calls = {"n": 0}
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None:
+                        calls.__setitem__("n", calls["n"] + 1) or
+                        _challenge_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    c = collect_search(sess, "u", limit=1, gather_cfg={})
+    # 1 + new_tab(1) + recycle(1) = 3 вызова; НЕ 4-й и НЕ бесконечный
+    assert calls["n"] == 3
+    assert c["products"][0]["error_kind"] == "session_blocked"
+    assert c["products"][0]["observed_scope"] == "profile_observed"
     assert c["collected"] == 0
 
 
@@ -557,7 +616,7 @@ def test_collect_search_challenge_new_tab_recovers(monkeypatch):
 
 
 def test_collect_search_challenge_new_tab_fallback_recycle(monkeypatch):
-    """Персистентный challenge: 2 новые вкладки → затем recycle (fallback) → успех."""
+    """Персистентный challenge: new_tab×1 → recycle×1 (лестница) → успех."""
     links = [{"pid": "1", "url": "u1"}]
     sess = _FakeSess(links)
     recycled = []
@@ -565,7 +624,7 @@ def test_collect_search_challenge_new_tab_fallback_recycle(monkeypatch):
 
     def fake_run_gather(cfg, sess=None):
         calls["n"] += 1
-        if calls["n"] == 4:                  # 1 + 2 вкладки + 1 recycle
+        if calls["n"] == 3:                  # 1 + new_tab + recycle
             return _ok_result(cfg["pid"])
         return _challenge_fail(cfg["pid"])
 
@@ -575,22 +634,24 @@ def test_collect_search_challenge_new_tab_fallback_recycle(monkeypatch):
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
     c = collect_search(sess, "u", limit=5, gather_cfg={})
-    assert sess.new_pages == 2
+    assert sess.new_pages == 1
     assert len(recycled) == 1
     p = c["products"][0]
     assert p["ok"] is True
-    assert p["new_tab_attempts"] == 2
+    assert p["new_tab_attempts"] == 1
     assert p["recovery_kind"] == "recycle"   # последний recovery — recycle
-    assert p["recycle_attempts"] == 4        # 1 + 2 вкладки + 1 recycle
-    assert c["recovery"]["new_tab_attempts"] == 2
+    assert p["recycle_attempts"] == 3        # 1 + new_tab + recycle
+    assert p["observed_scope"] == "browser_observed"
+    assert c["recovery"]["new_tab_attempts"] == 1
     assert c["recovery"]["new_tab_successes"] == 0
     assert c["recovery"]["recycles"] == 1
     kinds = [e["kind"] for e in c["recovery"]["events"]]
-    assert kinds == ["new_tab", "new_tab", "access_challenge"]
+    assert kinds == ["new_tab", "recycle"]
 
 
 def test_collect_search_challenge_new_tab_max_then_recycle_limit(monkeypatch):
-    """Максимум: 2 вкладки + 2 recycle на товар → ошибка как есть (без шторма)."""
+    """Лестница исчерпана: new_tab×1 + recycle×1 на товар → SESSION_BLOCKED,
+    остаток aborted (session_failure)."""
     links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
     sess = _FakeSess(links)
     recycled = []
@@ -600,16 +661,20 @@ def test_collect_search_challenge_new_tab_max_then_recycle_limit(monkeypatch):
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
     c = collect_search(sess, "u", limit=2, gather_cfg={})
-    assert sess.new_pages == 2 * 2           # 2 товара × 2 вкладки
-    assert len(recycled) == 2 * 2            # 2 товара × 2 recycle
-    for p in c["products"]:
-        assert p["ok"] is False
-        assert p["new_tab_attempts"] == 2
-        assert p["recovery_kind"] == "recycle"
-        assert p["recycle_attempts"] == 5    # 1 + 2 вкладки + 2 recycle
-    assert c["recovery"]["new_tab_attempts"] == 4
-    assert c["recovery"]["new_tab_successes"] == 0
-    assert c["recovery"]["recycles"] == 4
+    assert sess.new_pages == 1               # 1 new_tab (первый товар)
+    assert len(recycled) == 1                # 1 recycle (первый товар)
+    p0 = c["products"][0]
+    assert p0["ok"] is False
+    assert p0["error_kind"] == "session_blocked"
+    assert p0["failure_type"] == "session_failure"
+    assert p0["observed_scope"] == "profile_observed"
+    assert p0["new_tab_attempts"] == 1
+    assert p0["recycle_attempts"] == 3       # 1 + new_tab + recycle
+    # остаток aborted (session_failure, не штрафуем PID)
+    assert c["products"][1]["error_kind"] == "session_blocked"
+    assert c["aborted"]["reason"] == "session_blocked"
+    assert c["recovery"]["new_tab_attempts"] == 1
+    assert c["recovery"]["recycles"] == 1
 
 
 def test_collect_search_challenge_new_tab_failure_marks_product(monkeypatch):
@@ -637,6 +702,243 @@ def test_collect_search_challenge_new_tab_failure_marks_product(monkeypatch):
     assert p["new_tab_attempts"] == 1
     assert c["recovery"]["new_tab_attempts"] == 1
     assert c["recovery"]["recycles"] == 0
+
+
+# ---- этап 3: session budget (ADR §14.4) --------------------------------------
+
+def _budget(monkeypatch, **over):
+    b = {"challenge": 3, "new_tab": 3, "browser_recycle": 2, "wall_clock_s": 0}
+    b.update(over)
+    monkeypatch.setattr("ozon_collector.search.SESSION_BUDGET_DEFAULT", b)
+    return b
+
+
+def test_session_budget_challenge_exhausted(monkeypatch):
+    """challenge-budget исчерпан → SESSION_EXHAUSTED (abort run)."""
+    _budget(monkeypatch, challenge=1, new_tab=10, browser_recycle=10)
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    seen = set()
+
+    def fake_run_gather(cfg, sess=None):
+        if cfg["pid"] not in seen:     # transient: снимается new_tab
+            seen.add(cfg["pid"])
+            return _challenge_fail(cfg["pid"])
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    # товар1: challenge(1) → new_tab → ok; товар2: challenge(2 > 1) → exhausted
+    assert c["products"][0]["ok"] is True
+    assert c["products"][1]["error_kind"] == "session_exhausted"
+    assert c["products"][1]["failure_type"] == "session_failure"
+    assert c["aborted"]["reason"] == "session_exhausted"
+
+
+def test_session_budget_new_tab_exhausted(monkeypatch):
+    """new_tab-budget исчерпан → SESSION_EXHAUSTED, recycle-бюджет не тратится."""
+    _budget(monkeypatch, challenge=10, new_tab=1, browser_recycle=10)
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    seen = set()
+
+    def fake_run_gather(cfg, sess=None):
+        if cfg["pid"] not in seen:
+            seen.add(cfg["pid"])
+            return _challenge_fail(cfg["pid"])
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    assert c["products"][0]["ok"] is True
+    assert c["products"][1]["error_kind"] == "session_exhausted"
+    assert c["recovery"]["session_used"]["new_tab"] == 2  # 1 + попытка на 2-м
+    assert c["recovery"]["session_used"]["browser_recycle"] == 0
+
+
+def test_session_budget_wall_clock_param_override(monkeypatch):
+    """session_budget-параметр ПЕРЕКРЫВАЕТ SESSION_BUDGET_DEFAULT (ревизия 2.6).
+
+    Передаём свой бюджет с challenge=1 → 2-й challenge даёт SESSION_EXHAUSTED,
+    хотя глобальный SESSION_BUDGET_DEFAULT.challenge=3 (не тронут). Это
+    доказывает, что override-словарь используется, а не дефолт.
+    """
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    seen = set()
+
+    def fake_run_gather(cfg, sess=None):
+        if cfg["pid"] not in seen:
+            seen.add(cfg["pid"])
+            return _challenge_fail(cfg["pid"])
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    override = {"challenge": 1, "new_tab": 10, "browser_recycle": 10,
+                "wall_clock_s": 0}
+    c = collect_search(sess, "u", limit=2, gather_cfg={},
+                       session_budget=dict(override))
+    assert c["recovery"]["session_budget"]["challenge"] == 1
+    assert c["products"][0]["ok"] is True          # challenge(1) → new_tab → ok
+    assert c["products"][1]["error_kind"] == "session_exhausted"  # 2-й challenge
+    assert c["aborted"]["reason"] == "session_exhausted"
+
+
+def test_kpi_and_fingerprint_in_combined(monkeypatch):
+    """combined содержит KPI-агрегаты и fingerprint (ревизии 2.6/2.7)."""
+    links = [{"pid": "1", "url": "u1"}, {"pid": "2", "url": "u2"}]
+    sess = _FakeSess(links)
+    sess.fingerprint = {"ua": "Mozilla/5.0", "webdriver": False,
+                        "tz": "Europe/Moscow", "vw": 1080, "vh": 720}
+
+    def fake_run_gather(cfg, sess=None):
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    kpi = c["kpi"]
+    assert kpi["total_challenges"] == 0
+    assert kpi["total_recoveries"] == 0
+    assert kpi["success_rate"] == 1.0
+    assert c["fingerprint"]["webdriver"] is False
+    assert c["fingerprint"]["ua"] == "Mozilla/5.0"
+
+
+def test_kpi_challenge_recovery_counts(monkeypatch):
+    """KPI считает challenge и recovery-действия (ADR §14.4/§16)."""
+    _budget(monkeypatch, challenge=5, new_tab=5, browser_recycle=5)
+    links = [{"pid": "1", "url": "u1"}, {"pid": "2", "url": "u2"}]
+    sess = _FakeSess(links)
+    seen = set()
+
+    def fake_run_gather(cfg, sess=None):
+        if cfg["pid"] not in seen:
+            seen.add(cfg["pid"])
+            return _challenge_fail(cfg["pid"])
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    # 2 товара, оба с 1 challenge → new_tab recovery
+    assert c["kpi"]["total_challenges"] == 2
+    assert c["kpi"]["total_recoveries"] >= 2  # new_tab_attempts
+    assert c["kpi"]["success_rate"] == 1.0
+
+
+# ---- этап 7: recycle по browser stability (ADR §14.5) ------------------------
+
+def test_preventive_recycle_by_renderer_errors(monkeypatch):
+    """Накопленные renderer-ошибки → preventive recycle (stability), НЕ по
+    challenge. Challenge не вызывает stability-recycle."""
+    monkeypatch.setattr("ozon_collector.search.run_canary", lambda s: "ok")
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    recycled = []
+
+    def fake_run_gather(cfg, sess=None):
+        # renderer_failure на обоих товарах (после recycle fail остаётся)
+        return _recyclable_fail(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id:
+                        recycled.append(launch_id))
+    c = collect_search(sess, "u", limit=2, gather_cfg={},
+                       max_recycles=1)
+    # 2 товара × 1 recycle (max_recycles) + preventive (renderer_errors>=2)
+    assert len(recycled) >= 3
+    preventive = [e for e in c["recovery"]["events"]
+                  if e["kind"] == "preventive"]
+    assert len(preventive) >= 1             # stability-recycle случился
+    # access_stats НЕ растут от renderer (раздельно)
+    assert c["recovery"]["access_stats"]["challenges"] == 0
+
+
+# ---- этап 4: canary (ADR §14.2) ---------------------------------------------
+
+def test_canary_ok_after_recycle_continues(monkeypatch):
+    """Canary OK после recycle-recovery → прогон продолжается."""
+    monkeypatch.setattr("ozon_collector.search.run_canary",
+                        lambda sess: "ok")
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    recycled = []
+    calls = {"n": 0}
+
+    def _gather(cfg, sess=None):
+        calls["n"] += 1
+        if calls["n"] == 3:              # 3-й вызов — после new_tab+recycle → ok
+            return _ok_result(cfg["pid"])
+        return _challenge_fail(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", _gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id:
+                        recycled.append(launch_id))
+    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    # товар: challenge→new_tab(challenge)→recycle→ok; canary OK → без aborted
+    assert c["collected"] == 1
+    assert "aborted" not in c
+    assert c["recovery"].get("canary_fails") is None
+    assert c["products"][0]["ok"] is True
+    assert len(recycled) == 1
+
+
+def test_canary_challenge_blocks_session(monkeypatch):
+    """Canary CHALLENGE после recycle-recovery → остаток SESSION_BLOCKED, но уже
+    собранный товар НЕ штрафуется (raw/ok сохраняется, ADR §14.1)."""
+    monkeypatch.setattr("ozon_collector.search.run_canary",
+                        lambda sess: "challenge")
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    recycled = []
+    calls = {"n": 0}
+
+    def _gather(cfg, sess=None):
+        calls["n"] += 1
+        if calls["n"] == 3:              # после new_tab+recycle — ok
+            return _ok_result(cfg["pid"])
+        return _challenge_fail(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", _gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id:
+                        recycled.append(launch_id))
+    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    # товар1 собран (ok=True) через recycle; canary CHALLENGE → abort остатка
+    assert c["products"][0]["ok"] is True
+    assert c["products"][0]["raw"] is not None
+    # товар2 (ещё не начат) aborted как session_blocked
+    assert c["products"][1]["error_kind"] == "session_blocked"
+    assert c["products"][1]["failure_type"] == "session_failure"
+    assert c["recovery"]["canary_fails"] == 1
+    assert c["aborted"]["reason"] == "session_blocked"
+
+
+# ---- warmup: challenge на главной → новая вкладка (ревизия 2.6) -------------
+
+def test_warmup_home_challenge_switches_tab(monkeypatch):
+    """Challenge на главной при warmup → новая вкладка ДО категории (не тащим
+    challenge на первый PID)."""
+    import ozon_collector.search as _S
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+
+    def _challenge_page(page, where, reload_on_fab=True):
+        raise B.AccessChallengeError(f"анти-бот ({where}): title:captcha")
+
+    monkeypatch.setattr(_S.C, "check_challenge", _challenge_page)
+    _S._warmup_to_category(sess, "https://www.ozon.ru/category/c")
+    # главная (1) + категория (1) = 2 goto; плюс new_page при challenge
+    assert sess.gotos == 2
+    assert sess.new_pages == 1
 
 
 class _HangPage:
@@ -778,3 +1080,90 @@ def test_render_search_digest_no_truncate_if_zero():
     ]
     md = R.render_search_digest(_combined([ok]), reviews_per_product=0)
     assert "Автор2" in md
+
+
+# ---- этап 0: телеметрия recovery (ADR §14.6) --------------------------------
+
+def test_recovery_meta_telemetry_fields(monkeypatch):
+    """_recovery_meta обогащает событие: signature, last_url, tabs, duration."""
+    monkeypatch.setattr("ozon_collector.search.browser_tabs_count",
+                        lambda cdp_url: None)  # /json/list недоступен
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    ev = _recovery_meta(sess, {"pid": "1", "attempt": 2, "kind": "new_tab"},
+                        duration=1.25, products_since_recovery=7,
+                        error="Error: анти-бот (product_page): title:captcha")
+    assert ev["signature"] == "Error: анти-бот (product_page): title:captcha"
+    assert ev["last_url"] == "https://www.ozon.ru/product/1"
+    assert ev["browser_tabs"] is None        # /json/list недоступен в тесте
+    assert ev["collector_tabs"] == 1
+    assert ev["duration_ms"] == 1250
+    assert ev["products_since_recovery"] == 7
+    # базовые поля события сохранены
+    assert ev["kind"] == "new_tab" and ev["attempt"] == 2
+
+
+def test_collect_search_challenge_event_has_telemetry(monkeypatch):
+    """access_challenge → new_tab-событие с телеметрией (Этап 0)."""
+    monkeypatch.setattr("ozon_collector.search.browser_tabs_count",
+                        lambda cdp_url: None)
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+
+    def fake_run_gather(cfg, sess=None):
+        return _challenge_fail(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    # при первом new_tab сессия восстанавливается → второй вызов успешен
+    sess._managed = 2
+    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    ev = c["recovery"]["events"][0]
+    assert ev["kind"] == "new_tab"
+    assert ev["signature"]  # текст ошибки challenge
+    assert "last_url" in ev
+    assert "browser_tabs" in ev
+    assert ev["collector_tabs"] == 2
+    assert "duration_ms" in ev
+    assert ev["products_since_recovery"] == 0
+
+
+# ---- этап 1: ownership (_recycle_browser, ADR §14.1) -------------------------
+
+def test_recycle_browser_external_no_kill(monkeypatch):
+    """external-браузер: recycle НЕ перезапускает процесс, только вкладку."""
+    import ozon_collector.search as _S
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    sess.browser_owner = "external"
+    ensure_calls = []
+    sess.ensure_single_worker_tab = lambda: ensure_calls.append("ensure") or None
+    manager = type("M", (), {"profile_token": "ozon-profile"})()
+    restarts = []
+    monkeypatch.setattr(_S.P, "browser_processes", lambda *a, **k: [])
+    # подменяем внутренние шаги, чтобы увидеть, что restart НЕ зовётся
+    class FakeManager:
+        profile_token = "ozon-profile"
+        def restart(self, old, launch_id):
+            restarts.append(launch_id)
+    _S._recycle_browser(sess, FakeManager(), "ext-r1")
+    assert ensure_calls == ["ensure"]     # external → только новая вкладка
+    assert restarts == []                 # restart/kill НЕ вызван
+
+
+def test_recycle_browser_collector_restarts(monkeypatch):
+    """collector-браузер: recycle перезапускает процесс (restart + reconnect)."""
+    import ozon_collector.search as _S
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    sess.browser_owner = "collector"
+    restarts = []
+    reconnects = []
+    sess.reconnect = lambda: reconnects.append("reconnect") or None
+
+    class FakeManager:
+        profile_token = "ozon-profile"
+        def restart(self, old, launch_id):
+            restarts.append(launch_id)
+
+    monkeypatch.setattr(_S.P, "browser_processes",
+                        lambda cdp_url, profile_token: [("ident",)])
+    _S._recycle_browser(sess, FakeManager(), "c-r1")
+    assert restarts == ["c-r1"]
+    assert reconnects == ["reconnect"]

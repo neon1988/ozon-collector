@@ -49,11 +49,24 @@ def _rotate(path: Path):
             pass
 
 
+def _reconfigure_streams():
+    """Windows-консоль по умолчанию cp1251: юникодные символы (→ и др.)
+    в print падают с UnicodeEncodeError и роняют процесс при редиректе вывода
+    в файл. Переключаем stdout/stderr на UTF-8 с безопасным fallback."""
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
+
 def setup():
     """Открыть файл лога (идемпотентно). Вызывается при старте CLI."""
     global _fh
     if _fh is not None:
         return
+    _reconfigure_streams()
+    _reconfigure_streams()
     path = _resolve_path()
     _rotate(path)
     path.parent.mkdir(parents=True, exist_ok=True)

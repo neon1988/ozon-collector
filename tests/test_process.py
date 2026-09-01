@@ -113,14 +113,14 @@ def test_browser_processes_filters_to_browser_only(monkeypatch):
     """Из потока процессов берём только Browser-процесс на нашем profile+port."""
     fake = [
         (1001, ["chrome", "--remote-debugging-port=9222",
-                "--user-data-dir=/tmp/opencode/ozon-profile"]),
+                "--user-data-dir=/tmp/opencode/ozon-profile"], 900),
         (1002, ["chrome", "--remote-debugging-port=9222",
                 "--user-data-dir=/tmp/opencode/ozon-profile",
-                "--type=renderer"]),
+                "--type=renderer"], 1001),
         (1003, ["chrome", "--remote-debugging-port=9333",
-                "--user-data-dir=/tmp/opencode/ozon-profile"]),
+                "--user-data-dir=/tmp/opencode/ozon-profile"], 900),
         (1004, ["chrome", "--remote-debugging-port=9222",
-                "--user-data-dir=/tmp/opencode/other-profile"]),
+                "--user-data-dir=/tmp/opencode/other-profile"], 900),
     ]
     monkeypatch.setattr(P, "_iter_chromium_processes", lambda: iter(fake))
     monkeypatch.setattr(P, "process_identity",
