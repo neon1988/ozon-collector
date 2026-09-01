@@ -161,13 +161,19 @@ class WorkerContext:
         self.done: bool = False
         self.reader: threading.Thread | None = None
         self.exitcode: int | None = None
+        # Список индексов шарда этого воркера и ещё не обработанные (для
+        # переноса недоделанной работы при перезапуске упавшего воркера).
+        self.shard_indexes: list[int] = []
+        self.pending_indexes: list[int] = []
+        self.restarts: int = 0
+        self.deadline_halted: bool = False
 
     @property
     def worker_idx(self) -> int:
         return int(self.spec["worker_id"])
 
 
-def _reader_loop(wctx: WorkerContext):
+def _reader_loop(wctx: WorkerContext, on_event=None):
     """Читает протокол воркера (select по pipe на Windows не работает → поток)."""
     try:
         while True:
@@ -183,10 +189,22 @@ def _reader_loop(wctx: WorkerContext):
                 wctx.recovery_events.append(msg)
             elif t == "progress":
                 wctx.payload = msg.get("payload") or {}
+                _update_pending(wctx)
             elif t == "done":
                 wctx.payload = msg.get("payload") or {}
                 wctx.done = True
+                _update_pending(wctx)
+                if on_event is not None:
+                    try:
+                        on_event(wctx, msg)
+                    except Exception:
+                        pass
                 break
+            if on_event is not None:
+                try:
+                    on_event(wctx, msg)
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
@@ -196,7 +214,19 @@ def _reader_loop(wctx: WorkerContext):
             pass
 
 
-def _spawn_ctx(spec: dict, task: dict) -> WorkerContext:
+def _update_pending(wctx: WorkerContext):
+    """Обновить pending_indexes воркера из последнего progress/done payload.
+
+    processed_indexes = уже доведённые до результата индексы. Недоделанными
+    считаем те, что входят в шард воркера, но ещё не processed.
+    """
+    pl = wctx.payload or {}
+    processed = set(pl.get("processed_indexes") or [])
+    wctx.pending_indexes = [
+        idx for idx in wctx.shard_indexes if idx not in processed]
+
+
+def _spawn_ctx(spec: dict, task: dict, on_event=None) -> WorkerContext:
     """spawn воркера + reader-поток (протокол накапливается в WorkerContext)."""
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
@@ -205,7 +235,9 @@ def _spawn_ctx(spec: dict, task: dict) -> WorkerContext:
     proc.start()
     child_conn.close()
     wctx = WorkerContext(spec, proc, parent_conn)
-    wctx.reader = threading.Thread(target=_reader_loop, args=(wctx,),
+    wctx.shard_indexes = [int(idx) for idx, _p, _u in (task.get("items") or [])]
+    wctx.pending_indexes = list(wctx.shard_indexes)
+    wctx.reader = threading.Thread(target=_reader_loop, args=(wctx, on_event),
                                    daemon=True)
     wctx.reader.start()
     return wctx
@@ -495,6 +527,146 @@ def _storm_summary(wctxs, payloads, parallel: int) -> dict | None:
     }
 
 
+# ---- Оркестрация воркеров: перезапуск упавших ---------------------------------
+
+def _finalize_worker(wctx: WorkerContext):
+    """Зафиксировать exitcode завершённого/остановленного воркера."""
+    try:
+        wctx.proc.join(2)
+        wctx.exitcode = wctx.proc.exitcode
+    except Exception:
+        pass
+
+
+def _needs_restart(wctx: WorkerContext, max_restarts: int) -> bool:
+    """Нужен ли перезапуск воркера (аварийная гибель без доведения шарда).
+
+    Перезапускаем ТОЛЬКО при реальном сбое (процесс умер без done, либо done
+    с fatal_error/ненулевым exitcode), когда остались недоделанные индексы и
+    лимит перезапусков ещё не исчерпан. Истечение времени (deadline_halted)
+    и успешное/ожидаемое завершение не перезапускаем.
+    """
+    if max_restarts <= 0 or wctx.deadline_halted:
+        return False
+    if wctx.restarts >= max_restarts:
+        return False
+    if not wctx.pending_indexes:
+        return False
+    finished = wctx.done or not wctx.proc.is_alive()
+    if not finished:
+        return False
+    pl = wctx.payload or {}
+    if pl.get("fatal_error"):
+        return True
+    if wctx.exitcode not in (None, 0):
+        return True
+    return False
+
+
+def _respawn(wctx: WorkerContext, pending: list[int],
+             items_by_index: dict, gather_cfg: dict,
+             max_recycles: int, session_budget: dict | None,
+             on_event=None) -> WorkerContext:
+    """Поднять воркера-замену на том же worker_id с недоделанными индексами.
+
+    Сначала чистим зависший Chromium воркера (fresh браузер), ждём
+    освобождения порта, затем спавним заново с тем же spec и перенесённым
+    подмножеством items.
+    """
+    k = wctx.worker_idx
+    spec = dict(wctx.spec)
+    log.warning(f"worker{k}: перезапуск {wctx.restarts + 1}, "
+                f"недоделано {len(pending)} из {len(wctx.shard_indexes)} "
+                f"товаров")
+    _cleanup_worker(wctx)
+    _wait_port_free(spec)
+    pend_set = set(pending)
+    items2 = [(_idx, pid, url) for _idx, (pid, url) in items_by_index.items()
+              if _idx in pend_set]
+    task2 = {
+        "items": items2,
+        "gather_cfg": gather_cfg,
+        "max_recycles": max_recycles,
+        "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
+        "session_budget": dict(session_budget) if session_budget else None,
+    }
+    new = _spawn_ctx(spec, task2, on_event=on_event)
+    new.restarts = wctx.restarts + 1
+    new.shard_indexes = list(pending)
+    new.pending_indexes = list(pending)
+    return new
+
+
+def _wait_port_free(spec: dict, timeout_s: float = 8.0):
+    """Дождаться освобождения CDP-порта воркера после зачистки браузера."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _port_free(spec["port"]) and not cdp.browser_alive(
+                spec["cdp_url"]):
+            return
+        time.sleep(0.2)
+
+
+def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
+                   max_worker_restarts: int, items_by_index: dict,
+                   specs: list, gather_cfg: dict, max_recycles: int,
+                   session_budget: dict | None, on_event=None,
+                   poll: float = 0.3) -> list:
+    """Дождаться завершения воркеров, перезапуская аварийно упавших.
+
+    max_worker_restarts=0 → исходное поведение (join по очереди, terminate
+    зависших по дедлайну, без перезапуска). >0 → оркестрационный цикл с
+    перезапуском воркеров, упавших без доведения шарда.
+    """
+    if max_worker_restarts <= 0:
+        for wctx in wctxs:
+            remain = deadline - time.monotonic()
+            if remain > 0:
+                wctx.proc.join(remain)
+        for wctx in wctxs:
+            if wctx.proc.is_alive() and not wctx.done:
+                log.warning(f"worker{wctx.worker_idx} hang: terminate()")
+                wctx.proc.terminate()
+                wctx.proc.join(2)
+                _cleanup_worker(wctx)
+        for wctx in wctxs:
+            _finalize_worker(wctx)
+        return wctxs
+
+    active = list(wctxs)
+    finalized: list = []
+    while active:
+        now = time.monotonic()
+        for wctx in list(active):
+            finished = wctx.done or not wctx.proc.is_alive()
+            if finished:
+                _finalize_worker(wctx)
+                finalized.append(wctx)
+                active.remove(wctx)
+                continue
+            if now >= deadline:
+                log.warning(f"worker{wctx.worker_idx} hang/таймаут: "
+                            f"terminate()")
+                wctx.deadline_halted = True
+                wctx.proc.terminate()
+                wctx.proc.join(2)
+                _cleanup_worker(wctx)
+                finalized.append(wctx)
+                active.remove(wctx)
+        for wctx in list(finalized):
+            if not _needs_restart(wctx, max_worker_restarts):
+                continue
+            pending = list(wctx.pending_indexes)
+            active.append(_respawn(
+                wctx, pending, items_by_index, gather_cfg,
+                max_recycles, session_budget, on_event))
+            # упавший воркер "заменён": убираем из finalized, чтобы не
+            # перезапускать его повторно на каждой итерации while
+            finalized.remove(wctx)
+        time.sleep(poll)
+    return finalized
+
+
 def _stop_main_browser():
     """Полный останов main-Chromium (порт 9222, ozon-profile) ДО воркеров.
 
@@ -520,7 +692,9 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      pids: list | None = None,
                      skip_pids: list | None = None,
                      no_bootstrap: bool = False,
-                     session_budget: dict | None = None) -> dict:
+                     session_budget: dict | None = None,
+                     on_event=None,
+                     max_worker_restarts: int = 0) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
 
     pids — явный список артикулов вместо докрутки выдачи: main-сессия не
@@ -590,31 +764,27 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
             "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
             "session_budget": dict(session_budget) if session_budget else None,
         }
-        wctxs.append(_spawn_ctx(spec, task))
+        wctxs.append(_spawn_ctx(spec, task, on_event=on_event))
 
     deadline = time.monotonic() + join_timeout_s
-    for wctx in wctxs:
-        remain = deadline - time.monotonic()
-        if remain > 0:
-            wctx.proc.join(remain)
-
-    for wctx in wctxs:
-        if wctx.proc.is_alive() and not wctx.done:
-            log.warning(f"worker{wctx.worker_idx} hang: terminate()")
-            wctx.proc.terminate()
-            wctx.proc.join(2)
-            _cleanup_worker(wctx)
-
-    for wctx in wctxs:
-        wctx.proc.join(2)
-        wctx.exitcode = wctx.proc.exitcode
+    wctxs = _await_workers(
+        wctxs, deadline=deadline, join_timeout_s=join_timeout_s,
+        max_worker_restarts=max_worker_restarts,
+        items_by_index={i: (pid, url) for i, pid, url in items},
+        specs=specs, gather_cfg=gather_cfg, max_recycles=max_recycles,
+        session_budget=session_budget, on_event=on_event)
 
     payloads = []
     for wctx in wctxs:
         pl = wctx.payload or _empty_payload(wctx.worker_idx)
-        if wctx.proc.exitcode != 0 and pl["fatal_error"] is None:
-            pl["fatal_error"] = f"exit {wctx.proc.exitcode}"
-        pl["exitcode"] = wctx.proc.exitcode
+        if wctx.exitcode is None:
+            try:
+                wctx.exitcode = wctx.proc.exitcode
+            except Exception:
+                wctx.exitcode = None
+        if wctx.exitcode != 0 and pl["fatal_error"] is None:
+            pl["fatal_error"] = f"exit {wctx.exitcode}"
+        pl["exitcode"] = wctx.exitcode
         payloads.append(pl)
 
     products = merge_shard_results(payloads, shards)
