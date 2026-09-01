@@ -375,6 +375,8 @@ def worker_main(spec: dict, task: dict, conn):
     payload = _empty_payload(k)
     sess = None
     manager = None
+    _stop_event = threading.Event()
+    _wd = None
     try:
         # Windows-консоль по умолчанию cp1251: юникодные символы (→ и др.)
         # в print падают с UnicodeEncodeError и роняют воркер. Переключаем
@@ -389,6 +391,26 @@ def worker_main(spec: dict, task: dict, conn):
                         rotate_max_bytes=5 * 1024 * 1024)
         os.environ["OZON_WORKER_ID"] = str(k)
         payload["started"] = _now()
+
+        # Родительский watchdog (2026-09-02): если ОРКЕСТРАТОР (родитель)
+        # принудительно убит (kill -9 / Stop-Process -Force), воркер обязан
+        # завершиться сам, иначе остаётся сиротой: держит свой Chromium
+        # (порт/профиль), пишет в wd_out.log и вообще живёт вечно. Следим за
+        # живостью родителя; при его смерти — жёсткий os._exit(2) (браузер
+        # потом уберёт preflight-очистка orphaned_worker_browser_processes).
+        parent_pid = os.getppid()
+
+        def _parent_watchdog():
+            check_s = max(2.0, float(task.get("parent_watchdog_s") or 5.0))
+            while not _stop_event.is_set():
+                if not P.pid_alive(parent_pid):
+                    log.error("parent (orchestrator) died — worker exits")
+                    os._exit(2)
+                time.sleep(check_s)
+
+        _wd = threading.Thread(target=_parent_watchdog, daemon=True,
+                               name=f"parent-wd-{k}")
+        _wd.start()
         _send(conn, {"t": "start", "worker": k, "pid": os.getpid(),
                      "profile": spec["profile_token"], "port": spec["port"]})
 
@@ -483,6 +505,10 @@ def worker_main(spec: dict, task: dict, conn):
             except Exception as e:
                 log.warning(f"stop browser: {type(e).__name__}: {e}")
         payload["finished"] = _now()
+        try:
+            _stop_event.set()
+        except Exception:
+            pass
         _send(conn, {"t": "done", "worker": k, "payload": payload})
         try:
             conn.close()

@@ -372,6 +372,40 @@ def identity_alive(identity: ProcessIdentity) -> bool:
     return _linux_identity_alive(identity)
 
 
+def pid_alive(pid: int) -> bool:
+    """Жив ли процесс с данным PID (без identity-проверки).
+
+    Для watchdog'а воркера: проверяем, жив ли родитель (оркестратор). PID-reuse
+    здесь не критичен (родитель умирает редко и его PID не переиспользуется
+    мгновенно), а дешёвая OpenProcess-проверка на Windows не требует прав.
+    """
+    if pid is None or pid <= 0:
+        return False
+    if os.name == "nt":
+        # OpenProcess на недавно завершившийся процесс на Windows может
+        # вернуть handle (пока не переиспользован) — ложноположительный «жив».
+        # Надёжно: GetExitCodeProcess: у живого процесса код = STILL_ACTIVE
+        # (259), у завершённого — код завершения (≠259).
+        h = _win_open_process(pid, _WIN_PROCESS_QUERY)
+        if h is None:
+            return False
+        try:
+            exit_code = ctypes.c_uint32()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(h,
+                                                             ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            _win_close_handle(h)
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8",
+                  errors="replace") as f:
+            data = f.read()
+        return bool(data)
+    except (OSError, ValueError):
+        return False
+
+
 # ---- RSS (диагностика воркеров; без новых зависимостей) -------------------
 
 def rss_bytes(pid: int) -> int | None:
