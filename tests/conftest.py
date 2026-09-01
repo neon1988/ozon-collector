@@ -16,6 +16,20 @@ from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows: headless Chromium в teardown иногда шлёт в консольную группу ложное
+# console-control событие (CTRL_C/CTRL_BREAK), из-за чего драйвер Playwright
+# (node) падает и весь прогон рассыпается. Штатный способ изолировать процесс —
+# перевести его в режим «игнорировать Ctrl+C»: SetConsoleCtrlHandler(NULL, TRUE).
+# Экспериментально подтверждено: подходит только NULL-режим; ручные хендлеры
+# (даже с return True) драйвер НЕ защищают.
+if sys.platform == "win32":
+    import ctypes
+
+    try:
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)
+    except Exception:
+        pass
+
 from ozon_collector.collect import PRODUCT_JS, REVIEWS_JS, VARIANT_MODE_JS  # noqa: E402
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -64,10 +78,27 @@ def load_review_html(name: str) -> str:
 
 @pytest.fixture(scope="session")
 def browser():
-    with sync_playwright() as pw:
+    """Общий headless-Chromium на всю сессию. Никакого авто-перезапуска:
+    restart in-process ненадёжен (у Playwright один глобальный event loop) и
+    раньше вешал teardown фикстуры навсегда. Если драйвер умирает посередине —
+    последующие evaluate-тесты быстро падают с "Connection closed", а не виснут.
+    Закрытие только best-effort: если close()/stop() зависнут на мёртвом
+    коннекте, их снимет внешний watchdog (scripts/run_tests_guarded.py)."""
+    pw = sync_playwright().start()
+    b = None
+    try:
         b = pw.chromium.launch(headless=True)
         yield b
-        b.close()
+    finally:
+        if b is not None:
+            try:
+                b.close()
+            except BaseException:
+                pass
+        try:
+            pw.stop()
+        except BaseException:
+            pass
 
 
 @pytest.fixture

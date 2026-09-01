@@ -13,7 +13,10 @@ if ROOT not in sys.path:
 from ozon_collector.collect import CHALLENGE_TITLE_MARKERS
 from scripts.qa_raw import exit_code_for, qa_product, scan_file, summarize
 
-NOW = "2026-08-21T12:00:00+00:00"
+# Данные должны быть «свежими» относительно момента прогона: qa_raw ругается
+# OLD_DATA (WARN), если age_days > OLD_DATA_DAYS (7). Замораживать дату нельзя —
+# тесты протухают за неделю и OK-кейсы падают на лишнем WARN.
+NOW = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
 TS = int(dt.datetime.fromisoformat(NOW).timestamp())
 
 

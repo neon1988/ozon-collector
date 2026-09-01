@@ -24,6 +24,26 @@
 
 ## Статус и следующие шаги (последнее обновление: 2026-09-01)
 
+ - **✅ Windows: полный прогон pytest — 670 passed, стабильно (2026-09-01).** Полный
+   прогон воспроизводимо падал на `test_reviews.py::test_review_extract_live_markup`
+   (`Browser.new_page: Connection closed while reading from the driver`) в зависимости
+   от способа запуска: `cmd /c "... > file 2>&1"` — всегда FAIL (7/7), запуск через
+   python-обёртку с Ctrl-C-подавлением — всегда PASS. Диагностика (лог-хендлеры
+   CTRL-событий, мониторинг node/chrome, полные повторные прогоны) показала: события
+   до родителя НЕ приходят, а лечит именно штатный Win32-режим
+   `SetConsoleCtrlHandler(NULL, TRUE)` («игнорировать Ctrl+C») в процессе-родителе
+   до старта pytest. Ручные хендлеры (даже `return True`) не помогают. Источник
+   генерируемого headless-Chromium console-control события не установлен — это
+   гипотеза, не факт.
+   * Фикс: `ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)` при
+     `sys.platform == "win32"` в начале `tests/conftest.py` (прямые запуски pytest)
+     и перед `Popen` в `scripts/run_tests_guarded.py` (watchdog). `SIG_IGN` больше
+     не нужен и убран, вся диагностика (logger-хендлеры, мониторинг драйвера, хук
+     `pytest_runtest_makereport` с трейсбеками) из `conftest.py` удалена.
+   * Ключевые прогоны ОТ и ДО: 7× F при cmd-запуске; run_verb/run_verb3/run_verb7/
+     run_verb8 (Popen + `SetConsoleCtrlHandler(None, True)`) = **670 passed, 4 skipped,
+     1 xfailed** (~4 мин) — воспроизводимо.
+
  - **✅ CLI-сбор убран — демон единственный исполнитель сбора (2026-09-01).** Пользователь решил:
    оркестратор САМ ищет выдачу и рассылает товары воркерам; воркеры только собирают.
    * `cli.py`: подкоманда `search` удалена полностью (`cmd_search` + `_gather_cfg_from_args` + search-парсер).

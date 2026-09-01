@@ -746,11 +746,17 @@ def notify(progress: dict, msg: str) -> None:
     save_json(DATA_DIR / "campaigns" / camp / "status.json", payload)
     if progress.get("run_cfg", {}).get("notify") == "toast":
         try:
+            kwargs = {"capture_output": True, "timeout": 10}
+            if sys.platform == "win32":
+                # Не разделять консоль с pytest: иначе PowerShell при выходе
+                # шлёт CTRL_C_EVENT → KeyboardInterrupt в Python.
+                kwargs["creationflags"] = getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0x08000000)
             subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  f"Write-Host '{msg.replace(chr(39), '')}' ; "
                  f"[System.Media.SystemSounds]::Beep.Play()"],
-                capture_output=True, timeout=10)
+                **kwargs)
         except Exception:
             pass
 
