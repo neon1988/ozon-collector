@@ -66,7 +66,6 @@ def setup():
     if _fh is not None:
         return
     _reconfigure_streams()
-    _reconfigure_streams()
     path = _resolve_path()
     _rotate(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +95,15 @@ def attach_file(path, mode: str = "a", prefix: str = "",
     global _fh
     if prefix:
         set_prefix(prefix)
+    if _fh is not None:
+        # Закрыть предыдущий fd до открытия нового: иначе старый файл
+        # остаётся залоченным — на Windows ротация (`_rotate`) падает
+        # с OSError 32, а за раз может быть несколько attach_file подряд.
+        try:
+            _fh.close()
+        except Exception:
+            pass
+        _fh = None
     p = Path(path)
     if rotate_max_bytes and p.exists() and p.stat().st_size > rotate_max_bytes:
         _rotate(p)

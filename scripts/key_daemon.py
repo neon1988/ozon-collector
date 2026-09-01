@@ -1016,26 +1016,18 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
 
     max_restarts = int(cfg.get("max_worker_restarts", 2))
 
-    if parallel > 1:
-        from ozon_collector.parallel import collect_parallel
-        combined = collect_parallel(
-            url, limit=limit, gather_cfg=gather_cfg, parallel=parallel,
-            query=None, max_recycles=2, join_timeout_s=43200.0,
-            pids=pids or None, skip_pids=skip_pids, no_bootstrap=False,
-            session_budget=session_budget, on_event=_on_event,
-            max_worker_restarts=max_restarts, worker_log=worker_log)
-    else:
-        from ozon_collector.cdp import Session
-        _wm = gather_cfg.get("window_mode")
-        sess = Session(
-            keep_window=None if _wm is None else (_wm == "visible"))
-        try:
-            combined = S.collect_search(
-                sess, url, limit=limit, gather_cfg=gather_cfg,
-                query=None, pids=pids or None, skip_pids=skip_pids,
-                session_budget=session_budget)
-        finally:
-            sess.close()
+    # Сбор ВСЕГДА через collect_parallel (subprocess-воркер), даже при
+    # parallel=1: единый путь оркестрации, оркестратор (_await_workers)
+    # следит за воркерами (heartbeat, stall-terminate, respawn). Без этого
+    # при parallel=1 сбор шёл in-process в демоне и зависший CDP-вызов
+    # не мог быть прерван оркестратором (не было отдельного воркера).
+    from ozon_collector.parallel import collect_parallel
+    combined = collect_parallel(
+        url, limit=limit, gather_cfg=gather_cfg, parallel=parallel,
+        query=None, max_recycles=2, join_timeout_s=43200.0,
+        pids=pids or None, skip_pids=skip_pids, no_bootstrap=False,
+        session_budget=session_budget, on_event=_on_event,
+        max_worker_restarts=max_restarts, worker_log=worker_log)
 
     combined_file = CAMPAIGNS_DIR / camp / f"combined_{run_id}.json"
     combined_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1790,6 +1782,16 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    # Перекодировать stdout/stderr в UTF-8 ДО argparse: иначе help/usage
+    # (с кириллицей и стрелками) падают с UnicodeEncodeError в cp1251-консоли
+    # (Windows), когда вывод редиректится в файл/pipe.
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
     args = parse_args(argv)
     out = args.out or f"docs/{args.campaign}.md"
     progress = run_campaign(

@@ -24,6 +24,89 @@
 
 ## Статус и следующие шаги (последнее обновление: 2026-09-01)
 
+ - **✅ Fix: контроль зависания воркера перенесён в оркестратор (2026-09-01).**
+   Инцидент при сборе кампании `naushniki_bt`: при тотальной антибот-капче Ozon
+   воркер завис намертво на товаре hoco w35 air (>12 мин без прогресса). Причина
+   архитектурная: при `--parallel 1` `_inproc_collect` гонял сбор **in-process**
+   (`collect_search` прямо в демоне, без subprocess-воркера) → оркестратор не мог
+   прервать зависший CDP-вызов (не было отдельного воркера). Решение (по требованию
+   «оркестратор следит за воркерами, без костылей»):
+   * **key_daemon `_inproc_collect`**: убран in-process путь — сбор ВСЕГДА через
+     `collect_parallel` (subprocess-воркер), даже при `--parallel 1`. Единый путь
+     оркестрации: `_await_workers` следит за воркерами.
+   * **collect.py**: удалён сторож `_StallWatchdog` (костыль). Вместо него
+     `_touch_watchdog()` → heartbeat-hook `set_heartbeat_hook(fn)`, который
+     worker_main перехватывает и шлёт `{"t":"hb"}` в pipe родителю (throttled 15с).
+   * **parallel.py**: `WorkerContext.last_activity` обновляется в `_reader_loop` на
+     каждое сообщение воркера (start/recovery/progress/done/hb). `_await_workers`
+     (оба режима) terminate'ит воркера без heartbeat дольше `WORKER_STALL_S=300`:
+     `terminate()` → `_finalize_worker` → `_cleanup_worker` → respawn (если
+     разрешён). Воркер, зависший на CDP-вызове, теперь падает и перезапускается,
+     а не «вечно» висит.
+* Тесты: `tests/test_parallel_restart.py` +3 (stall-terminate без рестарта,
+      stall-terminate+respawn, heartbeat свежий → НЕ stall). parallel+restart 58 passed.
+   * ⚠️ test_search.py: зависает при полном прогоне (`pause_between_products` и
+      соседние) — проявляется и на чистом HEAD (проверено git stash), т.е. это
+      существующий флак/проблема окружения, НЕ регрессия от этих правок.
+
+ - **✅ Единый лог с ротацией (2026-09-02).** Убран отдельный `wd_out.log`
+   (редирект stdout процесса демона): всё и так пишется в один файл
+   `logs/{campaign}_daemon.log` с ротацией по размеру (5MB) и в DEBUG
+   (подробные шаги сбора отзывов от воркера). Демон пишет через `log()`,
+   воркер — через `attach_file(worker_log, prefix='[worker=k pid=N]')`
+   в тот же файл. stdout демона при запуске теперь уходит в NUL
+   (watchdog-скрипты: `> NUL 2>&1` вместо `> *_wd_out.log 2>&1`).
+   Один файл на кампанию — удобно смотреть: `logs/{campaign}_daemon.log`.
+
+ - **✅ Сбор naushniki_bt возобновлён успешно (2026-09-02, ~00:00).**
+   После cooldown антибот-капча Ozon спала: поиск выдал 336 товаров,
+   воркер-1 (порт 9223) открыл товар JBL Tune 520 BT и собирает отзывы
+   (unique=96, сходимость достигнута). Поиск идёт через main-браузер
+   (порт 9222, потом останавливается), сбор — через worker-браузер
+   (порт 9223) — поэтому окна браузера сменяют друг друга по фазам
+   (нормально). Ранее (вечер 09-01) сбор блокировался антиботом
+   (search_page + product_page captcha, cooldown 12-24ч); кампания была
+   удалена и пересоздана, потом завершилась из-за капчи. Сейчас идёт
+   новый run (parallel=1, target 300, min_valid 200).
+
+ - **✅ Аудит всего кода + фиксы багов (2026-09-01).** Полный обзор всех модулей
+   (browser/cdp/cache/collect/parallel/process/search/gather/report/ocr/log/puzzle).
+   Исправлены реальные баги (полный прогон 673 passed — +3 новых теста):
+   * **parallel.py — потеря данных при перезапуске воркера (critical).** Раньше при
+     аварийном kill воркера (OOM/без done) и включённом перезапуске уже собранные им
+     товары выбрасывались: `_respawn` удалял старый wctx из `finalized`, и `merge_shard_results`
+     помечал их «terminated/failed». Теперь `_await_workers` переносит снимок собранного
+     в `new.carried_payload`, а `collect_parallel` включает его через `_merge_carried`.
+   * **parallel.py — гонка reader-потока.** `_finalize_worker` ждал процесс, но не
+     writer-поток, читающий pipe: payload мог прочитаться неполным. Добавлен
+     `wctx.reader.join(3.0)` после join процесса.
+   * **log.py — утечка file-handle.** `attach_file` перезаписывал глобальный `_fh` без
+     закрытия старого → на Windows файл оставался залоченным (WinError 32 при ротации).
+     Старый `_fh.close()` перед открытием; убран дубль `_reconfigure_streams()` в `setup`.
+   * **cdp.py — утечка Playwright.** При неудачном `connect_over_cdp` (обе попытки)
+     запущенный `_playwright` не гасился → теперь `_playwright.stop()` перед `raise`.
+   * **cdp.py — goto глотал ошибки навигации.** Timeout/net::ERR_* (страница не
+     загрузилась) продолжались на старой странице → мусор в данные. Теперь
+     пробрасываются (как в `_collect_reviews_pass` в collect.py — аналогично).
+   * **cdp.py — `new_page` копил мёртвые Page в `_managed_pages`** — закрытая страница
+     удаляется из списка (медленная утечка при долгих recovery-циклах).
+   * **collect.py — `element_handle()` мог вернуть None** в `_expand_review_comments`
+     (элемент отсоединился между count() и element_handle()) → AttributeError;
+     добавлена проверка `h is None: continue`.
+   * **collect.py — fallback-рейтинг без диапазона 0..5** (в отличие от виджетов) —
+     опечатка в разметке давала бы рейтинг >5; добавлена проверка `v <= 5`.
+   * **collect.py — `next_url` `__CLICK__` evaluate без защиты** `list/children[2]`
+     (TypeError ловился, но грязно) — добавлена `if (!list || !list.children[2])`.
+   * **collect.py — убраны дублирующие `print()`** у log.debug/info (стр. 1858/1875).
+   * **report.py — `money(current)`/`current/p["old"]` ломался на строковой цене**
+     (ValueError/TypeError) — теперь `_num()` нормализует current/old/bank.
+   * Тесты: `tests/test_parallel_restart.py` +82 (carried_payload, _merge_carried).
+   * Не вносилось (риск/сложность): untrusted `.click()` в `_activate_variant_mode`
+     (осознанное поведение, A/B-эксперименты зафиксированы); правильный фикс
+     tessdata-dir с пробелами (pytesseract не разбирает кавычки — попытка откачена,
+     см. ниже); глобальный shared-deadline в `_await_workers`.
+
+
  - **✅ Windows: полный прогон pytest — 670 passed, стабильно (2026-09-01).** Полный
    прогон воспроизводимо падал на `test_reviews.py::test_review_extract_live_markup`
    (`Browser.new_page: Connection closed while reading from the driver`) в зависимости

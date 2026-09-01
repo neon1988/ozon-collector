@@ -189,6 +189,12 @@ class Session:
                     self.cdp_url)
                 self.browser_owner = "collector"
             else:
+                # второй connect тоже упал (или auto_launch выключен):
+                # гасим запущенный Playwright-подпроцесс, иначе он утекает
+                try:
+                    self._playwright.stop()
+                except Exception:
+                    pass
                 raise
         self.browser_pid = _browser_pid(self.cdp_url, self.profile_token)
         self.browser_started_at = time.time()
@@ -378,6 +384,15 @@ class Session:
             if is_renderer_failure(e):
                 log.warning(f"goto renderer_failure: {url} → {type(e).__name__}: {e}")
                 raise
+            msg = str(e)
+            # Навигационные сбои (таймаут, DNS, ERR_*) означают, что страница
+            # НЕ загрузилась: продолжать разбор по старой/ошибочной странице
+            # нельзя — пробрасываем, иначе соберём чужой/пустой контент.
+            name = type(e).__name__
+            if name == "TimeoutError" or "net::ERR_" in msg \
+                    or "Timeout" in msg:
+                log.warning(f"goto nav failure: {url} → {name}: {e}")
+                raise
             log.warning(f"[cdp] goto warn: {url} → {type(e).__name__}: {e}")
         self.page.wait_for_timeout(wait_ms)
         self._capture_fingerprint_once()
@@ -448,6 +463,13 @@ class Session:
         if close_current and old is not None:
             try:
                 old.close()
+            except Exception:
+                pass
+            # убрать закрытую страницу из набора managed, чтобы список не
+            # копил мёртвые Page-объекты при долгих recovery-циклах
+            try:
+                if old in self._managed_pages:
+                    self._managed_pages.remove(old)
             except Exception:
                 pass
         if getattr(self, "keep_window", False):

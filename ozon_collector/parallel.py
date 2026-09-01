@@ -29,6 +29,14 @@ from .browser import BrowserProcessManager
 
 WORKER_LOG_DIR = "logs"
 
+# Порог простоя воркера без heartbeat (2026-09-01): оркестратор следит за
+# прогрессом воркера через {"t":"hb"} от worker_main (перехватывает
+# collect._touch_watchdog). Если воркер жив, но дольше WORKER_STALL_S не
+# сообщал о прогрессе — считаем его зависшим на CDP-вызове (goto/evaluate
+# на заблокированном renderer'е висит без таймаута) и terminate'им с
+# перезапуском. Единый контроль воркеров в оркестраторе и для parallel=1.
+WORKER_STALL_S = 300           # 5 мин без heartbeat = зависание (в т.ч. параллель=1)
+
 
 # ---- Спеки и сериализуемые структуры ---------------------------------------
 
@@ -167,6 +175,14 @@ class WorkerContext:
         self.pending_indexes: list[int] = []
         self.restarts: int = 0
         self.deadline_halted: bool = False
+        # Снимок уже собранных товаров упавшего воркера, перенесённый в
+        # воркера-замену при перезапуске (см. _await_workers). Без него
+        # собранное до аварии терялось бы в merge_shard_results.
+        self.carried_payload: dict | None = None
+        # Последняя активность воркера (монотонные секунды): обновляется при
+        # каждом сообщении от воркера (start/recovery/progress/done/hb).
+        # Оркестратор по простою этого поля terminate'ит зависший воркер.
+        self.last_activity: float = time.monotonic()
 
     @property
     def worker_idx(self) -> int:
@@ -182,6 +198,7 @@ def _reader_loop(wctx: WorkerContext, on_event=None):
             except (EOFError, OSError, ValueError):
                 break
             t = msg.get("t")
+            wctx.last_activity = time.monotonic()
             if t == "start":
                 wctx.pid = msg.get("pid")
                 wctx.started = True
@@ -190,6 +207,8 @@ def _reader_loop(wctx: WorkerContext, on_event=None):
             elif t == "progress":
                 wctx.payload = msg.get("payload") or {}
                 _update_pending(wctx)
+            elif t == "hb":
+                pass  # heartbeat: last_activity уже обновлён выше
             elif t == "done":
                 wctx.payload = msg.get("payload") or {}
                 wctx.done = True
@@ -378,6 +397,22 @@ def worker_main(spec: dict, task: dict, conn):
         from .collect import set_scroll_jitter_seed
         set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
 
+        # Heartbeat оркестратору: перехватываем collect._touch_watchdog и
+        # шлём {"t":"hb"} в pipe (throttled). Родитель по простою heartbeat
+        # terminate'ит воркера, зависшего на CDP-вызове. Таймаут heartbeat
+        # не зависит от скорости сбора отзывов одного товара (см. WORKER_STALL_S).
+        hb_state = {"last": 0.0}
+
+        def _hb():
+            now = time.monotonic()
+            if now - hb_state["last"] < 15.0:
+                return
+            hb_state["last"] = now
+            _send(conn, {"t": "hb", "worker": k})
+
+        from .collect import set_heartbeat_hook
+        set_heartbeat_hook(_hb)
+
         warmup = _warmup_session(sess, label=f"worker{spec['worker_id']}")
         payload["warmup"] = warmup
         _send(conn, {"t": "warmup", "worker": k, **warmup})
@@ -532,12 +567,22 @@ def _storm_summary(wctxs, payloads, parallel: int) -> dict | None:
 # ---- Оркестрация воркеров: перезапуск упавших ---------------------------------
 
 def _finalize_worker(wctx: WorkerContext):
-    """Зафиксировать exitcode завершённого/остановленного воркера."""
+    """Зафиксировать exitcode завершённого/остановленного воркера.
+
+    Ждём и reader-поток (не только процесс): он асинхронно наполняет
+    wctx.payload/done, и без join payload мог бы прочитаться неполным
+    (гонка: процесс уже умер, а финальный progress/done ещё не обработан).
+    """
     try:
         wctx.proc.join(2)
         wctx.exitcode = wctx.proc.exitcode
     except Exception:
         pass
+    if wctx.reader is not None:
+        try:
+            wctx.reader.join(3.0)
+        except Exception:
+            pass
 
 
 def _needs_restart(wctx: WorkerContext, max_restarts: int) -> bool:
@@ -623,10 +668,28 @@ def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
     перезапуском воркеров, упавших без доведения шарда.
     """
     if max_worker_restarts <= 0:
-        for wctx in wctxs:
+        while True:
+            now = time.monotonic()
+            stalled = [wctx for wctx in wctxs
+                       if wctx.proc.is_alive() and not wctx.done
+                       and now - wctx.last_activity > WORKER_STALL_S]
+            if stalled:
+                for wctx in stalled:
+                    log.warning(f"worker{wctx.worker_idx} stall: нет heartbeat "
+                                f"{int(now - wctx.last_activity)}s "
+                                f"(> {WORKER_STALL_S}s) — terminate()")
+                    wctx.proc.terminate()
+                    wctx.proc.join(2)
+                    _cleanup_worker(wctx)
+                break
             remain = deadline - time.monotonic()
-            if remain > 0:
-                wctx.proc.join(remain)
+            if remain <= 0:
+                break
+            alive = [wctx for wctx in wctxs
+                     if wctx.proc.is_alive() and not wctx.done]
+            if not alive:
+                break
+            time.sleep(min(poll, remain))
         for wctx in wctxs:
             if wctx.proc.is_alive() and not wctx.done:
                 log.warning(f"worker{wctx.worker_idx} hang: terminate()")
@@ -648,6 +711,17 @@ def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
                 finalized.append(wctx)
                 active.remove(wctx)
                 continue
+            if now - wctx.last_activity > WORKER_STALL_S:
+                log.warning(f"worker{wctx.worker_idx} stall: нет heartbeat "
+                            f"{int(now - wctx.last_activity)}s "
+                            f"(> {WORKER_STALL_S}s) — terminate()")
+                wctx.proc.terminate()
+                wctx.proc.join(2)
+                _finalize_worker(wctx)
+                _cleanup_worker(wctx)
+                finalized.append(wctx)
+                active.remove(wctx)
+                continue
             if now >= deadline:
                 log.warning(f"worker{wctx.worker_idx} hang/таймаут: "
                             f"terminate()")
@@ -661,9 +735,23 @@ def _await_workers(wctxs: list, deadline: float, join_timeout_s: float,
             if not _needs_restart(wctx, max_worker_restarts):
                 continue
             pending = list(wctx.pending_indexes)
-            active.append(_respawn(
+            new = _respawn(
                 wctx, pending, items_by_index, gather_cfg,
-                max_recycles, session_budget, on_event, worker_log))
+                max_recycles, session_budget, on_event, worker_log)
+            # Перенести уже собранные товары упавшего воркера в замену: иначе
+            # merge_широко пометит их как "terminated/failed" (потеря данных).
+            # Копируем аккуратно: _reader_loop нового воркера перезаписывает
+            # wctx.payload при каждом progress, поэтому храним отдельно.
+            old_pl = wctx.payload or {}
+            old_products = old_pl.get("products") or []
+            if old_products:
+                new.carried_payload = {
+                    "products": list(old_products),
+                    "processed_indexes": list(
+                        old_pl.get("processed_indexes") or []),
+                    "failed_indexes": list(old_pl.get("failed_indexes") or []),
+                }
+            active.append(new)
             # упавший воркер "заменён": убираем из finalized, чтобы не
             # перезапускать его повторно на каждой итерации while
             finalized.remove(wctx)
@@ -784,6 +872,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     payloads = []
     for wctx in wctxs:
         pl = wctx.payload or _empty_payload(wctx.worker_idx)
+        pl = _merge_carried(pl, wctx)
         if wctx.exitcode is None:
             try:
                 wctx.exitcode = wctx.proc.exitcode
@@ -825,6 +914,24 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     if storm:
         combined["aborted"] = storm
     return combined
+
+
+def _merge_carried(pl: dict, wctx: WorkerContext) -> dict:
+    """Включить в payload воркера-замены снимок уже собранного из упавшего.
+
+    carried_payload заполняется в _await_workers при перезапуске (иначе merge
+    пометил бы эти товары как terminated/failed и данные терялись бы).
+    """
+    carried = wctx.carried_payload
+    if not carried or not carried.get("products"):
+        return pl
+    pl = dict(pl)
+    pl["products"] = list(carried["products"]) + list(pl.get("products") or [])
+    pl["processed_indexes"] = list(carried.get("processed_indexes") or []) \
+        + list(pl.get("processed_indexes") or [])
+    pl["failed_indexes"] = list(carried.get("failed_indexes") or []) \
+        + list(pl.get("failed_indexes") or [])
+    return pl
 
 
 def _worker_summary(wctx: WorkerContext, pl: dict) -> dict:

@@ -36,12 +36,12 @@ def _price_block(product: dict) -> list:
     """Строки секции цены: price (webPrice, точная) / price_parsed / price_parts."""
     lines = []
     p = product.get("price") or {}
-    current = p.get("current")
+    current = _num(p.get("current"))
     if current:
-        money = lambda v: f"{v:,}".replace(",", " ")
+        money = lambda v: f"{_num(v):,}".replace(",", " ")
         lines.append(f"**Цена: {money(current)} ₽**")
         if p.get("old"):
-            disc = round((1 - current / p["old"]) * 100)
+            disc = round((1 - current / _num(p["old"])) * 100)
             lines.append(f"- Старая цена: {money(p['old'])} ₽ (скидка {disc}%)")
         if p.get("bank"):
             lines.append(f"- С банком (кнопка «С банками»): {money(p['bank'])} ₽")

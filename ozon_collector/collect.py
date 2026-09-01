@@ -23,7 +23,6 @@ import json
 import os
 import random as _random
 import re
-import threading
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -54,67 +53,29 @@ MAX_TOPUP_STEPS = 40           # шагов top-up в каждой фазе (в�
 EMPTY_RETRY_PASSES = 2         # reload-попыток при 0 отзывов на стр. 1 (0 — выключено)
 EMPTY_RETRY_WAIT_MS = 4000     # пауза после reload перед повторной прокруткой
 
-# Сторож зависания вкладки (2026-08-21): page.evaluate не имеет таймаута и при
-# замёрзшем renderer'е может блокировать сбор часами (инцидент 03:47:34 на
-# товаре 2069397474 — «раскрыто 7 кнопок», дальше 7.5ч тишины). Демон-поток
-# следит за heartbeat; если сбор не двигается дольше STALL_TIMEOUT_S, сторож
-# убивает Chromium нашей CDP-сессии: заблокированный evaluate получает
-# TargetClosedError → renderer_failure (recyclable) → штатный recovery
-# перезапускает браузер и повторяет товар.
-STALL_TIMEOUT_S = 120          # 2 мин без прогресса = зависание (было 480/8 мин)
-STALL_CHECK_S = 10             # период проверки сторожем
+# Heartbeat-хук сбора (2026-09-01): контроль зависания воркера перенесён в
+# ОРКЕСТРАТОР (parallel._await_workers), а не локальный сторож-поток. Воркер
+# сообщает о прогрессе через _touch_watchdog(), а worker_main (parallel.py)
+# перехватывает это heartbeat-hook'ом и шлёт {"t":"hb"} в pipe родителю.
+# Родитель по простою heartbeat-сообщений (> WORKER_STALL_S) terminate'ит
+# зависший воркер и перезапускает его (recovery) — единый путь и для
+# parallel=1, и для parallel>1 (без костыля со сторожем внутри collect).
+_active_heartbeat = None        # hook (callable, throttled), ставит worker_main
 
-_active_watchdog = None        # текущий сторож (сбор однопоточный на процесс)
+
+def set_heartbeat_hook(fn):
+    """Установить функцию-хук прогресса (воркер шлёт heartbeat в pipe)."""
+    global _active_heartbeat
+    _active_heartbeat = fn
 
 
 def _touch_watchdog():
-    """Отметить прогресс сбора (сброс таймера простоя сторожа)."""
-    if _active_watchdog is not None:
-        _active_watchdog.touch()
-
-
-class _StallWatchdog:
-    """Kill Chromium при простое сбора дольше STALL_TIMEOUT_S (см. выше)."""
-
-    def __init__(self, cdp_url: str):
-        self._cdp_url = cdp_url
-        self._last = time.monotonic()
-        self._stop = threading.Event()
-        self.fired = False
-
-    def touch(self):
-        self._last = time.monotonic()
-
-    def start(self):
-        t = threading.Thread(target=self._loop, daemon=True,
-                             name="stall-watchdog")
-        t.start()
-
-    def stop(self):
-        self._stop.set()
-
-    def _loop(self):
-        while not self._stop.wait(STALL_CHECK_S):
-            idle = time.monotonic() - self._last
-            if idle <= STALL_TIMEOUT_S:
-                continue
-            self.fired = True
-            log.warning(f"[stall-watchdog] нет прогресса {int(idle)}s "
-                        f"(> {STALL_TIMEOUT_S}s) — kill Chromium сессии, "
-                        f"заблокированный evaluate получит TargetClosedError "
-                        f"и уйдёт в recovery")
-            try:
-                from . import process as P
-                idents = P.browser_processes(self._cdp_url)
-                recs = [P.ProcessRecord(f"stall-{int(idle)}s", i)
-                        for i in idents]
-                killed = P.kill_records(recs)
-                log.warning(f"[stall-watchdog] убито процессов браузера: "
-                            f"{len(killed)}")
-            except Exception as e:
-                log.error(f"[stall-watchdog] kill failed: "
-                          f"{type(e).__name__}: {e}")
-            return
+    """Отметить прогресс сбора (heartbeat для оркестратора)."""
+    if _active_heartbeat is not None:
+        try:
+            _active_heartbeat()
+        except Exception:
+            pass
 
 
 # Порог «полных» variant_count: до 100 отзывов Ozon отдаёт все и без логина,
@@ -297,7 +258,11 @@ PRODUCT_JS = r"""
       }
     }
     const m = T.match(/([\d.,]+)\s*\/\s*5\s*зв[её]зд/);
-    return m ? { value: parseFloat(m[1].replace(',', '.')), source: 'fallback_text' } : null;
+    if (m) {
+      const v = parseFloat(m[1].replace(',', '.'));
+      if (v > 0 && v <= 5) return { value: v, source: 'fallback_text' };
+    }
+    return null;
   };
   const ratingCount = () => {
     for (const wname of SCORE_WIDGETS) {
@@ -1122,6 +1087,7 @@ def next_url(page) -> Optional[str]:
             page.evaluate(
                 """() => {
                   const list = document.querySelector('div[data-widget="webListReviews"]');
+                  if (!list || !list.children[2]) return null;
                   const node = list.children[2];
                   const btn = node.querySelector('button') || node;
                   btn.click();
@@ -1352,6 +1318,10 @@ def _expand_review_comments(page, max_passes: int = 4) -> int:
                 if btn.count() == 0:
                     break
                 h = btn.element_handle()
+                if h is None:
+                    # элемент отсоединился между count() и element_handle()
+                    # (React-рендер/lazy-load) — пропускаем, не падаем
+                    continue
                 h.evaluate(
                     "(el) => { const c = el.closest('[data-review-uuid]');"
                     " if (c) c.setAttribute('data-comments-clicked', '1'); }"
@@ -1718,6 +1688,12 @@ def _collect_reviews_pass(
         except Exception as e:
             if B.is_renderer_failure(e):
                 raise
+            name = type(e).__name__
+            if name == "TimeoutError" or "net::ERR_" in str(e) \
+                    or "Timeout" in str(e):
+                # навигация не удалась (таймаут/DNS/ERR) — продолжать разбор
+                # по старой/ошибочной странице нельзя: соберём чужой контент
+                raise
             log.warning(f"[collect] page {p} goto warn: {e}")
             page.wait_for_timeout(3000)
         check_challenge(page, f"reviews_page p{p}")
@@ -1840,8 +1816,6 @@ def _collect_reviews_pass(
             if ok_v:
                 reviews.append(r)
                 matched_this += 1
-        print(f"[collect] стр. {p}: всего на странице {len(data['reviews'])}, "
-              f"под вариант {len(reviews)} (виден {len(seen)})")
         log.debug(f"стр. {p}: всего на странице {len(data['reviews'])}, "
                   f"под вариант {len(reviews)} (виден {len(seen)})")
         # Виртуализация infinite-scroll: REVIEWS_JS видит только смонтированное
@@ -1857,8 +1831,6 @@ def _collect_reviews_pass(
             pass_index = {_review_key(r): r for r in reviews[idx0:]}
             added = _topup_virtualized(page, count, seen, pass_index,
                                        reviews, target_variant, p)
-            print(f"[collect] стр. {p}: top-up завершён: +{added} "
-                  f"(собрано {len(reviews)}/{count})")
             log.info(f"стр. {p}: top-up завершён: +{added} "
                      f"(собрано {len(reviews)}/{count})")
             if added:
@@ -2074,10 +2046,6 @@ def collect(
         sess = Session(cdp_url)
     dom_html = None
     telemetry: dict = {}
-    global _active_watchdog
-    wd = _StallWatchdog(getattr(sess, "cdp_url", cdp_url))
-    _active_watchdog = wd
-    wd.start()
     try:
         sess.goto(product_url)
         check_challenge(sess.page, "product_page")
@@ -2123,8 +2091,6 @@ def collect(
                 no_count_hint=no_count_hint,
             )
     finally:
-        wd.stop()
-        _active_watchdog = None
         if sess_owned:
             sess.close()
 

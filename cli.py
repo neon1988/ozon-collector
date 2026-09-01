@@ -263,6 +263,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    # Перекодировать stdout/stderr в UTF-8 ДО argparse: иначе help/usage
+    # (с кириллицей и стрелкой →) падают с UnicodeEncodeError в cp1251-консоли
+    # (Windows), когда вывод редиректится в файл/pipe.
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
     p = build_parser()
     args = p.parse_args()
     if args.log:
