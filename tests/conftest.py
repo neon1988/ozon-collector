@@ -19,6 +19,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ozon_collector.collect import PRODUCT_JS, REVIEWS_JS, VARIANT_MODE_JS  # noqa: E402
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@pytest.fixture(autouse=True)
+def _redirect_log_dirs(tmp_path, monkeypatch):
+    """Юнит-тесты не должны писать в боевой каталог logs/ проекта.
+
+    key_daemon.log() пишет в LOGS_DIR/{campaign}_daemon.log, а воркеры parallel
+    используют WORKER_LOG_DIR → всё это перенаправляем во временный каталог.
+    Иначе прямоые тесты finalize_campaign/qa и параллельные тесты (FakeSession)
+    захламляют реальный logs/ (как было: None_daemon.log, ozon_worker_*.log).
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    import scripts.key_daemon as k
+    monkeypatch.setattr(k, "LOGS_DIR", logs)
+    from ozon_collector import parallel as parallel_mod
+    monkeypatch.setattr(parallel_mod, "WORKER_LOG_DIR", str(logs))
+
+
+
 FIXTURES = {
     "xiaomi": os.path.join(TESTS_DIR, "product_pages", "xiaomi.html.gz"),
     "roborock": os.path.join(TESTS_DIR, "product_pages", "roborock.html.gz"),
