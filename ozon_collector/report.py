@@ -631,7 +631,7 @@ def _best_for_digest(pid: str, data_dir: str):
     old_version / incompatible / incomplete / bad_timestamp).
     """
     from ozon_collector import cache as K
-    from ozon_collector.collect import CHALLENGE_TITLE_MARKERS
+    from ozon_collector.constants import CHALLENGE_TITLE_MARKERS
 
     best = None
     best_path = None

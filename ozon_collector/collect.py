@@ -33,6 +33,7 @@ from . import browser as B
 from . import cache as K
 from . import log
 from . import puzzle as _puzzle
+from .constants import CHALLENGE_TITLE_MARKERS
 from .cdp import Session
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.34 Safari/537.36"
@@ -876,16 +877,6 @@ def parse_variant(spec: str) -> dict:
 def _t_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-
-CHALLENGE_TITLE_MARKERS = (
-    "похоже, нет соединения",
-    "доступ ограничен",
-    "подтвердите, что вы не робот",
-    "подтвердите, что вы человек",
-    "проверка, что вы не робот",
-    "antibot captcha",
-    "captcha",
-)
 
 CHALLENGE_BODY_MARKERS = (
     "fab_chlg_",
