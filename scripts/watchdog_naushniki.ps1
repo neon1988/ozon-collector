@@ -40,7 +40,7 @@ function Get-LastWriteAge($path) {
 }
 
 function Start-Daemon {
-    $inner = "cmd.exe /c set KD_NO_COOLDOWN=1 && set PYTHONIOENCODING=utf-8 && cd /d $ROOT && python scripts\key_daemon.py --campaign naushniki --url `"$Q`" --limit 300 --out docs\naushniki.md --max-age 7d --min-reviews 40 --parallel 1 --min-valid 200 --max-no-progress-runs 3 --max-rescans 2 --max-total-hours 12 --notify toast --session-budget-wall-clock 43200 > logs\naushniki_wd_out.log 2>&1"
+    $inner = "cmd.exe /c set KD_NO_COOLDOWN=1 && set PYTHONIOENCODING=utf-8 && cd /d $ROOT && python scripts\key_daemon.py --campaign naushniki --url `"$Q`" --limit 300 --out docs\naushniki.md --max-age 7d --min-reviews 40 --parallel 1 --min-valid 200 --max-no-progress-runs 3 --max-rescans 2 --max-total-hours 12 --notify toast --session-budget-wall-clock 43200 > NUL 2>&1"
     $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $inner }
     if ($res.ReturnValue -eq 0) {
         WLog "daemon restarted, new pid=$($res.ProcessId)"
@@ -71,6 +71,19 @@ WLog "=== watchdog started (check every ${CheckS}s, max log idle ${MaxLogIdleS}s
 while ($true) {
     Start-Sleep -Seconds $CheckS
 
+    # 0) терминальное состояние кампании? Проверяем ПЕРВЫМИ (до «демон жив?») —
+    #    иначе завершённая кампания (final_state установлен) приводит к
+    #    бесконечным перезапускам демона, который сразу выходит по терминалу.
+    if (Test-Path $STATUS) {
+        try {
+            $s = Get-Content $STATUS -Encoding UTF8 -Raw | ConvertFrom-Json
+            if ($s.final_state) {
+                WLog "campaign final_state=$($s.final_state) reason=$($s.final_reason) valid=$($s.valid) -> stopping watchdog"
+                break
+            }
+        } catch { }
+    }
+
     # 1) демон жив?
     if (-not (Is-DaemonAlive)) {
         WLog "daemon NOT alive -> restart"
@@ -92,17 +105,6 @@ while ($true) {
         WLog "browser DOWN -> kill CLI (daemon will reconnect/relaunch browser)"
         Get-CliPids | ForEach-Object { Stop-Process -Id $_ -Force }
         continue
-    }
-
-    # 4) терминальное состояние кампании?
-    if (Test-Path $STATUS) {
-        try {
-            $s = Get-Content $STATUS -Encoding UTF8 -Raw | ConvertFrom-Json
-            if ($s.final_state) {
-                WLog "campaign final_state=$($s.final_state) reason=$($s.final_reason) valid=$($s.valid) -> stopping watchdog"
-                break
-            }
-        } catch { }
     }
 }
 

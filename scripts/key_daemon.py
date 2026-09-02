@@ -472,7 +472,10 @@ def _rotate_log(path: Path, limit: int = LOG_ROTATE_BYTES) -> None:
 
 
 def log(msg: str, level: str = "INFO", campaign: str = "campaign") -> None:
-    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {level:<8} {msg}"
+    # Единый формат с воркерами: маркер [orchestrator] явно отличает сообщения
+    # оркестратора от строк воркеров ([worker=k pid=N] ставит модульный логгер).
+    line = (f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+            f"{level:7s} [orchestrator] {msg}")
     print(line, flush=True)
     try:
         p = LOGS_DIR / f"{campaign}_daemon.log"
