@@ -1,6 +1,7 @@
 """Рендер Markdown-отчёта по собранному raw.json (без analysis-слоя)."""
 from __future__ import annotations
 
+import html as _html
 import json
 import os
 import re
@@ -10,14 +11,50 @@ DEFAULT_MAX_PRODUCTS_PER_FILE = 100
 
 
 def _norm_nbsp(s: str) -> str:
-    """Заменить неразрывные пробелы и похожие юникод-пробелы на обычные."""
+    """Очистить текст для вывода в markdown: убрать HTML-теги/коды, заменить
+    неразрывные и похожие юникод-пробелы на обычные."""
     if not s:
         return s
+    s = re.sub(r"<[^>]+>", "", s)
+    s = _html.unescape(s)
     out = list(s)
     for i, ch in enumerate(out):
         if ch in "\xa0\u202f\u2009\u200a":
             out[i] = " "
     return "".join(out)
+
+
+_ASPECT_RE = re.compile(r"^[^:\n]{1,40}:\s*\S")
+
+
+def _customer_aspects(customer_opinion) -> list[str]:
+    """Аксты из «По мнению покупателей» (`customer_opinion.text`).
+
+    Сырой текст блока содержит аспектную сводку (Качество звука: хорошее …
+    по одной строке на аспект) и следом мусор «Подобрали для вас»/футер.
+    Возвращаем только аспектные строки (метка: значение), без мусора.
+    """
+    if not customer_opinion:
+        return []
+    text = (customer_opinion.get("text") or "").strip()
+    if not text:
+        return []
+    lines = _norm_nbsp(text).split("\n")
+    # начать после заголовка «По мнению покупателей»
+    start = next((i for i, l in enumerate(lines)
+                  if re.search(r"По\s+мнению\s+покупателей", l, re.I) and i + 1 < len(lines)),
+                 None)
+    if start is None:
+        start = -1
+    aspects = []
+    for line in lines[start + 1:]:
+        line = line.strip()
+        if not line:
+            break
+        if not _ASPECT_RE.match(line):
+            break
+        aspects.append(line)
+    return aspects
 
 
 def _to_int_stamp(v):
@@ -29,6 +66,35 @@ def _to_int_stamp(v):
     return 0
 
 
+def _review_text_sig(r: dict) -> bool:
+    """Значимый ли текст отзыва (пригоден ли для LLM).
+
+    False для пустышек, где в тексте только имя автора (+ первая буква с новой
+    строки), напр. `М\\nМаксим С.` или `Андрей С.`. Такие отзывы собираются
+    (остаются в raw), но не несут ценности для дайджеста. Если автор скрыт —
+    «Имя скрыто» — тоже учитывается. При неуверенности (нет автора) — по длине.
+    """
+    text = (r.get("text") or "").strip()
+    if not text:
+        return False
+    name = (r.get("author") or "").strip()
+    if name:
+        # убрать все вхождения имени (и имя дважды подряд) — остаток значим?
+        rest = text
+        low_name = name.lower()
+        rest = re.sub(re.escape(name), "", text)
+        rest = rest.lower()
+        for pat in (low_name, low_name + " " + low_name):
+            rest = rest.replace(pat, "")
+        rest = re.sub(r"[\s\W_]+", "", rest)  # только буквы/цифры
+        # одна буква/пусто после удаления имени — пустышка
+        if len(rest) <= 1:
+            return False
+        return True
+    # нет имени — по длине
+    return len(re.sub(r"[\s\W_]+", "", text)) > 1
+
+
 def _top_reviews(reviews: list, n: int) -> list:
     """Топ отзывов для дайджеста (по «популярности»).
 
@@ -36,10 +102,9 @@ def _top_reviews(reviews: list, n: int) -> list:
     original_index) — сначала полезность, затем число комментариев, затем
     новизна; при полном равенстве сохраняется исходный порядок (стабильность).
 
-    Отзывы без текста (пустой text) исключаются из топа, если среди всех есть
-    хотя бы один текстовый (пустышка на LLM бесполезна); если текстовых нет
-    вовсе — топается как есть. Пустышками до n НЕ добираем: если текстовых
-    меньше n, вернётся сколько есть. Не мутирует и не сортирует вход.
+    Пустышки (пусто либо только имя автора в text) исключаются из топа, если
+    среди всех есть хоть один значимый (бесполезны для LLM); если значимых нет
+    вовсе — топается как есть. Пустышками до n НЕ добираем. Не мутирует вход.
     """
     if not reviews or n <= 0:
         return []
@@ -50,7 +115,7 @@ def _top_reviews(reviews: list, n: int) -> list:
         q = (r.get("helpful_yes") or 0) + (r.get("helpful_no") or 0)
         rk = (-q, -(r.get("comments_count") or 0),
               -_to_int_stamp(r.get("publishedAt")), i)
-        ranked.append((rk, r, bool((r.get("text") or "").strip())))
+        ranked.append((rk, r, _review_text_sig(r)))
     has_text = any(t for _, _, t in ranked)
     if has_text:
         ranked = [x for x in ranked if x[2]]
@@ -202,21 +267,23 @@ def _render_comments(comments: list, first_meta=None) -> list:
     return lines
 
 
-def _review_block(r: dict, first_meta=None, variant_in_header: bool = False) -> list:
+def _review_block(r: dict, first_meta=None, variant_in_header: bool = False,
+                  no: int = 0) -> list:
     star = "★" * min(5, r.get("stars") or 0) + "☆" * (5 - min(5, r.get("stars") or 0))
     author = r.get("author") or "—"
     date = r.get("date") or ""
     marker = " _(без текста)_" if r.get("_no_text") else ""
+    numbered = f"{no}. {author}" if no else author
     v_raw = r.get("variant") or ""
     v_parts = v_raw.split("\n") if v_raw else [""]
     v_head = v_parts[0].strip()
     v_aspects = " · ".join(x.strip() for x in v_parts[1:] if x.strip())
     if v_head and variant_in_header:
-        lines = [f"{author} — {date}{marker}"]
+        lines = [f"{numbered} — {date}{marker}"]
     elif v_head:
-        lines = [f"{author} — {date} | {v_head}{marker}"]
+        lines = [f"{numbered} — {date} | {v_head}{marker}"]
     else:
-        lines = [f"{author} — {date}{marker}"]
+        lines = [f"{numbered} — {date}{marker}"]
     if v_aspects:
         lines.append(v_aspects)
     txt = _norm_nbsp(r.get("text") or "")
@@ -266,6 +333,15 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
     variant_str = _variant_str(target)
     if variant_str:
         L.append(f"- Вариант: {variant_str}")
+    aspects = _customer_aspects(product.get("customer_opinion"))
+    if aspects:
+        L.append("- По мнению покупателей:")
+        for a in aspects:
+            L.append(f"  - {a}")
+    co = product.get("customer_opinion") or {}
+    rec = co.get("recommend_percent")
+    if rec is not None:
+        L.append(f"  - Рекомендуют: {rec}% покупателей")
     L.append(f"- URL: {raw.get('product_url', '—')}")
     L.append("")
 
@@ -316,9 +392,14 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
         L.append("")
 
     # ---- 6. Все отзывы варианта ----------------------------------------------
-    L.append(f"## 6. Все отзывы варианта ({len(reviews)})")
-    L.append("")
     vm = raw.get("reviews_variant_mode") or {}
+    _total_hdr = None
+    if vm.get("used") and vm.get("variant_count"):
+        _total_hdr = vm.get("variant_count")
+    elif (raw.get("stars_full") or {}).get("total") is not None:
+        _total_hdr = raw["stars_full"]["total"]
+    L.append(f"## 6. Все отзывы варианта ({_total_hdr if _total_hdr is not None else len(reviews)})")
+    L.append("")
     if vm.get("used") and vm.get("variant_count"):
         line = (f"Фильтр Ozon: «Этот вариант товара» "
                 f"({vm.get('variant_count')} из {vm.get('total_count') or '—'})")
@@ -337,10 +418,18 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
             "score_asc": "сначала низкие оценки",
         }
         parts = []
-        for s in sorts_req:
-            n = sum(1 for r in reviews if s in (r.get("review_sorts") or []))
-            parts.append(f"{_sort_labels.get(s, s)}: {n}")
-        L.append("Сортировки: " + " · ".join(parts))
+        # по умолчанию — по текущей выборке reviews; если есть sorts_full
+        # (счётчики по ВСЕМ собранным отзывам, док-пол восстановлен
+        # в render_search_digest до обрезания топ-N) — берём их.
+        if raw.get("sorts_full"):
+            counts = raw["sorts_full"]
+        else:
+            counts = {s: sum(1 for r in reviews if s in (r.get("review_sorts") or []))
+                      for s in sorts_req}
+        parts = [f"собрано {_sort_labels.get(s, s)}: {counts.get(s, 0)}" for s in sorts_req]
+        if parts:
+            parts[0] = "Собрано " + parts[0][len("собрано "):]
+        L.append(" · ".join(parts))
         L.append("")
     variants = {(r.get("variant") or "").split("\n", 1)[0] for r in reviews}
     variant_in_header = len(variants) == 1 and next(iter(variants))
@@ -350,21 +439,26 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
     if not reviews:
         L.append("_Отзывов не собрано._")
         L.append("")
-    counts = {s: 0 for s in range(1, 6)}
-    for r in reviews:
-        s = r.get("stars")
-        if isinstance(s, int) and 1 <= s <= 5:
-            counts[s] += 1
-    star_parts = [f"★{s}: {counts[s]}" for s in range(5, 0, -1) if counts[s]]
-    if star_parts:
-        L.append(f"Всего: {len(reviews)} {plural(len(reviews))} · " + " · ".join(star_parts))
-        L.append("")
     first_meta = None
     if dedup_replies:
         all_comments = [c for r in reviews for c in (r.get("comments") or [])]
         first_meta = {id(c): n for c, n in _group_comments(all_comments)}
-    for r in reviews:
-        L.extend(_review_block(r, first_meta, variant_in_header))
+    for i, r in enumerate(reviews, 1):
+        L.extend(_review_block(r, first_meta, variant_in_header, no=i))
+    if raw.get("stars_full") is not None:
+        total, counts = raw["stars_full"]["total"], raw["stars_full"]["counts"]
+    else:
+        counts = {s: 0 for s in range(1, 6)}
+        for r in reviews:
+            s = r.get("stars")
+            if isinstance(s, int) and 1 <= s <= 5:
+                counts[s] += 1
+        total = len(reviews)
+    star_parts = [f"★{s}: {counts[s]}" for s in range(5, 0, -1) if counts[s]]
+    if star_parts:
+        L.append(f"Из собранных после удаление дубликатов: {total} {plural(total)}"
+                 " · " + " · ".join(star_parts))
+        L.append("")
 
     # ---- 7. Метаданные --------------------------------------------------------
     L.append("## 7. Метаданные")
@@ -441,6 +535,21 @@ def render_search_digest(combined: dict,
         if reviews_per_product and reviews_per_product > 0:
             raw_view = copy.deepcopy(raw)
             reviews = raw_view.get("reviews") or []
+            # счётчики сортировок по ВСЕМ собранным отзывам (до топ-N),
+            # чтобы строка «Сортировки» отражала реальный сбор, а не топ.
+            sorts_req = raw.get("reviews_sorts") or []
+            if sorts_req:
+                raw_view["sorts_full"] = {
+                    s: sum(1 for r in reviews if s in (r.get("review_sorts") or []))
+                    for s in sorts_req}
+            # счётчик оценок по ВСЕМ собранным отзывам (до топ-N), чтобы
+            # строка «Всего: … ★…» в конце блока отражала весь сбор.
+            _counts = {s: 0 for s in range(1, 6)}
+            for r in reviews:
+                _s = r.get("stars")
+                if isinstance(_s, int) and 1 <= _s <= 5:
+                    _counts[_s] += 1
+            raw_view["stars_full"] = {"total": len(reviews), "counts": _counts}
             raw_view["reviews"] = _top_reviews(reviews, reviews_per_product)
         else:
             raw_view = raw

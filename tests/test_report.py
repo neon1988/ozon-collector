@@ -6,6 +6,7 @@ from ozon_collector.report import (
     _group_comments,
     _render_comments,
     _review_block,
+    _review_text_sig,
     _top_reviews,
     render,
     render_search_digest,
@@ -196,6 +197,25 @@ def test_norm_nbsp_in_review_text():
     assert "Очень хороший товар" in md
 
 
+def test_strip_html_in_review_text():
+    """HTML-теги и коды вырезаются из текста отзыва."""
+    r = _review("Автор", [])
+    r["text"] = "Звук <b>отличный</b> &amp; бас глубокий<br>ещё строка"
+    md = render(_raw([r]))
+    assert "<b>" not in md
+    assert "<br>" not in md
+    assert "&amp;" not in md
+    assert "Звук отличный & бас глубокий" in md
+
+
+def test_strip_html_in_comment_text():
+    """HTML-теги вырезаются из текста комментария."""
+    r = _review("Автор", [_c("Спасибо <em>за отзыв</em>!", author="Продавец")])
+    md = render(_raw([r]))
+    assert "<em>" not in md
+    assert "Спасибо за отзыв!" in md
+
+
 # ---- render / digest ---------------------------------------------------------
 
 def test_render_dedup_across_reviews():
@@ -219,8 +239,9 @@ def test_render_no_dedup_flag():
 
 
 def test_render_rating_and_opinion_omitted():
-    """Рейтинг и «По мнению покупателей» не выводятся в карточке md (это данные
-    обо всех вариантах и мешают оценке; в raw/кеше остаются)."""
+    """Рейтинг и % рекомендуют НЕ выводятся в карточке md (это данные обо всех
+    вариантах и мешают оценке; в raw/кеше остаются). АКСТЫ из customer_opinion
+    при отсутствии text тоже не выводятся."""
     raw = _raw([])
     raw["product"]["rating"] = 4.9
     raw["product"]["rating_count"] = 3045
@@ -234,6 +255,49 @@ def test_render_rating_and_opinion_omitted():
     assert "webSingleProductScore" not in md
     assert "По мнению покупателей" not in md
     assert "92% рекомендуют" not in md
+
+
+def test_customer_aspects_rendered():
+    """АКСТЫ из «По мнению покупателей» выводятся в карточке, мусор отбрасывается."""
+    raw = _raw([])
+    raw["product"]["customer_opinion"] = {
+        "text": "По мнению покупателей\nКачество звука: хорошее\n"
+                "Комфорт при использовании: удобно\nВнешний вид: великолепный\n"
+                "Подобрали для вас\n27 167 ₽\nSony ..."
+    }
+    md = render(raw)
+    assert "По мнению покупателей:" in md
+    assert "Качество звука: хорошее" in md
+    assert "Комфорт при использовании: удобно" in md
+    assert "Внешний вид: великолепный" in md
+    assert "Подобрали для вас" not in md
+    assert "Sony" not in md
+    assert "По мнению покупателей\n" not in md
+
+
+def test_customer_aspects_no_text_omitted():
+    """customer_opinion без text и процентов — строка сводки не выводится."""
+    raw = _raw([])
+    raw["product"]["customer_opinion"] = {"recommend_percent": None, "stars": {}}
+    md = render(raw)
+    assert "По мнению покупателей" not in md
+
+
+def test_customer_opinion_percents_rendered():
+    """% рекомендуют выводится, разбивка «Оценки: ★…» (все варианты) — НЕТ."""
+    raw = _raw([])
+    raw["product"]["customer_opinion"] = {
+        "recommend_percent": 92,
+        "stars": {"1": 0, "2": 6.66667, "3": 0, "4": 0, "5": 93.3333},
+        "text": "По мнению покупателей\nКачество звука: хорошее\nПодобрали для вас",
+    }
+    md = render(raw)
+    assert "Рекомендуют: 92% покупателей" in md
+    assert "Качество звука: хорошее" in md
+    assert "Подобрали для вас" not in md
+    assert "Оценки:" not in md
+    assert "★5:" not in md
+    assert "93%" not in md
 
 
 def test_render_no_rating_opinion_lines():
@@ -481,10 +545,41 @@ def test_top_reviews_no_text_fills_when_all_empty():
 
 
 def test_top_reviews_does_not_pad_to_n():
-    """Пустышками до n НЕ добираем: текстовых меньше n → вернётся сколько есть."""
-    reviews = [_rv(helpful_yes=1, text="a"), _rv(helpful_yes=2, text="")]
+    """Пустышками до n НЕ добираем: значимых меньше n → вернётся сколько есть."""
+    reviews = [_rv(helpful_yes=1, text="очень хороший звук"),
+               _rv(helpful_yes=2, text="")]
     top = _top_reviews(reviews, 10)
     assert len(top) == 1
+    assert top[0]["text"] == "очень хороший звук"
+
+
+def test_top_reviews_excludes_name_only_text():
+    """Отзыв с текстом = только имя автора (М\\nМаксим С.) — пустышка, в топ не идёт."""
+    reviews = [
+        {"uuid": "u1", "author": "Максим С.", "text": "М\nМаксим С.",
+         "helpful_yes": 100, "comments_count": 0, "publishedAt": "0"},
+        {"uuid": "u2", "author": "Иван Н.", "text": "Наушники шикарные, бас глубокий.",
+         "helpful_yes": 1, "comments_count": 0, "publishedAt": "0"},
+    ]
+    top = _top_reviews(reviews, 10)
+    assert [r["uuid"] for r in top] == ["u2"]
+
+
+def test_review_text_sig_name_only():
+    """Текст == имя автора (с/без первой буквы) → незначимый."""
+    assert _review_text_sig({"author": "Максим С.", "text": "М\nМаксим С."}) is False
+    assert _review_text_sig({"author": "Ильмир", "text": "Ильмир"}) is False
+    assert _review_text_sig({"author": "Имя скрыто", "text": "А\nИмя скрыто"}) is False
+    assert _review_text_sig({"author": "Андрей С.", "text": "Андрей С."}) is False
+
+
+def test_review_text_sig_meaningful():
+    """Реальный текст с пометкой автора → значимый."""
+    assert _review_text_sig(
+        {"author": "Максим С.", "text": "Максим С.\nОтличные наушники за свои деньги"}) is True
+    assert _review_text_sig({"author": "Иван", "text": "Хорошее качество звука"}) is True
+    assert _review_text_sig({"author": "", "text": "Нормально"}) is True
+    assert _review_text_sig({"author": "", "text": ""}) is False
 
 
 def test_top_reviews_stable_index_breaks_ties():
