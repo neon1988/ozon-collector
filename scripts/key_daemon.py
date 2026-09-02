@@ -43,6 +43,10 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from ozon_collector import log
+
 DATA_DIR = ROOT / "data"
 LOGS_DIR = ROOT / "logs"
 CAMPAIGNS_DIR = DATA_DIR / "campaigns"
@@ -451,40 +455,6 @@ class PidLock:
             pass
 
 
-# Порог ротации лога демона: файл {campaign}_daemon.log при превышении
-# сохраняется как {campaign}_daemon.log.1 (открывается заново .log). Единый
-# лог с ротацией — не плодим отдельные файлы на каждый запуск.
-LOG_ROTATE_BYTES = 5 * 1024 * 1024
-
-
-def _rotate_log(path: Path, limit: int = LOG_ROTATE_BYTES) -> None:
-    """Ротация одного файла лога: >limit → path.1 (перезапись предыдущего)."""
-    try:
-        if path.exists() and path.stat().st_size > limit:
-            old = path.with_suffix(path.suffix + ".1")
-            try:
-                old.unlink(missing_ok=True)
-            except OSError:
-                pass
-            path.rename(old)
-    except OSError:
-        pass
-
-
-def log(msg: str, level: str = "INFO", campaign: str = "campaign") -> None:
-    # Единый формат с воркерами: маркер [orchestrator] явно отличает сообщения
-    # оркестратора от строк воркеров ([worker=k pid=N] ставит модульный логгер).
-    line = (f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
-            f"{level:7s} [orchestrator] {msg}")
-    print(line, flush=True)
-    try:
-        p = LOGS_DIR / f"{campaign}_daemon.log"
-        _rotate_log(p)
-        p.open("a", encoding="utf-8").write(line + "\n")
-    except OSError:
-        pass
-
-
 def _status_payload(progress: dict) -> dict:
     """Полный snapshot состояния кампании — runtime API для мониторинга.
 
@@ -718,10 +688,9 @@ def _recover_interrupted_run(progress: dict, data_dir: str,
     _journal_stage(progress, last, "state_committed",
                    {"recovered": True, "new_valid": len(new_checked.get("valid_add", [])),
                     "checked": len(new_checked.get("checked", []))})
-    log(f"recovery: прерванный прогон {last} восстановлен "
-        f"(discovered={len(discovered)}, new_valid="
-        f"{len(new_checked.get('valid_add', []))})", "INFO",
-        progress.get("campaign", "campaign"))
+    log.info(f"recovery: прерванный прогон {last} восстановлен "
+             f"(discovered={len(discovered)}, new_valid="
+             f"{len(new_checked.get('valid_add', []))})")
 
 
 def _set_state(progress: dict, state: str, event: str = None, **kw) -> None:
@@ -1014,8 +983,7 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
         else:
             t = msg
             detail = None
-        log(f"worker{k} [{t}]" + (f" {detail}" if detail else ""),
-            campaign=camp)
+        log.info(f"worker{k} [{t}]" + (f" {detail}" if detail else ""))
 
     max_restarts = int(cfg.get("max_worker_restarts", 2))
 
@@ -1124,10 +1092,18 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  max_worker_restarts: int = 2,
                  session_budget_wall_clock: Optional[int] = None,
                  window_mode: Optional[str] = None,
+                 write_digest: bool = True,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
     lock = PidLock(DATA_DIR / "key_daemon.pid")
     if not lock.acquire(campaign):
         raise SystemExit("key_daemon уже запущен (pid-файл)")
+
+    # Единый логгер демона: оркестратор — владелец файла кампании и ротации.
+    # Воркеры (collect_parallel) получают тот же путь через task["worker_log"]
+    # и пишут в него в append-режиме без ротации.
+    log.attach_file(LOGS_DIR / f"{campaign}_daemon.log", mode="a",
+                    rotate_max_bytes=5 * 1024 * 1024)
+    log.set_context("orchestrator")
 
     camp_dir = CAMPAIGNS_DIR / campaign
     camp_dir.mkdir(parents=True, exist_ok=True)
@@ -1244,7 +1220,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     wait = datetime.fromisoformat(cu).timestamp() - time.time()
                     if wait > 5:
                         sleep_for = min(wait, remaining)
-                        log(f"cooldown: жду {int(sleep_for)}с", campaign=campaign)
+                        log.info(f"cooldown: жду {int(sleep_for)}с")
                         time.sleep(sleep_for)
                         # если проспали ровно до дедлайна — выходим по time_limit
                         if sleep_for >= remaining:
@@ -1277,8 +1253,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     set(progress.get("permanently_failed_pids", [])) | set(recurring))
                 progress["failed_pids"] = [
                     p for p in progress.get("failed_pids", []) if p not in recurring]
-                log(f"детерминированный брак → permanently_failed "
-                    f"(повторная причина): {len(recurring)}", "WARN", campaign)
+                log.warning(f"детерминированный брак → permanently_failed "
+                            f"(повторная причина): {len(recurring)}")
             if pending:
                 mode = "rescan"
                 targets = pending
@@ -1288,15 +1264,13 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     rescans[p] = rescans.get(p, 0) + 1
                 progress["running_rescans"] = rescans
                 attempts = [rescans[p] for p in pending[:10]]
-                log(f"rescan: {len(pending)} бракованных, попытки {attempts}"
-                    f"{'...' if len(pending) > 10 else ''}",
-                    "WARN", campaign)
+                log.warning(f"rescan: {len(pending)} бракованных, попытки {attempts}"
+                            f"{'...' if len(pending) > 10 else ''}")
             elif failed:
                 progress["permanently_failed_pids"] = normalize_pids(
                     set(progress.get("permanently_failed_pids", [])) | set(failed))
                 progress["failed_pids"] = []
-                log(f"бракованные переведены в permanently_failed: {len(failed)}",
-                    "WARN", campaign)
+                log.warning(f"бракованные переведены в permanently_failed: {len(failed)}")
 
             run_id = f"run_{int(time.time())}_{len(progress.get('runs', []))}"
             before_disc = set(progress.get("discovered_pids", []))
@@ -1308,12 +1282,12 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                        run_id=run_id, mode=mode)
             _journal_stage(progress, run_id, "run_started")
 
-            log(f"[{run_id}] in-process сбор ({mode}) старт", campaign=campaign)
+            log.info(f"[{run_id}] in-process сбор ({mode}) старт")
             try:
                 combined = _inproc_collect(progress, run_id, mode, targets)
                 exit_code = 0
             except Exception as exc:
-                log(f"in-process сбор упал: {exc}", "ERROR", campaign)
+                log.error(f"in-process сбор упал: {exc}")
                 # combined «пуст, но есть» + exit!=0 → UNKNOWN_FAILURE: прежнее
                 # поведение subprocess (combined записан, код ненулевой) →
                 # транзиентные ретраи → NEEDS_ATTENTION, а не тихий ABANDONED.
@@ -1349,7 +1323,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 progress["final_reason"] = "qa_parse_error"
                 progress["final_note"] = "QA-сводка недостоверна (не сошлись инварианты)"
                 notify(progress, "NEEDS_ATTENTION: QA-сводка недостоверна")
-                log("QA parse_error → NEEDS_ATTENTION", "ERROR", campaign)
+                log.error("QA parse_error → NEEDS_ATTENTION")
                 save_json(progress_path, progress)
                 break
             reconcile_validity(progress, new_checked, data_dir)
@@ -1403,11 +1377,10 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 stall["crash_runs"] = stall.get("crash_runs", 0) + 1
             progress["stall"] = stall
 
-            log(f"[{run_id}] status={status}: discovered "
+            log.info(f"[{run_id}] status={status}: discovered "
                 f"{len(progress.get('discovered_pids', []))} "
                 f"valid {len(progress.get('valid_pids', []))} "
-                f"(new_disc={len(new_disc)}, new_valid={len(new_valid)})",
-                campaign=campaign)
+                f"(new_disc={len(new_disc)}, new_valid={len(new_valid)})")
 
             # ---- реакция по статусу ----
             if status == "CHALLENGE_STORM":
@@ -1454,9 +1427,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     progress["final_reason"] = "challenge_storm"
                     progress["final_note"] = (
                         f"persistent challenge ({cc['storm_streak']} штормов)")
-                    log(f"persistent challenge → NEEDS_ATTENTION "
-                        f"(storm_streak={cc['storm_streak']})",
-                        "ERROR", campaign)
+                    log.error(f"persistent challenge → NEEDS_ATTENTION "
+                        f"(storm_streak={cc['storm_streak']})")
                     _set_state(progress, "NEEDS_ATTENTION", "CHALLENGE_STORM",
                                run_id=run_id, storm_streak=cc["storm_streak"])
                     notify(progress, "NEEDS_ATTENTION: persistent challenge")
@@ -1468,12 +1440,11 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 progress["cooldown_until"] = (
                     datetime.now(timezone.utc) +
                     timedelta(seconds=pause_s)).isoformat(timespec="seconds")
-                log(f"challenge detected → adaptive pause {int(pause_s)}с "
+                log.warning(f"challenge detected → adaptive pause {int(pause_s)}с "
                     f"(storm_streak={cc['storm_streak']}) "
                     f"{'ФУЛЛ' if all_stormed else 'ЧАСТИЧНЫЙ'}"
                     f"{' ' + str(stormed_workers) if stormed_workers else ''}, "
-                    f"challenge_seq={progress['challenge_seq']}",
-                    "WARN", campaign)
+                    f"challenge_seq={progress['challenge_seq']}")
                 _set_state(progress, "COOLDOWN_CHALLENGE", "CHALLENGE_STORM",
                            run_id=run_id, pause=int(pause_s),
                            storm_streak=cc["storm_streak"],
@@ -1491,8 +1462,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     datetime.now(timezone.utc) +
                     timedelta(seconds=crash_pause)).isoformat(
                         timespec="seconds")
-                log(f"crash сбора (exit!=0, нет combined), cooldown "
-                    f"{crash_pause}с", "WARN", campaign)
+                log.warning(f"crash сбора (exit!=0, нет combined), cooldown "
+                    f"{crash_pause}с")
                 _set_state(progress, "COOLDOWN_CRASH", "CRASH",
                            run_id=run_id, exit_code=exit_code)
 
@@ -1513,9 +1484,9 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     progress["last_error"] = (
                         f"UNKNOWN_FAILURE (exit={exit_code}); retry "
                         f"{progress['transient_failures']}/{max_tr}")
-                    log(f"UNKNOWN_FAILURE → transient retry "
+                    log.warning(f"UNKNOWN_FAILURE → transient retry "
                         f"{progress['transient_failures']}/{max_tr}, пауза "
-                        f"{TRANSIENT_RETRY_BACKOFF_S}с", "WARN", campaign)
+                        f"{TRANSIENT_RETRY_BACKOFF_S}с")
                     _set_state(progress, "COOLDOWN_CRASH", "TRANSIENT_RETRY",
                                run_id=run_id, attempt=progress["transient_failures"],
                                max_attempts=max_tr)
@@ -1572,11 +1543,33 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         if fs in ("COMPLETED_MIN", "ABANDONED") and fr:
             msg += f" / {fr}"
         _set_state(progress, fs, "FINALIZED", reason=fr)
+        if write_digest:
+            _write_digest(progress, data_dir)
         notify(progress, msg)
         return progress
 
     finally:
         lock.release()
+
+
+def _write_digest(progress: dict, data_dir: str) -> None:
+    """Markdown-дайджест собранной выдачи (по финальным accepted PID).
+
+    Рендерит из лучших валидных raw на каждый pid (report.build_search_digest_combined
+    + write_search_digest) в progress["out"]. Ничего не делает, если accepted
+    PID пустые (например, ABANDONED без данных).
+    """
+    from ozon_collector.report import (build_search_digest_combined,
+                                       write_search_digest)
+    pids = list(progress.get("campaign_accepted_pids")
+                or progress.get("campaign_final_pids") or [])
+    if not pids:
+        return
+    out = progress.get("out") or f"docs/{progress['campaign']}.md"
+    combined, _table = build_search_digest_combined(pids, data_dir)
+    written = write_search_digest(combined, out)
+    for path in written:
+        log.info(f"дайджест сохранён: {path}")
 
 
 def finalize_campaign(progress: dict, progress_path: Path,
@@ -1621,24 +1614,21 @@ def finalize_campaign(progress: dict, progress_path: Path,
             qa = qa_fn(batch)
             per_pid = qa.get("per_pid") or {}
             if not qa_summary_consistent(qa, len(batch)):
-                log(f"финальный QA batch {bi}/{n}: недостоверная сводка "
-                    f"(K4) → NEEDS_ATTENTION", "ERROR",
-                    campaign=progress.get("campaign"))
+                log.error(f"финальный QA batch {bi}/{n}: недостоверная сводка "
+                          f"(K4) → NEEDS_ATTENTION")
                 return [], 0, [], True
             if qa.get("fail", 0) > 0:
                 missing = [p for p in batch if p not in per_pid]
                 if missing:
-                    log(f"финальный QA batch {bi}/{n}: FAIL, но per_pid не "
-                        f"покрывает все PID → NEEDS_ATTENTION", "ERROR",
-                        campaign=progress.get("campaign"))
+                    log.error(f"финальный QA batch {bi}/{n}: FAIL, но per_pid не "
+                              f"покрывает все PID → NEEDS_ATTENTION")
                     return [], 0, [], True
             fails = qa.get("fail", 0)
             total_fail += fails
             qa_batches.append({"batch": bi, "size": len(batch),
                                "fail": fails, "ok": qa.get("ok", 0),
                                "warn": qa.get("warn", 0)})
-            log(f"финальный QA batch {bi}/{n}: FAIL={fails}",
-                campaign=progress.get("campaign"))
+            log.info(f"финальный QA batch {bi}/{n}: FAIL={fails}")
             for pid in batch:
                 v = per_pid.get(pid, "OK")  # OK только при доказанных инвариантах
                 if v in OK_VERDICTS:
@@ -1781,6 +1771,9 @@ def parse_args(argv=None):
                     help="режим окна браузера коллектора: visible — окно "
                          "развёрнуто и видимо наверху, hidden — свёрнуто "
                          "(по умолчанию из env OZON_KEEP_WINDOW=1 → visible)")
+    ap.add_argument("--no-digest", action="store_true",
+                    help="не создавать Markdown-дайджест итога кампании "
+                         "(по умолчанию создаётся в --out)")
     return ap.parse_args(argv)
 
 
@@ -1809,7 +1802,8 @@ def main(argv=None):
         max_transient_retries=args.max_transient_retries,
         max_worker_restarts=args.max_worker_restarts,
         session_budget_wall_clock=args.session_budget_wall_clock,
-        window_mode=args.window_mode)
+        window_mode=args.window_mode,
+        write_digest=not args.no_digest)
     print(json.dumps(summarize(progress), ensure_ascii=False, indent=2))
 
 
@@ -1817,7 +1811,7 @@ if __name__ == "__main__":
     import signal as _signal
 
     def _graceful_exit(signum, frame):
-        log(f"демон остановлен (сигнал {signum})", "WARN")
+        log.warning(f"демон остановлен (сигнал {signum})")
         try:
             (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
         except OSError:
@@ -1832,7 +1826,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log("демон остановлен (Ctrl-C)", "WARN")
+        log.warning("демон остановлен (Ctrl-C)")
         try:
             (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
         except OSError:

@@ -1175,6 +1175,11 @@ def test_integration_target_reached_completed(tmp_path, monkeypatch):
     assert prog["final_reason"] == "target_reached"
     assert len(prog["campaign_final_pids"]) == 3
     assert len(prog["campaign_reserve_pids"]) == 1  # 4 valid - 3 target
+    # единый логгер демона: строки оркестратора в {campaign}_daemon.log
+    daemon_log = (tmp_path / "logs" / "testcamp_daemon.log").read_text(
+        encoding="utf-8")
+    assert "[orchestrator]" in daemon_log
+    assert "[log] no context" not in daemon_log  # контекст взят из attach+set_context
 
 
 def test_integration_stagnation_soft_stop_completed_min(tmp_path, monkeypatch):

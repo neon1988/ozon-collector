@@ -29,6 +29,7 @@ def reset_log():
     yield
     log._fh = None
     log._worker_prefix = ""
+    log._context = ""
 
 
 def _items(n, start=0):
@@ -166,30 +167,55 @@ def test_storm_summary_all_workers():
 
 # ---- attach_file --------------------------------------------------------------
 
-def test_attach_file_appends_with_prefix(tmp_path, reset_log):
+def test_attach_file_appends_with_context(tmp_path, reset_log):
     f = tmp_path / "w.log"
     f.write_text("OLD LINE\n", encoding="utf-8")
-    log.attach_file(str(f), mode="a", prefix="[worker=1 pid=1] ")
-    log.info("hello worker1")
-    log.attach_file(str(f), mode="a", prefix="[worker=2 pid=2] ")
-    log.info("hello worker2")
+    log.attach_file(str(f), mode="a")
+    log.set_context("orchestrator")
+    log.info("campaign started")
+    log.attach_file(str(f), mode="a")   # новый хендл = сброс контекста
+    log.set_context("worker=1")
+    log.info("collecting 123")
     txt = f.read_text(encoding="utf-8")
     assert txt.startswith("OLD LINE\n")          # append, не перезапись
-    assert "[worker=1 pid=1] hello worker1" in txt
-    assert "[worker=2 pid=2] hello worker2" in txt
-    assert txt.count("hello worker") == 2
+    assert "[orchestrator] campaign started" in txt
+    assert "[worker=1] collecting 123" in txt
+    assert txt.count("collecting 123") == 1
+
+
+def test_attach_file_resets_context(tmp_path, reset_log):
+    f = tmp_path / "w.log"
+    log.attach_file(str(f), mode="a")
+    log.set_context("orchestrator")
+    log.info("with context")
+    log.attach_file(str(tmp_path / "other.log"), mode="a")  # сброс контекста
+    log.info("no context")                                     # старый формат
+    txt = (tmp_path / "other.log").read_text(encoding="utf-8")
+    assert "[orchestrator] with context" not in txt  # контекст сброшен
+    assert "[log] no context" in txt                  # старый формат без контекста
+    main = (tmp_path / "w.log").read_text(encoding="utf-8")
+    assert "[orchestrator] with context" in main      # до attach контекст держался
 
 
 def test_attach_file_no_rotation(tmp_path, reset_log):
     f = tmp_path / "w.log"
     f.write_text("X\n", encoding="utf-8")
-    log.attach_file(str(f), mode="a", prefix="[worker=1 pid=1] ")
+    log.attach_file(str(f), mode="a")
     assert not (tmp_path / "w.log.1").exists()   # ротации нет
     log.attach_file(str(tmp_path / "other.log"), mode="a")
     # w.log остался нетронутым (добавился только attach-заголовок)
     assert (tmp_path / "w.log").read_text(
         encoding="utf-8").startswith("X\n")
     assert (tmp_path / "other.log").exists()
+
+
+def test_attach_file_rotates_above_limit(tmp_path, reset_log):
+    f = tmp_path / "w.log"
+    f.write_text("A" * 100, encoding="utf-8")
+    log.attach_file(str(f), mode="a", rotate_max_bytes=50)
+    assert (tmp_path / "w.log.1").exists()        # превышен лимит → ротация
+    log.attach_file(str(tmp_path / "s.log"), mode="a", rotate_max_bytes=100)
+    assert not (tmp_path / "s.log.1").exists()    # ниже лимита → нет ротации
 
 
 # ---- token-матчинг browser_processes -----------------------------------------

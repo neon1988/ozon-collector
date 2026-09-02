@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 
@@ -29,52 +28,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from cli import parse_pids
-from ozon_collector import cache as K
-from ozon_collector.collect import CHALLENGE_TITLE_MARKERS
-from ozon_collector.report import render_search_digest, write_search_digest
-
-
-def _best_for_digest(pid: str, data_dir: str):
-    """Лучший raw pid для дайджеста.
-
-    Возвращает (raw|None, path|None, reason): reason == "ok" при валидном
-    кандидате; иначе причина отклонения (missing / challenge / no_reviews /
-    old_version / incompatible / incomplete / bad_timestamp).
-    """
-    best = None
-    best_path = None
-    best_key = None
-    reason = "missing"
-    for path in K._raw_candidates(pid, data_dir):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except (OSError, ValueError):
-            continue
-        r = K._validate_raw(raw, pid)
-        if r is not None:
-            reason = r
-            continue
-        title = (raw.get("product") or {}).get("title") or ""
-        t = title.strip().lower()
-        if any(m in t for m in CHALLENGE_TITLE_MARKERS):
-            reason = "challenge"
-            continue
-        n = int(raw.get("reviews_collected") or 0)
-        if n <= 0:
-            reason = "no_reviews"
-            continue
-        dt = K._parse_utc(raw.get("collected_at_utc"))
-        key = (
-            K._version_tuple(raw.get("collector_version")) or (0,),
-            dt.timestamp() if dt is not None else 0.0,
-            n,
-        )
-        if best is None or key > best_key:
-            best, best_path, best_key = raw, path, key
-    if best is None:
-        return None, None, reason
-    return best, best_path, "ok"
+from ozon_collector.report import (build_search_digest_combined,
+                                   render_search_digest,
+                                   write_search_digest)
 
 
 def main(argv=None) -> int:
@@ -120,42 +76,13 @@ def main(argv=None) -> int:
     if only:
         pids &= only
 
-    products = []
-    table = []
-    for pid in sorted(pids):
-        raw, path, reason = _best_for_digest(pid, args.data_dir)
-        if raw is None:
-            products.append({"ok": False, "pid": pid,
-                             "error": f"нет валидных данных ({reason})"})
-            table.append(f"{pid:>12}  SKIP  {reason}")
-            continue
-        n = int(raw.get("reviews_collected") or 0)
-        ver = raw.get("collector_version") or "?"
-        title = (raw.get("product") or {}).get("title") or ""
-        title_short = (title[:70] + "…") if len(title) > 70 else title
-        table.append(f"{pid:>12}  {n:>3} отз.  {ver:>6}  "
-                     f"{os.path.basename(path):<38} {title_short}")
-        products.append({
-            "ok": True,
-            "pid": pid,
-            "raw": raw,
-            "cache": f"raw:{os.path.basename(path)}",
-        })
-
-    ok_n = sum(1 for p in products if p.get("ok"))
+    combined, table = build_search_digest_combined(
+        pids, args.data_dir,
+        query=(None if only else args.query))
+    ok_n = combined["collected"]
     print(f"pid'ов: {len(pids)}, из них с валидными данными: {ok_n}")
     print("\n".join(table))
 
-    from datetime import datetime, timezone
-    query = (f"артикулы: {', '.join(sorted(pids))} (офлайн, из raw)"
-             if only else args.query)
-    combined = {
-        "search": {"query": query},
-        "collected_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "found": len(pids),
-        "collected": ok_n,
-        "products": products,
-    }
     md = render_search_digest(combined)
     if args.out:
         written = write_search_digest(

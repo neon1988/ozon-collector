@@ -39,10 +39,12 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 def _redirect_log_dirs(tmp_path, monkeypatch):
     """Юнит-тесты не должны писать в боевой каталог logs/ проекта.
 
-    key_daemon.log() пишет в LOGS_DIR/{campaign}_daemon.log, а воркеры parallel
-    используют WORKER_LOG_DIR → всё это перенаправляем во временный каталог.
-    Иначе прямоые тесты finalize_campaign/qa и параллельные тесты (FakeSession)
-    захламляют реальный logs/ (как было: None_daemon.log, ozon_worker_*.log).
+    Демон (orchestrator) и воркеры parallel используют единый модульный
+    логгер ozon_collector/log.py, пишущий в LOGS_DIR/{campaign}_daemon.log
+    (путь воркеру передаётся через task["worker_log"]). Перенаправляем всё во
+    временный каталог, иначе прямоые тесты finalize_campaign/qa и параллельные
+    тесты (FakeSession) захламляют реальный logs/ (как было: None_daemon.log,
+    ozon_worker_*.log).
     """
     logs = tmp_path / "logs"
     logs.mkdir(exist_ok=True)

@@ -6,6 +6,7 @@ from ozon_collector.report import (
     _group_comments,
     _render_comments,
     _review_block,
+    _top_reviews,
     render,
     render_search_digest,
 )
@@ -18,9 +19,14 @@ def _c(text, author="Продавец", reply_to="Иван"):
             "date": "2026-08-01", "text": text, "like": 0, "dislike": 0}
 
 
-def _review(author, comments, text="отзыв", stars=5):
-    return {"author": author, "date": "2026-08-01", "stars": stars,
-            "text": text, "comments": comments}
+def _review(author, comments, text="отзыв", stars=5, variant=None, stale=False):
+    r = {"author": author, "date": "2026-08-01", "stars": stars,
+         "text": text, "comments": comments}
+    if variant is not None:
+        r["variant"] = variant
+    if stale:
+        r["stale"] = True
+    return r
 
 
 def _raw(reviews):
@@ -123,6 +129,73 @@ def test_review_block_preserves_old_behavior_when_dedup_off():
     assert "пропущено" not in "\n".join(lines)
 
 
+def test_review_block_stale_hides_stars():
+    """stale-отзыв рендерится без звёздной строки (маркер Ozon «Отзыв устарел»)."""
+    lines = _review_block(_review("Автор", [], stars=4, stale=True))
+    text = "\n".join(lines)
+    assert "★" not in text
+    assert "☆" not in text
+    assert "Автор" in text
+    assert "отзыв" in text
+
+
+def test_review_block_normal_shows_stars():
+    lines = _review_block(_review("Автор", [], stars=3))
+    text = "\n".join(lines)
+    assert "★" in text
+
+
+def test_variant_in_header_dedups_from_reviews():
+    """Одинаковый вариант выносится в шапку один раз и не дублируется в отзывах."""
+    md = render(_raw([
+        _review("A", [], variant="Цвет товара: черный"),
+        _review("B", [], variant="Цвет товара: черный"),
+    ]))
+    assert md.count("Вариант: Цвет товара: черный") == 1
+    assert md.count("Цвет товара: черный") == 1
+    assert "| Цвет товара" not in md
+
+
+def test_variant_in_header_kept_when_differ():
+    """Разные варианты остаются в строке каждого отзыва."""
+    md = render(_raw([
+        _review("A", [], variant="Цвет товара: черный"),
+        _review("B", [], variant="Цвет товара: белый"),
+    ]))
+    assert "Вариант: Цвет товара: черный" not in md
+    assert md.count("Цвет товара: черный") == 1
+    assert md.count("Цвет товара: белый") == 1
+
+
+def test_review_block_aspects_join_single_line():
+    """Аспекты варианта выводятся одной ·-строкой, без пустых."""
+    lines = _review_block(_review(
+        "Автор", [], variant="Цвет товара: черный\nВнешний вид:Великолепный\n"
+        "Комфорт:Удобно\n\n"))
+    text = "\n".join(lines)
+    assert "\nКомфорт:" not in text, "Комфорт должен быть в строке аспектов, не отдельной"
+    assert "Внешний вид:Великолепный · Комфорт:Удобно" in text
+    assert not text.rstrip().endswith("·")
+    assert not text.rstrip().endswith(":")
+
+
+def test_review_block_aspects_empty_no_line():
+    """Без аспектов вариант-строка не выводится."""
+    lines = _review_block(_review("Автор", [], variant="Цвет товара: черный"))
+    text = "\n".join(lines)
+    assert "Внешний вид" not in text
+    assert "\nЦвет товара" not in text
+
+
+def test_norm_nbsp_in_review_text():
+    """Неразрывные пробелы в тексте отзыва заменяются на обычные."""
+    r = _review("Автор", [])
+    r["text"] = "Очень\u00a0хороший\u00a0товар"
+    md = render(_raw([r]))
+    assert "Очень\u00a0хороший\u00a0товар" not in md
+    assert "Очень хороший товар" in md
+
+
 # ---- render / digest ---------------------------------------------------------
 
 def test_render_dedup_across_reviews():
@@ -180,9 +253,9 @@ def test_render_avg_review_rating():
         _review("D", [], stars=3),
     ])
     md = render(raw)
-    assert "Средний рейтинг по отзывам:** 3.750 / 5 (4 оценки)" in md
+    assert "Средний рейтинг по отзывам: 3.750 / 5 (4 оценки)" in md
     md2 = render(_raw([_review("A", [], stars=5)]))
-    assert "Средний рейтинг по отзывам:** 5.000 / 5 (1 оценка)" in md2
+    assert "Средний рейтинг по отзывам: 5.000 / 5 (1 оценка)" in md2
 
 
 def _combined(products):
@@ -232,10 +305,10 @@ def test_digest_excluded_section():
     assert "## Товар 1: 2" in head
     assert "## Товар 2:" not in head
     # секция исключённых: pid, рейтинг, порог, заголовок товара
-    assert "**1** · рейтинг 4.3 (мин. 4.7): Товар Низкий" in sep
+    assert "1 · рейтинг 4.3 (мин. 4.7): Товар Низкий" in sep
     assert "# Товар Низкий" not in sep  # полного render исключённого нет
     # строка в шапке про исключённые
-    assert "Исключено по рейтингу:** 1 товаров" in md
+    assert "Исключено по рейтингу: 1 товаров" in md
 
 
 # ---- Phase A: единый дефолт 100 + размер дайджеста -------------------------
@@ -314,3 +387,126 @@ def test_write_digest_zero_limit_no_split(tmp_path):
                                   max_products_per_file=0)
     assert written == [str(out)]
     assert "Часть" not in out.read_text(encoding="utf-8")
+
+
+# ---- build_search_digest_combined: сборка combined из raw по pid -------------
+
+def _write_raw(data_dir, pid, title, version=None, n_reviews=1):
+    import json
+    import os
+    if version is None:
+        from ozon_collector import VERSION
+        version = VERSION
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "raw_fixtures", "shape_minimal.json"),
+              encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["collector_version"] = version
+    raw["pid"] = pid
+    raw["product_url"] = f"https://www.ozon.ru/product/{pid}"
+    raw["reviews_url"] = f"https://www.ozon.ru/product/{pid}?tab=reviews"
+    raw["product"] = dict(raw["product"], title=title)
+    raw["product"]["characteristics"] = dict(
+        raw["product"]["characteristics"], Артикул=pid)
+    raw["reviews_collected"] = n_reviews
+    with open(data_dir / f"{pid}_raw.json", "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False)
+
+
+def test_build_combined_ok_and_missing(tmp_path):
+    from ozon_collector.report import build_search_digest_combined
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_raw(data_dir, "3627230434", "Xiaomi REDMI Buds 8 Active, черные")
+    combined, table = build_search_digest_combined(
+        ["3627230434", "9999999999"], str(data_dir))
+    assert combined["found"] == 2
+    assert combined["collected"] == 1
+    prods = {p["pid"]: p for p in combined["products"]}
+    assert prods["3627230434"]["ok"] is True
+    assert prods["3627230434"]["cache"].startswith("raw:")
+    assert prods["9999999999"]["ok"] is False
+    assert "нет валидных данных" in prods["9999999999"]["error"]
+    assert any("SKIP" in line for line in table)
+    assert combined["search"]["query"].startswith("артикулы:")
+
+
+def test_build_combined_query_override(tmp_path):
+    from ozon_collector.report import build_search_digest_combined
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_raw(data_dir, "3627230434", "Xiaomi REDMI Buds 8 Active, черные")
+    combined, _ = build_search_digest_combined(
+        ["3627230434"], str(data_dir), query="тестовая выдача")
+    assert combined["search"]["query"] == "тестовая выдача"
+
+
+# ---- _top_reviews ---------------------------------------------------------
+
+def _rv(helpful_yes=0, helpful_no=0, comments_count=0, publishedAt="0", text="текст"):
+    return {"uuid": "u", "helpful_yes": helpful_yes, "helpful_no": helpful_no,
+            "comments_count": comments_count, "publishedAt": publishedAt,
+            "text": text}
+
+
+def test_top_reviews_by_usefulness():
+    """Приоритет — сумма полезности (yes+no), затем комментарии, затем новизна."""
+    reviews = [
+        _rv(helpful_yes=1, helpful_no=0),          # 1
+        _rv(helpful_yes=5, helpful_no=5),          # 10
+        _rv(helpful_yes=2, helpful_no=3),          # 5
+    ]
+    top = _top_reviews(reviews, 2)
+    assert [r["helpful_yes"] + r["helpful_no"] for r in top] == [10, 5]
+
+
+def test_top_reviews_excludes_no_text_when_text_exists():
+    """Пустые (без текста) выкидываются из топа, если есть хоть один текстовый."""
+    reviews = [
+        _rv(helpful_yes=100, text=""),
+        _rv(helpful_yes=1, text="с текстом"),
+        _rv(helpful_yes=2, text=""),
+    ]
+    top = _top_reviews(reviews, 3)
+    assert len(top) == 1
+    assert top[0]["text"] == "с текстом"
+
+
+def test_top_reviews_no_text_fills_when_all_empty():
+    """Если все отзывы без текста — топаются как есть (иначе потеряем всё)."""
+    reviews = [_rv(text=""), _rv(text="", helpful_yes=5)]
+    top = _top_reviews(reviews, 1)
+    assert len(top) == 1
+    assert top[0]["helpful_yes"] == 5
+
+
+def test_top_reviews_does_not_pad_to_n():
+    """Пустышками до n НЕ добираем: текстовых меньше n → вернётся сколько есть."""
+    reviews = [_rv(helpful_yes=1, text="a"), _rv(helpful_yes=2, text="")]
+    top = _top_reviews(reviews, 10)
+    assert len(top) == 1
+
+
+def test_top_reviews_stable_index_breaks_ties():
+    """При равной метрике сохраняется исходный порядок."""
+    a = _rv(helpful_yes=1, publishedAt="100", text="a")
+    b = _rv(helpful_yes=1, publishedAt="100", text="b")
+    assert [r["text"] for r in _top_reviews([a, b], 1)] == ["a"]
+
+
+def test_top_reviews_lower_usefulness_newer_loses():
+    """Новизна — только третичный ключ: более полезный старее побеждает."""
+    reviews = [
+        _rv(helpful_yes=0, publishedAt="9999999999", text="новый, но не полезный"),
+        _rv(helpful_yes=3, publishedAt="1", text="старый, полезный"),
+    ]
+    top = _top_reviews(reviews, 1)
+    assert top[0]["text"] == "старый, полезный"
+
+
+def test_top_reviews_respects_n_and_returns_fewer():
+    """n меньше числа отзывов → возвращается ровно n."""
+    reviews = [_rv(i, text=f"t{i}") for i in range(10)]
+    assert len(_top_reviews(reviews, 4)) == 4
+    assert len(_top_reviews(reviews, 0)) == 0
+    assert _top_reviews([], 5) == []

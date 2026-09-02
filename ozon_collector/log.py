@@ -23,6 +23,7 @@ _log_path = Path(os.environ.get("OZON_COLLECTOR_LOG", _DEFAULT_LOG))
 
 _fh = None
 _worker_prefix = ""
+_context = ""
 
 
 def _project_root() -> Path:
@@ -84,6 +85,17 @@ def set_prefix(prefix: str):
     _worker_prefix = prefix or ""
 
 
+def set_context(ctx: str = ""):
+    """Роль/контекст процесса в строке лога: '[orchestrator]', '[worker=1]'.
+
+    Процесс-локальный глобал; set_context("") отключает. При заданном
+    контексте строка пишется как '{ts} {level} [{ctx}] msg' (без [{модуль}]),
+    иначе — старый формат '{ts} {level} [{модуль}] {prefix}msg'.
+    """
+    global _context
+    _context = ctx or ""
+
+
 def attach_file(path, mode: str = "a", prefix: str = "",
                 rotate_max_bytes: int = 0):
     """Присоединить файл лога воркера (БЕЗ перезаписи; ротация — по размеру).
@@ -91,10 +103,15 @@ def attach_file(path, mode: str = "a", prefix: str = "",
     mode="a" (append) — не затирает чужой лог. prefix — [worker=k pid=N].
     rotate_max_bytes>0: если файл уже крупнее лимита, он переименуется в
     .log.1 перед открытием (единый общий лог воркеров не растёт бесконечно).
+
+    Новый файловый хендл = новое состояние логгера: после attach_file вызывающий
+    должен самостоятельно выставить set_context(...), иначе первая строка уйдёт
+    без контекста (старый формат).
     """
-    global _fh
+    global _fh, _context
     if prefix:
         set_prefix(prefix)
+    _context = ""
     if _fh is not None:
         # Закрыть предыдущий fd до открытия нового: иначе старый файл
         # остаётся залоченным — на Windows ротация (`_rotate`) падает
@@ -117,7 +134,10 @@ def _write_file(level: str, module: str, msg: str, extra: dict | None = None):
     if _fh is None:
         return
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{ts} {level:7s} [{module}] {_worker_prefix}{msg}"
+    if _context:
+        line = f"{ts} {level:7s} [{_context}] {msg}"
+    else:
+        line = f"{ts} {level:7s} [{module}] {_worker_prefix}{msg}"
     if extra:
         line += " " + json.dumps(extra, ensure_ascii=False, default=str)
     try:
@@ -139,7 +159,7 @@ def _caller_module() -> str:
 
 def _emit(level: str, msg: str, extra: dict | None, to_stderr: bool):
     _write_file(level, _caller_module(), msg, extra)
-    out = _worker_prefix + msg
+    out = (f"[{_context}] " if _context else _worker_prefix) + msg
     if to_stderr:
         print(out, file=sys.stderr)
     else:

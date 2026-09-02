@@ -24,6 +24,95 @@
 
 ## Статус и следующие шаги (последнее обновление: 2026-09-02)
 
+ - **✅ v1.16.3: «Задание для LLM» убрано + аспекты в одну строку (2026-09-02).**
+   VERSION 1.16.2 → 1.16.3. По запросу пользователя.
+   * **«Задание для LLM» удалено вообще** (`render_search_digest`): пользователь
+     вставляет задание сам, блок в каждой части кампании был бесполезным.
+     Тест `test_search.test_render_search_digest_format` — блок ТЕПЕРЬ отсутствует.
+   * **Аспекты варианта — одна ·-строка** (`_review_block`): вместо трёх отдельных
+     строк `Внешний вид:…` / `Комфорт:…` / `Качество:…` выводится одна
+     `Внешний вид:Великолепный · Комфорт:Удобно · Качество звука:Хорошее`
+     (разделитель « · », пустые аспекты отфильтрованы). Первая строка variant
+     (цвет) как раньше — в шапке при едином значении или в строке отзыва.
+   * Тесты: `test_report` — `test_review_block_aspects_join_single_line`,
+     `test_review_block_aspects_empty_no_line`; `test_search` — блок отсутствует.
+     Прогоны: test_report+test_search = 90 passed, test_reviews = 71 passed (суммарный
+     прогон падает по таймауту на flaky live-markup, по отдельности зелёно).
+   * Регенерация сырого дайджеста: `render()` — аспекты одной строкой, поисковый
+     дайджест — без «Задания для LLM». Пересбор кампании — позже, по команде
+     (FAB-риск); v1.16.3 инвалидирует raw v1.16.2 (old_version).
+
+ - **✅ Уменьшение размера дайджеста + stale-отзывы (2026-09-02).**
+   VERSION 1.16.1 → 1.16.2. По запросу пользователя сокращаем вес дайджеста
+   без потери информации.
+   * **Жирность убрана везде.** В report.py удалены все `**…**` (автор отзыва,
+     `→ М22`, метки карточки «Цена/Товар/Дата сбора/Вариант/Всего/…»,
+     «Фильтр Ozon», «Сортировки», «Задание», «Размер дайджеста» и т.д.) —
+     чистый текст для LLM. Тесты test_report обновлены на безжирный формат.
+   * **Вариант один раз в шапке.** В `render()` секции 6: если у всех отзывов
+     `variant` одинаков (первая строка поля `variant` — это «Цвет товара: …»,
+     поле в raw содержит ещё и аспекты «Качество/Комфорт/Внешний вид» через
+     `\n`, у 51 уникальных значений на 1032557475), выводится `Вариант: <label>`
+     один раз в шапке, а из каждого отзыва убирается дубль. Аспекты
+     (`Внешний вид:…`, `Качество звука:…`) остаются в каждом отзыве (не теряем
+     информацию). `_review_block` принимает `variant_in_header`.
+   * **`\xa0` → пробел.** Хелпер `_norm_nbsp` заменяет неразрывные и редкие
+     юникод-пробелы (`\xa0 \u202f \u2009 \u200a`) на обычные в текстах отзывов
+     и комментариев.
+   * **stale («Отзыв устарел»).** Discovery (пробный браузер, порт 9333,
+      профиль probe_stale): Ozon рендерит бейдж `<div title="Отзыв устарел">Отзыв
+      устарел</div>` (класс `b5_7_3-a4 tsBodyControl300XSmall`
+     хэшируется каждый деплой — ищем по `title`/тексту, не по классу). Ключевое:
+     у stale-карточек Ozon НЕ рендерит звёзды (starCount=0, svgs 2-3), у свежих
+     starCount=5 — collector уже корректно ловит stars=0. В REVIEWS_JS добавлен
+     `isStale(wrapper)` (по `title="Отзыв устарел"` или тексту `/^(Отзыв\s+)?устарел$/i`)
+     → поле `stale: bool` в каждый отзыв. В render `_review_block` при
+     `stale=true` звёздная строка `> ☆☆☆☆☆ …` не выводится (без per-review метки),
+     текст/дата остаются. Поле опционально: старые raw без `stale` валидны.
+   * Тесты: `test_report` — stale скрывает звёзды, вариант в шапке (одинаковый/
+     разный), `_norm_nbsp`; `test_reviews` — `isStale` по бейджу (stale=True/False).
+     Прогон test_report+test_reviews = 110 passed.
+   * Пересборка: 1032557475 — при желании; вся кампания 300 товаров — отдельно
+     (FAB-риск). Discovery-артефакты: D:/Temp/opencode/stale_probe/.
+
+ - **✅ B1: сбор комментариев через API + A: топ-отзывы в дайджесте (2026-09-02).**
+   VERSION 1.16.0 → 1.16.1 (две проблемы пользователя на 1032557475:
+   «Всего 100 vs 96+35» и «пустой текст ответов»).
+   * **Часть B (comments API).** Проблема №2: селекторы `parseComments`
+     (`span.jm0_25`, `div.j9l_25`, `a.l9j_25`) устарели → ответы продавца
+     приходили с пустым text/date. Решение B0-B1: перехват API
+     `rpGetCommentsByReviewUuid` (`POST https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid`,
+     post_data `{"reviewUuid":<uuid отзыва>,"sku":..,"rootSku":..,"limit":10,"offset":0}`,
+     ответ `{"comments":[{uuid, comment, publishedAtFormatted, parentUuid,
+     rootParentUuid, isDeleted, author:{firstName, clientOfficial:{brandName}},
+     usefulness:{useful,unuseful}}]}`). Привязка к отзыву — по `reviewUuid`
+     из post_data запроса (response-listener `resp.request.post_data`), порядок
+     кликов не нужен. В collect.py: `_expand_comments_snapshot(page)` →
+     (n_clicks, by_review) подписывает/снимает response-listener в try/finally
+     (лимиты `MAX_COMMENT_RESPONSES=500`, `MAX_RESPONSE_BYTES=200000`,
+     `MAX_COMMENTS_PER_REVIEW=500`, `MAX_TOTAL_COMMENTS=100000`), парсит через
+     `_parse_comment_api` (skip isDeleted/пустых, гигантских тел) и вливает
+     через `_apply_api_comments` ПОСЛЕ финального top-up в обоих местах
+     (главный цикл и `_topup_virtualized`). Источник один на отзыв:
+     API непуст → `comments_source: api`, иначе DOM. Неоднозначная привязка
+     (нет reviewUuid/не JSON/пустое тело) → DOM fallback, без угадываний.
+     DOM fallback-селекторы в `parseComments` обновлены на актуальные
+     `rpProduct_c4a`/`rpProduct_a4c`/`rpProduct_ca5` (старые k1l/j9l/jm0
+     оставлены как fallback). `import json` вновь используется (был удалён
+     как неиспользуемый в рефакторинге 2026-09-02).
+   * **Часть A (топ-отзывы).** Проблема №1: дайджест резал `reviews[:100]`.
+     В report.py добавлен `_top_reviews(reviews, n)`: метрика
+     `(-(helpful_yes+helpful_no), -comments_count, -publishedAt, index)` —
+     полезность → комментарии → новизна, стабильность (index). Отзывы без
+     текста исключаются из топа, если есть хоть один текстовый; пустышками
+     до n НЕ добираем. Применён в `render_search_digest` вместо среза;
+     `render()` не тронут; «Всего: N» = фактически отобранных.
+   * Тесты: `test_report._top_reviews`, `test_reviews._parse_comment_api` /
+     `_apply_api_comments` / `_expand_comments_snapshot` (фейк-page с
+     эмуляцией API-ответа), фикстура `_COMMENT_HTML` переведена на новые
+     классы. Прогоны: test_reviews/test_report/test_collect_topup/test_extractors/
+     test_qa_raw/test_cache = 192 passed.
+
  - **✅ Fix: воркеры умирают вместе с оркестратором (2026-09-02).** При
    принудительном kill демона (kill -9 / Stop-Process -Force) воркеры оставались
    сиротами: держали свой Chromium (порт/профиль), писали в wd_out.log и жили

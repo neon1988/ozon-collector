@@ -395,7 +395,6 @@ def worker_main(spec: dict, task: dict, conn):
     СВОЕГО браузера (force_stop по зарегистрированным identity) и close Session.
     """
     k = spec["worker_id"]
-    prefix = f"[worker={k} pid={os.getpid()}] "
     payload = _empty_payload(k)
     sess = None
     manager = None
@@ -411,8 +410,10 @@ def worker_main(spec: dict, task: dict, conn):
             except Exception:
                 pass
         worker_log = task.get("worker_log") or spec["log_path"]
-        log.attach_file(worker_log, mode="a", prefix=prefix,
-                        rotate_max_bytes=5 * 1024 * 1024)
+        # Append в общий лог демона (тот же path, что передал orchestrator);
+        # ротацию выполняет только оркестратор-владелец файла.
+        log.attach_file(worker_log, mode="a")
+        log.set_context(f"worker={k}")
         os.environ["OZON_WORKER_ID"] = str(k)
         payload["started"] = _now()
 

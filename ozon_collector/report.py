@@ -1,11 +1,61 @@
 """Рендер Markdown-отчёта по собранному raw.json (без analysis-слоя)."""
 from __future__ import annotations
 
+import json
 import os
 import re
 
 DEFAULT_REVIEWS_PER_PRODUCT = 100
 DEFAULT_MAX_PRODUCTS_PER_FILE = 100
+
+
+def _norm_nbsp(s: str) -> str:
+    """Заменить неразрывные пробелы и похожие юникод-пробелы на обычные."""
+    if not s:
+        return s
+    out = list(s)
+    for i, ch in enumerate(out):
+        if ch in "\xa0\u202f\u2009\u200a":
+            out[i] = " "
+    return "".join(out)
+
+
+def _to_int_stamp(v):
+    """publishedAt (строка Unix-сек или int) → int; None/мусор → 0."""
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return 0
+
+
+def _top_reviews(reviews: list, n: int) -> list:
+    """Топ отзывов для дайджеста (по «популярности»).
+
+    Метрика: (-(helpful_yes+helpful_no), -comments_count, -publishedAt,
+    original_index) — сначала полезность, затем число комментариев, затем
+    новизна; при полном равенстве сохраняется исходный порядок (стабильность).
+
+    Отзывы без текста (пустой text) исключаются из топа, если среди всех есть
+    хотя бы один текстовый (пустышка на LLM бесполезна); если текстовых нет
+    вовсе — топается как есть. Пустышками до n НЕ добираем: если текстовых
+    меньше n, вернётся сколько есть. Не мутирует и не сортирует вход.
+    """
+    if not reviews or n <= 0:
+        return []
+    ranked = []
+    for i, r in enumerate(reviews):
+        if r in ranked:
+            continue
+        q = (r.get("helpful_yes") or 0) + (r.get("helpful_no") or 0)
+        rk = (-q, -(r.get("comments_count") or 0),
+              -_to_int_stamp(r.get("publishedAt")), i)
+        ranked.append((rk, r, bool((r.get("text") or "").strip())))
+    has_text = any(t for _, _, t in ranked)
+    if has_text:
+        ranked = [x for x in ranked if x[2]]
+    ranked.sort(key=lambda x: x[0])
+    return [r for _, r, _ in ranked[:n]]
 
 
 def plural(n: int, forms=("отзыв", "отзыва", "отзывов")) -> str:
@@ -39,7 +89,7 @@ def _price_block(product: dict) -> list:
     current = _num(p.get("current"))
     if current:
         money = lambda v: f"{_num(v):,}".replace(",", " ")
-        lines.append(f"**Цена: {money(current)} ₽**")
+        lines.append(f"Цена: {money(current)} ₽")
         if p.get("old"):
             disc = round((1 - current / _num(p["old"])) * 100)
             lines.append(f"- Старая цена: {money(p['old'])} ₽ (скидка {disc}%)")
@@ -52,7 +102,7 @@ def _price_block(product: dict) -> list:
     parts = product.get("price_parts") or []
     if parsed:
         for p in parsed[:3]:
-            lines.append(f"- **{p.get('raw')}**")
+            lines.append(f"- {p.get('raw')}")
         lines.append("")
         lines.append("_Цена актуальная (крупный кегль/bold). Для оплаты через СБП/иные способы "
                      "могут быть другие цены — см. price_parsed выше._")
@@ -67,7 +117,7 @@ def _price_block(product: dict) -> list:
             lines.append(f"| {p.get('t', '')} | {p.get('fs', 0)} | {'✓' if p.get('weight') else ''} | {strike} |")
         lines.append("")
     elif product.get("price_text"):
-        lines.append(f"- **{product['price_text']}**")
+        lines.append(f"- {product['price_text']}")
     return lines
 
 
@@ -123,8 +173,8 @@ def _comment_lines(c: dict) -> list:
     reply = c.get("reply_to")
     reply_txt = f" (в ответ: {reply})" if reply else ""
     lines = [
-        f"> **→ {ca}**{reply_txt} — {cdate}",
-        f"> {c.get('text') or ''}",
+        f"> → {ca}{reply_txt} — {cdate}",
+        f"> {_norm_nbsp(c.get('text') or '')}",
     ]
     like = c.get("like") or 0
     dislike = c.get("dislike") or 0
@@ -152,17 +202,30 @@ def _render_comments(comments: list, first_meta=None) -> list:
     return lines
 
 
-def _review_block(r: dict, first_meta=None) -> list:
+def _review_block(r: dict, first_meta=None, variant_in_header: bool = False) -> list:
     star = "★" * min(5, r.get("stars") or 0) + "☆" * (5 - min(5, r.get("stars") or 0))
     author = r.get("author") or "—"
     date = r.get("date") or ""
-    variant = r.get("variant") or ""
     marker = " _(без текста)_" if r.get("_no_text") else ""
-    lines = [f"**{author}** — {date} | {variant}{marker}"]
-    txt = r.get("text") or ""
+    v_raw = r.get("variant") or ""
+    v_parts = v_raw.split("\n") if v_raw else [""]
+    v_head = v_parts[0].strip()
+    v_aspects = " · ".join(x.strip() for x in v_parts[1:] if x.strip())
+    if v_head and variant_in_header:
+        lines = [f"{author} — {date}{marker}"]
+    elif v_head:
+        lines = [f"{author} — {date} | {v_head}{marker}"]
+    else:
+        lines = [f"{author} — {date}{marker}"]
+    if v_aspects:
+        lines.append(v_aspects)
+    txt = _norm_nbsp(r.get("text") or "")
     if r.get("_no_text"):
         txt = "_(без текста)_"
-    lines.append(f"> {star} {txt}")
+    if r.get("stale"):
+        lines.append(f"> {txt}")
+    else:
+        lines.append(f"> {star} {txt}")
     helpful_yes = r.get("helpful_yes") or 0
     helpful_no = r.get("helpful_no") or 0
     if helpful_yes or helpful_no:
@@ -180,30 +243,30 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
 
     L.append(f"# {product.get('title') or 'Отчёт'}")
     L.append("")
-    L.append(f"- **Дата сбора (UTC):** {raw.get('collected_at_utc', '—')}")
-    L.append(f"- **Collector:** {raw.get('collector_version', '—')}")
-    L.append(f"- **Схема:** {raw.get('schema_version', '—')}")
-    L.append("- **Источник:** Ozon (CDP)")
+    L.append(f"- Дата сбора (UTC): {raw.get('collected_at_utc', '—')}")
+    L.append(f"- Collector: {raw.get('collector_version', '—')}")
+    L.append(f"- Схема: {raw.get('schema_version', '—')}")
+    L.append("- Источник: Ozon (CDP)")
     if raw.get("incomplete"):
         missing = ", ".join(raw.get("missing_fields") or ["?"])
         L.append("")
-        L.append(f"> ⚠ **Неполный сбор.** Отсутствуют: {missing}")
+        L.append(f"> ⚠ Неполный сбор. Отсутствуют: {missing}")
     L.append("")
 
     # ---- 1. Карточка ------------------------------------------------------
     L.append("## 1. Карточка товара")
     L.append("")
-    L.append(f"- **Товар:** {product.get('title', '—')}")
+    L.append(f"- Товар: {product.get('title', '—')}")
     avg = _avg_review_rating(reviews)
     if avg is not None:
-        L.append(f"- **Средний рейтинг по отзывам:** {avg:.3f} / 5 "
+        L.append(f"- Средний рейтинг по отзывам: {avg:.3f} / 5 "
                  f"({len(reviews)} {plural(len(reviews), ('оценка', 'оценки', 'оценок'))})")
     if product.get("category"):
-        L.append(f"- **Категория:** {product['category']}")
+        L.append(f"- Категория: {product['category']}")
     variant_str = _variant_str(target)
     if variant_str:
-        L.append(f"- **Вариант:** {variant_str}")
-    L.append(f"- **URL:** {raw.get('product_url', '—')}")
+        L.append(f"- Вариант: {variant_str}")
+    L.append(f"- URL: {raw.get('product_url', '—')}")
     L.append("")
 
     # ---- 2. Цена -----------------------------------------------------------
@@ -243,7 +306,7 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
         L.append(f"_{raw.get('gallery_stats_text', '')}_")
         L.append("")
         for o in ocr:
-            label = f"**img {o.get('path')}**"
+            label = f"img {o.get('path')}"
             if o.get("url"):
                 label = f"[{label}]({o['url']})"
             if o.get("text"):
@@ -257,14 +320,14 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
     L.append("")
     vm = raw.get("reviews_variant_mode") or {}
     if vm.get("used") and vm.get("variant_count"):
-        line = (f"**Фильтр Ozon:** «Этот вариант товара» "
+        line = (f"Фильтр Ozon: «Этот вариант товара» "
                 f"({vm.get('variant_count')} из {vm.get('total_count') or '—'})")
         if vm.get("reviews_dropped_by_client_filter"):
             line += f"; клиентский фильтр отбросил {vm.get('reviews_dropped_by_client_filter')}"
         L.append(line)
         L.append("")
     elif vm.get("variant_present") is not None and not vm.get("used"):
-        L.append("**Фильтр Ozon:** не применён (собраны все отзывы)")
+        L.append("Фильтр Ozon: не применён (собраны все отзывы)")
         L.append("")
     sorts_req = raw.get("reviews_sorts")
     if sorts_req:
@@ -277,7 +340,12 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
         for s in sorts_req:
             n = sum(1 for r in reviews if s in (r.get("review_sorts") or []))
             parts.append(f"{_sort_labels.get(s, s)}: {n}")
-        L.append("**Сортировки:** " + " · ".join(parts))
+        L.append("Сортировки: " + " · ".join(parts))
+        L.append("")
+    variants = {(r.get("variant") or "").split("\n", 1)[0] for r in reviews}
+    variant_in_header = len(variants) == 1 and next(iter(variants))
+    if variant_in_header:
+        L.append("Вариант: " + next(iter(variants)))
         L.append("")
     if not reviews:
         L.append("_Отзывов не собрано._")
@@ -289,14 +357,14 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
             counts[s] += 1
     star_parts = [f"★{s}: {counts[s]}" for s in range(5, 0, -1) if counts[s]]
     if star_parts:
-        L.append(f"**Всего: {len(reviews)} {plural(len(reviews))}** · " + " · ".join(star_parts))
+        L.append(f"Всего: {len(reviews)} {plural(len(reviews))} · " + " · ".join(star_parts))
         L.append("")
     first_meta = None
     if dedup_replies:
         all_comments = [c for r in reviews for c in (r.get("comments") or [])]
         first_meta = {id(c): n for c, n in _group_comments(all_comments)}
     for r in reviews:
-        L.extend(_review_block(r, first_meta))
+        L.extend(_review_block(r, first_meta, variant_in_header))
 
     # ---- 7. Метаданные --------------------------------------------------------
     L.append("## 7. Метаданные")
@@ -330,16 +398,16 @@ def render_search_digest(combined: dict,
     L.append("# Дайджест выдачи Ozon")
     L.append("")
     if chunk:
-        L.append(f"- **Часть {chunk[0]} из {chunk[1]}**")
+        L.append(f"- Часть {chunk[0]} из {chunk[1]}")
     if search.get("query"):
-        L.append(f"- **Запрос:** {search['query']}")
+        L.append(f"- Запрос: {search['query']}")
     if search.get("url"):
-        L.append(f"- **URL выдачи:** {search['url']}")
-    L.append(f"- **Дата сбора (UTC):** {combined.get('collected_at_utc', '—')}")
-    L.append(f"- **Найдено товаров в выдаче:** "
+        L.append(f"- URL выдачи: {search['url']}")
+    L.append(f"- Дата сбора (UTC): {combined.get('collected_at_utc', '—')}")
+    L.append(f"- Найдено товаров в выдаче: "
              f"{combined.get('found', 0)} уникальных товаров, "
              f"собрано {combined.get('collected', 0)}.")
-    L.append(f"- **Отзывы в дайджесте:** до {reviews_per_product} на товар "
+    L.append(f"- Отзывы в дайджесте: до {reviews_per_product} на товар "
              f"(в raw сохраняются все).")
     L.append("")
 
@@ -348,7 +416,7 @@ def render_search_digest(combined: dict,
     excluded = [p for p in products if p.get("excluded")]
     if excluded:
         e0 = excluded[0].get("excluded") or {}
-        L.append(f"- **Исключено по рейтингу:** {len(excluded)} товаров "
+        L.append(f"- Исключено по рейтингу: {len(excluded)} товаров "
                  f"(рейтинг ниже {e0.get('min_rating', '?')}, см. секцию "
                  f"«Исключено по рейтингу»).")
         L.append("")
@@ -373,7 +441,7 @@ def render_search_digest(combined: dict,
         if reviews_per_product and reviews_per_product > 0:
             raw_view = copy.deepcopy(raw)
             reviews = raw_view.get("reviews") or []
-            raw_view["reviews"] = reviews[:reviews_per_product]
+            raw_view["reviews"] = _top_reviews(reviews, reviews_per_product)
         else:
             raw_view = raw
         md = render(raw_view, dedup_replies=dedup_replies)
@@ -390,21 +458,15 @@ def render_search_digest(combined: dict,
             e = p.get("excluded") or {}
             rawp = p.get("raw") or {}
             title = (rawp.get("product", {}).get("title") or "").strip() or "—"
-            L.append(f"- **{p.get('pid')}** · рейтинг {e.get('rating')} "
+            L.append(f"- {p.get('pid')} · рейтинг {e.get('rating')} "
                      f"(мин. {e.get('min_rating')}): {title}")
         L.append("")
 
     L.append("---")
     L.append("")
-    L.append("## Задание для LLM")
-    L.append("")
-    L.append("Выбери лучший товар из списка выше и объясни, почему. "
-             "Учитывай цену, рейтинг, количество оценок и содержание отзывов "
-             "(плюсы/минусы, частые жалобы).")
-    L.append("")
     md = "\n".join(L)
     size_kb = len(md.encode("utf-8")) / 1024
-    L.append(f"- **Размер дайджеста:** {size_kb:.2f} КБ")
+    L.append(f"- Размер дайджеста: {size_kb:.2f} КБ")
     return "\n".join(L)
 
 
@@ -450,3 +512,94 @@ def _write_md(md: str, path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(md)
+
+
+def _best_for_digest(pid: str, data_dir: str):
+    """Лучший raw pid для дайджеста.
+
+    Возвращает (raw|None, path|None, reason): reason == "ok" при валидном
+    кандидате; иначе причина отклонения (missing / challenge / no_reviews /
+    old_version / incompatible / incomplete / bad_timestamp).
+    """
+    from ozon_collector import cache as K
+    from ozon_collector.collect import CHALLENGE_TITLE_MARKERS
+
+    best = None
+    best_path = None
+    best_key = None
+    reason = "missing"
+    for path in K._raw_candidates(pid, data_dir):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            continue
+        r = K._validate_raw(raw, pid)
+        if r is not None:
+            reason = r
+            continue
+        title = (raw.get("product") or {}).get("title") or ""
+        t = title.strip().lower()
+        if any(m in t for m in CHALLENGE_TITLE_MARKERS):
+            reason = "challenge"
+            continue
+        n = int(raw.get("reviews_collected") or 0)
+        if n <= 0:
+            reason = "no_reviews"
+            continue
+        dt = K._parse_utc(raw.get("collected_at_utc"))
+        key = (
+            K._version_tuple(raw.get("collector_version")) or (0,),
+            dt.timestamp() if dt is not None else 0.0,
+            n,
+        )
+        if best is None or key > best_key:
+            best, best_path, best_key = raw, path, key
+    if best is None:
+        return None, None, reason
+    return best, best_path, "ok"
+
+
+def build_search_digest_combined(pids, data_dir: str, query: str | None = None):
+    """Собрать combined-структуру дайджеста из raw по списку pid.
+
+    Для каждого pid выбирается лучший валидный raw (см. _best_for_digest),
+    по умолчанию query — «артикулы: …» из отсортированных pid (офлайн, из raw).
+    Возвращает (combined, table): combined — готовый дайджест для
+    render_search_digest/write_search_digest; table — строки-таблица «pid / число
+    отзывов / версия / файл / title» для вывода в консоль (или список ошибок SKIP).
+    """
+    from datetime import datetime, timezone
+
+    products = []
+    table = []
+    for pid in sorted(pids):
+        raw, path, reason = _best_for_digest(pid, data_dir)
+        if raw is None:
+            products.append({"ok": False, "pid": pid,
+                             "error": f"нет валидных данных ({reason})"})
+            table.append(f"{pid:>12}  SKIP  {reason}")
+            continue
+        n = int(raw.get("reviews_collected") or 0)
+        ver = raw.get("collector_version") or "?"
+        title = (raw.get("product") or {}).get("title") or ""
+        title_short = (title[:70] + "…") if len(title) > 70 else title
+        table.append(f"{pid:>12}  {n:>3} отз.  {ver:>6}  "
+                     f"{os.path.basename(path):<38} {title_short}")
+        products.append({
+            "ok": True,
+            "pid": pid,
+            "raw": raw,
+            "cache": f"raw:{os.path.basename(path)}",
+        })
+
+    if query is None:
+        query = (f"артикулы: {', '.join(sorted(pids))} (офлайн, из raw)")
+    combined = {
+        "search": {"query": query},
+        "collected_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "found": len(pids),
+        "collected": sum(1 for p in products if p.get("ok")),
+        "products": products,
+    }
+    return combined, table

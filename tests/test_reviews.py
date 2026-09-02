@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -368,6 +369,32 @@ def test_review_extract_without_webListReviews(evaluate_reviews):
     assert d["totalText"] is None
 
 
+def test_review_extract_stale_marker(evaluate_reviews):
+    """REVIEWS_JS устанавливает stale=True/False по бейджу «Отзыв устарел»
+    (DOM-маркер Ozon; классы хэшированы — ищем по title/тексту)."""
+    html = '''<html><body>
+      <div data-review-uuid="stale1" publishedat="2026-01-15">
+        <span class="tsCompactControl500Medium">Людмила Л.</span>
+        <div>8 июля 2026</div>
+        <div title="Отзыв устарел" class="b5_7_3-a4 tsBodyControl300XSmall">Отзыв устарел</div>
+        <div>Комфорт при использовании:Неудобно
+          Старый отзыв, больше не актуален</div>
+        <svg class="a9"></svg><svg class="a9"></svg><svg class="a9"></svg>
+      </div>
+      <div data-review-uuid="ok1" publishedat="2026-01-16">
+        <span class="tsCompactControl500Medium">Иван</span>
+        <div>9 января 2026</div>
+        <div>Хороший товар</div>
+        <svg class="a9"></svg><svg class="a9"></svg><svg class="a9"></svg>
+        <svg class="a9"></svg><svg class="a9"></svg>
+      </div>
+    </body></html>'''
+    d = evaluate_reviews(html=html)
+    by_uuid = {r["uuid"]: r for r in d["reviews"]}
+    assert by_uuid["stale1"]["stale"] is True
+    assert by_uuid["ok1"]["stale"] is False
+
+
 def _open_html(browser, html):
     page = browser.new_page()
     page.route("**/*", lambda route: route.abort())
@@ -617,22 +644,22 @@ _COMMENT_HTML = '''<html><body>
       <button id="cmbtn"><div class="tsBodyControl400Small">2 комментария</div></button>
     </div>
     <div class="k1l_25" id="comments1">
-      <div data-comment-uuid="cm1" class="jl8_25">
+      <div data-comment-uuid="cm1" class="rpProduct_ac3">
         <div class="i7z_25">
           <span class="tsCompactControl500Medium">Продавец</span>
-          <a class="l9j_25">в ответ Автор</a>
+          <a class="rpProduct_c4a">в ответ Автор</a>
         </div>
-        <div class="j9l_25">2 января 2026</div>
-        <div class="jm_25"><span class="jm0_25">Благодарим за отзыв, подробности в личных сообщениях.</span></div>
+        <div class="rpProduct_a4c">2 января 2026</div>
+        <div class="jm_25"><span class="rpProduct_ca5">Благодарим за отзыв, подробности в личных сообщениях.</span></div>
         <button><div class="b25_9_0-a2 tsBodyControl400Small">3</div></button>
         <button><div class="b25_9_0-a2 tsBodyControl400Small">1</div></button>
       </div>
-      <div data-comment-uuid="cm2" class="jl8_25">
+      <div data-comment-uuid="cm2" class="rpProduct_ac3">
         <div class="i7z_25">
           <span class="tsCompactControl500Medium">Покупатель</span>
         </div>
-        <div class="j9l_25">3 января 2026</div>
-        <div class="jm_25"><span class="jm0_25">Согласен с продавцом.</span></div>
+        <div class="rpProduct_a4c">3 января 2026</div>
+        <div class="jm_25"><span class="rpProduct_ca5">Согласен с продавцом.</span></div>
         <button><div class="b25_9_0-a2 tsBodyControl400Small">0</div></button>
         <button><div class="b25_9_0-a2 tsBodyControl400Small">0</div></button>
       </div>
@@ -1101,3 +1128,233 @@ def test_t_utc_iso_with_offset():
     dt = datetime.datetime.fromisoformat(s)
     assert dt.tzinfo is not None
     assert dt.utcoffset() == datetime.timedelta(0)
+
+
+# ---- _parse_comment_api / _apply_api_comments --------------------------------
+
+def test_parse_comment_api_normal():
+    """Парсинг тела ответа rpGetCommentsByReviewUuid: корректный JSON."""
+    body = json.dumps({
+        "cellTrackingInfo": {"0": {"type": "comment"}},
+        "comments": [
+            {
+                "uuid": "c1",
+                "comment": "Спасибо за отзыв!",
+                "publishedAtFormatted": "26 сентября 2025",
+                "createdAt": 1727318400,
+                "author": {"firstName": "Максим"},
+                "usefulness": {"useful": 3, "unuseful": 0},
+                "parentUuid": "",
+                "rootParentUuid": "review-uuid-1",
+                "isDeleted": False,
+            },
+            {
+                "uuid": "c2",
+                "comment": "Рады, что понравилось!",
+                "publishedAtFormatted": "27 сентября 2025",
+                "createdAt": 1727404800,
+                "author": {"firstName": "", "clientOfficial": {"brandName": "М22"}},
+                "usefulness": {"useful": 1, "unuseful": 0},
+                "parentUuid": "c1",
+                "rootParentUuid": "review-uuid-1",
+                "isDeleted": False,
+            },
+        ],
+    }).encode()
+    comments, reason = collect_mod._parse_comment_api(body)
+    assert reason == ""
+    assert len(comments) == 2
+    c1, c2 = comments
+    assert c1["uuid"] == "c1"
+    assert c1["author"] == "Максим"
+    assert c1["reply_to"] == ""  # reply_to не заполняется парсером (корневой)
+    assert c1["date"] == "26 сентября 2025"
+    assert c1["text"] == "Спасибо за отзыв!"
+    assert c1["like"] == 3
+    assert c1["dislike"] == 0
+    assert c2["author"] == "М22"
+    assert c2["text"] == "Рады, что понравилось!"
+
+
+def test_parse_comment_api_deleted_skipped():
+    """isDeleted=True пропускается парсером."""
+    body = json.dumps({"comments": [
+        {"uuid": "c1", "comment": "ok", "isDeleted": True},
+        {"uuid": "c2", "comment": "живой", "isDeleted": False},
+    ]}).encode()
+    comments, _ = collect_mod._parse_comment_api(body)
+    assert len(comments) == 1
+    assert comments[0]["uuid"] == "c2"
+
+
+def test_parse_comment_api_empty_text_skipped():
+    """Комментарий с пустым/пробельным текстом пропускается."""
+    body = json.dumps({"comments": [
+        {"uuid": "c1", "comment": "   ", "publishedAtFormatted": "1"},
+        {"uuid": "c2", "comment": "нормальный", "publishedAtFormatted": "2"},
+    ]}).encode()
+    comments, _ = collect_mod._parse_comment_api(body)
+    assert len(comments) == 1
+    assert comments[0]["text"] == "нормальный"
+
+
+def test_parse_comment_api_invalid_json():
+    """Битый JSON → (None, reason)."""
+    comments, reason = collect_mod._parse_comment_api(b"not json at all")
+    assert comments is None
+    assert "json" in reason
+
+
+def test_parse_comment_api_no_comments_key():
+    """Нет ключа comments в payload → (None, reason)."""
+    body = json.dumps({"cellTrackingInfo": {}}).encode()
+    comments, reason = collect_mod._parse_comment_api(body)
+    assert comments is None
+    assert "no-comments-list" in reason
+
+
+def test_parse_comment_api_empty_list():
+    """Пустой список comments → (None, reason)."""
+    body = json.dumps({"comments": []}).encode()
+    comments, reason = collect_mod._parse_comment_api(body)
+    assert comments is None
+
+
+def test_parse_comment_api_giant_body():
+    """Ответ > MAX_RESPONSE_BYTES → (None, reason), без парсинга."""
+    big = b"x" * (collect_mod.MAX_RESPONSE_BYTES + 1)
+    comments, reason = collect_mod._parse_comment_api(big)
+    assert comments is None
+    assert "body>=" in reason
+
+
+def test_parse_comment_api_reply_to_always_empty():
+    """По контракту B0 API-комментарии — корневые ответы продавца
+    (parentUuid пустой), поэтому reply_to всегда пустой (в отличие от DOM)."""
+    body = json.dumps({"comments": [
+        {"uuid": "p1", "comment": "Родительский", "author": {"firstName": "Иван"},
+         "usefulness": {}, "publishedAtFormatted": "1"},
+        {"uuid": "c1", "comment": "Ответ", "author": {"firstName": "Мария"},
+         "usefulness": {}, "publishedAtFormatted": "2"},
+    ]}).encode()
+    comments, _ = collect_mod._parse_comment_api(body)
+    assert len(comments) == 2
+    assert comments[0]["reply_to"] == ""
+    assert comments[1]["reply_to"] == ""
+
+
+def test_apply_api_comments_replaces_dom():
+    """API-комментарии перезаписывают DOM, если API непуст."""
+    reviews = [
+        {"uuid": "rv1", "comments": [{"text": "DOM1"}], "author": "Автор"},
+        {"uuid": "rv2", "comments": [], "author": "Другой"},
+    ]
+    api = {
+        "rv1": [{"uuid": "a1", "text": "API1"}],
+        "rv2": [{"uuid": "a2", "text": "API2"}],
+    }
+    n = collect_mod._apply_api_comments(reviews, api)
+    assert n == 2
+    assert reviews[0]["comments_source"] == "api"
+    assert reviews[0]["comments"][0]["text"] == "API1"
+    assert reviews[1]["comments_source"] == "api"
+    assert reviews[1]["comments"][0]["text"] == "API2"
+
+
+def test_apply_api_comments_fallback_dom_when_api_empty():
+    """Пустой API-ответ (люч [''] отзыву) → DOM остаётся."""
+    reviews = [
+        {"uuid": "rv1", "comments": [{"text": "DOM1"}]},
+    ]
+    n = collect_mod._apply_api_comments(reviews, {})
+    assert n == 0
+    assert reviews[0]["comments_source"] == "dom"
+    assert reviews[0]["comments"][0]["text"] == "DOM1"
+
+
+def test_apply_api_comments_skips_uuidless():
+    """Отзыв без uuid не трогается."""
+    reviews = [{"comments": [{"text": "DOM"}]}]
+    n = collect_mod._apply_api_comments(reviews, {"rv1": [{"text": "X"}]})
+    assert n == 0
+
+
+def test_parse_comment_api_brutally_long_text():
+    """Текст > 20000 символов обрезается."""
+    long_text = "x" * 25000
+    body = json.dumps({"comments": [
+        {"uuid": "c1", "comment": long_text, "publishedAtFormatted": "1",
+         "usefulness": {}},
+    ]}).encode()
+    comments, _ = collect_mod._parse_comment_api(body)
+    assert len(comments[0]["text"]) == 20000
+
+
+class _FakeCommentResp:
+    """Фейк Playwright-ответа: url/body/post_data для перехвата API."""
+    def __init__(self, url, body=b"", post_data=""):
+        self.url = url
+        self._body = body
+        self.request = type("Req", (), {"post_data": post_data})()
+
+    def body(self):
+        return self._body
+
+
+class _FakeCommentPage:
+    """Фейк page для _expand_comments_snapshot: принимает response-listener
+    и позволяет эмулировать приход API-ответа во время кликов."""
+    def __init__(self):
+        self.listeners = {"response": []}
+        self.sleep_ms = 0
+
+    def on(self, event, cb):
+        self.listeners.setdefault(event, []).append(cb)
+
+    def remove_listener(self, event, cb):
+        if cb in self.listeners.get(event, []):
+            self.listeners[event].remove(cb)
+
+    def wait_for_timeout(self, ms):
+        self.sleep_ms += ms
+
+    def emit_resp(self, resp):
+        for cb in list(self.listeners.get("response", [])):
+            cb(resp)
+
+
+def test_expand_comments_snapshot_captures_api(monkeypatch):
+    """_expand_comments_snapshot подхватывает API-ответ и привязывает его
+    к отзыву по reviewUuid из post_data; слушатель снимается в finally."""
+    page = _FakeCommentPage()
+    monkeypatch.setattr(collect_mod, "_expand_review_comments", lambda *a, **k: 2)
+    api_body = json.dumps({"comments": [
+        {"uuid": "c1", "comment": "Ответ продавца",
+         "publishedAtFormatted": "1 сентября 2026", "author": {"firstName": "М22"},
+         "usefulness": {"useful": 1, "unuseful": 0}},
+    ]}).encode()
+    n, by_review = collect_mod._expand_comments_snapshot(page)
+    assert n == 2
+    assert page.listeners["response"] == []  # снят после возврата
+    # эмулируем приход API именно во время подписки:
+    page = _FakeCommentPage()
+    monkeypatch.setattr(collect_mod, "_expand_review_comments",
+                        lambda *a, **k: page.emit_resp(_FakeCommentResp(
+                            url="https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid",
+                            body=api_body,
+                            post_data=json.dumps({"reviewUuid": "rv-uuid"}))))
+    n, by_review = collect_mod._expand_comments_snapshot(page)
+    assert "rv-uuid" in by_review
+    assert by_review["rv-uuid"][0]["text"] == "Ответ продавца"
+    assert page.listeners["response"] == []
+
+
+def test_expand_comments_snapshot_skips_unrelated_resp():
+    """Не относящиеся к API url не перехватываются."""
+    page = _FakeCommentPage()
+    page.emit_resp(_FakeCommentResp(url="https://www.ozon.ru/product/123", body=b"x",
+                                    post_data=json.dumps({"reviewUuid": "x"})))
+    bio = json.dumps({"comments": [{"uuid": "c1", "comment": "т"}]}).encode()
+    n, by_review = collect_mod._expand_comments_snapshot(page)
+    assert by_review == {}
+    assert n == 0

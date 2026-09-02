@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import json
 import os
 import random as _random
 import re
@@ -557,6 +558,16 @@ REVIEWS_JS = r"""
   const RE_ASPECT = /^[^:\n]{1,40}:\s*\S/;
   const blockIsAspects = (t) =>
     t.split('\n').filter((l) => l.trim()).every((l) => RE_ASPECT.test(l.trim()));
+  const isStale = (el) => {
+    if (el.getAttribute?.('title') === 'Отзыв устарел') return true;
+    const t = el.querySelector?.('[title="Отзыв устарел"], [title*="устарел"]');
+    if (t) return true;
+    for (const n of el.querySelectorAll('div, span')) {
+      const s = (n.innerText || '').trim();
+      if (s && /^Отзыв\s+устарел$/i.test(s)) return true;
+    }
+    return false;
+  };
   const extract = (card) => {
     const wrapper = card.querySelector('div[data-review-uuid]') || card;
     const uuid = wrapper.getAttribute('data-review-uuid');
@@ -625,6 +636,7 @@ REVIEWS_JS = r"""
     const comments = fullText.match(/(\d+)\s*комментар\S*/);
     return {
       uuid, publishedAt, author, author2, date, variant, stars,
+      stale: isStale(wrapper),
       text: text.slice(0, 20000),
       helpful_yes: helpful ? parseInt(helpful[1], 10) : 0,
       helpful_no: helpful ? parseInt(helpful[2], 10) : 0,
@@ -638,11 +650,11 @@ REVIEWS_JS = r"""
     if (!parent) return out;
     Array.from(parent.querySelectorAll('[data-comment-uuid]')).forEach((cm) => {
       const author = (cm.querySelector('span.tsCompactControl500Medium')?.innerText || '').trim();
-      const replyEl = cm.querySelector('a.l9j_25');
+      const replyEl = cm.querySelector('a.rpProduct_c4a') || cm.querySelector('a.l9j_25');
       let replyTo = replyEl ? (replyEl.innerText || '').trim() : '';
       if (/^в ответ/i.test(replyTo)) replyTo = replyTo.replace(/^в ответ\s*/i, '').trim();
-      const date = (cm.querySelector('div.j9l_25')?.innerText || '').trim();
-      const text = (cm.querySelector('span.jm0_25')?.innerText || '').trim();
+      const date = (cm.querySelector('div.rpProduct_a4c')?.innerText || cm.querySelector('div.j9l_25')?.innerText || '').trim();
+      const text = (cm.querySelector('span.rpProduct_ca5')?.innerText || cm.querySelector('span.jm0_25')?.innerText || '').trim();
       const votes = Array.from(cm.querySelectorAll('div.tsBodyControl400Small'))
         .map((v) => parseInt((v.innerText || '').trim().replace(/\D/g, ''), 10) || 0);
       out.push({
@@ -1282,6 +1294,21 @@ def _expand_review_texts(page, max_passes: int = 8) -> int:
 
 _COMMENT_BTN_RE = re.compile(r'[1-9]\d*\s*комментар', re.IGNORECASE)
 
+# Перехват API комментариев к отзывам (rpGetCommentsByReviewUuid, B0 2026-09-02):
+# API устойчив к смене hash-классов DOM и отдаёт текст/дату/голоса напрямую.
+# POST json: {"reviewUuid": <uuid отзыва>, "sku": .., "rootSku": .., "limit":10,"offset":0}
+# Ответ: {"cellTrackingInfo":{...},"comments":[{uuid, createdAt, comment,
+#   publishedAt, publishedAtFormatted, parentUuid, rootParentUuid, isDeleted,
+#   author:{firstName,clientOfficial:{brandName}}, usefulness:{useful,unuseful}}]}
+# Привязка к отзыву: reviewUuid в post_data == review.uuid из DOM
+# (rootParentUuid в ответе == тот же uuid отзыва).
+_COMMENTS_API_URL_FRAGMENT = "/_action/rpGetCommentsByReviewUuid"
+# Защитные пределы перехвата (на один проход сбора):
+MAX_COMMENT_RESPONSES = 500      # максимум обработанных ответов API
+MAX_RESPONSE_BYTES = 200_000     # тело ответа до response.json() (байт)
+MAX_COMMENTS_PER_REVIEW = 500    # комментариев на один отзыв
+MAX_TOTAL_COMMENTS = 100_000     # всех комментариев за сбор
+
 _STICKY_INTERCEPT_HINT = "intercepts pointer events"
 _UNSTABLE_ELEMENT_HINT = "element is not stable"
 
@@ -1369,6 +1396,147 @@ def _expand_review_comments(page, max_passes: int = 4) -> int:
             time.sleep(2.5)
         _touch_watchdog()  # завершение прохода — сброс таймера сторожа
     return total
+
+
+def _parse_comment_api(body: bytes) -> tuple[list | None, str]:
+    """Разбирает тело ответа rpGetCommentsByReviewUuid в комментарии.
+
+    Базовый API перехвачен в B0 (2026-09-02): комментарии приходят в fields,
+    названная полями Ozon (comment, publishedAtFormatted, usefulness и пр.).
+    Удалённые (isDeleted=true) и пустые комментарии пропускаются.
+    Возвращает (comments, reason): comments — список dict в формате DOM-поля
+    (uuid/author/reply_to/date/text/like/dislike, см. parseComments) либо None,
+    если тело не JSON / не список comments (тогда остаётся DOM fallback);
+    reason — краткая причина для лога (или "")."""
+    if len(body) > MAX_RESPONSE_BYTES:
+        return None, f"body>={MAX_RESPONSE_BYTES}B"
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except Exception as e:
+        return None, "json"
+    if not isinstance(payload, dict):
+        return None, "body-not-object"
+    raw = payload.get("comments")
+    if not isinstance(raw, list):
+        return None, "no-comments-list"
+    out = []
+    for c in raw[:MAX_COMMENTS_PER_REVIEW]:
+        if not isinstance(c, dict) or not c.get("uuid"):
+            continue
+        if c.get("isDeleted"):
+            continue
+        text = (c.get("comment") or "").strip()
+        if not text:
+            continue
+        author = (c.get("author") or {})
+        name = (author.get("firstName") or "").strip()
+        if not name:
+            brand = ((c.get("author") or {}).get("clientOfficial") or {})
+            name = (brand.get("brandName") or "").strip()
+        usefulness = (c.get("usefulness") or {})
+        out.append({
+            "uuid": c.get("uuid"),
+            "author": name,
+            "reply_to": "",
+            "date": c.get("publishedAtFormatted") or "",
+            "text": text[:20000],
+            "like": int(usefulness.get("useful") or 0),
+            "dislike": int(usefulness.get("unuseful") or 0),
+        })
+    return (out, "") if out else (None, "empty")
+
+
+def _expand_comments_snapshot(page, max_passes: int = 4) -> tuple[int, dict]:
+    """Раскрывает комментарии с перехватом API rpGetCommentsByReviewUuid.
+
+    Делает то же, что _expand_review_comments, но параллельно ловит ответы
+    API и привязывает их к отзыву по reviewUuid из post_data запроса
+    (response-listener, см. _parse_comment_api). Слушатель снимается в
+    try/finally; после кликов — короткая пауза, чтобы догнать хвост API.
+
+    Возвращает (n_clicks, by_review): by_review — {review_uuid: [comments]}
+    (пустой, если платформа не отвечала API). Отзывы с неоднозначной
+    привязкой (нет reviewUuid / не JSON / пустое тело) остаются с DOM
+    fallback: перехват просто их пропускает."""
+    by_review: dict = {}
+    n_resp = 0
+    total_comments = 0
+
+    def _on_response(resp):
+        nonlocal n_resp, total_comments
+        if _COMMENTS_API_URL_FRAGMENT not in (resp.url or ""):
+            return
+        if n_resp >= MAX_COMMENT_RESPONSES:
+            log.warning(f"[comments-api] перехвачено ответов >= {MAX_COMMENT_RESPONSES}, "
+                        f"пропускаю остальные")
+            return
+        n_resp += 1
+        rid = ""
+        try:
+            post = resp.request.post_data or ""
+            if post:
+                data = json.loads(post)
+                rid = (data.get("reviewUuid") or "").strip()
+        except Exception:
+            pass
+        if not rid:
+            return  # неоднозначно — остаётся DOM
+        try:
+            body = resp.body()
+        except Exception:
+            return  # тело недоступно (redirect/отмена) — остаётся DOM
+        comments, reason = _parse_comment_api(body)
+        if comments is None:
+            log.debug(f"[comments-api] {rid}: пропущен ({reason})")
+            return
+        total_comments += len(comments)
+        by_review[rid] = comments
+        _touch_watchdog()  # один сброс на обработанный ответ
+
+    try:
+        page.on("response", _on_response)
+    except Exception as e:
+        log.warning(f"[comments-api] подписка warn: {e}")
+        return 0, by_review
+    try:
+        n_clicks = _expand_review_comments(page, max_passes=max_passes)
+        try:
+            page.wait_for_timeout(1200)  # хвост API после последнего клика
+        except Exception:
+            time.sleep(1.2)
+        _touch_watchdog()
+    finally:
+        page.remove_listener("response", _on_response)
+    if by_review:
+        log.info(f"[comments-api] перехвачено отзывов: {len(by_review)}, "
+                 f"комментариев: {total_comments}")
+    return n_clicks, by_review
+
+
+def _apply_api_comments(reviews: list, api_comments: dict) -> int:
+    """Вливает API-комментарии в отзывы (после финального top-up).
+
+    Источник комментариев — один на отзыв: если API для отзыва дал
+    непустые комментарии, они перезаписывают DOM-комментарии (API полнее:
+    приходит с текстом/датами напрямую); иначе остаются DOM (fallback).
+    Ставит на отзыв comments_source: api|dom — телеметрия происхождения.
+    Возвращает число отзывов, где API заменил DOM."""
+    replaced = 0
+    for r in reviews:
+        uid = r.get("uuid")
+        api = api_comments.get(uid) if uid else None
+        if not api or not isinstance(api, list) or not api:
+            if r.get("comments"):
+                r["comments_source"] = "dom"
+            continue
+        dom = r.get("comments") or []
+        r["comments"] = api
+        r["comments_source"] = "api"
+        replaced += 1
+        if dom:
+            log.debug(f"[comments-api] {uid}: API заменил DOM "
+                      f"({len(api)} vs {len(dom)})")
+    return replaced
 
 
 
@@ -1516,10 +1684,11 @@ def _topup_virtualized(page, target_count: int, seen: set, index: dict,
     done = _sweep(SCROLL_STEP_UP_JS, "вверх")
     if not done and len(reviews) < target_count:
         _sweep(SCROLL_STEP_DOWN_JS, "вниз")
+    api_comments = {}
     try:
         _touch_watchdog()
         n_exp = _expand_review_texts(page)
-        n_com = _expand_review_comments(page)
+        n_com, api_comments = _expand_comments_snapshot(page)
         data = page.evaluate(REVIEWS_JS) if (n_exp or n_com) else None
     except Exception as e:
         if B.is_renderer_failure(e):
@@ -1531,6 +1700,10 @@ def _topup_virtualized(page, target_count: int, seen: set, index: dict,
         if refreshed:
             log.info(f"[collect] стр. {page_no}: top-up дозаполнил полей: "
                      f"{refreshed}")
+    n_api = _apply_api_comments(reviews, api_comments) if api_comments else 0
+    if n_api:
+        log.info(f"[collect] стр. {page_no}: API-комментарии заменили "
+                 f"DOM у {n_api} отзывов")
     return added_total
 
 
@@ -1788,9 +1961,10 @@ def _collect_reviews_pass(
             if B.is_renderer_failure(e):
                 raise
             log.warning(f"[collect] стр. {p}: раскрытие отзывов warn: {e}")
+        api_comments = {}
         try:
             _touch_watchdog()
-            n_comment = _expand_review_comments(page)
+            n_comment, api_comments = _expand_comments_snapshot(page)
             if n_comment:
                 log.info(f"[collect] стр. {p}: раскрыто комментариев к отзывам: {n_comment} кнопок")
         except Exception as e:
@@ -1838,6 +2012,9 @@ def _collect_reviews_pass(
             if added:
                 matched_this += added
                 page_tel["topup_added"] = page_tel.get("topup_added", 0) + added
+        n_api = _apply_api_comments(reviews, api_comments) if api_comments else 0
+        if n_api:
+            log.info(f"стр. {p}: API-комментарии заменили DOM у {n_api} отзывов")
         nxt = _next_page(page)
         if nxt and sort is not None:
             nxt = _sort_url(nxt, SORT_PARAMS.get(sort))

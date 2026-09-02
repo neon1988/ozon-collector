@@ -1065,7 +1065,7 @@ def test_render_search_digest_format():
     assert "Дайджест выдачи Ozon" in md
     assert "найдено товаров в выдаче" in md.lower()
     assert "⚠ Не удалось собрать: TimeoutError: нет сети" in md
-    assert "## Задание для LLM" in md
+    assert "## Задание для LLM" not in md
     # обрезка отзывов: до 5 (Автор0..Автор4 есть, Автор5.. нет)
     assert "Автор0" in md
     assert "Автор5" not in md
