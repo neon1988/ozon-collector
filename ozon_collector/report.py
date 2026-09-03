@@ -239,7 +239,7 @@ def _group_comments(comments: list) -> list:
 
 
 def _comment_lines(c: dict) -> list:
-    ca = c.get("author") or "—"
+    ca = _collapse_newlines(_norm_nbsp(c.get("author") or "—"))
     cdate = c.get("date") or ""
     reply = c.get("reply_to")
     reply_txt = f" (в ответ: {reply})" if reply else ""
@@ -280,7 +280,7 @@ def _render_comments(comments: list, first_meta=None) -> list:
 def _review_block(r: dict, first_meta=None, variant_in_header: bool = False,
                   no: int = 0) -> list:
     star = "★" * min(5, r.get("stars") or 0) + "☆" * (5 - min(5, r.get("stars") or 0))
-    author = r.get("author") or "—"
+    author = _collapse_newlines(_norm_nbsp(r.get("author") or "—"))
     date = r.get("date") or ""
     marker = " _(без текста)_" if r.get("_no_text") else ""
     numbered = f"{no}. {author}" if no else author
