@@ -396,6 +396,31 @@ def _combined(products):
     }
 
 
+def test_collapse_newlines_removes_blank_lines():
+    from ozon_collector.report import _collapse_newlines
+    txt = "Строка1\n\n\nСтрока2\n\nСтрока3\n"
+    assert _collapse_newlines(txt) == "Строка1\nСтрока2\nСтрока3"
+
+
+def test_collapse_newlines_keeps_single_newlines():
+    from ozon_collector.report import _collapse_newlines
+    assert _collapse_newlines("а\nб") == "а\nб"
+    assert _collapse_newlines("   ") == ""
+    assert _collapse_newlines("") == ""
+
+
+def test_render_collapses_blank_lines_in_review_text():
+    from ozon_collector.report import render
+    raw = _raw([_review("Лилия", [],
+                        text="Здравствуйте!\n\nСпасибо за отзыв.\n\nКоманда Fiio",
+                        stars=5)])
+    md = render(raw, dedup_replies=False)
+    # три фразы на отдельных строках без пустых строк между ними
+    assert "Здравствуйте!\nСпасибо за отзыв.\nКоманда Fiio" in md
+    # признаков исходных пустых (двойных) переводов строк не осталось в блоке текста
+    assert "Спасибо за отзыв.\n\nКоманда" not in md
+
+
 def _ok_result(pid, n_same=1):
     reviews = [_review("A", [_c("Иван, спасибо за заказ!")])]
     for i in range(1, n_same):

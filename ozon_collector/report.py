@@ -28,6 +28,21 @@ def _norm_nbsp(s: str) -> str:
     return "".join(out)
 
 
+def _collapse_newlines(s: str) -> str:
+    """Схлопнуть повторные переводы строк в одиночный (убрать пустые строки),
+    сохранив реальные разрывы строк. Используется для текстов отзывов,
+    комментариев и описаний товаров: «абзац» на отдельной строке без пустых."""
+    if not s:
+        return s
+    lines = s.split("\n")
+    out = []
+    for ln in lines:
+        if ln.strip() == "":
+            continue
+        out.append(ln.rstrip())
+    return "\n".join(out)
+
+
 _ASPECT_RE = re.compile(r"^[^:\n]{1,40}:\s*\S")
 
 
@@ -229,7 +244,7 @@ def _comment_lines(c: dict) -> list:
     if ca == "OZON":
         ctext = "_(текст скрыт)_"
     else:
-        ctext = _norm_nbsp(c.get("text") or "")
+        ctext = _collapse_newlines(_norm_nbsp(c.get("text") or ""))
     lines = [
         f"> → {ca}{reply_txt} — {cdate}",
         f"> {ctext}",
@@ -279,7 +294,7 @@ def _review_block(r: dict, first_meta=None, variant_in_header: bool = False,
         lines = [f"{numbered} — {date}{marker}"]
     if v_aspects:
         lines.append(v_aspects)
-    txt = _norm_nbsp(r.get("text") or "")
+    txt = _collapse_newlines(_norm_nbsp(r.get("text") or ""))
     if r.get("_no_text"):
         txt = "_(без текста)_"
     if r.get("stale"):
@@ -361,7 +376,7 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
         L.append("## 4. Описание")
         L.append("")
         for d in descs:
-            text = d if isinstance(d, str) else str(d)
+            text = _collapse_newlines(d) if isinstance(d, str) else str(d)
             if text.lower().startswith("описание"):
                 text = text[len("описание"):].lstrip()
             L.append(text)
