@@ -475,47 +475,189 @@ def test_digest_size_kb_line():
     assert "КБ" in md
 
 
-# ---- splitting: max товаров на файл (по умолчанию 100) ----------------------
+# ---- splitting по размеру файла (default 3 МиБ) ------------------------------
 
-def _mk_combined(n):
-    return _combined([_ok_result(str(i), n_same=1) for i in range(n)])
+def _review_long(i):
+    return _review(f"A{i}", [], text=("Текст отзыва " * 20) + str(i), stars=5)
 
 
-def test_default_max_products_per_file_is_100():
-    from ozon_collector.report import DEFAULT_MAX_PRODUCTS_PER_FILE
-    assert DEFAULT_MAX_PRODUCTS_PER_FILE == 100
+def _ok_long(pid, n_reviews=80):
+    reviews = [_review_long(i) for i in range(n_reviews)]
+    return {"pid": pid, "ok": True, "error": None, "cache": "hit", "ocr": "off",
+            "raw": _raw(reviews), "markdown": ""}
+
+
+def _combined_big(n_prods, n_reviews=80):
+    return _combined([_ok_long(str(i), n_reviews) for i in range(n_prods)])
+
+
+def _read_sizes(paths):
+    import os
+    return [(p, os.path.getsize(p)) for p in paths]
+
+
+def test_default_max_file_size_bytes_is_3_mib():
+    from ozon_collector.report import DEFAULT_MAX_FILE_SIZE_BYTES
+    assert DEFAULT_MAX_FILE_SIZE_BYTES == 3 * 1024 * 1024
 
 
 def test_write_digest_no_split_when_within_limit(tmp_path):
     from ozon_collector.report import write_search_digest
     out = tmp_path / "d.md"
-    written = write_search_digest(_mk_combined(3), str(out))
+    written = write_search_digest(_combined_big(2), str(out))
     assert written == [str(out)]
     assert out.exists()
     assert not (tmp_path / "d.part2.md").exists()
-
-
-def test_write_digest_splits_over_limit(tmp_path):
-    from ozon_collector.report import write_search_digest
-    out = tmp_path / "d.md"
-    written = write_search_digest(_mk_combined(250), str(out),
-                                  max_products_per_file=100)
-    assert written == [str(out), str(tmp_path / "d.part2.md"),
-                       str(tmp_path / "d.part3.md")]
-    assert "Часть 1 из 3" in out.read_text(encoding="utf-8")
-    assert "Часть 2 из 3" in (tmp_path / "d.part2.md").read_text(encoding="utf-8")
-    assert "Часть 3 из 3" in (tmp_path / "d.part3.md").read_text(encoding="utf-8")
-    assert "## Товар 100:" in out.read_text(encoding="utf-8")
-    assert "## Товар 101:" not in out.read_text(encoding="utf-8")
-
-
-def test_write_digest_zero_limit_no_split(tmp_path):
-    from ozon_collector.report import write_search_digest
-    out = tmp_path / "d.md"
-    written = write_search_digest(_mk_combined(250), str(out),
-                                  max_products_per_file=0)
-    assert written == [str(out)]
     assert "Часть" not in out.read_text(encoding="utf-8")
+
+
+def test_write_digest_default_splits_over_3_mib(tmp_path):
+    # суммарный рендер заведомо больше 3 МиБ → должно быть >1 файл,
+    # и каждый нормальный файл ≤ 3 МиБ по факту на диске.
+    from ozon_collector.report import write_search_digest
+    combined = _combined_big(60, n_reviews=100)
+    out = tmp_path / "d.md"
+    written = write_search_digest(combined, str(out))
+    assert len(written) > 1
+    sizes = dict(_read_sizes(written))
+    for p, sz in sizes.items():
+        assert sz <= 3 * 1024 * 1024, f"{p}: {sz}"
+
+
+def test_write_digest_split_by_small_limit_respects_bytes(tmp_path):
+    # маленький лимит → несколько частей, все нормальные файлы ≤ лимита на диске
+    from ozon_collector.report import write_search_digest
+    limit = 64 * 1024
+    out = tmp_path / "d.md"
+    written = write_search_digest(_combined_big(40, n_reviews=100), str(out),
+                                  max_file_size_bytes=limit)
+    assert len(written) > 1
+    for p, sz in _read_sizes(written):
+        assert sz <= limit, f"{p}: {sz}"
+
+
+def test_write_digest_parts_numbered_with_n_matching_count(tmp_path):
+    from ozon_collector.report import write_search_digest
+    limit = 64 * 1024
+    out = tmp_path / "d.md"
+    written = write_search_digest(_combined_big(40, n_reviews=100), str(out),
+                                  max_file_size_bytes=limit)
+    n = len(written)
+    for k, p in enumerate(written, start=1):
+        text = open(p, encoding="utf-8").read()
+        assert f"Часть {k} из {n}" in text
+
+
+def test_write_digest_first_part_is_out_not_part1(tmp_path):
+    import os
+    from ozon_collector.report import write_search_digest
+    limit = 64 * 1024
+    out = tmp_path / "d.md"
+    written = write_search_digest(_combined_big(40, n_reviews=100), str(out),
+                                  max_file_size_bytes=limit)
+    assert written[0] == str(out)
+    assert not os.path.exists(str(tmp_path / "d.part1.md"))
+    assert written[1] == str(tmp_path / "d.part2.md")
+
+
+def test_write_digest_preserves_product_order(tmp_path):
+    import re
+    from ozon_collector.report import write_search_digest
+    limit = 64 * 1024
+    combined = _combined_big(30, n_reviews=100)
+    out = tmp_path / "d.md"
+    written = write_search_digest(combined, str(out), max_file_size_bytes=limit)
+    seen = []
+    for p in written:
+        text = open(p, encoding="utf-8").read()
+        seen.extend(re.findall(r"## Товар \d+: (\d+)", text))
+    assert seen == [str(i) for i in range(30)]
+
+
+def test_write_digest_single_huge_product_allowed_overflow(tmp_path):
+    # один товар > лимита → свой файл, размер может превысить лимит (warning),
+    # остальные файлы ≤ лимита
+    from ozon_collector.report import write_search_digest
+    limit = 8 * 1024
+    huge = _ok_long("H", n_reviews=100)          # много отзывов → блок большой
+    small = _ok_long("1", n_reviews=1)           # маленький блок
+    combined = _combined([huge, small, _ok_long("2", n_reviews=1)])
+    out = tmp_path / "d.md"
+    written = write_search_digest(combined, str(out), max_file_size_bytes=limit)
+    assert len(written) >= 2
+    huge_paths = [p for p, sz in _read_sizes(written) if sz > limit]
+    assert huge_paths, "должен быть файл-переросток для огромного товара"
+    assert len(huge_paths) == 1
+    # остальные нормальные файлы в лимите
+    for p, sz in _read_sizes(written):
+        if sz > limit:
+            continue
+        assert sz <= limit
+
+
+def test_write_digest_two_huge_products_each_own_file(tmp_path):
+    from ozon_collector.report import write_search_digest
+    limit = 8 * 1024
+    combined = _combined([_ok_long("H1", 100), _ok_long("H2", 100),
+                          _ok_long("1", 1)])
+    out = tmp_path / "d.md"
+    written = write_search_digest(combined, str(out), max_file_size_bytes=limit)
+    over = [p for p, sz in _read_sizes(written) if sz > limit]
+    assert len(over) == 2
+
+
+def test_write_digest_zero_or_negative_limit_no_split(tmp_path):
+    from ozon_collector.report import write_search_digest
+    out = tmp_path / "d.md"
+    for limit in (0, -1):
+        written = write_search_digest(_combined_big(5), str(out),
+                                      max_file_size_bytes=limit)
+        assert written == [str(out)]
+    assert "Часть" not in out.read_text(encoding="utf-8")
+
+
+def test_write_digest_empty_products_single_out(tmp_path):
+    from ozon_collector.report import write_search_digest
+    out = tmp_path / "d.md"
+    written = write_search_digest(_combined([]), str(out),
+                                  max_file_size_bytes=0)
+    assert written == [str(out)]
+    assert out.exists()
+
+
+def test_write_digest_too_small_limit_does_not_create_empty_parts(tmp_path):
+    # если отдельные товары не влезают в лимит — они не порождают пустых файлов;
+    # каждый товар попадает в непустую часть, файлов ровно столько, сколько групп
+    from ozon_collector.report import write_search_digest
+    limit = 1024
+    combined = _combined_big(20, n_reviews=100)
+    out = tmp_path / "d.md"
+    written = write_search_digest(combined, str(out), max_file_size_bytes=limit)
+    assert written
+    for p in written:
+        assert "## Товар" in open(p, encoding="utf-8").read()
+
+
+def test_old_split_api_names_removed_from_code():
+    # гарантия: ни в коде, ни в скриптах не осталось старого API
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bad = ["max_products_per_file", "DEFAULT_MAX_PRODUCTS_PER_FILE"]
+    found = []
+    for dirpath, _dirs, files in os.walk(os.path.join(root, "ozon_collector")):
+        for fn in files:
+            if fn.endswith(".py"):
+                _scan_file(os.path.join(dirpath, fn), bad, found)
+    for fn in ("digest_from_raw.py", "key_daemon.py"):
+        _scan_file(os.path.join(root, "scripts", fn), bad, found)
+    assert not found, "\n".join(found)
+
+
+def _scan_file(path, needles, out):
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            if any(needle in line for needle in needles):
+                out.append(f"{path}:{i}: {line.rstrip()}")
 
 
 # ---- build_search_digest_combined: сборка combined из raw по pid -------------

@@ -29,6 +29,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from cli import parse_pids
 from ozon_collector.report import (build_search_digest_combined,
+                                   minimum_header_size_bytes,
                                    render_search_digest,
                                    write_search_digest)
 
@@ -44,9 +45,10 @@ def main(argv=None) -> int:
                          "только их и обрабатывать")
     ap.add_argument("--pids-file", default=None,
                     help="файл со списком артикулов/URL (по одному в строке)")
-    ap.add_argument("--max-products-per-file", type=int, default=100,
-                    help="макс. товаров в одном md-файле дайджеста "
-                         "(по умолч. 100; 0 — без разбиения)")
+    ap.add_argument("--max-file-size-mb", type=float, default=3.0,
+                    help="макс. размер одного md-файла дайджеста в МиБ "
+                         "(1 МиБ = 1024² байт; по умолч. 3.0; должен быть > 0, "
+                         "иначе разбиение невозможно)")
     args = ap.parse_args(argv)
 
     pids = set()
@@ -85,9 +87,16 @@ def main(argv=None) -> int:
 
     md = render_search_digest(combined)
     if args.out:
+        if args.max_file_size_mb <= 0:
+            ap.error("--max-file-size-mb должен быть > 0")
+        max_bytes = int(args.max_file_size_mb * 1024 * 1024)
+        min_bytes = minimum_header_size_bytes(combined)
+        if args.max_file_size_mb and max_bytes < min_bytes:
+            ap.error(
+                f"--max-file-size-mb={args.max_file_size_mb} даёт {max_bytes} байт, "
+                f"что меньше минимального размера шапки ({min_bytes} байт)")
         written = write_search_digest(
-            combined, args.out,
-            max_products_per_file=args.max_products_per_file)
+            combined, args.out, max_file_size_bytes=max_bytes)
         for path in written:
             size = os.path.getsize(path) / 1024
             print(f"\nДайджест сохранён: {path} ({size:.2f} КБ)")

@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import html as _html
 import json
+import logging
 import os
 import re
 
 DEFAULT_REVIEWS_PER_PRODUCT = 100
-DEFAULT_MAX_PRODUCTS_PER_FILE = 100
+# Максимальный размер одного файла дайджеста в байтах. 3 МиБ = 3 * 1024 * 1024.
+DEFAULT_MAX_FILE_SIZE_BYTES = 3 * 1024 * 1024
+
+_log = logging.getLogger(__name__)
 
 
 def _norm_nbsp(s: str) -> str:
@@ -480,26 +484,11 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
     return "\n".join(L).rstrip() + "\n"
 
 
-def render_search_digest(combined: dict,
-                         reviews_per_product: int = DEFAULT_REVIEWS_PER_PRODUCT,
-                         dedup_replies: bool = True,
-                         products: list | None = None,
-                         chunk: tuple[int, int] | None = None) -> str:
-    """Markdown-дайджест выдачи Ozon для передачи в LLM (Gemini).
-
-    combined — результат collect_search. Для каждого успешного товара
-    используется существующий render(raw), но отзывы обрезаются ТОЛЬКО в
-    дайджесте (raw остаётся полным). Ошибки товаров — компактным блоком.
-
-    products — необязательный список товаров для рендера (по умолчанию берутся
-    все из combined["products"]). chunk — (номер, всего) для файлов-частей.
-    """
-    import copy
-
-    L = []
+def _digest_header_lines(combined: dict, chunk: tuple[int, int] | None,
+                         reviews_per_product: int) -> list[str]:
+    """Строки шапки дайджеста (общей для каждой части) без продуктовой части."""
     search = combined.get("search") or {}
-    L.append("# Дайджест выдачи Ozon")
-    L.append("")
+    L = ["# Дайджест выдачи Ozon", ""]
     if chunk:
         L.append(f"- Часть {chunk[0]} из {chunk[1]}")
     if search.get("query"):
@@ -513,72 +502,115 @@ def render_search_digest(combined: dict,
     L.append(f"- Отзывы в дайджесте: до {reviews_per_product} на товар "
              f"(в raw сохраняются все).")
     L.append("")
+    return L
+
+
+def _excluded_summary_lines(excluded: list) -> list[str]:
+    """Строки верхней сводки об исключённых по рейтингу товарах."""
+    if not excluded:
+        return []
+    e0 = excluded[0].get("excluded") or {}
+    return [
+        f"- Исключено по рейтингу: {len(excluded)} товаров "
+        f"(рейтинг ниже {e0.get('min_rating', '?')}, см. секцию "
+        f"«Исключено по рейтингу»).",
+        "",
+    ]
+
+
+def _excluded_section_lines(excluded: list) -> list[str]:
+    """Строки нижней секции «Исключено по рейтингу»."""
+    L = ["---", "", "## Исключено по рейтингу", ""]
+    for p in excluded:
+        e = p.get("excluded") or {}
+        rawp = p.get("raw") or {}
+        title = (rawp.get("product", {}).get("title") or "").strip() or "—"
+        L.append(f"- {p.get('pid')} · рейтинг {e.get('rating')} "
+                 f"(мин. {e.get('min_rating')}): {title}")
+    L.append("")
+    return L
+
+
+def _product_block_lines(p: dict, idx: int, reviews_per_product: int,
+                         dedup_replies: bool) -> list[str]:
+    """Строки markdown-блока одного товара (с ведущим разделителем `---`).
+
+    Чистая функция без побочных эффектов: не мутирует `combined`/`raw`.
+    `idx` — глобальный номер товара в выдаче (сквозной, не per-part), т.к.
+    байт-размер блока должен быть одинаков в планировании и при записи.
+    """
+    import copy
+
+    L = ["---", ""]
+    if not p.get("ok"):
+        L.append(f"## Товар {p.get('pid', '?')}")
+        L.append("")
+        L.append(f"⚠ Не удалось собрать: {p.get('error', 'неизвестная ошибка')}")
+        L.append("")
+        return L
+    meta = []
+    if p.get("cache"):
+        meta.append(f"кэш: {p['cache']}")
+    if p.get("ocr"):
+        meta.append(f"ocr: {p['ocr']}")
+    raw = p.get("raw") or {}
+    meta.append(f"отзывов: {raw.get('reviews_collected', 0)}")
+    L.append(f"## Товар {idx}: {p.get('pid', '?')} ({', '.join(meta)})")
+    L.append("")
+    if reviews_per_product and reviews_per_product > 0:
+        raw_view = copy.deepcopy(raw)
+        reviews = raw_view.get("reviews") or []
+        # счётчики сортировок по ВСЕМ собранным отзывам (до топ-N),
+        # чтобы строка «Сортировки» отражала реальный сбор, а не топ.
+        sorts_req = raw.get("reviews_sorts") or []
+        if sorts_req:
+            raw_view["sorts_full"] = {
+                s: sum(1 for r in reviews if s in (r.get("review_sorts") or []))
+                for s in sorts_req}
+        # счётчик оценок по ВСЕМ собранным отзывам (до топ-N), чтобы
+        # строка «Всего: … ★…» в конце блока отражала весь сбор.
+        _counts = {s: 0 for s in range(1, 6)}
+        for r in reviews:
+            _s = r.get("stars")
+            if isinstance(_s, int) and 1 <= _s <= 5:
+                _counts[_s] += 1
+        raw_view["stars_full"] = {"total": len(reviews), "counts": _counts}
+        raw_view["reviews"] = _top_reviews(reviews, reviews_per_product)
+    else:
+        raw_view = raw
+    md = render(raw_view, dedup_replies=dedup_replies)
+    for line in md.rstrip("\n").split("\n"):
+        L.append(line)
+    L.append("")
+    return L
+
+
+def render_search_digest(combined: dict,
+                         reviews_per_product: int = DEFAULT_REVIEWS_PER_PRODUCT,
+                         dedup_replies: bool = True,
+                         products: list | None = None,
+                         chunk: tuple[int, int] | None = None,
+                         start_index: int = 1) -> str:
+    """Markdown-дайджест выдачи Ozon для передачи в LLM (Gemini).
+
+    combined — результат collect_search. Для каждого успешного товара
+    используется существующий render(raw), но отзывы обрезаются ТОЛЬКО в
+    дайджесте (raw остаётся полным). Ошибки товаров — компактным блоком.
+
+    products — необязательный список товаров для рендера (по умолчанию берутся
+    все из combined["products"]). chunk — (номер, всего) для файлов-частей.
+    start_index — глобальный номер первого товара (для сквозной нумерации при
+    рендере подмножества в частях; по умолчанию 1).
+    """
+    L = _digest_header_lines(combined, chunk, reviews_per_product)
 
     products = combined.get("products") or [] if products is None else products
     listed = [p for p in products if not p.get("excluded")]
     excluded = [p for p in products if p.get("excluded")]
-    if excluded:
-        e0 = excluded[0].get("excluded") or {}
-        L.append(f"- Исключено по рейтингу: {len(excluded)} товаров "
-                 f"(рейтинг ниже {e0.get('min_rating', '?')}, см. секцию "
-                 f"«Исключено по рейтингу»).")
-        L.append("")
-    for i, p in enumerate(listed, 1):
-        L.append("---")
-        L.append("")
-        if not p.get("ok"):
-            L.append(f"## Товар {p.get('pid', '?')}")
-            L.append("")
-            L.append(f"⚠ Не удалось собрать: {p.get('error', 'неизвестная ошибка')}")
-            L.append("")
-            continue
-        meta = []
-        if p.get("cache"):
-            meta.append(f"кэш: {p['cache']}")
-        if p.get("ocr"):
-            meta.append(f"ocr: {p['ocr']}")
-        raw = p.get("raw") or {}
-        meta.append(f"отзывов: {raw.get('reviews_collected', 0)}")
-        L.append(f"## Товар {i}: {p.get('pid', '?')} ({', '.join(meta)})")
-        L.append("")
-        if reviews_per_product and reviews_per_product > 0:
-            raw_view = copy.deepcopy(raw)
-            reviews = raw_view.get("reviews") or []
-            # счётчики сортировок по ВСЕМ собранным отзывам (до топ-N),
-            # чтобы строка «Сортировки» отражала реальный сбор, а не топ.
-            sorts_req = raw.get("reviews_sorts") or []
-            if sorts_req:
-                raw_view["sorts_full"] = {
-                    s: sum(1 for r in reviews if s in (r.get("review_sorts") or []))
-                    for s in sorts_req}
-            # счётчик оценок по ВСЕМ собранным отзывам (до топ-N), чтобы
-            # строка «Всего: … ★…» в конце блока отражала весь сбор.
-            _counts = {s: 0 for s in range(1, 6)}
-            for r in reviews:
-                _s = r.get("stars")
-                if isinstance(_s, int) and 1 <= _s <= 5:
-                    _counts[_s] += 1
-            raw_view["stars_full"] = {"total": len(reviews), "counts": _counts}
-            raw_view["reviews"] = _top_reviews(reviews, reviews_per_product)
-        else:
-            raw_view = raw
-        md = render(raw_view, dedup_replies=dedup_replies)
-        for line in md.rstrip("\n").split("\n"):
-            L.append(line)
-        L.append("")
-
-    if excluded:
-        L.append("---")
-        L.append("")
-        L.append("## Исключено по рейтингу")
-        L.append("")
-        for p in excluded:
-            e = p.get("excluded") or {}
-            rawp = p.get("raw") or {}
-            title = (rawp.get("product", {}).get("title") or "").strip() or "—"
-            L.append(f"- {p.get('pid')} · рейтинг {e.get('rating')} "
-                     f"(мин. {e.get('min_rating')}): {title}")
-        L.append("")
+    L.extend(_excluded_summary_lines(excluded))
+    for j, p in enumerate(listed, start_index):
+        L.extend(_product_block_lines(p, j, reviews_per_product, dedup_replies))
+    L.extend(_excluded_section_lines(excluded))
 
     L.append("---")
     L.append("")
@@ -592,44 +624,131 @@ def write_search_digest(combined: dict,
                         out: str,
                         reviews_per_product: int = DEFAULT_REVIEWS_PER_PRODUCT,
                         dedup_replies: bool = True,
-                        max_products_per_file: int = DEFAULT_MAX_PRODUCTS_PER_FILE) -> list:
-    """Записать дайджест в md-файл(ы), разбивая на части по числу товаров.
+                        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES) -> list:
+    """Записать дайджест в md-файл(ы), разбивая на части по РАЗМЕРУ файла.
 
-    max_products_per_file (по умолчанию 100) — максимум товаров в одном файле.
-    При превышении рендерятся отдельные файлы: `out` для первой части,
-    `out.part2`, `out.part3`, … (каждая со своей шапкой «Часть k из N»).
-    `max_products_per_file <= 0` — без разбиения. Возвращает список записанных путей.
+    max_file_size_bytes (по умолчанию 3 МиБ) — жёсткий лимит размера каждого
+    файла в байтах UTF-8. При превышении рендерятся отдельные файлы: `out` для
+    первой части, `out.part2`, `out.part3`, … (каждая со своей шапкой
+    «Часть k из N»). `max_file_size_bytes <= 0` — без разбиения (один файл).
+
+    Гарантия: каждый файл ≤ max_file_size_bytes, КРОМЕ единственного разрешённого
+    исключения — части, содержащей РОВНО один товар, чей блок сам по себе больше
+    лимита (такой файл может превысить лимит, в лог пишется warning).
+
+    Планирование границ делает консервативную (завышенную) оценку размера:
+    шапка-части и строка «Размер дайджеста» берутся худшим случаем, поэтому итог
+    записи никогда не превышает оценку. После записи каждый нормальный файл
+    проверяется через os.path.getsize; превышение вне исключения — RuntimeError.
     """
-    import math
-
     products = combined.get("products") or []
-    total = len(products)
-    if max_products_per_file <= 0 or total <= max_products_per_file:
+    listed = [p for p in products if not p.get("excluded")]
+    excluded = [p for p in products if p.get("excluded")]
+
+    if max_file_size_bytes <= 0 or not listed:
         md = render_search_digest(combined, reviews_per_product, dedup_replies)
         _write_md(md, out)
         return [out]
 
-    n_parts = math.ceil(total / max_products_per_file)
+    # -- Проход A: рендерим блок каждого товара ОДИН раз, считаем байты. --
+    # Консервативная (верхняя) оценка размера части:
+    #   - шапка с «Часть N из N» (ширина не меньше реальной при любом N <= len(listed));
+    #   - запас на строку «Размер дайджеста» (число КБ не больше 99999.99),
+    #     ново-строки между блоками и разделители.
+    worst_chunk = (len(listed), len(listed))
+    prefix_lines = _digest_header_lines(combined, worst_chunk, reviews_per_product)
+    prefix_lines += _excluded_summary_lines(excluded)
+    prefix = "\n".join(prefix_lines)
+    tails = _excluded_section_lines(excluded) + ["---", ""]
+    tail_bytes = len("\n".join(tails).encode("utf-8"))
+    # запас на разделители-переносы между блоками/шапкой/хвостом и строку размера
+    separator_overhead = len(listed) + len(tails) + 1
+    size_line_bytes = len("- Размер дайджеста: 99999.99 КБ".encode("utf-8"))
+
+    block_contents = [
+        _product_block_lines(p, i, reviews_per_product, dedup_replies)
+        for i, p in enumerate(listed, 1)]
+    block_bytes = [len("\n".join(b).encode("utf-8")) for b in block_contents]
+
+    prefix_bytes = len(prefix.encode("utf-8"))
+
+    def group_bytes(indices: list[int]) -> int:
+        return (prefix_bytes + sum(block_bytes[i] for i in indices)
+                + separator_overhead + tail_bytes + size_line_bytes)
+
+    # -- Жадная нарезка по порядку (без перестановок), консервативная оценка. --
+    # Оценка заведомо завышена (worst-case шапка и строка размера), поэтому
+    # итог записи не превысит max для групп размером >1 товара. Ширина реальной
+    # строки «Часть k из N» не больше ширины worst-случая при N = len(listed)
+    # (N ≤ len(listed)), т.к. цифр у len(listed) не меньше. Перепланирование
+    # по изменению N не требуется.
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    for i in range(len(listed)):
+        cur.append(i)
+        if len(cur) > 1 and group_bytes(cur) > max_file_size_bytes:
+            groups.append(cur[:-1])
+            cur = [cur[-1]]
+    if cur:
+        groups.append(cur)
+
+    # -- Проход B: запись и контроль фактического размера на диске. --
     written = []
-    for k in range(n_parts):
-        chunk_products = products[k * max_products_per_file:(k + 1) * max_products_per_file]
+    for k, grp in enumerate(groups):
+        n_parts = len(groups)
+        base = grp[0] + 1  # глобальный номер первого товара группы
         md = render_search_digest(
             combined, reviews_per_product, dedup_replies,
-            products=chunk_products, chunk=(k + 1, n_parts))
+            products=[listed[idx] for idx in grp],
+            chunk=(k + 1, n_parts) if n_parts > 1 else None,
+            start_index=base)
         if k == 0:
             path = out
         else:
             root, ext = os.path.splitext(out)
             path = f"{root}.part{k + 1}{ext}"
         _write_md(md, path)
+        actual = os.path.getsize(path)
+        if actual > max_file_size_bytes:
+            if len(grp) == 1:
+                _log.warning(
+                    "Товар %s превышает лимит дайджеста: %d байт (> %d). "
+                    "Выделен в отдельный файл %s",
+                    listed[grp[0]].get("pid"), actual, max_file_size_bytes, path)
+            else:
+                raise RuntimeError(
+                    f"файл {path} ({actual} байт) превысил лимит "
+                    f"{max_file_size_bytes} байт без разрешённого исключения")
         written.append(path)
     return written
 
 
 def _write_md(md: str, path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(md)
+
+
+def minimum_header_size_bytes(combined: dict,
+                              reviews_per_product: int = DEFAULT_REVIEWS_PER_PRODUCT) -> int:
+    """Минимальный размер одного файла дайджеста (только шапка + хвост).
+
+    Считается по контексту combined (длина запроса/URL/даты, сводка об
+    исключённых). Нужен CLI для отклонения заведомо невыполнимого лимита.
+    """
+    products = combined.get("products") or []
+    listed = [p for p in products if not p.get("excluded")]
+    excluded = [p for p in products if p.get("excluded")]
+    if not listed:
+        return 0
+    worst_chunk = (len(listed), len(listed))
+    prefix = _digest_header_lines(combined, worst_chunk, reviews_per_product)
+    prefix += _excluded_summary_lines(excluded)
+    tails = _excluded_section_lines(excluded) + ["---", ""]
+    size_line_bytes = len("- Размер дайджеста: 99999.99 КБ".encode("utf-8"))
+    return (len("\n".join(prefix).encode("utf-8"))
+            + len("\n".join(tails).encode("utf-8"))
+            + size_line_bytes + 2)
 
 
 def _best_for_digest(pid: str, data_dir: str):

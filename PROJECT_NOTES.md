@@ -22,7 +22,26 @@
 
  - **Параллельность: дефолтный лимит 2 > 8 воркеров (2026-08-17).** `PARALLEL_MAX_WORKERS` в `__init__.py` по умолчанию теперь 8 (env `OZON_PARALLEL_MAX` по-прежнему переопределяет). Порты воркеров назначаются динамически (9222+k > 9223–9230), профили — `worker_profile_token(k)`, конфликтов нет. Тест `test_parallel_validation_bounds` обновлён (дефолт 8, env 16). Внимание: 8 одновременных сессий Ozon — выше нагрузка на FAB, следить за challenge-штормом.
 
-## Статус и следующие шаги (последнее обновление: 2026-09-02)
+## Статус и следующие шаги (последнее обновление: 2026-09-03)
+
+ - **✅ Разбиение дайджеста по РАЗМЕРУ файла вместо числа товаров (2026-09-03).**
+   `write_search_digest` режет md по `max_file_size_bytes` (дефолт `DEFAULT_MAX_FILE_SIZE_BYTES
+   = 3 * 1024 * 1024` = 3 МиБ), а не по `max_products_per_file`. Старый API удалён полностью.
+   * `_product_block_lines` — чистый рендер блока одного товара (глобальная сквозная
+     нумерация `## Товар {i}`, не per-part) → байт-идентичность планирования и записи.
+   * Жадная нарезка по порядку PID (без перестановок) с консервативной оценкой размера
+     (worst-case шапка «Часть N из N» + строка размера) → запись никогда не превышает оценку.
+   * После записи каждый нормальный файл проверяется через `os.path.getsize`; превышение —
+     `RuntimeError`. Исключение: часть с РОВНО одним товаром, чей блок сам > лимита
+     (допустимый overflow, `logger.warning`).
+   * `_write_md` пишет с `newline="\n"` и `encoding="utf-8"` → размер на диске == UTF-8 байты
+     строки (без недетерминизма CRLF на Windows).
+   * CLI `scripts/digest_from_raw.py`: `--max-file-size-mb` (float, default 3.0, `>0`,
+     отклоняется если меньше `minimum_header_size_bytes`); `--max-products-per-file` убран.
+   * `scripts/key_daemon.py` не менялся — вызывает `write_search_digest(combined, out)` на
+     новом дефолте 3 МиБ.
+   * Проверено на реальном `naushniki_300`: 3 файла, каждый строго ≤ 3 145 728 байт
+     (3135365 / 3140109 / 887997). Тесты test_report = 66 passed.
 
  - **✅ «По мнению покупателей» — аспектная сводка в карточке (2026-09-02).**
    По запросу: аспекты между заголовком «По мнению покупателей» и маркером
@@ -694,9 +713,11 @@
    в шапку части добавляется «Часть k из N». Новая `report.write_search_digest(combined,
    out, max_products_per_file=100)` — пишет файлы, разбивая при >100 товаров:
    `out` + `out.part2`, `out.part3`, … (`max_products_per_file=0` — без разбиения).
-   CLI `search --max-products-per-file` (default 100) и `scripts/digest_from_raw.py
-   --max-products-per-file` используют её. pytest 360 passed (было 356), 1 pre-existing
-   fail `test_baseline_matches_source_raw` (дрейф raw). Не закоммичено — ждёт согласия.
+CLI `search --max-products-per-file` (default 100) и `scripts/digest_from_raw.py
+    --max-products-per-file` используют её. pytest 360 passed (было 356), 1 pre-existing
+    fail `test_baseline_matches_source_raw` (дрейф raw). Не закоммичено — ждёт согласия.
+    ⚠️ **ЗАМЕНЕНО (2026-09-03):** этот API `max_products_per_file` удалён — см. «Статус»
+    выше. Разбиение теперь по размеру файла через `max_file_size_bytes`/`--max-file-size-mb`.
  - **new_tab recovery ВНЕДРЁН И ЗАКОММИЧЕН (2026-08-17, коммит `7429cda`).** Реализация
    принята пользователем, git-коммит сделан (`feat: recover from access_challenge via new
    tab in same context`). Артефакты live-прогона `.coverage` и `challenge_probe_report.json`
