@@ -124,6 +124,71 @@ def test_render_comments_no_dedup():
     assert "пропущено" not in txt
 
 
+def test_render_comments_ozon_author_hides_text():
+    """Комментарий от «OZON» (шаблонный текст о возврате) — с заглушкой."""
+    lines = _render_comments([_c("Благодарим за отзыв, возможен возврат", author="OZON")])
+    txt = "\n".join(lines)
+    assert "_(текст скрыт)_" in txt
+    assert "Благодарим за отзыв" not in txt
+    # заголовок (автор) и дата сохраняются
+    assert "OZON" in txt
+    assert "2026-08-01" in txt
+
+
+def test_render_comments_ozon_author_empty_text_shows_placeholder():
+    """У Пустого комментария «OZON» тоже заглушка, не пустая строка."""
+    lines = _render_comments([_c("", author="OZON")])
+    txt = "\n".join(lines)
+    assert "_(текст скрыт)_" in txt
+
+
+def test_render_comments_polzovatel_ozon_keeps_text():
+    """Автор «Пользователь OZON» (не точный «OZON») текст НЕ скрывает."""
+    lines = _render_comments([_c("комментарий пользователя", author="Пользователь OZON")])
+    txt = "\n".join(lines)
+    assert "комментарий пользователя" in txt
+    assert "скрыт" not in txt
+
+
+def test_render_comments_technozone_keeps_text():
+    """Продавец, чьё имя лишь содержит OZON (TechnoZone), текст НЕ скрывает."""
+    lines = _render_comments([_c("Наш ответ", author="TechnoZone")])
+    txt = "\n".join(lines)
+    assert "Наш ответ" in txt
+    assert "скрыт" not in txt
+
+
+def test_render_comments_regular_author_keeps_text():
+    """Обычный автор по-прежнему выводит текст и не получает заглушку."""
+    lines = _render_comments([_c("обычный текст", author="Иван")])
+    txt = "\n".join(lines)
+    assert "обычный текст" in txt
+    assert "скрыт" not in txt
+
+
+def test_review_text_sig_stale_placeholder_is_empty():
+    """Stale-пустышка «Отзыв устарел» (текст = буква + имя) — незначима."""
+    assert not _review_text_sig(_review(
+        "Ольга Б.", [], text="О\nОльга Б.\n\nОтзыв устарел"))
+
+
+def test_review_text_sig_stale_placeholder_with_content_is_significant():
+    """«Отзыв устарел» + реальный текст — всё ещё значим."""
+    assert _review_text_sig(_review(
+        "Пользователь OZON", [],
+        text="Отзыв устарел\nУпаковка разорвана испорчена. Товар повреждён."))
+
+
+def test_top_reviews_drops_stale_placeholders():
+    """Пустышки уровня «Отзыв устарел» не попадают в топ."""
+    top = _top_reviews([
+        _review("Ольга Б.", [], text="О\nОльга Б.\n\nОтзыв устарел",
+                stars=1),
+        _review("Иван", [], text="Отличный товар", stars=5),
+    ], 10)
+    assert [r["author"] for r in top] == ["Иван"]
+
+
 def test_review_block_preserves_old_behavior_when_dedup_off():
     lines = _review_block(_review("Автор", [_c("Привет!"), _c("Привет!")]))
     assert "Привет!" in "\n".join(lines)

@@ -626,6 +626,15 @@ REVIEWS_JS = r"""
       .replace(/\s*\d+\s*комментар\S*/, '')
       .replace(/\n\s*(?:Читать полностью|Читать дальше|Развернуть|Свернуть)\s*$/g, '')
       .trim();
+    // имя автора дублируется первой строкой тела текста (DOM: имя отзыва
+    // попадает в innerText карточки из-за наложения блока заголовка) — срезаем
+    // ведущую строку, если она совпадает с именем автора.
+    if (author) {
+      const firstLine = (text.split('\n')[0] || '').trim();
+      if (firstLine && firstLine === author) {
+        text = text.split('\n').slice(1).join('\n').trim();
+      }
+    }
     const svgs = Array.from(wrapper.querySelectorAll('svg'));
     let stars = 0;
     svgs.forEach((s) => {

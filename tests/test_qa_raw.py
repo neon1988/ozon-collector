@@ -218,11 +218,11 @@ def test_sort_imbalance_skipped_on_complete_collection():
     assert rep["verdict"] == "OK"
 
 
-def test_zero_reviews_warn():
+def test_zero_reviews_fail():
     raw = _raw(vc=0, rc=None, reviews=[])
     rep = qa_product(raw, "42")
     assert "ZERO_REVIEWS" in _codes(rep)
-    assert rep["verdict"] == "WARN"
+    assert rep["verdict"] == "FAIL"
     assert rep["collection_mode"] == "UNKNOWN"
 
 

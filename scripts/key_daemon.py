@@ -86,7 +86,7 @@ DAEMON_STATES = {
 }
 # Версия QA-логики. Входит в ключ QA-кэша (verdict_meta.qa_version): улучшение
 # QA (новый FAIL/WARN) инвалидирует старые вердикты даже если raw не менялся.
-QA_VERSION = "1.5"
+QA_VERSION = "1.6"
 
 
 def _sha256_text(s: str) -> str:

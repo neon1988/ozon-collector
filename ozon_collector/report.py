@@ -70,9 +70,12 @@ def _review_text_sig(r: dict) -> bool:
     """Значимый ли текст отзыва (пригоден ли для LLM).
 
     False для пустышек, где в тексте только имя автора (+ первая буква с новой
-    строки), напр. `М\\nМаксим С.` или `Андрей С.`. Такие отзывы собираются
-    (остаются в raw), но не несут ценности для дайджеста. Если автор скрыт —
-    «Имя скрыто» — тоже учитывается. При неуверенности (нет автора) — по длине.
+    строки), напр. `М\\nМаксим С.` или `Андрей С.`. Также для stale-пустышек
+    вида `О\\nОльга Б.\\n\\nОтзыв устарел` (плашка Ozon попала в текст, а
+    содержательного текста нет — первая буква имени на отдельной строке).
+    Такие отзывы собираются (остаются в raw), но не несут ценности для
+    дайджеста. Если автор скрыт — «Имя скрыто» — тоже учитывается. При
+    неуверенности (нет автора) — по длине.
     """
     text = (r.get("text") or "").strip()
     if not text:
@@ -86,6 +89,8 @@ def _review_text_sig(r: dict) -> bool:
         rest = rest.lower()
         for pat in (low_name, low_name + " " + low_name):
             rest = rest.replace(pat, "")
+        # служебный маркер Ozon «Отзыв устарел», попавший в текст пустышки
+        rest = rest.replace("отзыв устарел", "")
         rest = re.sub(r"[\s\W_]+", "", rest)  # только буквы/цифры
         # одна буква/пусто после удаления имени — пустышка
         if len(rest) <= 1:
@@ -237,14 +242,18 @@ def _comment_lines(c: dict) -> list:
     cdate = c.get("date") or ""
     reply = c.get("reply_to")
     reply_txt = f" (в ответ: {reply})" if reply else ""
+    if ca == "OZON":
+        ctext = "_(текст скрыт)_"
+    else:
+        ctext = _norm_nbsp(c.get("text") or "")
     lines = [
         f"> → {ca}{reply_txt} — {cdate}",
-        f"> {_norm_nbsp(c.get('text') or '')}",
+        f"> {ctext}",
     ]
     like = c.get("like") or 0
     dislike = c.get("dislike") or 0
     if like or dislike:
-        lines.append(f"> _👍 {like} · 👎 {dislike}_")
+        lines.append(f"> _👍 {like}, 👎 {dislike}_")
     return lines
 
 
@@ -296,7 +305,7 @@ def _review_block(r: dict, first_meta=None, variant_in_header: bool = False,
     helpful_yes = r.get("helpful_yes") or 0
     helpful_no = r.get("helpful_no") or 0
     if helpful_yes or helpful_no:
-        lines.append(f"> _👍 полезно: {helpful_yes}, нет: {helpful_no}_")
+        lines.append(f"> _👍 {helpful_yes}, 👎 {helpful_no}_")
     lines.extend(_render_comments(r.get("comments") or [], first_meta))
     lines.append("")
     return lines
