@@ -17,6 +17,8 @@ cooldown + авто-resume), защита от зацикливания на о�
   ABANDONED        — valid < min_valid (нехватка товаров / тех. отказ) или
                      no-progress-лимит
   NEEDS_ATTENTION  — непредвиденная ошибка; требует человека (терминально)
+  INTERRUPTED      — остановлено пользователем (Ctrl+C): graceful shutdown,
+                     прогресс сохранён, resume подхватит недособранное
 
 Атомарно ведёт manifest data/campaigns/{campaign}/progress.json и
 logs/{campaign}_daemon.log. Итог сбора читает из машиночитаемого combined JSON.
@@ -37,6 +39,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +60,16 @@ CAMPAIGNS_DIR = DATA_DIR / "campaigns"
 # перезапуском/тёплой сессией. Включён по запросу пользователя 2026-08-31.
 _NO_COOLDOWN = bool(os.environ.get("KD_NO_COOLDOWN"))
 
+# Кооперативная остановка по Ctrl+C (2026-09-03). Демон — ЕДИНСТВЕННЫЙ, кто
+# получает консольный CTRL_C_EVENT (воркеры глушат его через SetConsoleCtrlHandler
+# в worker_main). Обработчик сигнала ставит STOP_EVENT, а collect_parallel —
+# _await_workers штатно сворачивают воркеров (без респавна) и сохраняют прогресс;
+# кампания завершается с final_state=INTERRUPTED (НЕ CRASH, счётчики сбоев не
+# трогаем). Второй Ctrl+C во время shutdown — форс: поднимает _FORCE_EXIT, вместо
+# кооперативного ожидания демон после короткой зачистки выходит принудительно.
+_STOP_EVENT = threading.Event()
+_FORCE_EXIT = threading.Event()
+
 PYTHON = sys.executable
 QA_RAW = str(ROOT / "scripts" / "qa_raw.py")
 
@@ -75,14 +88,15 @@ CHALLENGE_PARTIAL_PAUSE_S = 20
 # т.к. это временные сбои subprocess, а не устойчивый кризис счётчика.
 TRANSIENT_RETRY_BACKOFF_S = 4
 QA_BATCH_SIZE = 100
-TERMINAL_STATES = {"COMPLETED", "COMPLETED_MIN", "ABANDONED", "NEEDS_ATTENTION"}
+TERMINAL_STATES = {"COMPLETED", "COMPLETED_MIN", "ABANDONED", "NEEDS_ATTENTION",
+                   "INTERRUPTED"}
 OK_VERDICTS = {"OK", "WARN"}
 # Формализованные состояния runtime-цикла демона (для status.json / state API),
 # отдельно от TERMINAL_STATES (итог кампании). Внутренние фазы:
 DAEMON_STATES = {
     "STARTING", "RUNNING_FULL", "RUNNING_RESCAN", "COOLDOWN_CHALLENGE",
     "COOLDOWN_CRASH", "FINALIZING", "COMPLETED", "COMPLETED_MIN",
-    "ABANDONED", "NEEDS_ATTENTION",
+    "ABANDONED", "NEEDS_ATTENTION", "INTERRUPTED",
 }
 # Версия QA-логики. Входит в ключ QA-кэша (verdict_meta.qa_version): улучшение
 # QA (новый FAIL/WARN) инвалидирует старые вердикты даже если raw не менялся.
@@ -998,7 +1012,8 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
         query=None, max_recycles=2, join_timeout_s=43200.0,
         pids=pids or None, skip_pids=skip_pids, no_bootstrap=False,
         session_budget=session_budget, on_event=_on_event,
-        max_worker_restarts=max_restarts, worker_log=worker_log)
+        max_worker_restarts=max_restarts, worker_log=worker_log,
+        stop_event=_STOP_EVENT)
 
     combined_file = CAMPAIGNS_DIR / camp / f"combined_{run_id}.json"
     combined_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1189,6 +1204,16 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
 
         while True:
             # ---- терминальные и лимитные проверки ----
+            # Кооперативный стоп по Ctrl+C: зафиксировали final_state=INTERRUPTED,
+            # НЕ трогаем no_progress/crash-счётчики; цикл выходит, финализация
+            # пропускается (см. finalize_campaign), прогресс сохранён ниже.
+            if _STOP_EVENT.is_set():
+                progress["final_state"] = "INTERRUPTED"
+                progress["final_reason"] = "user_interrupt"
+                progress["final_note"] = "остановлено пользователем (Ctrl+C)"
+                log.warning("демон: пользователь остановил кампанию (Ctrl+C) → "
+                            "INTERRUPTED")
+                break
             if progress.get("final_state") and progress["final_state"] in TERMINAL_STATES:
                 break
             if time.time() - started_ts >= max_total_hours * 3600:
@@ -1221,7 +1246,14 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     if wait > 5:
                         sleep_for = min(wait, remaining)
                         log.info(f"cooldown: жду {int(sleep_for)}с")
-                        time.sleep(sleep_for)
+                        # stop-осведомлённый sleep: опрашиваем Ctrl+C, чтобы
+                        # долгий cooldown не блокировал graceful shutdown
+                        _ended = time.monotonic()
+                        _deadline = _ended + sleep_for
+                        while time.monotonic() < _deadline:
+                            if _STOP_EVENT.is_set():
+                                break
+                            time.sleep(min(1.0, _deadline - time.monotonic()))
                         # если проспали ровно до дедлайна — выходим по time_limit
                         if sleep_for >= remaining:
                             progress["final_reason"] = "time_limit"
@@ -1298,6 +1330,30 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             _journal_stage(progress, run_id, "run_completed",
                            {"status": status, "exit_code": exit_code})
             _absorb_recovery_telemetry(progress, combined)
+
+            # Ctrl+C во время сбора: collect_parallel вернулся с уже собранным
+            # payload (воркеры сворачиваются). Сохраняем, что реально собрано
+            # (discovery/QA/reconcile по частичным данным), НЕ трогая счётчики
+            # статуса/шторма, и выходим на INTERRUPTED (обработается на верху
+            # цикла). PROGRESS_EVERY=5 даёт payload даже у прерванных воркеров.
+            if _STOP_EVENT.is_set():
+                log.warning("демон: сбор прерван Ctrl+C — сохраняю частичный "
+                            "результат этого прогона")
+                discovered = extract_discovered_pids(combined)
+                ok_pids = extract_ok_pids(combined)
+                if discovered:
+                    progress["discovered_pids"] = normalize_pids(
+                        list(progress.get("discovered_pids", [])) + list(discovered))
+                if ok_pids:
+                    new_checked = classify_new_pids(progress, ok_pids, qa_fn=qa_fn)
+                    reconcile_validity(progress, new_checked, data_dir)
+                _journal_stage(progress, run_id, "state_committed",
+                               {"interrupted": True})
+                progress["final_state"] = "INTERRUPTED"
+                progress["final_reason"] = "user_interrupt"
+                progress["final_note"] = "остановлено пользователем (Ctrl+C)"
+                save_json(progress_path, progress)
+                break
 
             discovered = extract_discovered_pids(combined)
             ok_pids = extract_ok_pids(combined)
@@ -1543,7 +1599,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         if fs in ("COMPLETED_MIN", "ABANDONED") and fr:
             msg += f" / {fr}"
         _set_state(progress, fs, "FINALIZED", reason=fr)
-        if write_digest:
+        if write_digest and fs != "INTERRUPTED":
+            # на INTERRUPTED данные неполные — дайджест не рендерим
             _write_digest(progress, data_dir)
         notify(progress, msg)
         return progress
@@ -1593,8 +1650,10 @@ def finalize_campaign(progress: dict, progress_path: Path,
     min_valid = progress.get("min_valid", 0)
     reason = progress.get("final_reason")
 
-    # NEEDS_ATTENTION / уже решённая критическая остановка — не трогаем.
-    if progress.get("final_state") == "NEEDS_ATTENTION":
+    # NEEDS_ATTENTION / INTERRUPTED / уже решённая критическая остановка — не трогаем.
+    # INTERRUPTED: стоп по Ctrl+C, данные неполные — финальный QA по snapshot
+    # недостоверен, пропускаем (как NEEDS_ATTENTION), прогресс уже сохранён.
+    if progress.get("final_state") in ("NEEDS_ATTENTION", "INTERRUPTED"):
         save_json(progress_path, progress)
         return
 
@@ -1811,12 +1870,22 @@ if __name__ == "__main__":
     import signal as _signal
 
     def _graceful_exit(signum, frame):
-        log.warning(f"демон остановлен (сигнал {signum})")
-        try:
-            (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise SystemExit(1)
+        """Ctrl+C / SIGTERM → кооперативная остановка (см. _STOP_EVENT выше).
+
+        Первый сигнал: ставим _STOP_EVENT — collect_parallel/_await_workers штатно
+        сворачивают воркеров (без респавна), прогресс сохраняется, кампания
+        завершается с final_state=INTERRUPTED. Демон НЕ выходит здесь — он живёт,
+        пока _await_workers не вернётся и run_campaign не запишет progress.
+        Второй сигнал во время shutdown: _FORCE_EXIT — принудительный выход.
+        """
+        if _STOP_EVENT.is_set():
+            # уже останавливаемся (первый Ctrl+C обработан) → эскалация
+            log.warning(f"демон: повторный сигнал {signum} — форс-выход")
+            _FORCE_EXIT.set()
+            return
+        log.warning(f"демон: получен сигнал {signum}, graceful shutdown "
+                    f"(воркеры сворачиваются, прогресс сохраняется)")
+        _STOP_EVENT.set()
 
     _signal.signal(_signal.SIGINT, _graceful_exit)
     try:
@@ -1826,7 +1895,22 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log.warning("демон остановлен (Ctrl-C)")
+        # На случай, если сигнал-обработчик по какой-то причине не сработал
+        # (например, interrupt прилетел в блок, где обработчик ещё не был
+        # установлен). Ставим стоп-событие, чтобы ниже дождаться graceful
+        # завершения активного сбора.
+        log.warning("демон: KeyboardInterrupt — ставлю остановку")
+        _STOP_EVENT.set()
+        if _FORCE_EXIT.is_set():
+            log.error("демон: форс-выход по второму прерыванию")
+            try:
+                (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
+            except OSError:
+                pass
+            import os as _os
+            _os._exit(1)
+        raise
+    finally:
         try:
             (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
         except OSError:

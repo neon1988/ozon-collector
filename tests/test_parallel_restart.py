@@ -307,3 +307,65 @@ def test_await_no_stall_when_heartbeat_recent():
     t.join(1.0)
     assert not w.deadline_halted      # воркер НЕ считался зависшим (ни stall, ни дедлайн)
     assert not w.proc.is_alive()      # завершён штатно (done → join) — terminate не вызывался
+
+
+# ---- Кооперативный стоп (Ctrl+C → stop_event) --------------------------------
+
+def test_await_stop_event_terminates_no_restart_limit0(monkeypatch):
+    """Ветка limit=0: stop_event сворачивает живых воркеров БЕЗ респавна."""
+    import threading as _t
+    w = _mk_worker(worker_id=1, alive=True, done=False, pending=[0, 1, 2])
+    w.last_activity = time.monotonic()  # свежий heartbeat — не stall
+    called = []
+    monkeypatch.setattr(PL, "_respawn", lambda *a, **k: called.append(1))
+    stop = _t.Event()
+    stop.set()  # стоп уже активен до входа
+    out = PL._await_workers([w], deadline=time.monotonic() + 30,
+                            max_worker_restarts=0, items_by_index={},
+                            gather_cfg={}, max_recycles=2,
+                            session_budget=None, poll=0.01, stop_event=stop)
+    assert called == []                 # респавна нет
+    assert not w.proc.is_alive()        # воркер terminate'нут
+    assert len(out) == 1 and out[0] is w
+
+
+def test_await_stop_event_terminates_no_restart_restart_branch(monkeypatch):
+    """Ветка restart (limit>0): stop_event сворачивает живых воркеров без respawn."""
+    import threading as _t
+    w = _mk_worker(worker_id=1, alive=True, done=False, pending=[0, 1, 2])
+    w.last_activity = time.monotonic()  # свежий heartbeat — не stall
+    called = []
+    monkeypatch.setattr(PL, "_respawn", lambda *a, **k: called.append(1))
+    stop = _t.Event()
+    stop.set()
+    out = PL._await_workers([w], deadline=time.monotonic() + 30,
+                            max_worker_restarts=2, items_by_index={},
+                            gather_cfg={}, max_recycles=2,
+                            session_budget=None, poll=0.01, stop_event=stop)
+    assert called == []                 # НЕ респавним остановленного воркера
+    assert not w.proc.is_alive()        # terminate'нут
+    assert len(out) == 1 and out[0] is w
+
+
+def test_await_stop_event_late_break():
+    """stop_event, поднятый ПОСЛЕ старта цикла, прерывает ожидание досрочно."""
+    import threading as _t
+    w = _mk_worker(worker_id=1, alive=True, done=False, pending=[0, 1])
+    w.last_activity = time.monotonic()
+    stop = _t.Event()
+
+    def _set_stop_later():
+        time.sleep(0.3)
+        stop.set()
+
+    _t.Thread(target=_set_stop_later, daemon=True).start()
+    # большой дедлайн: цикл должен завершиться по stop (~0.3с), а не по дедлайну
+    deadline = time.monotonic() + 30
+    t0 = time.monotonic()
+    out = PL._await_workers([w], deadline=deadline,
+                            max_worker_restarts=2, items_by_index={},
+                            gather_cfg={}, max_recycles=2,
+                            session_budget=None, poll=0.01, stop_event=stop)
+    assert time.monotonic() - t0 < 10    # вышел по stop, не по дедлайну (30с)
+    assert not w.proc.is_alive()         # воркер stop'нут (terminate/join)
+    assert len(out) == 1 and out[0] is w

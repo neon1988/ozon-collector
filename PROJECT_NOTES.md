@@ -24,6 +24,37 @@
 
 ## Статус и следующие шаги (последнее обновление: 2026-09-03)
 
+ - **✅ Красивый Ctrl+C: graceful shutdown воркеров + INTERRUPTED (2026-09-03).**
+   Раньше Ctrl+C в консоли Windows получали демон И spawn-воркеры (одна console-group):
+   KeyboardInterrupt рвал `finally` воркера и `_stop_worker_browser` не доезжал →
+   осиротевшие Chromium на портах 9223–9228. Пофикшено на уровне архитектуры.
+   * `parallel.py worker_main`: в самом начале — `SetConsoleCtrlHandler(NULL, TRUE)`
+     на Windows (взят из `run_tests_guarded.py`). Воркеры НЕ видят консольный Ctrl+C;
+     остановкой управляет только оркестратор.
+   * `_await_workers` (обе ветки: limit=0 и restart): новый параметр `stop_event`;
+     при установке — штатно сворачивает живых воркеров через `_terminate_worker`
+     → `_cleanup_worker` → `force_stop` (зачистка браузера в РОДИТЕЛЕ, надёжно,
+     не зависит от `finally` воркера), БЕЗ респавна. Текущий item воркера теряется
+     (не помечается completed) → на resume `_recover_interrupted_run` доберёт.
+   * `collect_parallel(...stop_event=...)` пробрасывает event в `_await_workers`.
+   * `key_daemon.py`: глоб. `_STOP_EVENT`/`_FORCE_EXIT`. `_graceful_exit` (SIGINT/
+     SIGTERM) больше НЕ делает `raise SystemExit` — ставит `_STOP_EVENT`. Второй
+     Ctrl+C во время shutdown → `_FORCE_EXIT` (defensive escape в `__main__`).
+   * Цикл `run_campaign`: на верху `while True` и в mid-collect ветке проверка
+     `_STOP_EVENT` → сохраняем частичный результат (discovery/QA/reconcile по тому,
+     что реально собрано), `final_state=INTERRUPTED`, `final_reason=user_interrupt`.
+   * `TERMINAL_STATES` + `DAEMON_STATES` + `finalize_campaign` ранний выход:
+     INTERRUPTED трактуется как NEEDS_ATTENTION (фин. QA по неполным данным НЕ
+     прогоняем), счётчики `no_progress`/`crash_runs`/`challenge_seq` НЕ растут,
+     дайджест на INTERRUPTED не пишется. Resume после Ctrl+C работает штатно.
+   * Cooldown-сон и цикл ожидания — stop-осведомлённые (опрашивают событие ≤1с).
+   * Тесты: +3 (test_parallel_restart.py: stop_event limit0 / restart-branch / late-
+     break), +2 (test_key_daemon.py: INTERRUPTED top-of-loop / during-collect-partial).
+     205 key_daemon + 63 parallel (+16 restart) + 81 cli/digest/report — все зелёные.
+   Правки целиком в `key_daemon.py`, `parallel.py`, `tests/test_parallel_restart.py`,
+   `tests/test_key_daemon.py`. Требует живой проверки заглушки Ctrl+C в воркере
+   (контрольный прогон с ручным Ctrl+C).
+
  - **✅ Тексты в дайджесте без пустых строк (2026-09-03).**
    По запросу: в отзывах, комментариях и описаниях товаров убраны повторные
    переводы строк (пустые строки), текст идёт сплошным потоком строк.

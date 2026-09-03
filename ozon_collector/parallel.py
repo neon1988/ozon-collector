@@ -394,6 +394,18 @@ def worker_main(spec: dict, task: dict, conn):
     fatal_error + частичные processed/failed → exit 0. В finally — остановка
     СВОЕГО браузера (force_stop по зарегистрированным identity) и close Session.
     """
+    # Воркеры НЕ должны видеть консольный Ctrl+C (Windows CTRL_C_EVENT идёт всей
+    # console-group: демон + spawn-воркеры). Иначе KeyboardInterrupt рвёт finally
+    # воркера и _stop_worker_browser не доезжает → осиротевший Chromium (порты
+    # 922x). Глушим Ctrl+C в воркере КАК МОЖНО РАНЬШЕ, до браузера: остановкой
+    # управляет только оркестратор (stop_event → _terminate_worker → _cleanup_worker
+    # в родителе). Паттерн из run_tests_guarded.py.
+    if sys.platform == "win32":
+        import ctypes
+        try:
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)
+        except Exception:
+            pass
     k = spec["worker_id"]
     payload = _empty_payload(k)
     sess = None
@@ -725,15 +737,28 @@ def _await_workers(wctxs: list, deadline: float,
                    gather_cfg: dict, max_recycles: int,
                    session_budget: dict | None, on_event=None,
                    worker_log: str | None = None,
-                   poll: float = 0.3) -> list:
+                   poll: float = 0.3,
+                   stop_event=None) -> list:
     """Дождаться завершения воркеров, перезапуская аварийно упавших.
 
     max_worker_restarts=0 → исходное поведение (join по очереди, terminate
     зависших по дедлайну, без перезапуска). >0 → оркестрационный цикл с
     перезапуском воркеров, упавших без доведения шарда.
+
+    stop_event (threading.Event, от демона) — кооперативный запрос остановки
+    (Ctrl+C в демоне): при установке прекращаем выдачу новых задач/респавн и
+    штатно сворачиваем живых воркеров (_terminate_worker → _cleanup_worker →
+    force_stop браузера в родителе), НЕ помечая остановку как CRASH.
+    Уже собранный payload сохраняется; текущий item воркера теряется и на
+    resume добирается заново (это цена graceful shutdown без 2-го канала IPC).
     """
     if max_worker_restarts <= 0:
         while True:
+            if stop_event is not None and stop_event.is_set():
+                for wctx in wctxs:
+                    if wctx.proc.is_alive() and not wctx.done:
+                        _terminate_worker(wctx, "stop: user interrupt (Ctrl+C)")
+                break
             now = time.monotonic()
             stalled = [wctx for wctx in wctxs
                        if wctx.proc.is_alive() and not wctx.done
@@ -763,6 +788,16 @@ def _await_workers(wctxs: list, deadline: float,
     active = list(wctxs)
     finalized: list = []
     while active:
+        if stop_event is not None and stop_event.is_set():
+            log.warning("stop: user interrupt (Ctrl+C) — сворачиваю воркеров, "
+                        f"без респавна (active={len(active)})")
+            for wctx in list(active):
+                if wctx.proc.is_alive() and not wctx.done:
+                    _terminate_worker(wctx, "stop: user interrupt (Ctrl+C)")
+                else:
+                    _finalize_worker(wctx)
+                finalized.append(wctx)
+            break
         now = time.monotonic()
         for wctx in list(active):
             finished = wctx.done or not wctx.proc.is_alive()
@@ -844,7 +879,8 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      session_budget: dict | None = None,
                      on_event=None,
                      max_worker_restarts: int = 0,
-                     worker_log: str | None = None) -> dict:
+                     worker_log: str | None = None,
+                     stop_event=None) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
 
     pids — явный список артикулов вместо докрутки выдачи: main-сессия не
@@ -917,7 +953,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         items_by_index={i: (pid, url) for i, pid, url in items},
         gather_cfg=gather_cfg, max_recycles=max_recycles,
         session_budget=session_budget, on_event=on_event,
-        worker_log=worker_log)
+        worker_log=worker_log, stop_event=stop_event)
 
     payloads = []
     for wctx in wctxs:

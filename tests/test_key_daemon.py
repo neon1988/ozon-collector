@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 
 import pytest
 
@@ -2887,3 +2888,61 @@ def test_integration_full_storm_parallel_escalates(tmp_path, monkeypatch):
     assert prog["final_reason"] == "challenge_storm"
     assert prog["challenge_control"]["storm_streak"] > 3
     assert prog["profile_cooldown"]["reason"] == "repeated_challenge"
+
+
+# ---- Кооперативный стоп по Ctrl+C → INTERRUPTED ------------------------------
+
+def test_integration_interrupted_top_of_loop(tmp_path, monkeypatch):
+    """СТОП установлен ДО старта прогона → run_campaign выходит с INTERRUPTED,
+    прогресс сохраняется, счётчики сбоев (no_progress/crash) НЕ растут."""
+    prev = k._STOP_EVENT
+    k._STOP_EVENT = threading.Event()
+    k._STOP_EVENT.set()           # Ctrl+C уже нажат
+    try:
+        def fac(argv):
+            return {"products": [{"pid": 0, "ok": True, "excluded": None}],
+                    "found": 1}
+        def qa(batch):
+            return {"products": len(batch), "ok": len(batch), "warn": 0,
+                    "fail": 0, "per_pid": {p: "OK" for p in batch}}
+        prog = _run_campaign_integration(
+            tmp_path, monkeypatch, target=3, min_valid=1,
+            combined_factory=fac, qa_fn=qa, n_pids=1,
+            reserve_count=0, max_total_hours=24.0)
+        assert prog["final_state"] == "INTERRUPTED"
+        assert prog["final_reason"] == "user_interrupt"
+        assert prog.get("no_progress_count", 0) == 0   # НЕ как сбой
+        assert prog.get("stall", {}).get("crash_runs", 0) == 0
+    finally:
+        k._STOP_EVENT = prev
+        k._STOP_EVENT.clear()
+
+
+def test_integration_interrupted_during_collect_saves_partial(tmp_path, monkeypatch):
+    """СТОП поднят ВО ВРЕМЯ сбора: частично собранные пиды сохраняются,
+    кампания завершается INTERRUPTED (не CRASH)."""
+    prev = k._STOP_EVENT
+    k._STOP_EVENT = threading.Event()
+    try:
+        def fac(argv):
+            # воркеры успели собрать 2 пида, затем пришёл Ctrl+C
+            k._STOP_EVENT.set()
+            return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                                 {"pid": 1, "ok": True, "excluded": None}],
+                    "found": 2}
+        def qa(batch):
+            return {"products": len(batch), "ok": len(batch), "warn": 0,
+                    "fail": 0, "per_pid": {p: "OK" for p in batch}}
+        prog = _run_campaign_integration(
+            tmp_path, monkeypatch, target=5, min_valid=1,
+            combined_factory=fac, qa_fn=qa, n_pids=2,
+            reserve_count=0, max_total_hours=24.0)
+        assert prog["final_state"] == "INTERRUPTED"
+        assert prog["final_reason"] == "user_interrupt"
+        # собранные пиды попали в манифест (не потерялись)
+        assert len(prog.get("valid_pids", [])) >= 1
+        assert prog.get("no_progress_count", 0) == 0   # НЕ как сбой
+        assert prog.get("stall", {}).get("crash_runs", 0) == 0
+    finally:
+        k._STOP_EVENT = prev
+        k._STOP_EVENT.clear()
