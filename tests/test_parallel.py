@@ -773,3 +773,80 @@ def test_preflight_makedirs_error(monkeypatch, profile_base):
     monkeypatch.setattr(os, "makedirs", _raise)
     errs = PL.preflight_check([PL.worker_spec(1)])
     assert any("не удалось создать профиль" in e for e in errs)
+
+
+# ---- collect_parallel: graceful-стоп докрутки ссылок (Ctrl+C) ----------------
+
+def test_collect_parallel_graceful_link_stop_returns_partial(monkeypatch):
+    """_collect_links_with_recovery raises CollectionInterrupted(forced=False) →
+    collect_parallel возвращает частичный combined (discovered_pids из ссылок,
+    collected=0, воркеры НЕ спавнились, browser остановлен)."""
+    from ozon_collector.search import CollectionInterrupted
+
+    class _FakeSession:
+        cdp_url = "http://127.0.0.1:9222"
+        def close(self):
+            pass
+
+    stopped = []
+    monkeypatch.setattr(PL, "_stop_main_browser",
+                        lambda: stopped.append(1))
+    monkeypatch.setattr(PL.cdp, "Session", lambda *a, **k: _FakeSession())
+
+    class _FakeManager:
+        pass
+
+    monkeypatch.setattr(PL, "BrowserProcessManager",
+                        lambda *a, **k: _FakeManager())
+
+    def _fake_links(sess, manager, url, limit, max_recycles, recovery,
+                    stop_event=None, force_event=None):
+        raise CollectionInterrupted(
+            [{"pid": "111", "url": "u111"},
+             {"pid": "222", "url": "u222"}], forced=False)
+
+    monkeypatch.setattr(PL.S, "_collect_links_with_recovery", _fake_links)
+
+    spawned = []
+    monkeypatch.setattr(PL, "_spawn_ctx",
+                        lambda *a, **k: spawned.append(1) or None)
+
+    out = PL.collect_parallel(
+        "https://www.ozon.ru/search/?text=x", limit=130,
+        gather_cfg={}, parallel=2, query="x", stop_event=threading.Event())
+    assert out["collected"] == 0
+    assert out["discovered_pids"] == ["111", "222"]   # частичные ссылки
+    assert out["interrupted"] is True
+    assert out["products"] == []
+    assert spawned == []                               # воркеры НЕ запускались
+    assert stopped == [1]                              # main-браузер остановлен
+
+
+def test_collect_parallel_force_link_stop_propagates(monkeypatch):
+    """_collect_links_with_recovery raises CollectionInterrupted(forced=True) →
+    collect_parallel пробрасывает исключение (не возвращает partial) — emergency."""
+    from ozon_collector.search import CollectionInterrupted
+
+    class _FakeSession:
+        cdp_url = "http://127.0.0.1:9222"
+        def close(self):
+            pass
+
+    monkeypatch.setattr(PL, "_stop_main_browser", lambda: None)
+    monkeypatch.setattr(PL.cdp, "Session", lambda *a, **k: _FakeSession())
+    monkeypatch.setattr(PL, "BrowserProcessManager", lambda *a, **k: object())
+
+    def _fake_links(sess, manager, url, limit, max_recycles, recovery,
+                    stop_event=None, force_event=None):
+        raise CollectionInterrupted([], forced=True)
+
+    monkeypatch.setattr(PL.S, "_collect_links_with_recovery", _fake_links)
+
+    try:
+        PL.collect_parallel(
+            "https://www.ozon.ru/search/?text=x", limit=130,
+            gather_cfg={}, parallel=2, query="x")
+    except CollectionInterrupted as exc:
+        assert exc.forced
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (forced)")

@@ -24,6 +24,41 @@
 
 ## Статус и следующие шаги (последнее обновление: 2026-09-03)
 
+ - **✅ Ctrl+C: закрыты 2 дыры — докрутка ссылок stop-aware + «живой» 2-й форс (2026-09-03).**
+   Live-прогон выявил: первый Ctrl+C игнорировался, пока шла докрутка выдачи
+   (main-сессия `_collect_links_with_recovery` не проверяла `_STOP_EVENT` и нап.
+   делала recycle/reconnect), а «2-й Ctrl+C = форс-выход» был фактически МЁРТВ:
+   обработчик SIGINT глотает сигнал и не доходил до `except KeyboardInterrupt`,
+   где проверялся `_FORCE_EXIT`. Пофикшено (вариант 1.A, централизованный
+   emergency shutdown).
+   * `search.py new CollectionInterrupted(links, forced)` — низкий уровень НЕ зовёт
+     os._exit(), только сигнализирует (forced=False=стоп / True=форс). `_collect_links`
+     и `_collect_links_with_recovery` принимают `stop_event`/`force_event`
+     (defaults None → cli/тесты не меняются); проверка на границе каждой итерации
+     скролла И до/после каждой recovery (new_tab/recycle), приоритет force>stop;
+     после стопа НЕ запускается повторный recycle/goto (тот самый бесконечный
+     `recycle→reconnect→scroll` из проблемы).
+   * `parallel.py collect_parallel(..., force_event=None)` + `_await_workers`:
+     graceful-стоп докрутки → возвращает partial combined (`discovered_pids` из
+     найденных ссылок, `collected=0`, воркеры НЕ запускаются); форс-стоп докрутки →
+     проброс `CollectionInterrupted(forced=True)`. `_await_workers` при force →
+     `_terminate_worker` ВСЕХ активных воркеров (зачистка их браузеров в родителе),
+     без респавна/новых задач.
+   * `key_daemon.py`: `_inproc_collect` пробрасывает `force_event`; в `run_campaign`
+     явный `except CollectionInterrupted` ДО общего `except Exception` (форс НЕ
+     классифицируется как CRASH/UNKNOWN_FAILURE); `_FORCE_EXIT` проверяется после
+     worker-фазы (`_emergency_shutdown(force="workers")`) и в link-фазе
+     (`force="collection"`). `_emergency_shutdown` — ЕДИНСТВЕННАЯ точка `os._exit(1)`
+     + зачистка pid-файла (bounded cleanup браузеров уже сделал `_await_workers`).
+   * `extract_discovered_pids` сливает `combined.discovered_pids` (graceful-стоп
+     докрутки), иначе найденные ссылки терялись бы (products пуст).
+   * Тесты: +2 `_collect_links`, +1 `_collect_links_with_recovery`, +2
+     `collect_parallel` partial/force, +3 `_await_workers` force(+приоритет),
+     +2 key_daemon (emergency shutdown на FORCE / extract merge); обновлён
+     `fake_collect_links` в test_search.py. 275 key_daemon+parallel+restart и
+     5 search-веток — зелёные. Требует живой проверки: докрутка+Ctrl+C (быстрый
+     стоп) и 2-й Ctrl+C (форс) в реальном прогоне.
+
  - **✅ Красивый Ctrl+C: graceful shutdown воркеров + INTERRUPTED (2026-09-03).**
    Раньше Ctrl+C в консоли Windows получали демон И spawn-воркеры (одна console-group):
    KeyboardInterrupt рвал `finally` воркера и `_stop_worker_browser` не доезжал →

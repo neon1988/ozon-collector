@@ -2946,3 +2946,57 @@ def test_integration_interrupted_during_collect_saves_partial(tmp_path, monkeypa
     finally:
         k._STOP_EVENT = prev
         k._STOP_EVENT.clear()
+
+
+# ---- Форс (2-й Ctrl+C) и частичный discovery из докрутки ---------------------
+
+def test_extract_discovered_pids_merges_partial_discovery_field():
+    """extract_discovered_pids сливает combined.discovered_pids (заполняемые при
+    graceful-стопе докрутки ссылок, когда products пуст)."""
+    combined = {"products": [], "discovered_pids": ["111", "222"]}
+    assert k.extract_discovered_pids(combined) == ["111", "222"]
+    combined2 = {"products": [{"pid": "333", "ok": True}],
+                 "discovered_pids": ["111"]}
+    assert k.extract_discovered_pids(combined2) == ["333", "111"]
+
+
+def test_run_campaign_force_collection_calls_emergency_shutdown(tmp_path, monkeypatch):
+    """FORCE (2-й Ctrl+C) во время докрутки: CollectionInterrupted(forced=True)
+    → вызывается _emergency_shutdown (НЕ классифицируется как CRASH/UNKNOWN).
+    После (недостижимого в проде, т.к. os._exit) возврата из _emergency_shutdown —
+    исключение пробрасывается наверх, а не глотается как UNKNOWN_FAILURE."""
+    from ozon_collector.search import CollectionInterrupted
+    prev_f = k._FORCE_EXIT
+    prev_s = k._STOP_EVENT
+    k._FORCE_EXIT = threading.Event()
+    k._FORCE_EXIT.set()          # форс уже активен
+    k._STOP_EVENT = threading.Event()
+    k._STOP_EVENT.clear()
+    calls = []
+    monkeypatch.setattr(k, "_emergency_shutdown",
+                        lambda progress_path, force="": calls.append(force))
+    try:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir(exist_ok=True)
+        monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path / "campaigns")
+        monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+
+        def raise_forced(progress, run_id, mode, targets=None):
+            raise CollectionInterrupted([], forced=True)
+
+        monkeypatch.setattr(k, "_inproc_collect", raise_forced)
+        monkeypatch.setattr(k, "_NO_COOLDOWN", True)
+
+        with pytest.raises(CollectionInterrupted):
+            k.run_campaign(
+                campaign="testcamp", url="u", target=3, min_valid=1,
+                out="o.md", data_dir=str(data_dir), max_total_hours=24.0,
+                qa_fn=lambda batch: {"products": len(batch), "ok": len(batch),
+                                     "warn": 0, "fail": 0,
+                                     "per_pid": {p: "OK" for p in batch}})
+    finally:
+        k._FORCE_EXIT = prev_f
+        k._STOP_EVENT = prev_s
+    assert calls, "ожидали вызов _emergency_shutdown при FORCE (collection)"
+    assert calls[0] == "collection"

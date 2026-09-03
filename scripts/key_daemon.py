@@ -49,6 +49,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from ozon_collector import log
+from ozon_collector.search import CollectionInterrupted
 
 DATA_DIR = ROOT / "data"
 LOGS_DIR = ROOT / "logs"
@@ -150,11 +151,15 @@ def extract_discovered_pids(combined: Optional[dict]) -> list[str]:
 
     PID нормализуются (снимают URL-обёртку и хвосты), чтобы дальнейшие
     сравнения/словари были консистентны независимо от формата записи.
+    Также сливает combined.discovered_pids (заполняется при graceful-стопе
+    докрутки ссылок в collect_parallel: products пуст, но ссылки найдены).
     """
     if not combined:
         return []
-    return normalize_pids(p["pid"] for p in (combined.get("products") or [])
-                          if p.get("pid") is not None)
+    pids = [p["pid"] for p in (combined.get("products") or [])
+            if p.get("pid") is not None]
+    pids += list(combined.get("discovered_pids") or [])
+    return normalize_pids(pids)
 
 
 def extract_ok_pids(combined: Optional[dict]) -> list[str]:
@@ -1013,7 +1018,7 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
         pids=pids or None, skip_pids=skip_pids, no_bootstrap=False,
         session_budget=session_budget, on_event=_on_event,
         max_worker_restarts=max_restarts, worker_log=worker_log,
-        stop_event=_STOP_EVENT)
+        stop_event=_STOP_EVENT, force_event=_FORCE_EXIT)
 
     combined_file = CAMPAIGNS_DIR / camp / f"combined_{run_id}.json"
     combined_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1318,6 +1323,16 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             try:
                 combined = _inproc_collect(progress, run_id, mode, targets)
                 exit_code = 0
+            except CollectionInterrupted as exc:
+                # FORCE (2-й Ctrl+C) во время докрутки ссылок: воркеры не
+                # спавнились, пользователь требует немедленного выхода.
+                # НЕ классифицируем как CRASH/UNKNOWN_FAILURE — emergency exit.
+                log.error("демон: принудительная остановка (2-й Ctrl+C) во время "
+                          "сбора — экстренное завершение")
+                _emergency_shutdown(progress_path, force="collection")
+                # reachable только если _emergency_shutdown mocked/вернулся:
+                # не даём упасть в unbound exit_code / CRASH-ветку ниже.
+                raise
             except Exception as exc:
                 log.error(f"in-process сбор упал: {exc}")
                 # combined «пуст, но есть» + exit!=0 → UNKNOWN_FAILURE: прежнее
@@ -1330,6 +1345,12 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             _journal_stage(progress, run_id, "run_completed",
                            {"status": status, "exit_code": exit_code})
             _absorb_recovery_telemetry(progress, combined)
+
+            # FORCE (2-й Ctrl+C) в worker-фазе: _await_workers уже принудительно
+            # завершил воркеров (зачистка их браузеров в родителе). Не уходим в
+            # graceful INTERRUPTED/сохранение — экстренный выход (семантика force).
+            if _FORCE_EXIT.is_set():
+                _emergency_shutdown(progress_path, force="workers")
 
             # Ctrl+C во время сбора: collect_parallel вернулся с уже собранным
             # payload (воркеры сворачиваются). Сохраняем, что реально собрано
@@ -1834,6 +1855,32 @@ def parse_args(argv=None):
                     help="не создавать Markdown-дайджест итога кампании "
                          "(по умолчанию создаётся в --out)")
     return ap.parse_args(argv)
+
+
+def _emergency_shutdown(progress_path: Path, force: str = ""):
+    """ЕДИНСТВЕННАЯ точка физического (принудительного) завершения демона.
+
+    Вызывается по 2-му Ctrl+C (FORCE) из точек, где замечен _FORCE_EXIT:
+      - докрутка ссылок: CollectionInterrupted(forced=True) в _inproc_collect;
+      - worker-фаза: _await_workers уже принудительно завершил воркеров
+        (_terminate_worker → _cleanup_worker → force_stop их браузеров), затем
+        этот хелпер вызывается из run_campaign при _FORCE_EXIT.is_set().
+
+    os._exit() здесь — ПРАВИЛЬНЫЙ инструмент: минует graceful-финализацию
+    (aca сематика force — потеря последних незаписанных данных приемлема,
+    пользователь требует немедленного выхода). Низкоуровневые search/parallel
+    НИКОГДА не зовут os._exit — только поднимают сигнал.
+    """
+    log.error(f"демон: emergency shutdown (force{('=' + force) if force else ''}) "
+              f"— принудительный выход")
+    try:
+        pid_file = DATA_DIR / "key_daemon.pid"
+        if pid_file.exists():
+            pid_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+    import os as _os
+    _os._exit(1)
 
 
 def main(argv=None):

@@ -6,7 +6,8 @@ import gzip
 import os
 
 from ozon_collector.search import (
-    SEARCH_JS, search_url, collect_search, _recovery_meta)
+    SEARCH_JS, search_url, collect_search, _recovery_meta,
+    CollectionInterrupted, _collect_links, _collect_links_with_recovery)
 from ozon_collector import browser as B
 from ozon_collector import report as R
 
@@ -960,7 +961,8 @@ def test_collect_search_links_recovery(monkeypatch):
     calls = {"n": 0}
 
     def fake_collect_links(sess, limit, scan_limit=None, max_scrolls=40,
-                           scroll_by=1500, wait_ms=1000, quiet_after=2):
+                           scroll_by=1500, wait_ms=1000, quiet_after=2,
+                           stop_event=None, force_event=None):
         calls["n"] += 1
         if calls["n"] == 1:
             from playwright.sync_api import TimeoutError
@@ -1167,3 +1169,103 @@ def test_recycle_browser_collector_restarts(monkeypatch):
     _S._recycle_browser(sess, FakeManager(), "c-r1")
     assert restarts == ["c-r1"]
     assert reconnects == ["reconnect"]
+
+
+# ---- Кооперативная остановка докрутки ссылок (Ctrl+C) ------------------------
+
+class _InterruptSess(_FakeSess):
+    """Выдача, которая сама поднимает событие после первого eval (для partial)."""
+    def __init__(self, links, event, on_eval):
+        super().__init__(links)
+        self._event = event
+        self._on_eval = on_eval
+
+    def eval(self, js):
+        res = super().eval(js)
+        self._on_eval()
+        return res
+
+
+def test_collect_links_graceful_stop_returns_partial_links():
+    """stop_event на k-й итерации → CollectionInterrupted(forced=False) с
+    частично найденными ссылками (не теряем прогресс докрутки)."""
+    import threading as _t
+    stop = _t.Event()
+    collected = []
+    # 2 ссылки появляются на первом eval, потом событие поднимается ДО след. скролла
+    step = {"n": 0}
+    def _snap():
+        step["n"] += 1
+        if step["n"] == 1:
+            stop.set()
+    sess = _InterruptSess([{"pid": "111", "url": "u111"},
+                           {"pid": "222", "url": "u222"}], stop, _snap)
+    try:
+        _collect_links(sess, limit=10, stop_event=stop)
+    except CollectionInterrupted as exc:
+        collected = exc.links
+        assert not exc.forced
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (graceful)")
+    pids = [l["pid"] for l in collected]
+    assert pids == ["111", "222"]     # частичные ссылки сохранены
+
+
+def test_collect_links_force_stop_raises_forced():
+    """force_event → CollectionInterrupted(forced=True) — emergency (не graceful)."""
+    import threading as _t
+    force = _t.Event()
+    force.set()
+    sess = _FakeSess([{"pid": "111", "url": "u111"}])
+    try:
+        _collect_links(sess, limit=10, force_event=force)
+    except CollectionInterrupted as exc:
+        assert exc.forced
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (forced)")
+
+
+def test_collect_links_force_beats_stop():
+    """Оба события установлены → побеждает force (FORCE > STOP)."""
+    import threading as _t
+    stop = _t.Event()
+    force = _t.Event()
+    stop.set()
+    force.set()
+    sess = _FakeSess([{"pid": "111", "url": "u111"}])
+    try:
+        _collect_links(sess, limit=10, stop_event=stop, force_event=force)
+    except CollectionInterrupted as exc:
+        assert exc.forced
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (forced)")
+
+
+def test_collect_links_with_recovery_stop_blocks_retry(monkeypatch):
+    """stop_event между попытками recovery → НЕ запускаем следующий recycle и
+    не повторяем goto: пробрасываем CollectionInterrupted (не endless retry)."""
+    import threading as _t
+    import ozon_collector.search as _S
+    stop = _t.Event()
+    stop.set()                       # стоп активен до входа в контур recovery
+
+    class _Sess:
+        def goto(self, url, wait_ms=None):
+            pass
+        @property
+        def page(self):
+            return None
+
+    recycled = []
+    monkeypatch.setattr(_S, "_recycle_browser",
+                        lambda sess, manager, la: recycled.append(la))
+    try:
+        _collect_links_with_recovery(_Sess(), manager=None, url="u",
+                                     limit=5, max_recycles=2,
+                                     recovery={"events": []},
+                                     stop_event=stop)
+    except CollectionInterrupted as exc:
+        assert not exc.forced
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (graceful)")
+    assert recycled == []            # повторная recovery НЕ запускалась

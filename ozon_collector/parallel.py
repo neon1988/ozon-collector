@@ -738,7 +738,7 @@ def _await_workers(wctxs: list, deadline: float,
                    session_budget: dict | None, on_event=None,
                    worker_log: str | None = None,
                    poll: float = 0.3,
-                   stop_event=None) -> list:
+                   stop_event=None, force_event=None) -> list:
     """Дождаться завершения воркеров, перезапуская аварийно упавших.
 
     max_worker_restarts=0 → исходное поведение (join по очереди, terminate
@@ -751,9 +751,26 @@ def _await_workers(wctxs: list, deadline: float,
     force_stop браузера в родителе), НЕ помечая остановку как CRASH.
     Уже собранный payload сохраняется; текущий item воркера теряется и на
     resume добирается заново (это цена graceful shutdown без 2-го канала IPC).
+
+    force_event (2-й Ctrl+C) — приоритет над stop_event: немедленно
+    _terminate_worker для ВСЕХ активных воркеров (зачистка их браузеров в
+    родителе), без респавна и без выдачи новых задач. Сам os._exit() НЕ зовём —
+    это ответственность демона (emergency shutdown).
     """
+    def _force_stop():
+        log.warning("stop: force (Ctrl+C ×2) — принудительно завершаю всех "
+                    "воркеров (без респавна)")
+        for wctx in list(wctxs):
+            if wctx.proc.is_alive() and not wctx.done:
+                _terminate_worker(wctx, "force: 2-й Ctrl+C, emergency stop")
+            else:
+                _finalize_worker(wctx)
+
     if max_worker_restarts <= 0:
         while True:
+            if force_event is not None and force_event.is_set():
+                _force_stop()
+                break
             if stop_event is not None and stop_event.is_set():
                 for wctx in wctxs:
                     if wctx.proc.is_alive() and not wctx.done:
@@ -788,6 +805,10 @@ def _await_workers(wctxs: list, deadline: float,
     active = list(wctxs)
     finalized: list = []
     while active:
+        if force_event is not None and force_event.is_set():
+            _force_stop()
+            finalized = [wctx for wctx in wctxs]
+            break
         if stop_event is not None and stop_event.is_set():
             log.warning("stop: user interrupt (Ctrl+C) — сворачиваю воркеров, "
                         f"без респавна (active={len(active)})")
@@ -880,7 +901,8 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      on_event=None,
                      max_worker_restarts: int = 0,
                      worker_log: str | None = None,
-                     stop_event=None) -> dict:
+                     stop_event=None,
+                     force_event=None) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
 
     pids — явный список артикулов вместо докрутки выдачи: main-сессия не
@@ -891,6 +913,16 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
 
     Возвращает combined-объект схемы 2.0 (аддитивно parallel{workers[],shards[]}).
     Ошибка preflight → RuntimeError (воркеры не запускаются).
+
+    stop_event/force_event (от демона, threading.Event): остановка Ctrl+C.
+      stop_event  во время докрутки ссылок → CollectionInterrupted(forced=False):
+                  возвращаем частичный combined (discovered_pids из найденных
+                  ссылок, collected=0, воркеры НЕ запускаем) — демон сохранит
+                  discovery и завершится INTERRUPTED.
+      force_event во время докрутки → пробрасываем CollectionInterrupted(forced=True)
+                  наверх: воркеры ещё не спавнились, экстренный выход выполняет
+                  демон. force_event во время worker-фазы обрабатывает
+                  _await_workers (terminate всех воркеров).
     """
     parallel = int(parallel)
     if pids:
@@ -904,7 +936,33 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         try:
             manager_main = BrowserProcessManager(cdp_url=sess.cdp_url)
             links = S._collect_links_with_recovery(
-                sess, manager_main, url, limit, max_recycles, recovery_main)
+                sess, manager_main, url, limit, max_recycles, recovery_main,
+                stop_event=stop_event, force_event=force_event)
+        except S.CollectionInterrupted as exc:
+            # finally ниже всё равно гасит main-браузер и сессию; здесь только
+            # решаем: graceful (вернуть partial) или force (пробросить).
+            if exc.forced:
+                log.warning("collection: принудительная остановка докрутки ссылок "
+                            "(Ctrl+C ×2) — пробрасываю в демон (emergency)")
+                raise
+            log.warning("collection: докрутка ссылок прервана Ctrl+C — возвращаю "
+                        f"частично найденные ссылки ({len(exc.links)})")
+            discovered = [it["pid"] for it in exc.links]
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "collector_version": VERSION,
+                "collected_at_utc": _now(),
+                "search": {"url": url, "query": query},
+                "found": len(exc.links),
+                "limit": limit,
+                "collected": 0,
+                "excluded": 0,
+                "discovered_pids": discovered,
+                "recovery": recovery_main,
+                "products": [],
+                "interrupted": True,
+                "parallel": {"workers": [], "shards": []},
+            }
         finally:
             try:
                 sess.close()
@@ -953,7 +1011,8 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         items_by_index={i: (pid, url) for i, pid, url in items},
         gather_cfg=gather_cfg, max_recycles=max_recycles,
         session_budget=session_budget, on_event=on_event,
-        worker_log=worker_log, stop_event=stop_event)
+        worker_log=worker_log, stop_event=stop_event,
+        force_event=force_event)
 
     payloads = []
     for wctx in wctxs:

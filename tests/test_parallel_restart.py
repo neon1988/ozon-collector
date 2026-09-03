@@ -369,3 +369,67 @@ def test_await_stop_event_late_break():
     assert time.monotonic() - t0 < 10    # вышел по stop, не по дедлайну (30с)
     assert not w.proc.is_alive()         # воркер stop'нут (terminate/join)
     assert len(out) == 1 and out[0] is w
+
+
+# ---- Принудительный стоп (2-й Ctrl+C → force_event) --------------------------
+
+def test_await_force_event_terminates_no_restart_limit0(monkeypatch):
+    """Ветка limit=0: force_event принудительно сворачивает воркеров без respawn."""
+    import threading as _t
+    w = _mk_worker(worker_id=1, alive=True, done=False, pending=[0, 1, 2])
+    w.last_activity = time.monotonic()
+    called = []
+    monkeypatch.setattr(PL, "_respawn", lambda *a, **k: called.append(1))
+    force = _t.Event()
+    force.set()
+    out = PL._await_workers([w], deadline=time.monotonic() + 30,
+                            max_worker_restarts=0, items_by_index={},
+                            gather_cfg={}, max_recycles=2,
+                            session_budget=None, poll=0.01,
+                            force_event=force)
+    assert called == []                 # респавна нет
+    assert not w.proc.is_alive()        # terminate'нут (зачистка браузера в родителе)
+    assert len(out) == 1 and out[0] is w
+
+
+def test_await_force_event_terminates_no_restart_restart_branch(monkeypatch):
+    """Ветка restart: force_event принудительно завершает всех воркеров, без
+    выдачи новых задач и без респавна."""
+    import threading as _t
+    w1 = _mk_worker(worker_id=1, alive=True, done=False, pending=[0, 1])
+    w2 = _mk_worker(worker_id=2, alive=True, done=False, pending=[0, 1])
+    for w in (w1, w2):
+        w.last_activity = time.monotonic()
+    called = []
+    monkeypatch.setattr(PL, "_respawn", lambda *a, **k: called.append(1))
+    force = _t.Event()
+    force.set()
+    out = PL._await_workers([w1, w2], deadline=time.monotonic() + 30,
+                            max_worker_restarts=2, items_by_index={},
+                            gather_cfg={}, max_recycles=2,
+                            session_budget=None, poll=0.01,
+                            force_event=force)
+    assert called == []                 # НЕ респавним
+    assert not w1.proc.is_alive() and not w2.proc.is_alive()  # оба terminate'нуты
+    assert len(out) == 2                # оба в результате (зачищены)
+
+
+def test_await_force_priority_over_stop(monkeypatch):
+    """Если установлены И stop_event, И force_event — побеждает force."""
+    import threading as _t
+    w = _mk_worker(worker_id=1, alive=True, done=False, pending=[0, 1])
+    w.last_activity = time.monotonic()
+    called = []
+    monkeypatch.setattr(PL, "_respawn", lambda *a, **k: called.append(1))
+    stop = _t.Event()
+    force = _t.Event()
+    stop.set()
+    force.set()
+    out = PL._await_workers([w], deadline=time.monotonic() + 30,
+                            max_worker_restarts=2, items_by_index={},
+                            gather_cfg={}, max_recycles=2,
+                            session_budget=None, poll=0.01,
+                            stop_event=stop, force_event=force)
+    assert called == []
+    assert not w.proc.is_alive()
+    assert len(out) == 1 and out[0] is w

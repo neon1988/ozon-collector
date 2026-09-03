@@ -49,6 +49,28 @@ SEARCH_JS = r"""
 """
 
 
+class CollectionInterrupted(Exception):
+    """Кооперативная остановка докрутки выдачи пользователем (Ctrl+C в демоне).
+
+    Наследует Exception и пробрасывается из _collect_links /
+    _collect_links_with_recovery вверх до демона. Ключевой маркер — флаг `forced`:
+
+      forced=False (STOP):  первый Ctrl+C — graceful; часть уже найденных ссылок
+                           (self.links) НЕ должна теряться, их сохраняем в
+                           discovered_pids, сбор воркеров НЕ запускаем.
+      forced=True  (FORCE): второй Ctrl+C — экстренный выход; низкий уровень НЕ
+                           зовёт os._exit(), а лишь сигнализирует — решение о
+                           физическом завершении принимает lifecycle демона.
+
+    Низкоуровневые search.py/parallel.py никогда не вызывают os._exit() — только
+    поднимают/пробрасывают это исключение.
+    """
+    def __init__(self, links=None, forced: bool = False):
+        super().__init__("collection interrupted (forced=%s)" % forced)
+        self.links = list(links) if links else []
+        self.forced = bool(forced)
+
+
 def search_url(query: str) -> str:
     """URL выдачи по текстовому запросу."""
     q = urllib.parse.quote(query)
@@ -57,7 +79,8 @@ def search_url(query: str) -> str:
 
 def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
                    max_scrolls: int = 40, scroll_by: int = 1500,
-                   wait_ms: int = 1000, quiet_after: int = 2) -> list[dict]:
+                   wait_ms: int = 1000, quiet_after: int = 2,
+                   stop_event=None, force_event=None) -> list[dict]:
     """Докручивает выдачу (tileGridDesktop), пока прибавляются товары.
 
     Возвращает ВСЕ найденные уникальные товары (found) — НЕ ограничиваясь
@@ -72,6 +95,15 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
 
     seen копим в Python: virtual-лист может размонтировать ушедшие вверх
     карточки, и они не должны потеряться.
+
+    stop_event/force_event (threading.Event, от демона) — кооперативная
+    остановка Ctrl+C. Приоритет: FORCE > STOP. На границе каждой итерации:
+      stop_event  → CollectionInterrupted(links, forced=False) — graceful,
+                    возвращаем частично найденные ссылки, чтобы сохранить их
+                    в discovered_pids и не потерять прогресс докрутки;
+      force_event → CollectionInterrupted(links, forced=True) — emergency.
+    Уже идущий блокирующий CDP-вызов (scroll/eval) не прерывается polling-флагом,
+    но задержка ограничена одной итерацией / таймаутом сессии.
     """
     if scan_limit is None:
         scan_limit = max(limit, 50)
@@ -79,6 +111,14 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
     stagnant = 0
     prev = 0
     for i in range(max_scrolls + 1):
+        if force_event is not None and force_event.is_set():
+            raise CollectionInterrupted(
+                [{"pid": p, "url": u} for p, u in seen.items()], forced=True)
+        if stop_event is not None and stop_event.is_set():
+            log.info("[stop] прерывание докрутки выдачи (Ctrl+C) — сохраняю "
+                     f"частично найденные ссылки ({len(seen)})")
+            raise CollectionInterrupted(
+                [{"pid": p, "url": u} for p, u in seen.items()], forced=False)
         for item in sess.eval(SEARCH_JS):
             seen.setdefault(item["pid"], item["url"])
         log.debug(f"links iter {i}: seen={len(seen)} stagnant={stagnant}")
@@ -218,7 +258,8 @@ def _recovery_meta(sess, ev: dict, duration: float | None = None,
 
 
 def _collect_links_with_recovery(sess, manager, url: str, limit: int,
-                                 max_recycles: int, recovery: dict):
+                                 max_recycles: int, recovery: dict,
+                                 stop_event=None, force_event=None):
     """Докрутка выдачи с recovery по FSM-лестнице (ADR §14.2).
 
     Единый контур с _collect_shard: access_challenge → new_tab×1 → recycle×1 →
@@ -226,19 +267,35 @@ def _collect_links_with_recovery(sess, manager, url: str, limit: int,
     (renderer_failure/browser) → recycle до max_recycles. Зависание renderer'а
     при докрутке не роняет весь search traceback'ом — перезапуск и повтор.
     Возвращает найденные ссылки; после исчерпания — пробрасывает ошибку.
-    Телеметрия пишется в recovery (pid='links')."""
+    Телеметрия пишется в recovery (pid='links').
+
+    stop_event/force_event (от демона): на верху каждой итерации цикла И перед
+    каждой recovery-операцией (new_tab/_recycle_browser/reconnect) проверяем их,
+    чтобы после Ctrl+C НЕ запускать повторный recovery/reconnect/scroll (тот
+    самый «recycle→reconnect→новая попытка» цикл из проблемы). CollectionInterrupted
+    из _collect_links пробрасывается как есть.
+    """
     attempts = 0
     incident_new_tab = INCIDENT_NEW_TAB_MAX
     incident_recycle = INCIDENT_RECYCLE_MAX
     while True:
+        if force_event is not None and force_event.is_set():
+            raise CollectionInterrupted(forced=True)
+        if stop_event is not None and stop_event.is_set():
+            log.info("[stop] прерывание докрутки выдачи до повторной попытки "
+                     "(Ctrl+C)")
+            raise CollectionInterrupted(forced=False)
         attempt_t0 = time.time()
         attempts += 1
         try:
             sess.goto(url)
             if getattr(sess, "page", None) is not None:
                 C.check_challenge(sess.page, "search_page")
-            return _collect_links(sess, limit)
+            return _collect_links(sess, limit, stop_event=stop_event,
+                                  force_event=force_event)
         except Exception as e:
+            if isinstance(e, CollectionInterrupted):
+                raise
             cls = B.classify_error(e, sess=sess)
             kind = cls.error_kind or "unknown"
             # access_challenge → FSM-лестница (FAB залипает на вкладке):
