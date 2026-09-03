@@ -157,42 +157,22 @@ def _num(v):
 
 
 def _price_block(product: dict) -> list:
-    """Строки секции цены: price (webPrice, точная) / price_parsed / price_parts."""
-    lines = []
+    """Строки секции цены: только цена с Ozon Картой (price.bank, кнопка
+    «С банками») одной строкой. Старая цена, current, уверенность и структура
+    price_parts не выводятся (по решению пользователя 2026-09-03).
+
+    Если цены с картой нет — fallback на текущую цену (price.current) одной
+    строкой; при её отсутствии — на raw price_text.
+    """
     p = product.get("price") or {}
-    current = _num(p.get("current"))
-    if current:
-        money = lambda v: f"{_num(v):,}".replace(",", " ")
-        lines.append(f"Цена: {money(current)} ₽")
-        if p.get("old"):
-            disc = round((1 - current / _num(p["old"])) * 100)
-            lines.append(f"- Старая цена: {money(p['old'])} ₽ (скидка {disc}%)")
-        if p.get("bank"):
-            lines.append(f"- С банком (кнопка «С банками»): {money(p['bank'])} ₽")
-        if p.get("confidence"):
-            lines.append(f"- Уверенность: {p['confidence']:.0%} (источник: {p.get('source')})")
-        return lines
-    parsed = product.get("price_parsed") or []
-    parts = product.get("price_parts") or []
-    if parsed:
-        for p in parsed[:3]:
-            lines.append(f"- {p.get('raw')}")
-        lines.append("")
-        lines.append("_Цена актуальная (крупный кегль/bold). Для оплаты через СБП/иные способы "
-                     "могут быть другие цены — см. price_parsed выше._")
-    if parts:
-        lines.append("")
-        lines.append("### Структура цены (price_parts)")
-        lines.append("")
-        lines.append("| Текст | Кегль | Bold | Зачёркнута |")
-        lines.append("|-------|------|------|------------|")
-        for p in parts:
-            strike = "✓" if p.get("strike") else ""
-            lines.append(f"| {p.get('t', '')} | {p.get('fs', 0)} | {'✓' if p.get('weight') else ''} | {strike} |")
-        lines.append("")
-    elif product.get("price_text"):
-        lines.append(f"- {product['price_text']}")
-    return lines
+    money = lambda v: f"{_num(v):,}".replace(",", " ")
+    if p.get("bank"):
+        return [f"Цена с Ozon Картой: {money(p['bank'])} ₽"]
+    if p.get("current"):
+        return [f"Цена: {money(p['current'])} ₽"]
+    if product.get("price_text"):
+        return [f"- {product['price_text']}"]
+    return []
 
 
 def _variant_str(target: dict) -> str:
