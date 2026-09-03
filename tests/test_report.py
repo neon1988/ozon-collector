@@ -407,6 +407,9 @@ def test_collapse_newlines_keeps_single_newlines():
     assert _collapse_newlines("а\nб") == "а\nб"
     assert _collapse_newlines("   ") == ""
     assert _collapse_newlines("") == ""
+    # неразрывные/узкие юникод-пробелы заменяются обычными
+    assert _collapse_newlines("Цена\u00a01\u2009234\u200a₽") == "Цена 1 234 ₽"
+    assert "\u00a0" not in _collapse_newlines("a\u00a0b\u202fc\u2009d")
 
 
 def test_render_collapses_blank_lines_in_review_text():
@@ -419,6 +422,18 @@ def test_render_collapses_blank_lines_in_review_text():
     assert "Здравствуйте!\nСпасибо за отзыв.\nКоманда Fiio" in md
     # признаков исходных пустых (двойных) переводов строк не осталось в блоке текста
     assert "Спасибо за отзыв.\n\nКоманда" not in md
+
+
+def test_render_description_replaces_nbsp(tmp_path=None):
+    from ozon_collector.report import render
+    raw = _raw([])
+    raw["product"]["descriptions"] = ["Описание \u00a0с\u2009неразрывными\u200aпробелами\u00a0и\n\nпереносом"]
+    md = render(raw, dedup_replies=False)
+    assert "\u00a0" not in md
+    assert "\u2009" not in md and "\u200a" not in md
+    assert "с неразрывными пробелами и" in md
+    # двойного переноса больше нет
+    assert "и\n\nпереносом" not in md
 
 
 def _ok_result(pid, n_same=1):
