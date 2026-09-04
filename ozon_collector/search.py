@@ -24,6 +24,7 @@ from . import process as P
 from . import puzzle as _puzzle
 from .cdp import browser_tabs_count
 from .gather import run_gather
+from .report import sort_digest_products
 
 SEARCH_JS = r"""
 () => {
@@ -415,8 +416,9 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
     _puzzle.reset()
     budget = recovery.get("session_budget") or SESSION_BUDGET_DEFAULT
     used = recovery.setdefault("session_used", {"challenge": 0, "new_tab": 0,
-                                                "browser_recycle": 0})
+                                                 "browser_recycle": 0})
     started_ts = recovery.get("session_started_ts", time.time())
+
     for n, (idx, pid, url) in enumerate(items, 1):
         # жёсткий таймер сессии (ADR §14.4): wall_clock_s исчерпан → abort
         if budget.get("wall_clock_s") and \
@@ -691,7 +693,7 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
         # сессии НЕ доказана, проверяем перед следующим PID. После new_tab challenge
         # уже снят на товарном URL и товар собран (check_challenge прошёл) — canary
         # избыточен (не трогаем Qrator лишний раз). НЕ после профилактического recycle.
-        if res["ok"] and last_recovery == "recycle" and access_recovery:
+        if sess is not None and res["ok"] and last_recovery == "recycle" and access_recovery:
             canary = run_canary(sess)
             if canary != CANARY_OK:
                 canary_fails = recovery.setdefault("canary_fails", 0) + 1
@@ -719,8 +721,9 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
         # Recycle по browser stability (ADR §14.5): renderer-ошибки (OOM/краши)
         # или safety-ceiling RECYCLE_EVERY. НЕ по challenge (access отдельно).
         bstats = recovery.setdefault("browser_stats", {"renderer_errors": 0})
-        if since_recycle >= RECYCLE_EVERY or \
-                bstats.get("renderer_errors", 0) >= RENDERER_RECYCLE_THRESHOLD:
+        if sess is not None and (
+                since_recycle >= RECYCLE_EVERY or
+                bstats.get("renderer_errors", 0) >= RENDERER_RECYCLE_THRESHOLD):
             try:
                 _recycle_browser(sess, manager, f"{label}-preventive-{n}")
             except Exception as e:
@@ -836,6 +839,7 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
 
     products = _collect_shard(sess, manager, items, gather_cfg,
                               max_recycles, recovery, label="search")
+    sort_digest_products(products)
     collected = sum(1 for p in products
                     if p["ok"] and not p.get("excluded"))
     excluded = sum(1 for p in products if p.get("excluded"))

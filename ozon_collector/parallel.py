@@ -18,6 +18,7 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 from . import SCHEMA_VERSION, VERSION
@@ -26,6 +27,7 @@ from . import log
 from . import process as P
 from . import search as S
 from .browser import BrowserProcessManager
+from .report import sort_digest_products
 
 WORKER_LOG_DIR = "logs"
 
@@ -36,6 +38,12 @@ WORKER_LOG_DIR = "logs"
 # на заблокированном renderer'е висит без таймаута) и terminate'им с
 # перезапуском. Единый контроль воркеров в оркестраторе и для parallel=1.
 WORKER_STALL_S = 300           # 5 мин без heartbeat = зависание (в т.ч. параллель=1)
+
+# Размер пачки динамической раздачи (единиц товаров за один task_request).
+# Компромисс между балансировкой и overhead handshake (сбор товара 5-180 с ⇒
+# пачка 5 даёт почти нулевой отрицательный эффект). Настраивается через
+# gather_cfg["batch_size"] для эмпирического тюнинга.
+DEFAULT_BATCH_SIZE = 5
 
 
 # ---- Спеки и сериализуемые структуры ---------------------------------------
@@ -156,12 +164,18 @@ def preflight_check(specs: list[dict]) -> list[str]:
 # ---- WorkerContext и reader ------------------------------------------------
 
 class WorkerContext:
-    """Состояние воркера со стороны parent: процесс, события, payload."""
+    """Состояние воркера со стороны parent: процесс, события, payload.
 
-    def __init__(self, spec: dict, proc, conn):
+    conn — канал воркер→parent (все сообщения от воркера: start/heartbeat/
+    progress/recovery/done_batch/done). p2w_conn — обратный канал parent→worker
+    (только выдача пачек {t:"next", batch} / {t:"none"}).
+    """
+
+    def __init__(self, spec: dict, proc, conn, p2w_conn=None):
         self.spec = spec
         self.proc = proc
         self.conn = conn
+        self.p2w_conn = p2w_conn
         self.pid: int | None = None
         self.started: bool = False
         self.recovery_events: list[dict] = []
@@ -183,6 +197,16 @@ class WorkerContext:
         # каждом сообщении от воркера (start/recovery/progress/done/hb).
         # Оркестратор по простою этого поля terminate'ит зависший воркер.
         self.last_activity: float = time.monotonic()
+        # Динамическая пакетная раздача: флаг «воркер запросил пачку и ждёт
+        # ответа» (выставляется reader-потоком при {t:"task_request"}/
+        # {t:"done_batch"}). Модифицируется ТОЛЬКО reader-потоком; читается
+        # (и сбрасывается) главным циклом _await_workers при раздаче.
+        self.waiting_for_batch: bool = False
+        # Индексы завершённой пачки воркера (из done_batch processed+failed),
+        # накопленные reader-потоком; главный цикл переводит их в
+        # completed_indexes. Отдельная очередь — чтобы не было гонки reader
+        # thread ↔ основной цикл по модификации общих completed_indexes.
+        self.batch_completed: list[int] = []
 
     @property
     def worker_idx(self) -> int:
@@ -207,6 +231,18 @@ def _reader_loop(wctx: WorkerContext, on_event=None):
             elif t == "progress":
                 wctx.payload = msg.get("payload") or {}
                 _update_pending(wctx)
+            elif t == "task_request":
+                wctx.waiting_for_batch = True
+            elif t == "done_batch":
+                pl = msg.get("payload") or {}
+                wctx.payload = pl
+                _update_pending(wctx)
+                wctx.batch_completed.extend(
+                    list(pl.get("processed_indexes") or [])
+                    + list(pl.get("failed_indexes") or []))
+                # воркер сразу обязан отослать следующий task_request, но
+                # страхуемся: после done_batch тоже готовы к выдаче пачки.
+                wctx.waiting_for_batch = True
             elif t == "hb":
                 pass  # heartbeat: last_activity уже обновлён выше
             elif t == "done":
@@ -246,16 +282,33 @@ def _update_pending(wctx: WorkerContext):
 
 
 def _spawn_ctx(spec: dict, task: dict, on_event=None) -> WorkerContext:
-    """spawn воркера + reader-поток (протокол накапливается в WorkerContext)."""
+    """spawn воркера + reader-поток (протокол накапливается в WorkerContext).
+
+    Два однонаправленных pipe (динамическая пакетная раздача):
+      worker→parent: conn (все сообщения воркера);
+      parent→worker : p2w_conn (только выдача пачек next/none).
+    task["items"] — начальный список для merge-совместимости/журнала; при
+    динамической раздаче фактическая выдача идёт через p2w_conn по заданию
+    оркестратора, а НЕ через статический шард.
+    """
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
-    proc = ctx.Process(target=worker_main, args=(spec, task, child_conn),
+    # parent→worker канал: duplex=False → первый конец RECV, второй SEND.
+    # Родителю нужен SEND (отправлять пачки), воркеру — RECV (принимать).
+    # Переставляем: p2w_conn (родитель) = SEND-конец, p2w_child = RECV-конец.
+    _p2w_recv, _p2w_send = multiprocessing.Pipe(duplex=False)
+    p2w_child = _p2w_recv
+    p2w_conn = _p2w_send
+    proc = ctx.Process(target=worker_main,
+                       args=(spec, task, child_conn, p2w_child),
                        name=f"ozon-worker-{spec['worker_id']}")
     proc.start()
     child_conn.close()
-    wctx = WorkerContext(spec, proc, parent_conn)
+    p2w_child.close()
+    wctx = WorkerContext(spec, proc, parent_conn, p2w_conn)
     wctx.shard_indexes = [int(idx) for idx, _p, _u in (task.get("items") or [])]
     wctx.pending_indexes = list(wctx.shard_indexes)
+    wctx.waiting_for_batch = True
     wctx.reader = threading.Thread(target=_reader_loop, args=(wctx, on_event),
                                    daemon=True)
     wctx.reader.start()
@@ -387,7 +440,7 @@ def _stop_worker_browser(spec: dict) -> int:
         return 0
 
 
-def worker_main(spec: dict, task: dict, conn):
+def worker_main(spec: dict, task: dict, conn, p2w_conn):
     """Точка входа воркер-процесса: свой браузер, свой шард, payload → pipe.
 
     Весь worker_main в try/except (правка 5): любое исключение → payload с
@@ -477,11 +530,9 @@ def worker_main(spec: dict, task: dict, conn):
         from .collect import set_heartbeat_hook
         set_heartbeat_hook(_hb)
 
-        warmup = _warmup_session(sess, label=f"worker{spec['worker_id']}")
-        payload["warmup"] = warmup
+        warmup = _warmup_session(sess, label=f"worker{k}")
         _send(conn, {"t": "warmup", "worker": k, **warmup})
 
-        items = list(task["items"])
         gather_cfg = dict(task.get("gather_cfg") or {})
         max_recycles = int(task.get("max_recycles", 2))
         recovery = payload["recovery_metrics"]
@@ -495,36 +546,82 @@ def worker_main(spec: dict, task: dict, conn):
             # сюда — только телеметрия по pipe родителю.
             _send(conn, {"t": "recovery", "worker": k, **ev})
 
-        def on_progress(products, n, total):
-            # периодическая передача частичных результатов: при terminate
-            # родитель берёт последний progress-снимок, и собранные товары
-            # не теряются (без этого payload уходит только в конце и всё
-            # падает в "worker terminated/failed").
-            if n % PROGRESS_EVERY != 0:
-                return
-            partial = {
-                "products": [
-                    {"index": idx, "result": res}
-                    for (idx, _pid, _url), res in zip(items, products)],
-                "processed_indexes": [idx for idx, _p, _u in items[:len(products)]],
-                "failed_indexes": [
-                    idx for (idx, _p, _u), res in zip(items, products)
-                    if not res["ok"]],
-            }
-            _send(conn, {"t": "progress", "worker": k, "payload": partial})
+        # Суммарный результат воркера (по всем пачкам): сохраняем отдельно,
+        # т.к. payload наполняется по пачкам, а итоговый {"t":"done"} уходит
+        # один раз в конце.
+        agg_products: list[dict] = []
+        agg_processed: list[int] = []
+        agg_failed: list[int] = []
+        num_batches = 0
 
-        results = _run_shard(
-            spec, sess, manager, items, gather_cfg,
-            max_recycles=max_recycles, recovery=recovery,
-            on_recovery=on_recovery, on_progress=on_progress)
+        def _recv_batch(recv_conn):
+            """Дождаться следующей пачки от оркестратора.
 
-        payload["products"] = [
-            {"index": idx, "result": res}
-            for (idx, _pid, _url), res in zip(items, results)]
-        payload["processed_indexes"] = [idx for idx, _p, _u in items]
-        payload["failed_indexes"] = [
-            idx for (idx, _p, _u), res in zip(items, results)
-            if not res["ok"]]
+            Блокирующий recv между пачками (Windows: poll на pipe не работает).
+            При обрыве канала (родитель умер) — EOFError/BrokenPipeError →
+            трактуем как конец работы (graceful выход).
+            """
+            try:
+                msg = recv_conn.recv()
+            except (EOFError, OSError, ValueError):
+                return None
+            if not isinstance(msg, dict):
+                return None
+            if msg.get("t") != "next" or not msg.get("batch"):
+                return None
+            return list(msg["batch"])
+
+        # Первая пачка: сразу после прогрева.
+        batch = _recv_batch(p2w_conn)
+        while batch is not None:
+            num_batches += 1
+            items = list(batch)
+
+            def on_progress(products, n, total):
+                # периодическая передача частичных результатов текущей пачки:
+                # при terminate родитель берёт последний progress-снимок, и
+                # собранные товары не теряются.
+                if n % PROGRESS_EVERY != 0:
+                    return
+                partial = {
+                    "products": [
+                        {"index": idx, "result": res}
+                        for (idx, _pid, _url), res in zip(items, products)],
+                    "processed_indexes": [
+                        idx for idx, _p, _u in (items or [])[:len(products)]],
+                    "failed_indexes": [
+                        idx for (idx, _p, _u), res in zip(items, products)
+                        if not res["ok"]],
+                }
+                _send(conn, {"t": "progress", "worker": k, "payload": partial})
+
+            results = _run_shard(
+                spec, sess, manager, items, gather_cfg,
+                max_recycles=max_recycles, recovery=recovery,
+                on_recovery=on_recovery, on_progress=on_progress)
+
+            agg_products.extend(
+                {"index": idx, "result": res}
+                for (idx, _pid, _url), res in zip(items, results))
+            agg_processed.extend(idx for idx, _p, _u in items)
+            agg_failed.extend(
+                idx for (idx, _p, _u), res in zip(items, results)
+                if not res["ok"])
+            _send(conn, {
+                "t": "done_batch", "worker": k,
+                "payload": {
+                    "products": [
+                        {"index": idx, "result": res}
+                        for (idx, _pid, _url), res in zip(items, results)],
+                    "processed_indexes": list(agg_processed),
+                    "failed_indexes": list(agg_failed),
+                }})
+            batch = _recv_batch(p2w_conn)
+
+        payload["products"] = agg_products
+        payload["processed_indexes"] = agg_processed
+        payload["failed_indexes"] = agg_failed
+        payload["num_batches"] = num_batches
         payload["rss_bytes"] = P.rss_bytes(os.getpid())
     except Exception as e:
         payload["fatal_error"] = f"{type(e).__name__}: {e}"
@@ -549,10 +646,38 @@ def worker_main(spec: dict, task: dict, conn):
             conn.close()
         except Exception:
             pass
+        try:
+            p2w_conn.close()
+        except Exception:
+            pass
     return 0
 
 
 # ---- Parent: merge, cleanup, collect_parallel ------------------------------
+
+def _rebuild_shards(owner: dict, pid_by_idx: dict, url_by_idx: dict,
+                    items: list, parallel: int) -> list[list[tuple]]:
+    """Собрать совместимый shards из актуального owner (полные кортежи).
+
+    Формат прежний: shards[k-1] = [(idx,pid,url), ...]. Индексы, не выданные
+    ни одному воркеру (динамическая раздача их не успела раздать — e.g.
+    graceful stop), остаются в статически-назначенном шарде (owner fallback),
+    чтобы merge корректно пометил их как "terminated/failed".
+    """
+    shards: list[list[tuple]] = [[] for _ in range(parallel)]
+    seen: set[int] = set()
+    for idx in sorted(owner):
+        w_k = int(owner[idx])
+        shards[w_k - 1].append((idx, pid_by_idx.get(idx), url_by_idx.get(idx)))
+        seen.add(idx)
+    # fallback-владелец для невыданных индексов (тот же round-robin, что в
+    # shard_items) — только для подсчёта owner в merge.
+    for idx, pid, url in items:
+        if idx in seen:
+            continue
+        shards[idx % parallel].append((idx, pid, url))
+    return shards
+
 
 def merge_shard_results(payloads: list[dict], shards: list[list[tuple]]) -> list[dict]:
     """Слияние по index → products строго в исходном порядке (всего len(shards)*N).
@@ -599,6 +724,12 @@ def _cleanup_worker(wctx: WorkerContext):
     except Exception as e:
         log.warning(f"worker{spec['worker_id']} cleanup: "
                     f"{type(e).__name__}: {e}")
+    for _c in (wctx.conn, wctx.p2w_conn):
+        try:
+            if _c is not None:
+                _c.close()
+        except Exception:
+            pass
 
 
 def _storm_summary(wctxs, payloads, parallel: int) -> dict | None:
@@ -646,19 +777,35 @@ def _finalize_worker(wctx: WorkerContext):
             pass
 
 
-def _needs_restart(wctx: WorkerContext, max_restarts: int) -> bool:
-    """Нужен ли перезапуск воркера (аварийная гибель без доведения шарда).
+def _needs_restart(wctx: WorkerContext, max_restarts: int,
+                   dynamic: bool = False,
+                   owner: dict | None = None,
+                   completed_indexes: set | None = None,
+                   shared_items=None) -> bool:
+    """Нужен ли перезапуск воркера (аварийная гибель без доведения работы).
 
     Перезапускаем ТОЛЬКО при реальном сбое (процесс умер без done, либо done
-    с fatal_error/ненулевым exitcode), когда остались недоделанные индексы и
-    лимит перезапусков ещё не исчерпан. Истечение времени (deadline_halted)
-    и успешное/ожидаемое завершение не перезапускаем.
+    с fatal_error/ненулевым exitcode) и когда осталась незавершённая работа.
+    Истечение времени (deadline_halted) и успешное/ожидаемое завершение не
+    перезапускаем.
+
+    dynamic=True: критерий невыполненной работы — есть ещё индексы, назначенные
+    воркеру и не завершённые (owner/completed_indexes), либо очередь пачек
+    не пуста. legacy: pending_indexes воркера (статический шард).
     """
     if max_restarts <= 0 or wctx.deadline_halted:
         return False
     if wctx.restarts >= max_restarts:
         return False
-    if not wctx.pending_indexes:
+    if dynamic:
+        unfinished = bool(shared_items)
+        if owner:
+            unfinished = unfinished or any(
+                w_k == wctx.worker_idx and idx not in completed_indexes
+                for idx, w_k in owner.items())
+        if not unfinished:
+            return False
+    elif not wctx.pending_indexes:
         return False
     finished = wctx.done or not wctx.proc.is_alive()
     if not finished:
@@ -674,23 +821,33 @@ def _needs_restart(wctx: WorkerContext, max_restarts: int) -> bool:
 def _respawn(wctx: WorkerContext, pending: list[int],
              items_by_index: dict, gather_cfg: dict,
              max_recycles: int, session_budget: dict | None,
-             on_event=None, worker_log: str | None = None) -> WorkerContext:
+             on_event=None, worker_log: str | None = None,
+             dynamic: bool = False) -> WorkerContext:
     """Поднять воркера-замену на том же worker_id с недоделанными индексами.
 
     Сначала чистим зависший Chromium воркера (fresh браузер), ждём
     освобождения порта, затем спавним заново с тем же spec и перенесённым
     подмножеством items.
+
+    dynamic=True (динамическая пакетная раздача): items НЕ передаём статически
+    (их уже вернули в shared_items через requeue) — новая выдача пачек
+    управляется очередью оркестратора, поэтому worker стартует с items=[].
     """
     k = wctx.worker_idx
     spec = dict(wctx.spec)
-    log.warning(f"worker{k}: перезапуск {wctx.restarts + 1}, "
-                f"недоделано {len(pending)} из {len(wctx.shard_indexes)} "
-                f"товаров")
+    if not dynamic:
+        log.warning(f"worker{k}: перезапуск {wctx.restarts + 1}, "
+                    f"недоделано {len(pending)} из "
+                    f"{len(wctx.shard_indexes)} товаров")
     _cleanup_worker(wctx)
     _wait_port_free(spec)
-    pend_set = set(pending)
-    items2 = [(_idx, pid, url) for _idx, (pid, url) in items_by_index.items()
-              if _idx in pend_set]
+    if dynamic:
+        items2 = []
+    else:
+        pend_set = set(pending)
+        items2 = [(_idx, pid, url)
+                  for _idx, (pid, url) in items_by_index.items()
+                  if _idx in pend_set]
     task2 = {
         "items": items2,
         "gather_cfg": gather_cfg,
@@ -732,31 +889,149 @@ def _terminate_worker(wctx: WorkerContext, reason: str,
     _cleanup_worker(wctx)
 
 
+def _unfinished_crashed(wctx: WorkerContext, completed_indexes,
+                        owner) -> list[int]:
+    """Индексы, назначенные упавшему воркеру и не завершённые (для respawn).
+
+    owner[idx]==k и idx∉completed_indexes. Возвращает отсортированный список.
+    Если динамическая раздача неактивна (owner пуст) — fallback на
+    pending_indexes воркера (legacy-семантика шарда).
+    """
+    if owner:
+        return sorted(idx for idx, w_k in owner.items()
+                      if w_k == wctx.worker_idx
+                      and idx not in completed_indexes)
+    return list(wctx.pending_indexes or [])
+
+
+def _attach_scheduler_metrics(wctxs, requeue_metrics: dict) -> None:
+    """Прикрепить к воркерам агрегированную телеметрию пакетной раздачи.
+
+    Хранится на самом WorkerContext (wctx.scheduler_metrics), чтобы не менять
+    возврат _await_workers (сигнатура остаётся прежней для unit-тестов).
+    _worker_summary затем включает их в combined.parallel.
+    """
+    for wctx in wctxs:
+        wctx.scheduler_metrics = {
+            "requeue_count": int(requeue_metrics.get("count") or 0),
+            "p2w_broken": int(requeue_metrics.get("p2w_broken") or 0),
+        }
+
+
 def _await_workers(wctxs: list, deadline: float,
                    max_worker_restarts: int, items_by_index: dict,
                    gather_cfg: dict, max_recycles: int,
                    session_budget: dict | None, on_event=None,
                    worker_log: str | None = None,
                    poll: float = 0.3,
-                   stop_event=None, force_event=None) -> list:
+                   stop_event=None, force_event=None,
+                   shared_items=None, completed_indexes=None,
+                   owner=None, pid_by_idx=None, url_by_idx=None,
+                   batch_size: int = DEFAULT_BATCH_SIZE) -> list:
     """Дождаться завершения воркеров, перезапуская аварийно упавших.
+
+    Динамическая пакетная раздача: когда переданы shared_items/completed_indexes/
+    owner (из collect_parallel), воркеры получают пачки через parent→worker pipe
+    по запросу task_request; завершённые индексы (done_batch) идут в
+    completed_indexes (immutable guard, повторно не выдаются). Если НЕ переданы
+    (legacy-режим, используется unit-тестами оркестрации с фейковыми воркерами
+    без живых pipe) — поведение прежнее (просто join по дедлайну + респавн).
 
     max_worker_restarts=0 → исходное поведение (join по очереди, terminate
     зависших по дедлайну, без перезапуска). >0 → оркестрационный цикл с
-    перезапуском воркеров, упавших без доведения шарда.
+    перезапуском воркеров, упавших без доведения пачки.
 
     stop_event (threading.Event, от демона) — кооперативный запрос остановки
-    (Ctrl+C в демоне): при установке прекращаем выдачу новых задач/респавн и
-    штатно сворачиваем живых воркеров (_terminate_worker → _cleanup_worker →
-    force_stop браузера в родителе), НЕ помечая остановку как CRASH.
-    Уже собранный payload сохраняется; текущий item воркера теряется и на
-    resume добирается заново (это цена graceful shutdown без 2-го канала IPC).
+    (Ctrl+C): прекращаем выдачу новых пачек/респавн и сворачиваем живых воркеров
+    (_terminate_worker → _cleanup_worker), НЕ помечая остановку как CRASH.
+    Текущая пачка/товар воркера теряется и на resume добирается заново (цена
+    быстрого, детерминированного стопа — Вариант A).
 
     force_event (2-й Ctrl+C) — приоритет над stop_event: немедленно
-    _terminate_worker для ВСЕХ активных воркеров (зачистка их браузеров в
-    родителе), без респавна и без выдачи новых задач. Сам os._exit() НЕ зовём —
-    это ответственность демона (emergency shutdown).
+    _terminate_worker для ВСЕХ активных воркеров, без респавна и без выдачи
+    новых пачек. Сам os._exit() НЕ зовём — это ответственность демона.
     """
+    dynamic = (
+        shared_items is not None and completed_indexes is not None
+        and owner is not None and pid_by_idx is not None
+        and url_by_idx is not None)
+
+    def _send_to_worker(wctx, msg: dict) -> bool:
+        """Отправить пачку/команду воркеру через parent→worker pipe.
+
+        Возвращает False при обрыве канала (воркер уже мёртв) — в этом случае
+        выданная пачка должна быть возвращена в очередь.
+        """
+        if wctx.p2w_conn is None:
+            return False
+        try:
+            wctx.p2w_conn.send(msg)
+            return True
+        except (BrokenPipeError, EOFError, OSError, ValueError):
+            return False
+
+    def _dispatch(wctx):
+        """Выдать воркеру следующую пачку (или none), если он её ждёт."""
+        if not dynamic or wctx.p2w_conn is None:
+            return
+        if not wctx.proc.is_alive() or wctx.done:
+            return
+        if not wctx.waiting_for_batch:
+            return
+        # stop/force → больше пачек не выдаём, воркеру none.
+        if (force_event is not None and force_event.is_set()) or \
+                (stop_event is not None and stop_event.is_set()):
+            wctx.waiting_for_batch = False
+            _send_to_worker(wctx, {"t": "none"})
+            return
+        batch = []
+        while shared_items and len(batch) < batch_size:
+            item = shared_items.popleft()
+            idx = int(item[0])
+            owner[idx] = wctx.worker_idx
+            batch.append(item)
+        if batch:
+            wctx.waiting_for_batch = False
+            if not _send_to_worker(wctx, {"t": "next", "batch": batch}):
+                # воркер умер до получения пачки → вернуть пачку в очередь
+                shared_items.extendleft(reversed(batch))
+                requeue_metrics["p2w_broken"] = (
+                    requeue_metrics.get("p2w_broken", 0) + 1)
+        else:
+            wctx.waiting_for_batch = False
+            _send_to_worker(wctx, {"t": "none"})
+
+    def _drain_completed():
+        """Перелить подтверждённые done_batch индексы в completed_indexes."""
+        if not dynamic:
+            return
+        for wctx in wctxs:
+            if wctx.batch_completed:
+                completed_indexes.update(wctx.batch_completed)
+                wctx.batch_completed = []
+
+    def _requeue_unfinished(crashed):
+        """Вернуть недоделанные выданные пачки упавшего воркера в очередь.
+
+        Только индексы, назначенные этому воркеру из owner и НЕ завершённые
+        (completed_indexes — immutable guard). Пачка возвращается целиком в начало
+        очереди, исходный порядок внутри сохранён (FIFO-front приоритет).
+        """
+        if not dynamic:
+            return 0
+        pend = [idx for idx, w_k in owner.items()
+                if w_k == crashed.worker_idx and idx not in completed_indexes]
+        if not pend:
+            return 0
+        pend_sorted = sorted(pend)
+        requeue = [(idx, pid_by_idx.get(idx), url_by_idx.get(idx))
+                   for idx in pend_sorted]
+        shared_items.extendleft(reversed(requeue))
+        requeue_metrics["count"] += len(requeue)
+        return len(requeue)
+
+    requeue_metrics = {"count": 0, "p2w_broken": 0}
+
     def _force_stop():
         log.warning("stop: force (Ctrl+C ×2) — принудительно завершаю всех "
                     "воркеров (без респавна)")
@@ -776,16 +1051,23 @@ def _await_workers(wctxs: list, deadline: float,
                     if wctx.proc.is_alive() and not wctx.done:
                         _terminate_worker(wctx, "stop: user interrupt (Ctrl+C)")
                 break
+            _drain_completed()
+            for wctx in wctxs:
+                _dispatch(wctx)
             now = time.monotonic()
             stalled = [wctx for wctx in wctxs
                        if wctx.proc.is_alive() and not wctx.done
+                       and not wctx.waiting_for_batch
                        and now - wctx.last_activity > WORKER_STALL_S]
             if stalled:
+                log.warning(f"stall: {len(stalled)} воркер(ов) без heartbeat "
+                            f"(> {WORKER_STALL_S}s) — terminate")
                 for wctx in stalled:
                     _terminate_worker(
                         wctx,
                         f"stall: нет heartbeat {int(now - wctx.last_activity)}s "
                         f"(> {WORKER_STALL_S}s)")
+                _drain_completed()
                 break
             remain = deadline - time.monotonic()
             if remain <= 0:
@@ -794,12 +1076,17 @@ def _await_workers(wctxs: list, deadline: float,
                      if wctx.proc.is_alive() and not wctx.done]
             if not alive:
                 break
+            # Очередь пуста и все живые воркеры либо ждут пачку (на неё уже
+            # отправлено none), либо завершаются: единственный случай полного
+            # ожидания — воркер обрабатывает пачку. Ждём, пока все не закончат.
             time.sleep(min(poll, remain))
         for wctx in wctxs:
             if wctx.proc.is_alive() and not wctx.done:
                 _terminate_worker(wctx, "hang: нет завершения к дедлайну")
+        _drain_completed()
         for wctx in wctxs:
             _finalize_worker(wctx)
+        _attach_scheduler_metrics(wctxs, requeue_metrics)
         return wctxs
 
     active = list(wctxs)
@@ -818,7 +1105,11 @@ def _await_workers(wctxs: list, deadline: float,
                 else:
                     _finalize_worker(wctx)
                 finalized.append(wctx)
+            _drain_completed()
             break
+        _drain_completed()
+        for wctx in active:
+            _dispatch(wctx)
         now = time.monotonic()
         for wctx in list(active):
             finished = wctx.done or not wctx.proc.is_alive()
@@ -827,7 +1118,8 @@ def _await_workers(wctxs: list, deadline: float,
                 finalized.append(wctx)
                 active.remove(wctx)
                 continue
-            if now - wctx.last_activity > WORKER_STALL_S:
+            if (not wctx.waiting_for_batch
+                    and now - wctx.last_activity > WORKER_STALL_S):
                 _terminate_worker(
                     wctx,
                     f"stall: нет heartbeat {int(now - wctx.last_activity)}s "
@@ -845,16 +1137,25 @@ def _await_workers(wctxs: list, deadline: float,
                 finalized.append(wctx)
                 active.remove(wctx)
         for wctx in list(finalized):
-            if not _needs_restart(wctx, max_worker_restarts):
+            if not _needs_restart(
+                    wctx, max_worker_restarts,
+                    dynamic=dynamic, owner=owner,
+                    completed_indexes=completed_indexes,
+                    shared_items=shared_items):
                 continue
-            pending = list(wctx.pending_indexes)
-            new = _respawn(
-                wctx, pending, items_by_index, gather_cfg,
-                max_recycles, session_budget, on_event, worker_log)
+            _requeue_unfinished(wctx)
+            pending = _unfinished_crashed(wctx, completed_indexes, owner)
+            if dynamic:
+                new = _respawn(
+                    wctx, pending, items_by_index, gather_cfg,
+                    max_recycles, session_budget, on_event, worker_log,
+                    dynamic=dynamic)
+            else:
+                new = _respawn(
+                    wctx, pending, items_by_index, gather_cfg,
+                    max_recycles, session_budget, on_event, worker_log)
             # Перенести уже собранные товары упавшего воркера в замену: иначе
-            # merge_широко пометит их как "terminated/failed" (потеря данных).
-            # Копируем аккуратно: _reader_loop нового воркера перезаписывает
-            # wctx.payload при каждом progress, поэтому храним отдельно.
+            # merge широко пометит их как "terminated/failed" (потеря данных).
             old_pl = wctx.payload or {}
             old_products = old_pl.get("products") or []
             if old_products:
@@ -865,10 +1166,9 @@ def _await_workers(wctxs: list, deadline: float,
                     "failed_indexes": list(old_pl.get("failed_indexes") or []),
                 }
             active.append(new)
-            # упавший воркер "заменён": убираем из finalized, чтобы не
-            # перезапускать его повторно на каждой итерации while
             finalized.remove(wctx)
         time.sleep(poll)
+    _attach_scheduler_metrics(wctxs, requeue_metrics)
     return finalized
 
 
@@ -995,7 +1295,11 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         # window_mode: visible/hidden для воркер-браузеров (spec видит Session)
         spec["window_mode"] = _wm
         task = {
-            "items": shards[k - 1],
+            # Динамическая пакетная раздача: полный список НЕ раздаётся
+            # статическим шардом; фактическая выдача пачек идёт через
+            # parent→worker pipe в _await_workers. items здесь — только для
+            # журнала/совместимости инициализации WorkerContext.
+            "items": [],
             "gather_cfg": gather_cfg,
             "max_recycles": max_recycles,
             "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
@@ -1003,6 +1307,14 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
             "worker_log": worker_log,
         }
         wctxs.append(_spawn_ctx(spec, task, on_event=on_event))
+
+    # Динамическая пакетная раздача: источники истины у оркестратора.
+    shared_items = deque(items)
+    completed_indexes: set[int] = set()
+    owner: dict[int, int] = {}
+    pid_by_idx = {idx: pid for idx, pid, _url in items}
+    url_by_idx = {idx: url for idx, _pid, url in items}
+    batch_size = int(gather_cfg.get("batch_size", DEFAULT_BATCH_SIZE))
 
     deadline = time.monotonic() + join_timeout_s
     wctxs = _await_workers(
@@ -1012,7 +1324,18 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         gather_cfg=gather_cfg, max_recycles=max_recycles,
         session_budget=session_budget, on_event=on_event,
         worker_log=worker_log, stop_event=stop_event,
-        force_event=force_event)
+        force_event=force_event,
+        shared_items=shared_items, completed_indexes=completed_indexes,
+        owner=owner, pid_by_idx=pid_by_idx, url_by_idx=url_by_idx,
+        batch_size=batch_size)
+
+    # После завершения динамической раздачи пересобираем shards из актуального
+    # owner (полные кортежи (idx,pid,url)) — совместимый формат для
+    # merge_shard_results/QA/digest. Записи без владельца (ни разу не выданы)
+    # остаются в своих статически-назначенных шардах (см. shard_items-отработал
+    # как fallback-владелец для подсчёта).
+    shards = _rebuild_shards(
+        owner, pid_by_idx, url_by_idx, items, parallel)
 
     payloads = []
     for wctx in wctxs:
@@ -1029,6 +1352,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         payloads.append(pl)
 
     products = merge_shard_results(payloads, shards)
+    sort_digest_products(products)
     collected = sum(1 for p in products
                     if p["ok"] and not p.get("excluded"))
     excluded = sum(1 for p in products if p.get("excluded"))
@@ -1050,6 +1374,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
             "shards": [{"worker_idx": k, "count": len(s),
                         "indexes": [idx for idx, _p, _u in s]}
                        for k, s in enumerate(shards, 1)],
+            "scheduler": _scheduler_summary(wctxs, batch_size),
         },
     }
     mr = gather_cfg.get("min_rating")
@@ -1095,4 +1420,44 @@ def _worker_summary(wctx: WorkerContext, pl: dict) -> dict:
         "rss_bytes": pl.get("rss_bytes"),
         "browser_stopped": pl.get("browser_stopped"),
         "recovery": pl.get("recovery_metrics"),
+        "num_batches": pl.get("num_batches"),
+        "scheduler": getattr(wctx, "scheduler_metrics", None),
     }
+
+
+def _scheduler_summary(wctxs, batch_size: int | None) -> dict:
+    """Агрегированная телеметрия пакетной раздачи (динамический режим).
+
+    wall/active тайминги строятся из UTC-меток started/finished воркеров
+    (единое время _now(), без смещения часовых поясов). tail_ratio и
+    active_balance_ratio описывают «хвост»: насколько дольше/активнее работал
+    самый медленный воркер относительно среднего.
+    """
+    walls = []
+    for wctx in wctxs:
+        pl = wctx.payload or {}
+        s, f = pl.get("started"), pl.get("finished")
+        if s and f:
+            try:
+                walls.append((datetime.fromisoformat(f)
+                              - datetime.fromisoformat(s)).total_seconds())
+            except (ValueError, TypeError):
+                pass
+    summary = {
+        "batch_size": batch_size,
+        "requeue_count": 0,
+        "p2w_broken": 0,
+        "tail_ratio": None,
+        "active_balance_ratio": None,
+    }
+    for wctx in wctxs:
+        m = getattr(wctx, "scheduler_metrics", None) or {}
+        summary["requeue_count"] += int(m.get("requeue_count") or 0)
+        summary["p2w_broken"] += int(m.get("p2w_broken") or 0)
+    if walls:
+        mean = sum(walls) / len(walls)
+        mx = max(walls)
+        if mean > 0:
+            summary["tail_ratio"] = round(mx / mean, 3)
+            summary["active_balance_ratio"] = round(mx / mean, 3)
+    return summary
