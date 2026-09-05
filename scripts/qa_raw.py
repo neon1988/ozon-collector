@@ -219,8 +219,16 @@ def qa_product(raw, pid):
                 f"{collected}/{official} ({coverage:.1%}), стена логина")
 
     if collected == 0:
-        add("ZERO_REVIEWS", "FAIL",
-            "не собрано ни одного отзыва (пустая вкладка / у выбранного варианта нет своих отзывов)")
+        confirmed_zero = bool(raw.get("no_reviews_confirmed"))
+        if confirmed_zero:
+            # Экстрактор подтвердил «Отзывы о товаре 0» (reviewsCount/totalScore=0
+            # в state-JSON webReviewProductScore) — это валидный нулевик с
+            # нормальной карточкой, а не сломанный сбор. Не FAIL.
+            add("CONFIRMED_NO_REVIEWS", "INFO",
+                "подтверждённый ноль отзывов (no_reviews_confirmed)")
+        else:
+            add("ZERO_REVIEWS", "FAIL",
+                "не собрано ни одного отзыва (пустая вкладка / у выбранного варианта нет своих отзывов)")
 
     sorts_expected = raw.get("reviews_sorts") or []
     per_sort = Counter(

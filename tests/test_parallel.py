@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 
 import pytest
 
@@ -371,14 +372,39 @@ def _spawn_workers(specs, items, monkeypatch, tmp_path, scenario,
     shards = PL.shard_items(items, len(specs))
     wctxs = []
     for k, spec in enumerate(specs, 1):
-        task = {"items": shards[k - 1], "gather_cfg": {},
+        task = {"items": [], "gather_cfg": {},
                 "max_recycles": 2, "scroll_jitter_seed": 1}
         wctxs.append(PL._spawn_ctx(spec, task))
+    # Диспетчер динамической пакетной раздачи (тестовый макет _await_workers):
+    # выдаём каждому воркеру его статический шард (batch_size=5 → одной пачкой),
+    # ждём done, затем none. Так тесты сохраняют проверку попарного охвата шарда.
     deadline = time.monotonic() + timeout
-    for w in wctxs:
+    per_worker = {w.worker_idx: deque(shards[w.worker_idx - 1])
+                  for w in wctxs}
+    while True:
+        for w in list(wctxs):
+            if w.done or not w.proc.is_alive():
+                continue
+            if w.waiting_for_batch:
+                w.waiting_for_batch = False
+                q = per_worker[w.worker_idx]
+                if q:
+                    batch = [q.popleft() for _ in range(len(q))]
+                    try:
+                        w.p2w_conn.send({"t": "next", "batch": batch})
+                    except (BrokenPipeError, EOFError, OSError, ValueError):
+                        q.extendleft(reversed(batch))
+                else:
+                    try:
+                        w.p2w_conn.send({"t": "none"})
+                    except (BrokenPipeError, EOFError, OSError, ValueError):
+                        pass
+        if all(w.done or not w.proc.is_alive() for w in wctxs):
+            break
         remain = deadline - time.monotonic()
-        if remain > 0:
-            w.proc.join(remain)
+        if remain <= 0:
+            break
+        time.sleep(min(0.05, remain))
     for w in wctxs:
         w.proc.join(2)
         w.exitcode = w.proc.exitcode
@@ -493,9 +519,14 @@ def test_worker_hang_after_progress_keeps_partial(monkeypatch, tmp_path):
     monkeypatch.setenv("OZON_COLLECTOR_LOG", str(tmp_path / "main.log"))
     spec = PL.worker_spec(1)
     items = _items(10)
-    task = {"items": items, "gather_cfg": {},
+    task = {"items": [], "gather_cfg": {},
             "max_recycles": 2, "scroll_jitter_seed": 1}
     w = PL._spawn_ctx(spec, task)
+    # Динамическая раздача: выдаём одну пачку (10 товаров) — воркер в
+    # hang_after_progress обработает 5 (кратно PROGRESS_EVERY), пришлёт progress
+    # и повиснет.
+    w.waiting_for_batch = False
+    w.p2w_conn.send({"t": "next", "batch": list(items)})
     w.proc.join(6)
     assert w.proc.is_alive()          # всё ещё виснет после прогресса
     w.proc.terminate()

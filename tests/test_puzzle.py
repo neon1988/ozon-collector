@@ -139,3 +139,67 @@ def test_check_challenge_solver_success_skips_fab_reload():
         monkey.undo()
     assert not reload_calls  # перезагрузок не было
     assert puzzle.failures() == 0
+
+
+class _FakePuzzlePage(_FakePage):
+    """Страница с найденным слайдер-пазлом в DOM (bg + puzzle)."""
+
+    def evaluate(self, _js):
+        return {"bg": {"src": "http://x/bg.png", "r": [0, 0, 300, 100]},
+                "puzzle": {"src": "http://x/p.png", "r": [0, 0, 40, 40]},
+                "slider": {"r": [0, 0, 100, 20]},
+                "has": True}
+
+
+def test_looks_like_puzzle_detects_dom_elements():
+    assert puzzle.looks_like_puzzle(_FakePuzzlePage("x"))
+
+
+def test_looks_like_puzzle_false_without_bg():
+    assert not puzzle.looks_like_puzzle(_FakePage("x"))
+
+
+class _FakeSliderDomPage(_FakePage):
+    """DOM как у живой капчи: bg(512x384), трек(480x2), ручка(40x32)."""
+
+    def __init__(self):
+        super().__init__("puzzle")
+        self.return_track = [472, 509, 480, 2]
+        self.return_handle = [472, 494, 40, 32]
+
+    def evaluate(self, _js):
+        return {"track": list(self.return_track),
+                "handle": list(self.return_handle)}
+
+
+def test_find_slider_returns_track_and_handle():
+    assert puzzle._find_slider(_FakeSliderDomPage()) == \
+        {"track": [472, 509, 480, 2], "handle": [472, 494, 40, 32]}
+
+
+def test_find_slider_none_when_no_track():
+    class _NoTrack(_FakePage):
+        def evaluate(self, _js):
+            return None
+
+    assert puzzle._find_slider(_NoTrack("x")) is None
+
+
+def test_check_challenge_solver_runs_for_antibot_captcha_with_dom_puzzle():
+    """'antibot captcha' без 'пазл' в сигнатуре, но с пазлом в DOM → решаем."""
+    from ozon_collector import collect as C
+    calls = []
+    monkey = pytest.MonkeyPatch()
+    puzzle.reset()
+    monkey.setattr(C, "detect_challenge",
+                   lambda page, **kw: "title:antibot captcha")
+    monkey.setattr(C, "_puzzle", puzzle)
+    monkey.setattr(puzzle, "solve_puzzle", lambda page: calls.append(1) or False)
+    try:
+        try:
+            C.check_challenge(_FakePuzzlePage("puzzle"), "product_page")
+        except C.B.AccessChallengeError:
+            pass
+    finally:
+        monkey.undo()
+    assert calls  # решатель вызывался, несмотря на сигнатуру 'antibot captcha'

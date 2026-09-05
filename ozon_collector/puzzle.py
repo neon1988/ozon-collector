@@ -41,6 +41,17 @@ def is_puzzle(signature: Optional[str]) -> bool:
     return bool(signature and ("пазл" in signature or "ползунок" in signature))
 
 
+def looks_like_puzzle(page) -> bool:
+    """Есть ли на странице элементы слайдер-пазла (фон + кусочек) по DOM.
+
+    Не полагается на текстовую сигнатуру title/body: если detect_challenge
+    вернул общий анти-бот маркер (например 'antibot captcha'), но в DOM есть
+    фон и кусочек — это пазл, который можно решить, а не глухой FAB-reload.
+    """
+    info = _capture_info(page)
+    return bool(info and info.get("has"))
+
+
 def _find_notch(bg: np.ndarray, piece: np.ndarray) -> Optional[int]:
     """x-top-left выемки в фоне (в пикселях картинки) или None.
 
@@ -85,8 +96,7 @@ def _capture_info(page) -> Optional[dict]:
                                 r:[r.x,r.y,r.width,r.height]};
               });
               document.querySelectorAll(
-                '[class*=slider],[class*=slide],[class*=handler],
-                 [class*=track],[class*=drag],[class*=ckbox]'
+                '[class*=slider],[class*=slide],[class*=handler],[class*=track],[class*=drag],[class*=ckbox]'
               ).forEach(el => {
                 const r = el.getBoundingClientRect();
                 if (r.width > 30 && r.height > 15)
@@ -100,9 +110,58 @@ def _capture_info(page) -> Optional[dict]:
 
 
 def _still_challenge(page) -> bool:
-    """Пазл всё ещё на странице после попыток решения."""
+    """Есть ли ещё на странице нерешённый слайдер-пазл."""
+    if looks_like_puzzle(page):
+        return True
     from .collect import detect_challenge
     return is_puzzle(detect_challenge(page))
+
+
+def _find_slider(page) -> Optional[dict]:
+    """Найти ручку и трек слайдера по геометрии (у Ozon классы пустые).
+
+    Возвращает {track:[x,y,w,h], handle:[x,y,w,h]} в экранных px или None.
+    Трек — самый широкий тонкий DIV ниже фона; ручка — DIV ~40x32 у левого
+    края трека (содержит svg-иконку).
+    """
+    try:
+        return page.evaluate(
+            """() => {
+              let bg = null;
+              [...document.querySelectorAll('img')].forEach(i => {
+                const r = i.getBoundingClientRect();
+                const c = String(i.className||'');
+                if (c.includes('image') && r.width>200) bg = r;
+              });
+              if (!bg) return null;
+              const all = [...document.querySelectorAll('div')];
+              const belowY = bg.y + bg.height;
+              let track=null, handle=null;
+              all.forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (r.width<=0 || r.height<=0) return;
+                if (r.y >= belowY-5 && r.y < belowY+200
+                    && r.width>=300 && r.height<=6)
+                  if (!track || r.width>track)
+                    track=[r.x, r.y, r.width, r.height];
+              });
+              if (!track) return null;
+              const ty = track[1] + track[3]/2;
+              all.forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (r.width<=0 || r.height<=0) return;
+                const cy = r.y + r.height/2;
+                if (Math.abs(cy-ty) < 30
+                    && Math.abs(r.width-40) <= 15
+                    && Math.abs(r.height-32) <= 18)
+                  if (!handle || r.x < handle[0])
+                    handle=[r.x, r.y, r.width, r.height];
+              });
+              if (!handle) return null;
+              return {track: track, handle: handle};
+            }""")
+    except Exception:
+        return None
 
 
 def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS) -> bool:
@@ -125,7 +184,6 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS) -> bool:
             bsrc = (info["bg"] or {}).get("src")
             psrc = (info["puzzle"] or {}).get("src")
             b_r = info["bg"]["r"]
-            p_r = info["puzzle"]["r"]
             if not (bsrc and psrc):
                 _PUZZLE_FAILURES[0] += 1
                 return False
@@ -136,18 +194,29 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS) -> bool:
                 _PUZZLE_FAILURES[0] += 1
                 return False
             b_x0, _b_y0, b_w, _b_h = b_r
-            p_x0, p_y0, p_w, p_h = p_r
             scale_x = b_w / bg.shape[1]
-            target_cx = b_x0 + bx * scale_x + (p_w * scale_x) / 2
-            cur_cx = p_x0 + p_w / 2
-            cur_cy = p_y0 + p_h / 2
-            dx = target_cx - cur_cx
-            page.mouse.move(cur_cx, cur_cy)
+            dx_px = bx * scale_x
+            sl = _find_slider(page)
+            if not sl:
+                _PUZZLE_FAILURES[0] += 1
+                return False
+            track, handle = sl["track"], sl["handle"]
+            track_x0, _ty, track_w, _th = track
+            hx, hy, hw, hh = handle
+            usable = max(1, track_w - hw)
+            target_left = min(track_x0 + usable,
+                              max(track_x0, track_x0 + dx_px))
+            # Цепляем за ЛЕВУЮ часть ручки: в центре ручки лежит svg-иконка,
+            # её `elementFromPoint` перехватывает и drag не срабатывает.
+            grab_x = hx + min(6, max(1, hw * 0.2))
+            grab_y = hy + hh / 2
+            dx = target_left - hx
+            page.mouse.move(grab_x, grab_y)
             page.mouse.down()
-            page.mouse.move(cur_cx + dx, cur_cy, steps=25)
+            page.mouse.move(grab_x + dx, grab_y, steps=30)
             time.sleep(0.4)
             page.mouse.up()
-            time.sleep(1.0)
+            time.sleep(1.2)
         except Exception:
             _PUZZLE_FAILURES[0] += 1
             return False

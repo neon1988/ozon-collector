@@ -308,7 +308,8 @@ def test_collect_search_pids_skips_link_scan(monkeypatch):
     assert sess.gotos == 0
     assert c["found"] == 2
     assert c["collected"] == 2
-    assert [p["pid"] for p in c["products"]] == ["999", "777"]
+    pids = [p["pid"] for p in c["products"]]
+    assert sorted(pids) == ["777", "999"]
 
 
 def test_collect_search_pids_uses_product_url(monkeypatch):

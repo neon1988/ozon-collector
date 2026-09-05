@@ -2960,6 +2960,98 @@ def test_extract_discovered_pids_merges_partial_discovery_field():
     assert k.extract_discovered_pids(combined2) == ["333", "111"]
 
 
+# --- --reset: полное пересоздание существующей кампании ---
+
+def test_run_campaign_force_reset_wipes_terminal_campaign(tmp_path, monkeypatch):
+    """--reset (force_reset=True) на завершённой кампании: каталог кампании
+    удаляется, кампания стартует заново — свежий манифест, новый identity
+    (url_sha256), старые discovered/valid/runs не наследуются."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    for pid in ("0", "1"):
+        (data_dir / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    campaigns = tmp_path / "campaigns"
+    camp_dir = campaigns / "testcamp"
+    camp_dir.mkdir(parents=True, exist_ok=True)
+    old = k.default_manifest("testcamp", 5, 2, "old-url", "o.md",
+                             data_dir=str(data_dir))
+    old["discovered_pids"] = ["999", "998"]
+    old["valid_pids"] = ["999"]
+    old["runs"] = ["run_old_1", "run_old_2"]
+    old["final_state"] = "COMPLETED_MIN"
+    k.save_json(camp_dir / "progress.json", old)
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", campaigns)
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(k, "PYTHON", "python")
+    # артефакты старой кампании, которые должны исчезнуть вместе с каталогом
+    (camp_dir / "status.json").write_text('{"runtime_state":"COMPLETED"}',
+                                          encoding="utf-8")
+
+    def fac(argv):
+        return {"products": [{"pid": p, "ok": True, "excluded": None}
+                             for p in ("0", "1")], "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: fac(
+                            k.build_cli_args(progress, run_id, mode, targets)))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+
+    prog = k.run_campaign(
+        campaign="testcamp", url="new-url", target=2, min_valid=1,
+        out="o.md", data_dir=str(data_dir), max_no_progress_runs=10,
+        max_total_hours=24.0, force_reset=True, qa_fn=qa)
+
+    # старая терминальная кампания стёрта → стартовали именно новые пиды
+    assert prog["campaign_identity"]["url_sha256"] == k._sha256_text("new-url")
+    assert "999" not in prog["discovered_pids"]
+    assert "998" not in prog["discovered_pids"]
+    assert set(prog["discovered_pids"]) == {"0", "1"}
+    assert prog["valid_pids"] == ["0", "1"]
+    # прогоны уже НЕ содержат заглушки-"строки" из старого манифеста
+    assert all(isinstance(r, dict) for r in prog["runs"])
+    assert prog["final_state"] == "COMPLETED"
+
+
+def test_run_campaign_force_reset_without_existing_is_fresh(tmp_path, monkeypatch):
+    """--reset когда кампании ещё нет: работает как обычный новый старт,
+    без ошибок (удалять нечего)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    for pid in ("0", "1"):
+        (data_dir / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path / "campaigns")
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(k, "PYTHON", "python")
+
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                             {"pid": 1, "ok": True, "excluded": None}],
+                "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: fac(
+                            k.build_cli_args(progress, run_id, mode, targets)))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+
+    prog = k.run_campaign(
+        campaign="testcamp", url="u", target=2, min_valid=1,
+        out="o.md", data_dir=str(data_dir), max_no_progress_runs=10,
+        max_total_hours=24.0, force_reset=True, qa_fn=qa)
+
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["valid_pids"] == ["0", "1"]
+
+
 def test_run_campaign_force_collection_calls_emergency_shutdown(tmp_path, monkeypatch):
     """FORCE (2-й Ctrl+C) во время докрутки: CollectionInterrupted(forced=True)
     → вызывается _emergency_shutdown (НЕ классифицируется как CRASH/UNKNOWN).

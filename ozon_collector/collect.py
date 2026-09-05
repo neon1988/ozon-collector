@@ -235,6 +235,19 @@ PRODUCT_JS = r"""
     const f = parseFloat(String(v).replace(/\s/g, '').replace(',', '.'));
     return isNaN(f) ? null : f;
   };
+  // Явный ноль отзывов из state-JSON виджета webReviewProductScore
+  // (блок «Отзывы о товаре 0» машинно отдаёт reviewsCount/totalScore=0).
+  const reviewZero = () => {
+    const st = document.querySelector('[id^="state-webReviewProductScore"]');
+    if (!st) return false;
+    try {
+      const state = JSON.parse(st.getAttribute('data-state'));
+      const rcVal = state && (state.reviewsCount ?? state.totalScore);
+      return typeof rcVal === 'number' && rcVal <= 0;
+    } catch (e) {
+      return false;
+    }
+  };
   const title = () => {
     const h1 = document.querySelector('h1');
     if (h1) return h1.innerText.trim();
@@ -243,6 +256,7 @@ PRODUCT_JS = r"""
   };
   const SCORE_WIDGETS = ["webProductScore", "webSingleProductScore", "webReviewProductScore"];
   const rating = () => {
+    if (reviewZero()) return { value: 0, source: "no_reviews_widget" };
     for (const wname of SCORE_WIDGETS) {
       const w = document.querySelector('[data-widget="' + wname + '"]');
       if (!w) continue;
@@ -266,6 +280,7 @@ PRODUCT_JS = r"""
     return null;
   };
   const ratingCount = () => {
+    if (reviewZero()) return 0;
     for (const wname of SCORE_WIDGETS) {
       const w = document.querySelector('[data-widget="' + wname + '"]');
       if (!w) continue;
@@ -947,10 +962,12 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
     бросаем AccessChallengeError.
     """
     sig = detect_challenge(page)
-    if _puzzle.is_puzzle(sig):
+    if sig and (_puzzle.is_puzzle(sig) or _puzzle.looks_like_puzzle(page)):
         # Слайдер-пазл (НЕ FAB-заглушка): сначала пытаемся РЕШИТЬ, а не
         # перезагружать вслепую. Успех → пазл снят, никакого AccessChallenge
-        # (не тратим бюджет challenge/new_tab/recycle).
+        # (не тратим бюджет challenge/new_tab/recycle). DOM-детекция покрывает
+        # случаи, когда сигнатура — общий 'antibot captcha', но на странице
+        # реально есть фон+кусочек пазла.
         if _puzzle.solve_puzzle(page):
             log.warning(f"[collect] пазл решён ({where})")
             return
@@ -1006,7 +1023,36 @@ def _pass_age_gate(page) -> bool:
                 raise
             log.warning(f"[collect] age-gate button wait warn: {e}")
         if btn.is_enabled():
-            btn.click()
+            try:
+                # Обычный Playwright click падает на перехвате pointer events
+                # оверлеем модалки.  el.click() даёт synthetic click, но
+                # Vue-компонент Ozon слушает pointerdown/pointerup — нужна
+                # полная цепочка pointer+mouse events, иначе setBirthdate
+                # API не вызывается и модалка остаётся.
+                h = btn.element_handle()
+                if h is not None:
+                    h.evaluate("""(el) => {
+                        const rect = el.getBoundingClientRect();
+                        const cx = rect.x + rect.width / 2;
+                        const cy = rect.y + rect.height / 2;
+                        for (const type of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+                            el.dispatchEvent(new PointerEvent(type, {
+                                bubbles: true, cancelable: true, composed: true,
+                                clientX: cx, clientY: cy, button: 0, buttons: 1,
+                                pointerId: 1, pointerType: 'mouse',
+                                view: window
+                            }));
+                        }
+                    }""", timeout=5000)
+                else:
+                    btn.click(timeout=8000, force=True)
+            except Exception as e:
+                if B.is_renderer_failure(e) and not _is_sticky_intercept(e):
+                    try:
+                        btn.click(timeout=8000, force=True)
+                    except Exception as e2:
+                        if B.is_renderer_failure(e2):
+                            raise
             page.wait_for_timeout(1500)
             log.info("[collect] возрастной гейт 18+ пройден")
             return True
@@ -2307,6 +2353,26 @@ def collect(
         missing_fields.append("product.rating")
     raw["incomplete"] = bool(missing_fields)
     raw["missing_fields"] = missing_fields
+
+    # Подтверждённый 0 отзывов: товар явно сообщает об отсутствии отзывов.
+    # Такой raw кешируется, иначе отсутствие rating/price делает его
+    # incomplete → каждый повторный проход пересобирает с нуля.
+    # Два достоверных сигнала:
+    #   1) rating_count == 0  (экстрактор карточки подтвердил)
+    #   2) виджет варианта variant_count == 0 (при used=True)
+    # Если rc=None и виджета нет — случай неоднозначный (сбой парсинга),
+    # кешировать НЕЛЬЗЯ.
+    rv = raw.get("reviews_variant_mode") or {}
+    rc = (raw.get("product") or {}).get("rating_count")
+    explicit_zero = (
+        (isinstance(rc, int) and rc <= 0)
+        or (bool(rv.get("used")) and rv.get("variant_count") == 0)
+    )
+    raw["no_reviews_confirmed"] = bool(
+        explicit_zero
+        and not (raw.get("reviews") or [])
+        and not variant_review_problems(raw)
+    )
 
     if save_dom and dom_html:
         pid = pid_from_url(product_url)

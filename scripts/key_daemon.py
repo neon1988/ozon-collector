@@ -36,6 +36,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -101,7 +102,7 @@ DAEMON_STATES = {
 }
 # Версия QA-логики. Входит в ключ QA-кэша (verdict_meta.qa_version): улучшение
 # QA (новый FAIL/WARN) инвалидирует старые вердикты даже если raw не менялся.
-QA_VERSION = "1.6"
+QA_VERSION = "1.7"
 
 
 def _sha256_text(s: str) -> str:
@@ -1107,7 +1108,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  max_rescans: int = 2, max_total_hours: float = 12.0,
                  reserve_count: int = 30, notify_mode: str = "off",
                  challenge_pause: int = CHALLENGE_RETRY_DELAY_S,
-                 force_new: bool = False,
+                 force_new: bool = False, force_reset: bool = False,
                  max_transient_retries: int = 3,
                  max_worker_restarts: int = 2,
                  session_budget_wall_clock: Optional[int] = None,
@@ -1128,6 +1129,18 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
     camp_dir = CAMPAIGNS_DIR / campaign
     camp_dir.mkdir(parents=True, exist_ok=True)
     progress_path = camp_dir / "progress.json"
+
+    # --reset: полный сброс существующей кампании. Каталог кампании удаляется
+    # целиком (progress.json, status.json, events.jsonl, runs/), затем демон
+    # стартует как НОВАЯ кампания (fresh=True) — с требованием --url и
+    # пустыми discovered/valid. Сырой кеш товаров (data/*_raw*.json) общий
+    # для всех кампаний и специально НЕ трогается.
+    if force_reset and progress_path.is_file():
+        log.warning(f"key_daemon: --reset: удаляю существующую кампанию "
+                    f"'{campaign}' ({camp_dir}) — начинаю заново")
+        shutil.rmtree(camp_dir, ignore_errors=True)
+        camp_dir.mkdir(parents=True, exist_ok=True)
+        progress_path = camp_dir / "progress.json"
 
     existing = load_json(progress_path)
     fresh = existing is None
@@ -1837,6 +1850,12 @@ def parse_args(argv=None):
     ap.add_argument("--force-new", action="store_true",
                     help="принудительно пересоздать кампанию, игнорируя "
                          "несовпадение identity (URL/схема) при resume")
+    ap.add_argument("--reset", action="store_true",
+                    help="полный сброс существующей кампании: удаляет каталог "
+                         "data/campaigns/<name> (progress.json, status.json, "
+                         "events.jsonl, runs/) и начинает сбор заново — "
+                         "требуется --url. Сырой кеш товаров (data/*_raw*.json) "
+                         "НЕ трогается.")
     ap.add_argument("--max-transient-retries", type=int, default=3,
                     help="сколько раз ретраить UNKNOWN_FAILURE (временные сбои "
                          "сбора) до перехода в NEEDS_ATTENTION")
@@ -1905,6 +1924,7 @@ def main(argv=None):
         max_total_hours=args.max_total_hours,
         reserve_count=args.reserve_count, notify_mode=args.notify,
         challenge_pause=args.challenge_pause, force_new=args.force_new,
+        force_reset=args.reset,
         max_transient_retries=args.max_transient_retries,
         max_worker_restarts=args.max_worker_restarts,
         session_budget_wall_clock=args.session_budget_wall_clock,

@@ -160,13 +160,132 @@ def plural(n: int, forms=("отзыв", "отзыва", "отзывов")) -> st
     return forms[2]
 
 
-def _avg_review_rating(reviews: list) -> float | None:
-    """Средний балл по оценкам собранных отзывов (stars 1–5), None — отзывов нет."""
-    vals = [r.get("stars") for r in (reviews or [])]
-    vals = [v for v in vals if isinstance(v, (int, float)) and 1 <= v <= 5]
+def _is_score_asc(review: dict) -> bool:
+    """Отзыв получен через диагностическую сортировку «сначала низкие оценки»
+    (score_asc). Старые raw без метки review_sorts — не диагностические."""
+    ss = review.get("review_sorts")
+    if not ss:
+        return False
+    return "score_asc" in ss
+
+
+def variant_rating_from(reviews: list) -> tuple:
+    """(avg, n) по нейтральной выборке собранных отзывов.
+
+    Средний балл (stars 1–5) и число оценок по отзывам, НЕ полученным через
+    диагностическую сортировку score_asc («сначала низкие оценки»): её порция
+    искажает распределение в сторону худших отзывов и к среднему не допускается
+    (артефакт занижал рейтинг популярных товаров). (None, 0) — нейтральных
+    отзывов с оценкой нет.
+    """
+    vals = []
+    for r in (reviews or []):
+        if _is_score_asc(r):
+            continue
+        v = r.get("stars")
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and 1 <= v <= 5:
+            vals.append(v)
     if not vals:
-        return None
-    return sum(vals) / len(vals)
+        return None, 0
+    return sum(vals) / len(vals), len(vals)
+
+
+def official_rating_info(product: dict) -> tuple:
+    """Справочный рейтинг всей карточки Ozon: (rating, count).
+
+    Сначала точное полное распределение оценок customer_opinion.counts
+    (среднее по 1–5★), затем product.rating (count из rating_count, если есть).
+    (None, None) — данных нет.
+    """
+    co = (product or {}).get("customer_opinion") or {}
+    total, acc = 0, 0.0
+    for k, v in (co.get("counts") or {}).items():
+        try:
+            star, n = int(k), int(v)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= star <= 5 and n > 0:
+            acc += star * n
+            total += n
+    if total:
+        return acc / total, total
+    r = (product or {}).get("rating")
+    if isinstance(r, (int, float)) and not isinstance(r, bool) and 0 < r <= 5:
+        rc = (product or {}).get("rating_count")
+        if isinstance(rc, (int, float)) and not isinstance(rc, bool) and rc > 0:
+            return float(r), int(rc)
+        return float(r), None
+    return None, None
+
+
+def official_negative_share(product: dict) -> tuple:
+    """Доля негативных оценок (1–2★): (share 0..1, total).
+
+    Считается ТОЛЬКО по полному распределению всей карточки Ozon
+    (customer_opinion.counts): (N1 + N2) / (N1+N2+N3+N4+N5). Собранные отзывы
+    для доли не используются: диагностический канал score_asc и лимит сбора
+    смещают выборку в сторону худших отзывов (selection bias — «показатель
+    эффективности скрипта», а не статистика покупателей). (None, None) —
+    распределения нет: долю не выводить и не выдумывать.
+    """
+    co = (product or {}).get("customer_opinion") or {}
+    neg, total = 0, 0
+    for k, v in (co.get("counts") or {}).items():
+        try:
+            star, n = int(k), int(v)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= star <= 5 and n > 0:
+            total += n
+            if star <= 2:
+                neg += n
+    if not total:
+        return None, None
+    return neg / total, total
+
+
+def digest_rating(product: dict, reviews: list) -> tuple:
+    """(rating, count, source) — основной рейтинг дайджеста.
+
+    source:
+      'variant'  — среднее по нейтральной выборке собранных отзывов (без
+                   score_asc); count — число таких оценок. Рейтинг выбранного
+                   варианта.
+      'official' — рейтинг всей карточки Ozon (нейтральной выборки нет);
+                   count — полное число оценок (0, если неизвестно).
+      None       — рейтинга нет вовсе.
+    """
+    avg, n = variant_rating_from(reviews)
+    if avg is not None:
+        return avg, n, "variant"
+    rating, cnt = official_rating_info(product)
+    if rating is not None:
+        return rating, int(cnt or 0), "official"
+    return None, 0, None
+
+
+def sort_digest_products(products: list) -> None:
+    """Отсортировать товары дайджеста in-place: «лучшие» в начало.
+
+    Балл — рейтинг выбранного варианта по нейтральной выборке (без
+    диагностической сортировки «сначала низкие оценки» score_asc) × число
+    таких оценок (решение пользователя 2026-09-05, уточнено после разбора
+    артефакта score_asc: порция «сначала низкие» занижала рейтинг популярных
+    товаров). Товары без нейтральной выборки — по официальному рейтингу
+    карточки без множителя (ниже имеющих рейтинг варианта). Товары без
+    рейтинга вовсе — ниже имеющих его; ошибочные (ok=False) — в конец.
+    При равном балле — больше N, затем pid.
+    """
+    def _key(p):
+        if not p.get("ok"):
+            return (1, 0, 0, 0, p.get("pid", 0))
+        raw = p.get("raw") or {}
+        rating, n, src = digest_rating(raw.get("product") or {}, raw.get("reviews"))
+        if rating is None:
+            return (0, float("inf"), 0, 0, p.get("pid", 0))   # без рейтинга — ниже
+        cnt = n if src == "variant" else 1
+        return (0, -(rating * cnt), -cnt, 0, p.get("pid", 0))
+    products.sort(key=_key)
 
 
 def _num(v):
@@ -334,10 +453,31 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
     L.append("## 1. Карточка товара")
     L.append("")
     L.append(f"- Товар: {product.get('title', '—')}")
-    avg = _avg_review_rating(reviews)
-    if avg is not None:
-        L.append(f"- Средний рейтинг по отзывам: {avg:.3f} / 5 "
-                 f"({len(reviews)} {plural(len(reviews), ('оценка', 'оценки', 'оценок'))})")
+    pre = raw.get("_digest_rating")
+    if pre:
+        rating, n, src = pre["rating"], pre["n"], pre["source"]
+    else:
+        rating, n, src = digest_rating(product, reviews)
+    if src == "variant":
+        L.append(f"- Рейтинг по собранным отзывам (без «сначала низкие»): "
+                 f"{rating:.3f} / 5 "
+                 f"({n} {plural(n, ('оценка', 'оценки', 'оценок'))})")
+        off_rating, off_count = official_rating_info(product)
+        if off_rating is not None:
+            cnt_txt = (f" · {off_count} "
+                       f"{plural(off_count, ('оценка', 'оценки', 'оценок'))}"
+                       if off_count else "")
+            L.append(f"- Ozon (вся карточка): {off_rating:.3f} / 5{cnt_txt}")
+    elif src == "official":
+        cnt_txt = (f" ({n} {plural(n, ('оценка', 'оценки', 'оценок'))})" if n else "")
+        L.append(f"- Рейтинг карточки Ozon: {rating:.3f} / 5{cnt_txt} "
+                 f"_(нет нейтральной выборки)_")
+    neg_share, neg_total = official_negative_share(product)
+    if neg_share is not None:
+        L.append(f"- Негативных оценок (1–2★): {neg_share * 100:.1f}% · "
+                 f"по {neg_total} "
+                 f"{plural(neg_total, ('оценке', 'оценкам', 'оценкам'))} "
+                 f"(вся карточка Ozon)")
     if product.get("category"):
         L.append(f"- Категория: {product['category']}")
     variant_str = _variant_str(target)
@@ -449,26 +589,77 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
     if not reviews:
         L.append("_Отзывов не собрано._")
         L.append("")
-    first_meta = None
-    if dedup_replies:
-        all_comments = [c for r in reviews for c in (r.get("comments") or [])]
-        first_meta = {id(c): n for c, n in _group_comments(all_comments)}
-    for i, r in enumerate(reviews, 1):
-        L.extend(_review_block(r, first_meta, variant_in_header, no=i))
-    if raw.get("stars_full") is not None:
-        total, counts = raw["stars_full"]["total"], raw["stars_full"]["counts"]
     else:
-        counts = {s: 0 for s in range(1, 6)}
-        for r in reviews:
-            s = r.get("stars")
-            if isinstance(s, int) and 1 <= s <= 5:
-                counts[s] += 1
-        total = len(reviews)
-    star_parts = [f"★{s}: {counts[s]}" for s in range(5, 0, -1) if counts[s]]
-    if star_parts:
-        L.append(f"Из собранных после удаление дубликатов: {total} {plural(total)}"
-                 " · " + " · ".join(star_parts))
-        L.append("")
+        # Отзывы делятся на две статистически разные роли:
+        #   neutral — обычная выборка (без «сначала низкие»), используется для
+        #             рейтинга варианта (variant_rating_from) — ИНВАРИАНТ:
+        #             это ровно то же множество отзывов.
+        #   diag    — диагностические (score_asc): целенаправленный поиск
+        #             проблем/брака; их количество НЕ доля недовольных.
+        neutral = [r for r in reviews if not _is_score_asc(r)]
+        diag = [r for r in reviews if _is_score_asc(r)]
+        first_meta = None
+        if dedup_replies:
+            all_comments = [c for r in reviews for c in (r.get("comments") or [])]
+            first_meta = {id(c): n for c, n in _group_comments(all_comments)}
+
+        def _stars_summary(revs: list) -> list:
+            cc = {s: 0 for s in range(1, 6)}
+            for r in revs:
+                s = r.get("stars")
+                if isinstance(s, int) and 1 <= s <= 5:
+                    cc[s] += 1
+            return [f"★{s}: {cc[s]}" for s in range(5, 0, -1) if cc[s]]
+
+        if neutral:
+            L.append(f"### Отзывы покупателей — обычная выборка ({len(neutral)} "
+                     f"{plural(len(neutral), ('отзыв', 'отзыва', 'отзывов'))})")
+            L.append("")
+            L.append("_Отзывы без сортировки «сначала низкие оценки». Эта выборка "
+                     "используется для расчёта рейтинга варианта (раздел 1) и "
+                     "отражает обычное впечатление покупателей._")
+            L.append("")
+            for i, r in enumerate(neutral, 1):
+                L.extend(_review_block(r, first_meta, variant_in_header, no=i))
+            sp = _stars_summary(neutral)
+            if sp:
+                L.append(" · ".join(sp))
+                L.append("")
+
+        if diag:
+            L.append(f"### Негативные отзывы — целенаправленный поиск проблем "
+                     f"({len(diag)} "
+                     f"{plural(len(diag), ('отзыв', 'отзыва', 'отзывов'))})")
+            L.append("")
+            L.append("> ⚠️ Эти отзывы собраны сортировкой «сначала низкие "
+                     "оценки» для поиска недостатков. Их количество НЕ является "
+                     "долей недовольных покупателей и не должно использоваться "
+                     "для оценки распространённости негатива. Реальная "
+                     "статистика — в разделе 1 и официальных данных Ozon.")
+            L.append("")
+            for i, r in enumerate(diag, 1):
+                L.extend(_review_block(r, first_meta, variant_in_header, no=i))
+            sp = _stars_summary(diag)
+            if sp:
+                L.append(" · ".join(sp))
+                L.append("")
+
+        # Итог по всем собранным отзывам (включая диагностическую порцию).
+        if raw.get("stars_full") is not None:
+            total = raw["stars_full"]["total"]
+            counts = raw["stars_full"]["counts"]
+        else:
+            counts = {s: 0 for s in range(1, 6)}
+            for r in reviews:
+                s = r.get("stars")
+                if isinstance(s, int) and 1 <= s <= 5:
+                    counts[s] += 1
+            total = len(reviews)
+        star_parts = [f"★{s}: {counts[s]}" for s in range(5, 0, -1) if counts[s]]
+        if star_parts:
+            L.append(f"Итог по всем собранным отзывам: {total} {plural(total)}"
+                     " · " + " · ".join(star_parts))
+            L.append("")
 
     # ---- 7. Метаданные --------------------------------------------------------
     L.append("## 7. Метаданные")
@@ -572,6 +763,11 @@ def _product_block_lines(p: dict, idx: int, reviews_per_product: int,
             if isinstance(_s, int) and 1 <= _s <= 5:
                 _counts[_s] += 1
         raw_view["stars_full"] = {"total": len(reviews), "counts": _counts}
+        # рейтинг варианта по ВСЕМ собранным отзывам (до топ-N), чтобы порция
+        # срезанных из дайджеста отзывов не влияла на рейтинг в карточке.
+        rrating, rn, rsrc = digest_rating(raw.get("product") or {}, reviews)
+        raw_view["_digest_rating"] = {"rating": rrating, "n": rn,
+                                      "source": rsrc}
         raw_view["reviews"] = _top_reviews(reviews, reviews_per_product)
     else:
         raw_view = raw
@@ -826,6 +1022,8 @@ def build_search_digest_combined(pids, data_dir: str, query: str | None = None):
             "raw": raw,
             "cache": f"raw:{os.path.basename(path)}",
         })
+
+    sort_digest_products(products)
 
     if query is None:
         query = (f"артикулы: {', '.join(sorted(pids))} (офлайн, из raw)")

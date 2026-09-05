@@ -406,3 +406,57 @@ def test_run_gather_cache_hit_short_recollects(monkeypatch, capsys):
     assert res["ok"] is True
     assert res["cache"] == "miss"
     assert "кеш-хит с браком" in out
+
+
+def _zero_raw(pid="42"):
+    """Заведомо 0-отзывовой raw: rating_count=0, no_reviews_confirmed=True."""
+    return {
+        "pid": pid, "schema_version": "2.0",
+        "collector_version": _raw()["collector_version"],
+        "collected_at_utc": "2026-08-08T10:00:00+00:00",
+        "product": {"title": "Товар", "rating_count": 0,
+                    "price": None, "rating": None},
+        "reviews": [],
+        "reviews_collected": 0,
+        "reviews_variant_mode": {"used": False, "reason": "no_reviews_product",
+                                 "variant_count": 0},
+        "incomplete": True,
+        "missing_fields": ["product.price.current", "product.rating"],
+        "no_reviews_confirmed": True,
+    }
+
+
+def test_run_gather_confirmed_zero_hit_no_recollect(monkeypatch, capsys):
+    """Заведомо 0-отзывовой кеш-хит НЕ пересобирается: collect не вызывается."""
+    zero = _zero_raw()
+    calls = []
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma, **kw: (zero, "hit"))
+    monkeypatch.setattr("ozon_collector.gather.C.collect",
+                        lambda **kw: calls.append(1) or zero)
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400, "no_ocr": True})
+    out = capsys.readouterr().out
+    assert not calls
+    assert res["ok"] is True
+    assert res["cache"] == "hit"
+    assert "cache=hit" in out
+
+
+def test_run_gather_confirmed_zero_miss_recollects(monkeypatch, capsys):
+    """Заведомо 0-отзывовой при miss собирается один раз и НЕ режется как брак
+    (variant_review_problems=[] для явного нуля)."""
+    zero = _zero_raw()
+    calls = []
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma, **kw: (None, "missing"))
+    monkeypatch.setattr("ozon_collector.gather.C.collect",
+                        lambda **kw: calls.append(1) or zero)
+    monkeypatch.setattr("ozon_collector.gather._delete_raw_file",
+                        lambda p: None)
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400, "no_ocr": True})
+    out = capsys.readouterr().out
+    assert len(calls) == 1
+    assert res["ok"] is True
+    assert res["raw"]["no_reviews_confirmed"] is True

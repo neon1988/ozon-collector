@@ -97,6 +97,53 @@ def test_gallery_only_product_widgets(evaluate):
     assert len(g) == 2, f"ожидал 2 (webGallery+desc), получил: {g}"
 
 
+def test_review_zero_from_widget_state(evaluate):
+    """«Отзывы о товаре 0»: state-JSON webReviewProductScore c reviewsCount=0
+    → rating=0 и rating_count=0 (подтверждённый ноль, а не неопределённость)."""
+    html = '''<html><body>
+      <div id="state-webReviewProductScore-3132021-default-1"
+           data-state="{&quot;score&quot;:null,&quot;reviewsCount&quot;:0,
+                       &quot;totalScore&quot;:0,
+                       &quot;constants&quot;:{&quot;emptyScoreText&quot;:&quot;Нет оценок&quot;,
+                                            &quot;reviewsTextExist&quot;:&quot;0 отзывов&quot;}}"></div>
+      <h1>Спрей для горла</h1>
+    </body></html>'''
+    d = evaluate(html=html)
+    assert d.get("rating") == 0, f"rating={d.get('rating')!r}"
+    assert d.get("rating_source") == "no_reviews_widget", \
+        f"rating_source={d.get('rating_source')!r}"
+    assert d.get("rating_count") == 0, f"rating_count={d.get('rating_count')!r}"
+
+
+def test_review_zero_from_total_score_only(evaluate):
+    """Если reviewsCount отсутствует, но totalScore=0 — тоже подтверждённый ноль."""
+    html = '''<html><body>
+      <div id="state-webReviewProductScore-1-default-1"
+           data-state="{&quot;score&quot;:null,&quot;totalScore&quot;:0}"></div>
+    </body></html>'''
+    d = evaluate(html=html)
+    assert d.get("rating") == 0
+    assert d.get("rating_count") == 0
+
+
+def test_review_state_with_count_not_zero_untouched(evaluate):
+    """reviewsCount>0 → rating_count не приравнивается к нулю, обычный путь."""
+    html = '''<html><body>
+      <div id="state-webReviewProductScore-1-default-1"
+           data-state="{&quot;reviewsCount&quot;:277,&quot;totalScore&quot;:0}"></div>
+      <div data-widget="webSingleProductScore"><div>5.0/5</div></div>
+    </body></html>'''
+    d = evaluate(html=html)
+    assert d.get("rating_count") is None or d.get("rating_count") != 0
+
+
+def test_review_zero_absent_no_crash(evaluate):
+    """Нет state-JSON виджета → reviewZero=false, без краша, обычное поведение."""
+    d = evaluate(html="<html><body><p>товара нет</p></body></html>")
+    assert d.get("rating") is None
+    assert d.get("rating_count") is None
+
+
 def test_customer_opinion_recommend_and_stars(evaluate):
     """«По мнению покупателей»: % рекомендуют + разбивка оценок по звёздам.
     Реальная разметка Ozon: строки «N звёзд», процент в style=width, кол-во в конце."""

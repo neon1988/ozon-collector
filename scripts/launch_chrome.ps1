@@ -161,6 +161,8 @@ public class LaunchChromeMin {
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll", SetLastError=true)] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
 
     public static IntPtr FindMainWindow(int pid) {
         IntPtr found = IntPtr.Zero;
@@ -189,6 +191,9 @@ public class LaunchChromeMin {
 }
 "@
 
+$GWL_EXSTYLE = -20
+$WS_EX_NOACTIVATE = 0x08000000
+
 # Запоминаем окно, которое было в фокусе ДО запуска — вернём ему фокус после
 # (Chrome при старте сам вызывает SetForegroundWindow и крадёт фокус).
 Add-Type @"
@@ -206,15 +211,16 @@ $prevFg = [FocusSave]::GetForegroundWindow()
 
 function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowWindow = $true) {
     # Показывает окно БЕЗ активации и прижимает поверх всех (HWND_TOPMOST):
-    # окно свёрнутое и не перехватывает фокус. SW_SHOWMINNOACTIVE показывает
-    # сразу свёрнутым без промежуточного разворачивания (без мелькания).
-    # WS_EX_NOACTIVATE НЕ ставится — окно остаётся обычным (taskbar работает).
-    # $ShowWindow=$false — только ждём появления окна, не показывая.
+    # окно ВИДИМО и не перехватывает фокус. SW_RESTORE выставляет WS_VISIBLE
+    # (иначе окно остаётся «видимым» для EnumWindows, но не на экране).
+    # $ShowWindow=$false — только ставим WS_EX_NOACTIVATE, не показывая окно.
     $deadline = (Get-Date).AddMilliseconds($WaitMs)
     while ((Get-Date) -lt $deadline) {
         $win = Get-Process -Id $PidToWatch -ErrorAction SilentlyContinue
         $h = if ($win) { [LaunchChromeMin]::FindMainWindow($PidToWatch) } else { [IntPtr]::Zero }
         if ($h -ne [IntPtr]::Zero) {
+            $style = [LaunchChromeMin]::GetWindowLong($h, $GWL_EXSTYLE)
+            [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $style -bor $WS_EX_NOACTIVATE) | Out-Null
             if ($ShowWindow) {
                 [LaunchChromeMin]::ShowWindow($h, 7) | Out-Null          # SW_SHOWMINNOACTIVE (свёрнутое, без активации)
                 [void][LaunchChromeMin]::SetTopmost($h)                  # поверх всех, без активации
@@ -251,8 +257,8 @@ function Restore-Focus {
     }
 }
 
-# Первый проход: находим окно как можно раньше (оно скрыто с рождения — SW_HIDE),
-# НЕ показывая его.
+# Первый проход: находим окно и ставим WS_EX_NOACTIVATE как можно раньше,
+# НЕ показывая его (оно скрыто с рождения — SW_HIDE).
 $minimized = Invoke-MinimizeNoActivate $targetPid 10000 $false
 
 # Ждём, пока CDP-порт ответит: к этому моменту Chrome закончил старт и
@@ -271,9 +277,9 @@ if (-not $ready) {
     Write-Host "ждём... проверьте http://127.0.0.1:$Port/json/version"
 }
 
-# Контрольные проходы ПОСЛЕ полного старта: показываем окно свёрнутым
-# без активации (SW_SHOWMINNOACTIVE) и прижимаем поверх всех (HWND_TOPMOST),
-# затем возвращаем фокус. Окно ВИДИМО свёрнутым, фокус не крадёт.
+# Контрольные проходы ПОСЛЕ полного старта: повторно применяем стиль
+# WS_EX_NOACTIVATE, показываем окно (SW_RESTORE) и прижимаем поверх всех
+# (HWND_TOPMOST), затем возвращаем фокус. Окно ВИДИМО всегда, фокус не крадёт.
 if (-not $minimized) {
     $minimized = Invoke-MinimizeNoActivate $targetPid 3000 $false
 }

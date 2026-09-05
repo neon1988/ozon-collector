@@ -24,7 +24,7 @@ from . import process as P
 from . import puzzle as _puzzle
 from .cdp import browser_tabs_count
 from .gather import run_gather
-from .report import sort_digest_products
+from .report import digest_rating, sort_digest_products
 
 SEARCH_JS = r"""
 () => {
@@ -669,8 +669,10 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
             break
         mr = gather_cfg.get("min_rating")
         if res["ok"] and mr is not None:
-            rating = (res.get("raw") or {}).get("product", {}).get("rating")
-            if isinstance(rating, (int, float)) and rating < mr:
+            rating, _n, _src = digest_rating(
+                (res.get("raw") or {}).get("product") or {},
+                (res.get("raw") or {}).get("reviews"))
+            if rating is not None and rating < mr:
                 res["excluded"] = {
                     "reason": "rating_below",
                     "rating": rating,

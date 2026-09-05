@@ -8,6 +8,140 @@
 > Прошлые cp1251-вставки перекодированы в UTF-8 2026-08-18 (9 строк). Никогда
 > не писать и не читать эти файлы как cp1251/другие кодировки.
 
+ - **Дайджест: секция отзывов разделена на «обычную» и «диагностическую» (2026-09-05).**
+   После устранения ложной статистики осталось «когнитивное» искажение: LLM
+   видела сплошную стену негатива из score_asc и могла сделать вывод «половина
+   ругает товар» при рейтинге 4.96. Решение — структурно разделить блок 6 в
+   report.py(render): `### Отзывы покупателей — обычная выборка (N)`
+   (отзывы без score_asc, с пояснением «используется для рейтинга варианта»)
+   и `### Негативные отзывы — целенаправленный поиск проблем (M)` с
+   предупреждением `⚠️ …количество НЕ является долей недовольных покупателей».
+   Единый предикат `_is_score_asc` для расчёта рейтинга и секций (Инвариант:
+   «обычная» секция = выборка `variant_rating_from`; mixed-отзывы
+   `['published_at_desc','score_asc']` идут в диагностическую, как и
+   исключаются из рейтинга). Нумерация отзывов с 1 в каждой секции, порядок
+   исходный. Пер-секционные счётчики ★ , итоговая суммарная строка
+   «Итог по всем собранным отзывам: …» по-прежнему по всем (включая score_asc).
+   Пересбор не нужен (review_sorts уже в raw). Тесты: +6 в test_report
+   (91 passed), search 53, digest_from_raw+cli 11. Промпт-страховка:
+   «секцию "Негативные отзывы" не экстраполировать на общую удовлетворённость».
+
+ - **Рейтинг дайджеста и доля негатива: вариант по нейтральной выборке, score_asc только контент (2026-09-05).**
+   Найдено: у товаров с большим числом отзывов в дайджесте рейтинг системно
+   занижен — это НЕ реальное качество, а артефакт сбора. Сортировка
+   «сначала низкие оценки» (±score_asc) выбивает худшие отзывы первыми, и для
+   гигантов (нельзя собрать всё — стена входа) выборка ~190 набита негативом:
+   пример pid 1283214310 — собранный негатив 26% и avg 2.51 при реальных
+   0.66% негатива и полном распределении 4.91 (365 142 оценки). «Официальный
+   рейтинг» Ozon (вся карточка) как основной источник ОТКЛОНЁН пользователем:
+   карточка может слопать несколько разных товаров. Решение (report.py):
+   **основной рейтинг варианта = среднее только по отзывам без метки
+   score_asc** (`review_sorts` уже сохранён у каждого отзыва → пересбор НЕ
+   нужен): `variant_rating_from`/`digest_rating`. Старые raw без `review_sorts`
+   — нейтральные; у кого после отсечения 0 отзывов — фолбэк на рейтинг
+   карточки Ozon с пометкой «нет нейтральной выборки». Справочная строка
+   в карточке: `Ozon (вся карточка): X·K оценок` из `customer_opinion.counts`
+   (точное распределение) или `product.rating`. Сортировка (`sort_digest_products`):
+   балл = рейтинг варианта × число нейтральных оценок (без множителя у
+   фолбэка-карточки), tie-break больше N → pid, без рейтинга ниже, ok=False
+   в конец. `--min-rating` (search.collect_search) фильтрует ПО НОВОМУ баллу
+   варианта (единый критерий с показом), не по официальному. **Доля негативных
+   оценок (1–2★)** — только из полного распределения `customer_opinion.counts`
+   `(N1+N2)/(N1..N5)`, строка «Негативных оценок (1–2★): 2.0% · по 365142
+   оценкам (вся карточка Ozon)»; распределения нет → строку не выводим (никаких
+   процентов по собранной выборке: score_asc — канал поиска проблем, не
+   статистика покупателей; обсуждение ботов 2026-09-05). Тесты: report
+   85 passed, search 53 passed (включая min_rating), digest_from_raw+cli 11.
+   Полный прогон test_key_daemon в этой сессии не гонялся (тяжёлый, висит).
+
+ - **Дайджест: сортировка по avg×count вместо среднего балла (2026-09-05).**
+   Раньше «лучшие в начало» = средний балл собранных отзывов (убыв.), затем
+   число отзывов (решение 2026-09-04). НО: сортировка по среднему возносила
+   товары с парой отзывов на 5★ над товарами с 3★×9, даже если последний
+   объективно популярнее. Изменён `sort_digest_products` (report.py): ключ =
+   **средний балл × число собранных отзывов** (убыв.) — «популярностный балл».
+   Пример: 3×9=27 > 4×5=20 > 5×2=10. Семантика прочего сохранена: ok=False — в
+   конец; без собранных отзывов (avg=None) — ниже имеющих их (ключ +inf, НЕ -inf:
+   иначе при восходящей сортировке они уезжали наверх); pid — детерм. tie-break
+   при равном произведении. Вызывается теми же 3 точками (report.build_search_
+   digest_combined, search.collect_search, parallel после merge_shard_results).
+   Тесты test_report.py: переписан best_avg→best_avgxcount (3,9/4,5/5,2 → 3,1,2),
+   renamed avgxcount_grows_with_count, добавлен tie_break_by_pid (3×4=4×3),
+   errors_and_no_reviews_last сохранён = 74 passed, py_compile чист.
+
+ - **`key_daemon --reset`: полное пересоздание существующей кампании (2026-09-05).**
+   Раньше свежий сбор = руками удалять `data/campaigns/<name>` (иначе терминальная
+   кампания → мгновенный выход, а ещё продолжались старые discovered/valid).
+   Добавлен флаг `--reset` в `scripts/key_daemon.py`: удаляет каталог кампании
+   целиком (progress.json, status.json, events.jsonl, runs/) ДО загрузки манифеста
+   и стартует как новая кампания (fresh=True): требуется `--url`, discovered/valid/
+   runs не наследуются, `campaign_identity.url_sha256` пересчитывается. Сырой кеш
+   товаров (`data/*_raw*.json`) общий и НЕ трогается — свежесть сбора по-прежнему
+   через `--max-age 0`. Защита: выполняется после PidLock, лог демона в отдельном
+   LOGS_DIR не удаляется. `--force-new` по-прежнему НЕ сбрасывает состояние (только
+   обход identity). Тесты: 2 новых в test_key_daemon.py (reset терминальной
+   COMPLETED_MIN + reset без существующей кампании) = 209 passed, py_compile чист.
+
+ - **Окна воркер-браузеров: возвращены плавающие блоки над таскбаром (2026-09-05).**
+   Коммит `936a715` убрал `WS_EX_NOACTIVATE` из `launch_chrome.ps1`, `cdp.py
+   _minimize_window_native()` и `_restore_window_native()` → воркер-браузеры стали
+   появляться в таскбаре кучей обычных кнопок. Причина: `WS_EX_NOACTIVATE`
+   (0x08000000) говорит Shell «окно НЕ должно получать taskbar-кнопку»;
+   при + `HWND_TOPMOST` оно рендерится как маленький плавающий блок над таскбаром.
+   Решение: ВЕРНУЛИ `WS_EX_NOACTIVATE` + `SW_RESTORE` во всех трёх местах
+   (фактически откат `936a715`). Окна снова плавающие блоки, фокус не сбивается
+   (окно не активируется). Побочка (принята пользователем): двойной клик по
+   блоку НЕ восстанавливает окно (Shell-thumbnail рендерит отдельный процесс;
+   `WM_NCLBUTTONDBLCLK` не доходит) — восстановление через Alt+Tab/клик по списку.
+   **Фикс вспышки (та же сессия):** `SW_RESTORE` (9) в `Invoke-MinimizeNoActivate`
+   показывал окно развёрнутым ~100-300 мс, потом Chrome сворачивал → «окна
+   появляются а потом сворачиваются». Заменён на `SW_SHOWMINNOACTIVE` (7) —
+   показывает сразу свёрнутым без мелькания. `cdp.py` НЕ трогали (там `SW_MINIMIZE`
+   уже корректный; `_restore_window_native` с `SW_RESTORE` только для keep_window).
+   VERSION не повышался. Тесты: test_search.py 53 passed.
+
+ - **Ленивый запуск браузеров: reintroduced (2026-09-05).** Раньше каждый
+   воркер в `worker_main` делал `_make_session(spec)` (запуск Chrome) СРАЗУ при
+   старте процесса — до назначения товаров. При rescans (4 товара на 12
+   воркеров) ~8 воркеров поднимали браузер зря. История: ленивый вариант уже
+   был в коммите `4a672c1` (динамическая раздача), но откачен `38a8b77` из-за
+   `asyncio loop error` (`sync_playwright().start()` вызывался из глубокого
+   стека `_collect_shard`). **Новая реализация в `parallel.py worker_main`:**
+   `sess=None` до `_recv_batch(p2w_conn)`; `_make_session(spec)` +
+   `_warmup_session(sess)` вызываются ПОСЛЕ получения первой пачки, на верхнем
+   уровне `worker_main` (стек `worker_main → _make_session → Session.__init__ →
+   _connect → sync_playwright().start()` — без вложенных event loops).
+   Воркеры без товаров выходят без запуска Chrome. Heartbeat-hook работает и
+   без сессии (просто шлёт в pipe). finally: guards `sess is not None` уже были.
+   Статический шардинг не менялся. Экономия: ~8 запусков Chrome × 2-3 сек +
+   ~800 МБ RAM на rescan 12 воркеров. Тесты: test_search.py 53 + test_parallel.py
+   49 + test_parallel_restart.py 19 passed, py_compile чист.
+
+ - **«Отзывы о товаре 0» из state-JSON → подтверждённый ноль (2026-09-04).** Кампания `gorlo`: 105 товаров вечно пересобирались как `incomplete` (`rc=None`, no_widget). Причина: у таких нулевиков страница нормальная, просто отзывов нет (вручную подтверждено), но экстрактор `ratingCount()` искал только числа («N оценок», «N отзывов»), а виджет `webReviewProductScore` машинно отдаёт `reviewsCount: 0`/`totalScore: 0` в `data-state` JSON (блок «Отзывы о товаре 0»). Решение: в `PRODUCT_JS` добавлен helper `reviewZero()` (collect.py) — читает `data-state` виджета `webReviewProductScore`, возвращает true при `reviewsCount<=0` (fallback totalScore<=0); `rating()` → `{value:0}`, `ratingCount()` → `0`. Итог: `product.rating=0` (не None → `missing_fields` пуст, `incomplete=False`), `rating_count=0` → `no_reviews_confirmed=True` → кеш hit. `min_rating` в кампании не задан → exclusion «rating ниже» не срабатывает. Age-gate (`4465529033`, title «Подтвердите возраст») — **отдельная задача, не входит сюда**. VERSION не повышался. Тесты: 4 новых в `test_extractors.py` (state zero, totalScore-only, count>0 не тронут, отсутствие виджета без краша) = 13 passed; `test_cache`+`test_gather`+`test_report`+`test_qa_raw` = 179 passed.
+
+ - **QA: CONFIRMED_NO_REVIEWS → OK для подтверждённых нулевиков (2026-09-04).** QA в `qa_raw.py:221` ставил `ZERO_REVIEWS` FAIL при `collected==0`, даже для настоящих нулевиков с `no_reviews_confirmed=True` (нормальная карточка, экстрактор подтвердил reviewsCount=0). Итог: нулевик собирался как ok, кеш хитил, но QA → FAIL → не попадал в `valid_pids`. Решение: если `raw["no_reviews_confirmed"]` truthy и `collected==0` → INFO `CONFIRMED_NO_REVIEWS` вместо FAIL. Вердикт нулевика → OK. `QA_VERSION` с `1.6` → `1.7` (инвалидация QA-кеша). Новая кампания: первый сбор нулевика записывает `no_reviews_confirmed=True` в canonical → QA → OK → valid_pids. Существующие кампании: нулевики в canonical (без флага) останутся FAIL до следующего прогонного QA (verdict invalidated qa_version). Тесты: 2 новых в `test_qa_raw.py` (confirmed zero → OK, rc=0 + confirmed → OK) = 24 passed.
+
+ - **0-отзывовые товары кешируются как hit, не пересобираются (2026-09-04).** Причина: `incomplete=True` (отсутствие `product.rating`/`price.current`) → `cache._validate_raw` отбрасывал raw → `miss` каждый проход → повторный полный сбор с заходом на Ozon. Решение: поле `no_reviews_confirmed` в raw (collect.py, сразу после `missing_fields`); кеш: `incomplete and not no_reviews_confirmed` → `"incomplete"` → `"hit"`. Два достоверных сигнала явного нуля: `rating_count == 0` (экстрактор карточки) **или** `variant_count == 0` при `used=True` (виджет варианта). `variant_review_problems == []` необходимо, но недостаточно — без явного сигнала нуля (`rc=None`, `no_widget`) товар не кешируется (неоднозначный случай). Не кеширует: недогруз (`short(N/rc)`), нет подтверждения. `_best_raw` ранжирует: `(1 если reviews>0, ts, N)` — confirmed-нулевик не вытесняет полный raw. gather.py при `hit` + `variant_review_problems=[]` не обнуляет кеш. Бамп VERSION не требуется (поле аддитивно, старые raw без него — miss → 1 пересбор → потом hit). Тесты: `test_cache.py` (confirmed-zero hit, widget-zero hit, ambiguous incomplete, short incomplete, backward-compat) + `test_gather.py` (confirmed-zero hit no-recollect, miss recollects) = 718 passed.
+
+ - **Лучшие товары — в начале дайджеста (2026-09-04).** `report.sort_digest_products` сортирует `combined["products"]` in-place по: средний балл СОбранных нами отзывов (`_avg_review_rating`, убыв.) → число собранных (reviews_collected, убыв.) → pid (детерм. tie-break). Ошибки (ok=False) — в конец; ok без отзывов — ниже имеющих их (avg=None → -inf ключ). Вызывается во всех трёх точках формирования combined: `report.build_search_digest_combined` (офлайн digest_from_raw + key_daemon._write_digest), `search.collect_search` (живой одиночный), `parallel` после `merge_shard_results` (живой параллельный). `render_search_digest`/`write_search_digest` не менялись — нарезка на части остаётся согласованной (combined отсортирован ДО планирования). Регресс test_report(73)+parallel+digest_from_raw+reviews+collect_topup = 209 passed, py_compile чист.
+
+- **Решение возрастного гейта 18+ «Подтвердите возраст» (2026-09-04).** Модалка поверх карточки товаров 18+ (напр. pid=4465529033), НЕ анти-бот-заглушка — `detect_challenge` её не видит, title/body карточки нормальные. Реализация `collect._pass_age_gate(page)` (collect.py:984), вызывается сразу после `check_challenge` и на reviews (1882), и на product (2233). Логика: probe `_AGE_GATE_PROBE_JS` (/Подтвердите возраст/) → `input:visible` → `press_sequentially("01011990")` (маска ДД.ММ.ГГГГ не принимает value) → кнопка «Подтвердить» (`get_by_role("button", name="Подтвердить")`) → если enabled → клик.
+>
+> **Фикс 2026-09-04:** `el.click()` → synthetic `click`-событие, а Vue-компонент Ozon (userAdultModal) слушает `pointerdown`/`pointerup` цепочку — без неё `setBirthdate?isAlco=false` API не вызывается, модалка остаётся (лог «пройден», а карточка всё ещё «Подтвердите возраст»). Заменено на полную цепочку `pointerdown → mousedown → pointerup → mouseup → click` через `dispatchEvent(new PointerEvent(...))` с `clientX/clientY`, `pointerId`, `pointerType:'mouse'` (collect.py:1030-1043). Проверено вживую на `4465529033` (подключение к рабочему Chrome через CDP на 9222): дата `01.01.1990` вводится (inner input value корректен), pointer chain снимает гейт, товар «Спрей для полости рта» загружается. Fallback `btn.click(force=True)` сохранён для случая `element_handle()==None`. Тесты: test_age_gate 3 passed + test_extractors 13 = 16 passed.
+
+ **Ключевой фикс (2026-09-04):** обычный `btn.click()` (Playwright) падал с `TimeoutError ... subtree intercepts pointer events` — оверлей модалки `<div class="a75_4_1-b3">` внутри `<div class="vue-portal-target">` перехватывает pointer events (в логе: 33× retry → renderer_failure → recyclable). Заменён на **trusted JS-клик** `handle.evaluate("(el) => el.click()")` (как в `_expand_review_comments`/`_is_sticky_intercept`), фолбэк `btn.click(force=True)` только при renderer_failure и не-sticky. Подтверждено вживую: после JS-клика `age=False` (модалка ушла), карточка открывается, `looks_like_puzzle=False`, пазл после возраста НЕ появляется. Остаётся куки-баннер («ОК») — на снятие не влияет, в age/probe не входит. Тесты: новый `tests/test_age_gate.py` (JS-клик vs Playwright, no-gate, disabled) = 3 passed; регресс age+puzzle+challenge_guard+collect_topup = 42 passed.
+
+- **Решение слайдер-пазла «Сопоставьте пазл, двигая ползунок» ВНЕДРЕНО (2026-09-04).** Ради кампании stir_poroshok (падала на анти-бот капче). Интеграция ЕДИНАЯ через `collect.check_challenge` (collect.py:941-961), который вызывается и при поиске (search_page/canary/warmup_home, search.py:210/293/376), и при сборе (reviews_page/product_page, collect.py:1881/1938/2232): если `detect_challenge` дал сигнатуру ИЛИ в DOM есть фон+кусочек пазла — вызывается `puzzle.solve_puzzle`, успех → возврат без AccessChallenge (не тратится FAB-reload/budget). warmup в parallel.py:399 только прогревает куки, пазл решает уже `_collect_shard` по товарам.
+
+ **Три корневых фикса в `ozon_collector/puzzle.py` (2026-09-04):**
+ 1. `_capture_info` — многострочный JS-строковый литерал селектора слайдера (перенос строки внутри `'[class*=slider]...'`) давал `SyntaxError` → детект пазла по DOM всегда возвращал `None`. Сделан однострочным.
+ 2. `_still_challenge` полагался только на `is_puzzle(detect_challenge)`, а для `title:antibot captcha` сигнатура не содержит «пазл» → всегда False даже при нерешённом пазле (ложный `solved:true`). Теперь сначала проверяет DOM (`looks_like_puzzle`).
+ 3. Зацеп не за ручку слайдера: у Ozon классы ручки/трека ПУСТЫЕ (`cls:""`), `slider:null`; и drag-за-центр ручки не работает (в центре svg-иконка перехватывает клик через `elementFromPoint`). Добавлен `_find_slider` по ГЕОМЕТРИИ (трек = самый широкий тонкий DIV ниже фона, ручка ~40x32 у его левого края) и drag **за левую часть ручки** (grab_x = handle.x + ~6, не центр).
+
+ **Алгоритм (puzzle.py):** `_capture_info` (bg=img.image w>200, puzzle=img.puzzle) → скачиваем bg/piece (urllib) → `_find_notch` (OpenCV matchTemplate, x выемки) → `_find_slider` (трек+ручка, геометрия) → dx = bx*scale в экранные px → drag ручки за левый край. `PUZZLE_MAX_ATTEMPTS=2`, `_PUZZLE_FAILURES` (счётчик неудач через `failures()`/`reset()`).
+
+ **Подтверждено вживую (2026-09-04):** капча на `ozon.ru/search/?text=спрей лечения горла&from_global=true` → `verdict=solved`, `failures=0`, `title_after=спрей лечения горла - купить на OZON` (переход на выдачу); `elapsed_s=2.41`. Пробник: `tests/puzzle_probe.py` (изолир. профиль, порт 9335, `--url --yes [--force-copy]`), отчёт JSON. Тесты: `tests/test_puzzle.py` (+ `_find_slider`/`looks_like_puzzle`) и `test_challenge_guard.py` = 26 passed; `test_collect_topup.py` = 13 passed.
+ 
  - **OCR по умолчанию ВЫКЛЮЧЕН (2026-08-17).** Флаг --no-ocr заменён на --ocr (включает tesseract); в конфигах no_ocr = not args.ocr. Параллельный OCR требует --allow-parallel-ocr (проверка: args.ocr and not args.allow_parallel_ocr). Сбор 300 без OCR ускоряется в разы. test_gather.py 16 passed.
 
  - **Новое поле: По мнению покупателей (customer_opinion) (2026-08-17).** В PRODUCT_JS добавлено извлечение блока: % рекомендуют (по всей странице) + гистограмма оценок по звёздам (строки N звёзд, процент из style=width, количество отзывов в конце строки). Поля: recommend_percent, stars {5..1: %}, counts {5..1: N}, text. Рендер в report.py: строка По мнению покупателей в карточке товара, напр. 92% рекомендуют 5? 88% (4527) · 4? 7.3% (374) .... Тесты test_extractors.py + test_report.py добавлены. Примечание: реальная разметка Ozon - проценты в атрибуте style=width строки N звёзд (webReviewProductScore), а не текст NN%.
@@ -22,7 +156,53 @@
 
  - **Параллельность: дефолтный лимит 2 > 8 воркеров (2026-08-17).** `PARALLEL_MAX_WORKERS` в `__init__.py` по умолчанию теперь 8 (env `OZON_PARALLEL_MAX` по-прежнему переопределяет). Порты воркеров назначаются динамически (9222+k > 9223–9230), профили — `worker_profile_token(k)`, конфликтов нет. Тест `test_parallel_validation_bounds` обновлён (дефолт 8, env 16). Внимание: 8 одновременных сессий Ozon — выше нагрузка на FAB, следить за challenge-штормом.
 
-## Статус и следующие шаги (последнее обновление: 2026-09-03)
+## Статус и следующие шаги (последнее обновление: 2026-09-05)
+
+ - **✅ Секция отзывов дайджеста: обычная / диагностическая (2026-09-05).**
+   Блок 6 разделён на «Обычная выборка» (без score_asc, пояснение «для рейтинга
+   варианта») и «Негативные отзывы — целенаправленный поиск проблем» с
+   предупреждением про НЕ-долю недовольных. Предикат секций = предикат рейтинга
+   (`_is_score_asc`), инвариант «обычная секция ≡ выборка рейтинга» покрыт
+   тестом. Нумерация с 1 в секции, порядок исходный, итоговая суммарная строка
+   осталась. test_report.py: 91 passed (+6), test_search.py: 53 passed,
+   digest_from_raw + cli: 11 passed. Пересбор НЕ требуется.
+   Осталось (опц.): экстра-строка в `qa_raw` про секции; актуализация README/docs.
+
+ - **✅ Рейтинг варианта по нейтральной выборке + честная доля негатива (2026-09-05).**
+   См. запись в шапке: артефакт чрезвычайных low-first-сортировок раскрыт и
+   убран — основной рейтинг и сортировка дайджеста идут по отзывам без
+   `score_asc`, официальный рейтинг карточки справочной строкой, `--min-rating`
+   фильтрует по новому баллу; доля негатива (1–2★) — только из полного
+   распределения Ozon (вся карточка), без распределения — не выводится.
+   Пересбор данных НЕ требуется. Осталось (опц.):
+   `score_asc` в коллекторе помечать флагом «для анализа дефектов» и не смешивать
+   в пул среднего вообще (сейчас смешивание уже не влияет — фильтр на этапе
+   расчёта); актуализировать подписи/README и, при желании, docs о метрике.
+
+ - **✅ Окна воркер-браузеров + ленивый запуск (2026-09-05).** См. записи в шапке:
+   `WS_EX_NOACTIVATE` возвращён (плавающие блоки над таскбаром, без кражи фокуса),
+   `SW_SHOWMINNOACTIVE` вместо `SW_RESTORE` при старте (без вспышки). Ленивый
+   запуск браузеров reintroduced: `_make_session`+`_warmup` после `_recv_batch`.
+
+ - **✅ Динамическая пакетная раздача (batch=5) реализована (2026-09-03).**
+   Замена статического round-robin шардинга на «общий ящик задач» у оркестратора:
+   воркер по завершении пачки запрашивает следующую через parent→worker pipe —
+   устраняет «хвост» (простаивание быстрых воркеров в конце кампании).
+   * `parallel.py`: два однонаправленных pipe на воркера — `conn` (worker→parent)
+     и `p2w_conn` (parent→worker, только `{t:"next",batch}` / `{t:"none"}`);
+     `worker_main` переведён на пакетный цикл `_recv_batch`→`_run_shard`→`{t:"done_batch"}`;
+     `_await_workers` = диспетчер (shared_items deque + completed_indexes/owner),
+     requeue недоделанных при краше, stall штрафует только PROCESSING (не WAITING_FOR_TASK);
+     stop = Вариант A (мгновенный terminate всех живых), force = 2-й Ctrl+C без респавна;
+     `_rebuild_shards` пересобирает совместимый shards из owner (fallback на статический
+     шард для невыданных); телеметрия `combined.parallel.scheduler` (batch_size, requeue_count,
+     tail_ratio); `DEFAULT_BATCH_SIZE=5`, настраивается `gather_cfg["batch_size"]`.
+   * ВАЖНО об концах duplex=False: первый конец = RECV, второй = SEND; для parent→worker
+     родителю отдан SEND, воркеру RECV (иначе OSError read-only).
+   * Scope: только parallel.py + тесты; search/cache/key_daemon/QA/FAB не трогались.
+   * Тесты: `_spawn_workers`/test_parallel.py переведены на пакетный диспетчер;
+     test_parallel.py 49, test_parallel_restart.py 19, search/qa/digest/raw/collect_topup 98,
+     gather/report/cache/ocr/etc. 268 — все зелёные.
 
  - **✅ Ctrl+C: закрыты 2 дыры — докрутка ссылок stop-aware + «живой» 2-й форс (2026-09-03).**
    Live-прогон выявил: первый Ctrl+C игнорировался, пока шла докрутка выдачи

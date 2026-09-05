@@ -303,10 +303,10 @@ def test_render_no_dedup_flag():
     assert "пропущено" not in md
 
 
-def test_render_rating_and_opinion_omitted():
-    """Рейтинг и % рекомендуют НЕ выводятся в карточке md (это данные обо всех
-    вариантах и мешают оценке; в raw/кеше остаются). АКСТЫ из customer_opinion
-    при отсутствии text тоже не выводятся."""
+def test_render_card_rating_when_no_variant_sample():
+    """Без нейтральной выборки (нет отзывов) рейтинг карточки выводится с
+    пометкой «нет нейтральной выборки»; rating_source не показывается.
+    АКСТЫ из customer_opinion при отсутствии text не выводятся."""
     raw = _raw([])
     raw["product"]["rating"] = 4.9
     raw["product"]["rating_count"] = 3045
@@ -316,7 +316,8 @@ def test_render_rating_and_opinion_omitted():
         "stars": {"5": "81", "4": "12", "3": "4", "2": "2", "1": "1"},
     }
     md = render(raw)
-    assert "Рейтинг:" not in md
+    assert ("Рейтинг карточки Ozon: 4.900 / 5 (3045 оценок) "
+            "_(нет нейтральной выборки)_") in md
     assert "webSingleProductScore" not in md
     assert "По мнению покупателей" not in md
     assert "92% рекомендуют" not in md
@@ -368,13 +369,13 @@ def test_customer_opinion_percents_rendered():
 def test_render_no_rating_opinion_lines():
     """Без рейтинга/opinion в raw — строки не выводятся, карточка цела."""
     md = render(_raw([]))
-    assert "Рейтинг:" not in md
+    assert "Рейтинг" not in md
     assert "По мнению покупателей" not in md
     assert "Средний рейтинг по отзывам" not in md
 
 
 def test_render_avg_review_rating():
-    """Средний балл по оценкам собранных отзывов выводится в карточке."""
+    """Средний балл по нейтральной выборке собранных отзывов (без score_asc)."""
     raw = _raw([
         _review("A", [], stars=5),
         _review("B", [], stars=4),
@@ -382,9 +383,11 @@ def test_render_avg_review_rating():
         _review("D", [], stars=3),
     ])
     md = render(raw)
-    assert "Средний рейтинг по отзывам: 3.750 / 5 (4 оценки)" in md
+    assert ("Рейтинг по собранным отзывам (без «сначала низкие»): "
+            "3.750 / 5 (4 оценки)") in md
     md2 = render(_raw([_review("A", [], stars=5)]))
-    assert "Средний рейтинг по отзывам: 5.000 / 5 (1 оценка)" in md2
+    assert ("Рейтинг по собранным отзывам (без «сначала низкие»): "
+            "5.000 / 5 (1 оценка)") in md2
 
 
 def _combined(products):
@@ -750,6 +753,308 @@ def test_build_combined_query_override(tmp_path):
     combined, _ = build_search_digest_combined(
         ["3627230434"], str(data_dir), query="тестовая выдача")
     assert combined["search"]["query"] == "тестовая выдача"
+
+
+# ---- sort_digest_products -------------------------------------------------
+
+def _sort_raw(stars, n_collected):
+    reviews = [{"author": "a", "date": "2026-08-01", "stars": stars,
+                "text": "отзыв", "comments": []} for _ in range(n_collected)]
+    raw = _raw(reviews)
+    raw["reviews_collected"] = n_collected
+    return raw
+
+
+def _sort_res(pid, *, ok=True, raw=None):
+    return {"pid": pid, "ok": ok, "raw": raw if ok else None}
+
+
+def test_sort_digest_products_best_avgxcount_first():
+    # ключ сортировки — средний балл × число собранных отзывов (решение 2026-09-05):
+    # 3×9=27 > 4×5=20 > 5×2=10, хотя средний балл у p2 выше всех
+    from ozon_collector.report import sort_digest_products
+    products = [
+        _sort_res(1, raw=_sort_raw(4, 5)),  # 20
+        _sort_res(2, raw=_sort_raw(5, 2)),  # 10 -> последний среди ok
+        _sort_res(3, raw=_sort_raw(3, 9)),  # 27 -> первый
+    ]
+    sort_digest_products(products)
+    assert [p["pid"] for p in products] == [3, 1, 2]
+
+
+def test_sort_digest_products_avgxcount_grows_with_count():
+    # при равном среднем балле больше отзывов → выше произведение avg×count
+    from ozon_collector.report import sort_digest_products
+    products = [
+        _sort_res(1, raw=_sort_raw(4, 3)),  # 12
+        _sort_res(2, raw=_sort_raw(4, 8)),  # 32 -> первый
+        _sort_res(3, raw=_sort_raw(4, 5)),  # 20
+    ]
+    sort_digest_products(products)
+    assert [p["pid"] for p in products] == [2, 3, 1]
+
+
+def test_sort_digest_products_tie_break_by_pid():
+    # одинаковое произведение avg×count (3×4 и 4×3) → tie-break по pid
+    from ozon_collector.report import sort_digest_products
+    products = [
+        _sort_res(2, raw=_sort_raw(4, 3)),  # 12
+        _sort_res(1, raw=_sort_raw(3, 4)),  # 12
+    ]
+    sort_digest_products(products)
+    assert [p["pid"] for p in products] == [1, 2]
+
+
+def test_sort_digest_products_errors_and_no_reviews_last():
+    from ozon_collector.report import sort_digest_products
+    products = [
+        _sort_res(9, ok=False),      # ошибка — в самый конец
+        _sort_res(1, raw=_sort_raw(4, 2)),
+        _sort_res(2, ok=True, raw=None),  # ok, но без отзывов — ниже
+    ]
+    sort_digest_products(products)
+    assert [p["pid"] for p in products] == [1, 2, 9]
+
+
+def _raw_sorted(stars_neutral, n_neutral, stars_asc, n_asc,
+                rating=None, rating_count=None):
+    reviews = []
+    for i in range(n_neutral):
+        reviews.append({"author": "a", "stars": stars_neutral, "text": "отзыв",
+                        "review_sorts": ["published_at_desc"]})
+    for i in range(n_asc):
+        reviews.append({"author": "a", "stars": stars_asc, "text": "отзыв",
+                        "review_sorts": ["score_asc"]})
+    raw = _raw(reviews)
+    raw["reviews_collected"] = n_neutral + n_asc
+    if rating is not None:
+        raw["product"]["rating"] = rating
+    if rating_count is not None:
+        raw["product"]["rating_count"] = rating_count
+    return raw
+
+
+def test_sort_digest_products_ignores_score_asc():
+    """Порция «сначала низкие оценки» не участвует ни в рейтинге, ни в балле
+    сортировки: 5×10 нейтральных > 4×11 (несмотря на 90 добавленных единиц)."""
+    from ozon_collector.report import sort_digest_products
+    products = [
+        _sort_res(1, raw=_raw_sorted(4, 11, 1, 0)),   # 4×11=44
+        _sort_res(2, raw=_raw_sorted(5, 10, 1, 90)),  # 5×10=50 -> первый
+    ]
+    sort_digest_products(products)
+    assert [p["pid"] for p in products] == [2, 1]
+
+
+def test_sort_digest_products_official_fallback_no_multiplier():
+    """Нет нейтральной выборки → рейтинг карточки без множителя (ниже имеющих
+    рейтинг варианта, но выше товаров без рейтинга вовсе)."""
+    from ozon_collector.report import sort_digest_products
+    products = [
+        _sort_res(2, raw=None),                              # без рейтинга
+        _sort_res(3, ok=False),                              # ошибка — в конец
+        _sort_res(1, raw=_raw_sorted(0, 0, 1, 5,
+                                     rating=4.8, rating_count=3000)),
+    ]
+    sort_digest_products(products)
+    assert [p["pid"] for p in products] == [1, 2, 3]
+
+
+def test_variant_rating_excludes_score_asc_from_render():
+    """В карточке рейтинг по нейтральным отзывам (без score_asc), а официальный
+    рейтинг карточки выводится справочной строкой."""
+    raw = _raw_sorted(5, 2, 1, 2, rating=4.9, rating_count=365142)
+    md = render(raw)
+    assert ("Рейтинг по собранным отзывам (без «сначала низкие»): "
+            "5.000 / 5 (2 оценки)") in md
+    assert "- Ozon (вся карточка): 4.900 / 5 · 365142 оценки" in md
+
+
+def test_variant_rating_only_score_asc_falls_back_to_card():
+    """Все отзывы из score_asc → рейтинга варианта нет, карточка с пометкой."""
+    raw = _raw_sorted(0, 0, 1, 5, rating=4.2)
+    md = render(raw)
+    assert "Рейтинг по собранным отзывам" not in md
+    assert ("Рейтинг карточки Ozon: 4.200 / 5 "
+            "_(нет нейтральной выборки)_") in md
+
+
+def test_digest_rating_variant_wins_over_official():
+    """При наличии нейтральной выборки берётся вариант, даже если карточка выше."""
+    from ozon_collector.report import digest_rating
+    raw = _raw_sorted(3, 10, 1, 90, rating=4.9, rating_count=3000)
+    rating, n, src = digest_rating(raw["product"], raw["reviews"])
+    assert (rating, n, src) == (3.0, 10, "variant")
+
+
+def test_official_rating_info_from_counts():
+    """Полное распределение customer_opinion.counts точнее product.rating."""
+    from ozon_collector.report import official_rating_info
+    product = {
+        "rating": 4.9,
+        "rating_count": 365142,
+        "customer_opinion": {"counts": {"5": 340899, "4": 19582,
+                                        "3": 2271, "2": 820, "1": 1570}},
+    }
+    rating, count = official_rating_info(product)
+    assert count == 365142
+    assert abs(rating - 4.90) < 0.05
+
+
+def test_official_rating_info_no_data():
+    from ozon_collector.report import official_rating_info
+    assert official_rating_info(None) == (None, None)
+    assert official_rating_info({}) == (None, None)
+    assert official_rating_info({"customer_opinion": {"stars": {}}}) == (None, None)
+
+
+# ---- доля негативных оценок (только полное распределение Ozon) ---------------
+
+def test_official_negative_share_from_counts():
+    """Доля негатива (1–2★) берётся ТОЛЬКО из полного распределения
+    customer_opinion.counts (генеральная совокупность), а не из собранных
+    отзывов (score_asc смещает выборку)."""
+    from ozon_collector.report import official_negative_share
+    product = {
+        "rating": 4.9,
+        "rating_count": 500,
+        "customer_opinion": {"counts": {"5": 100, "4": 100, "3": 100,
+                                        "2": 100, "1": 100}},
+    }
+    share, total = official_negative_share(product)
+    assert total == 500
+    assert abs(share - 0.4) < 1e-9
+
+
+def test_official_negative_share_ignores_rating_without_counts():
+    """Без распределения counts долю не считаем: product.rating один не даёт
+    доли негатива, и никакого процента по собранной выборке не выдумываем."""
+    from ozon_collector.report import official_negative_share
+    assert official_negative_share(None) == (None, None)
+    assert official_negative_share({}) == (None, None)
+    assert official_negative_share({"rating": 4.2, "rating_count": 3000}) == (None, None)
+    assert official_negative_share({"customer_opinion": {"stars": {}}}) == (None, None)
+
+
+def test_render_negative_share_line_from_counts():
+    """В карточке выводится официальная доля негатива с базой «вся карточка Ozon»."""
+    raw = _raw_sorted(5, 2, 1, 2)
+    raw["product"]["customer_opinion"] = {
+        "counts": {"5": 93, "4": 4, "3": 1, "2": 1, "1": 1},
+    }
+    md = render(raw)
+    assert "- Негативных оценок (1–2★): 2.0% · по 100 оценкам (вся карточка Ozon)" in md
+
+
+def test_render_no_negative_line_without_counts():
+    """Распределения нет → строки о доле негатива нет вовсе (ни официальной, ни
+    «по собранным»): никакой ложной статистики по смещённой выборке."""
+    raw = _raw_sorted(5, 2, 1, 2, rating=4.9, rating_count=365142)
+    md = render(raw)
+    assert "Негативных оценок" not in md
+
+
+# ---- разделение секций отзывов (обычная / диагностическая) ------------------
+
+def _raw_split(neutral, diag, sorts=("published_at_desc", "score_asc")):
+    """raw с двумя группами отзывов: neutral (без score_asc) и diag (с ним).
+    Порядок в reviews сохраняется: нейтральные не перемешиваются с diag."""
+    revs = [rev for stars, text in neutral
+            for rev in [{"author": "a", "stars": stars, "text": text,
+                         "review_sorts": ["published_at_desc"]}]]
+    revs += [rev for stars, text in diag
+             for rev in [{"author": "a", "stars": stars, "text": text,
+                          "review_sorts": ["score_asc"]}]]
+    raw = _raw(revs)
+    raw["reviews_sorts"] = list(sorts)
+    return raw
+
+
+def test_render_reviews_sections_split():
+    """Обычная выборка идёт первой, диагностическая — второй с предупреждением;
+    каждого отзыва из своей группы попадает в свою секцию."""
+    raw = _raw_split(neutral=[(5, "отличный"), (4, "хороший")],
+                     diag=[(1, "брак"), (2, "комкается")])
+    md = render(raw)
+    assert "### Отзывы покупателей — обычная выборка (2 отзыва)" in md
+    assert ("### Негативные отзывы — целенаправленный поиск проблем (2 отзыва)"
+            in md)
+    assert "долей недовольных покупателей" in md
+    # порядок секций: обычная выше негативной
+    assert md.index("обычная выборка") < md.index("Негативные отзывы")
+    # группировка по секциям
+    assert md.index("отличный") < md.index("брак")
+
+
+def test_render_reviews_mixed_score_asc_goes_to_diagnostic():
+    """Отзыв с метками ['published_at_desc','score_asc'] идёт в диагностическую
+    секцию — ровно как исключается из рейтинга варианта (_is_score_asc).
+    Инвариант: «обычная» выборка = выборка variant_rating_from."""
+    reviews = [
+        {"author": "a", "stars": 5, "text": "норм", "review_sorts": ["published_at_desc"]},
+        {"author": "b", "stars": 1, "text": "очень плохо", "review_sorts": ["published_at_desc", "score_asc"]},
+        {"author": "c", "stars": 5, "text": "ещё норм", "review_sorts": ["published_at_desc"]},
+    ]
+    raw = _raw(reviews)
+    md = render(raw)
+    # секции
+    neutral_start = md.index("### Отзывы покупателей — обычная выборка")
+    diag_start = md.index("### Негативные отзывы")
+    assert "норм" in md[neutral_start:diag_start]
+    assert "очень плохо" not in md[neutral_start:diag_start]
+    assert "очень плохо" in md[diag_start:]
+    # рейтинг варианта не учитывает второй отзыв
+    from ozon_collector.report import digest_rating
+    rating, n, src = digest_rating(raw["product"], reviews)
+    assert (rating, n, src) == (5.0, 2, "variant")
+
+
+def test_render_reviews_only_score_asc_single_section():
+    """Все отзывы из score_asc → только диагностическая секция с предупреждением,
+    «обычной» нет (рейтинг варианта недоступен — фолбэк карточки в разделе 1)."""
+    raw = _raw_split(neutral=[], diag=[(1, "плохо"), (2, "так себе")])
+    md = render(raw)
+    assert "обычная выборка" not in md
+    assert "### Негативные отзывы — целенаправленный поиск проблем (2 отзыва)" in md
+    assert "долей недовольных покупателей" in md
+
+
+def test_render_reviews_without_score_asc_single_section():
+    """Без score_asc — одна секция «обычная выборка», диагностической нет."""
+    raw = _raw_split(neutral=[(5, "отличный"), (4, "хороший")], diag=[])
+    md = render(raw)
+    assert "### Отзывы покупателей — обычная выборка (2 отзыва)" in md
+    assert "Негативные отзывы" not in md
+
+
+def test_render_reviews_sections_order_preserved():
+    """Порядок отзывов внутри каждой секции = исходный порядок reviews
+    (простая фильтрация, без пересортировки)."""
+    raw = _raw_split(neutral=[(5, "ТОК-А"), (4, "ТОК-Б"), (5, "ТОК-В")],
+                     diag=[(1, "ТОК-Г"), (2, "ТОК-Д"), (1, "ТОК-Е")])
+    md = render(raw)
+    n_start = md.index("### Отзывы покупателей — обычная выборка")
+    d_start = md.index("### Негативные отзывы")
+    n_block = md[n_start:d_start]
+    d_block = md[d_start:]
+    n_pos = [n_block.index(x) for x in ("ТОК-А", "ТОК-Б", "ТОК-В")]
+    d_pos = [d_block.index(x) for x in ("ТОК-Г", "ТОК-Д", "ТОК-Е")]
+    assert n_pos == sorted(n_pos)
+    assert d_pos == sorted(d_pos)
+
+
+def test_render_reviews_final_totals():
+    """После обеих секций выводится итоговая суммарная строка по ВСЕМ собранным
+    отзывам (обычная + диагностическая), с корректными счётчиками звёзд."""
+    raw = _raw_split(neutral=[(5, "н1"), (4, "н2")],
+                     diag=[(2, "д1"), (1, "д2")])
+    raw["stars_full"] = {"total": 4, "counts": {1: 1, 2: 1, 3: 0, 4: 1, 5: 1}}
+    md = render(raw)
+    assert ("Итог по всем собранным отзывам: 4 отзыва · ★5: 1 · ★4: 1 · ★2: 1 · ★1: 1"
+            in md)
+    # пер-секционные счётчики тоже присутствуют
+    assert "★5: 1 · ★4: 1" in md
+    assert "★2: 1 · ★1: 1" in md
 
 
 # ---- _top_reviews ---------------------------------------------------------

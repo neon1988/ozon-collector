@@ -216,10 +216,9 @@ class Session:
         и крадёт фокус. Двойная защита:
         1) CDP Browser.setWindowBounds (windowState=minimized) — сворачивание
            через сам браузер;
-        2) user32: SW_MINIMIZE на главное окно процесса —
+        2) user32: WS_EX_NOACTIVATE + SW_MINIMIZE на главное окно процесса —
            окно не получает фокус при разворачивании (важно при live-сборе,
            чтобы печать в другом приложении не прерывалась).
-        WS_EX_NOACTIVATE НЕ ставится — окно остаётся обычным (taskbar работает).
         Игнорируем ошибки: сбой минимизации некритичен.
         """
         try:
@@ -242,11 +241,10 @@ class Session:
 
     @staticmethod
     def _minimize_window_native(port: int):
-        """user32: свёртывание окна CDP-Chromium (Windows).
+        """user32: свёртывание + запрет активации окна CDP-Chromium (Windows).
 
         Находит главное окно процесса chrome с remote-debugging-port=port
-        (наш воркер) и сворачивает (SW_MINIMIZE). WS_EX НЕ ставится — окно
-        остаётся обычным (taskbar работает, двойной клик восстанавливает).
+        (наш воркер), ставит WS_EX_NOACTIVATE и сворачивает (SW_MINIMIZE).
         Окна обычного Chrome пользователя не трогаются. Не-Windows — no-op.
         """
         if os.name != "nt":
@@ -256,6 +254,8 @@ class Session:
             from ctypes import wintypes
 
             user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
             SW_MINIMIZE = 6
 
             # ищем PID процесса chrome с remote-debugging-port через wmic
@@ -276,6 +276,9 @@ class Session:
             for pid in pids:
                 hwnd = _window_for_pid(pid)
                 if hwnd:
+                    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                          style | WS_EX_NOACTIVATE)
                     user32.ShowWindow(hwnd, SW_MINIMIZE)
                     break
         except Exception as e:
@@ -313,12 +316,11 @@ class Session:
 
     @staticmethod
     def _restore_window_native(port: int):
-        """user32: SW_SHOWNOACTIVATE + TOPMOST окна Chromium (Windows), без активации.
+        """user32: SW_RESTORE + TOPMOST окна Chromium (Windows), без активации.
 
         Дублирует путь launch_chrome.ps1, но применим к уже работающему окну
-        (после reconnect/перезапуска коллектором). SW_SHOWNOACTIVATE показывает
-        без активации; WS_EX_NOACTIVATE НЕ ставится — окно остаётся обычным
-        (taskbar работает, двойной клик восстанавливает).
+        (после reconnect/перезапуска коллектором). NOACTIVATE + SW_RESTORE,
+        фокус не крадём.
         """
         if os.name != "nt":
             return
@@ -327,6 +329,9 @@ class Session:
             from ctypes import wintypes
 
             user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            SW_RESTORE = 9
             HWND_TOPMOST = -1
             SWP_NOMOVE = 0x0002
             SWP_NOSIZE = 0x0001
@@ -349,11 +354,14 @@ class Session:
             for pid in pids:
                 # require_visible=False: главное окно браузера находим даже В
                 # СКРЫТОМ состоянии (SW_HIDE при старте) — иначе его нельзя
-                # найти и показать (замкнутый круг). SW_SHOWNOACTIVATE +
+                # найти и показать (замкнутый круг). SW_RESTORE +
                 # SWP_SHOWWINDOW гарантированно показывают невидимое окно.
                 hwnd = _window_for_pid(pid, require_visible=False)
                 if hwnd:
-                    user32.ShowWindow(hwnd, 8)  # SW_SHOWNOACTIVATE
+                    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                          style | WS_EX_NOACTIVATE)
+                    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
                     user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                                         | 0x0040)  # SWP_SHOWWINDOW

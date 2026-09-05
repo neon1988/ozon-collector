@@ -509,10 +509,9 @@ def worker_main(spec: dict, task: dict, conn, p2w_conn):
         _send(conn, {"t": "start", "worker": k, "pid": os.getpid(),
                      "profile": spec["profile_token"], "port": spec["port"]})
 
-        sess = _make_session(spec)
-        manager = _make_manager(spec)
+        sess = None
+        manager = None
         from .collect import set_scroll_jitter_seed
-        set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
 
         # Heartbeat оркестратору: перехватываем collect._touch_watchdog и
         # шлём {"t":"hb"} в pipe (throttled). Родитель по простою heartbeat
@@ -530,8 +529,7 @@ def worker_main(spec: dict, task: dict, conn, p2w_conn):
         from .collect import set_heartbeat_hook
         set_heartbeat_hook(_hb)
 
-        warmup = _warmup_session(sess, label=f"worker{k}")
-        _send(conn, {"t": "warmup", "worker": k, **warmup})
+        warmup = None
 
         gather_cfg = dict(task.get("gather_cfg") or {})
         max_recycles = int(task.get("max_recycles", 2))
@@ -571,8 +569,18 @@ def worker_main(spec: dict, task: dict, conn, p2w_conn):
                 return None
             return list(msg["batch"])
 
-        # Первая пачка: сразу после прогрева.
+        # Первая пачка: ждём назначения товара.
         batch = _recv_batch(p2w_conn)
+
+        # Ленивый запуск: браузер ТОЛЬКО после назначения товара.
+        # Воркеры без товаров выйдут без запуска Chrome.
+        if batch is not None:
+            sess = _make_session(spec)
+            manager = _make_manager(spec)
+            set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
+            warmup = _warmup_session(sess, label=f"worker{k}")
+            _send(conn, {"t": "warmup", "worker": k, **warmup})
+
         while batch is not None:
             num_batches += 1
             items = list(batch)

@@ -152,8 +152,12 @@ def _validate_raw(raw: dict, pid: str | None = None) -> str | None:
     timestamp. pid — ожидаемый PID (необязательно): при передаче raw с другим
     pid (битый файл) тоже отклоняется. Негодные кандидаты не блокируют поиск
     лучшего файла.
+
+    incomplete с no_reviews_confirmed=True (товар заведомо без отзывов) —
+    допустимый кандидат: отсутствие price/rating не является для него браком
+    сбора, иначе такой товар пересобирался бы при каждом появлении.
     """
-    if raw.get("incomplete"):
+    if raw.get("incomplete") and not raw.get("no_reviews_confirmed"):
         return "incomplete"
     if pid is not None and str(raw.get("pid") or "") != str(pid):
         return "pid_mismatch"

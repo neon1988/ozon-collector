@@ -39,7 +39,8 @@ def _rev(uuid, stars=5, text=None, sort="published_at_desc", age_s=3600):
     }
 
 
-def _raw(pid="42", vc=5, reviews=None, rc=None, sorts=("published_at_desc",)):
+def _raw(pid="42", vc=5, reviews=None, rc=None, sorts=("published_at_desc",),
+         no_reviews_confirmed=False):
     vm = {
         "variant_present": bool(vc),
         "variant_count": vc,
@@ -83,6 +84,7 @@ def _raw(pid="42", vc=5, reviews=None, rc=None, sorts=("published_at_desc",)):
         "incomplete": False,
         "missing_fields": [],
         "artifacts": {},
+        "no_reviews_confirmed": no_reviews_confirmed,
     }
 
 
@@ -224,6 +226,24 @@ def test_zero_reviews_fail():
     assert "ZERO_REVIEWS" in _codes(rep)
     assert rep["verdict"] == "FAIL"
     assert rep["collection_mode"] == "UNKNOWN"
+
+
+def test_confirmed_zero_reviews_ok():
+    """Подтверждённый нулевик (no_reviews_confirmed=True) — НЕ FAIL, вердикт OK."""
+    raw = _raw(vc=0, rc=None, reviews=[], no_reviews_confirmed=True)
+    rep = qa_product(raw, "42")
+    codes = _codes(rep)
+    assert "ZERO_REVIEWS" not in codes
+    assert "CONFIRMED_NO_REVIEWS" in codes
+    assert rep["verdict"] == "OK"
+
+
+def test_confirmed_zero_reviews_with_count_still_ok():
+    """Нулевик с rc=0 (a не None) тоже валиден."""
+    raw = _raw(vc=0, rc=0, reviews=[], no_reviews_confirmed=True)
+    rep = qa_product(raw, "42")
+    assert "ZERO_REVIEWS" not in _codes(rep)
+    assert rep["verdict"] == "OK"
 
 
 def test_bad_json(tmp_path):

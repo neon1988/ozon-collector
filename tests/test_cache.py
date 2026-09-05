@@ -209,6 +209,91 @@ def test_cache_check_incomplete(tmp_path):
     assert r is None and reason == "incomplete"
 
 
+def _write_cache_json(tmp_path, pid, raw):
+    with open(os.path.join(tmp_path, f"{pid}_raw.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+
+
+def test_cache_check_confirmed_zero_hit(tmp_path):
+    """Заведомо 0-отзывовой raw (rating_count=0) с incomplete=True кешируется
+    как hit: отсутствие price/rating не мешает, товар больше не пересобирается."""
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "21", "incomplete": True,
+        "missing_fields": ["product.price.current"],
+        "no_reviews_confirmed": True,
+        "reviews_collected": 0,
+        "reviews": [],
+        "product": {"rating_count": 0, "price": None, "rating": None},
+        "reviews_variant_mode": {"used": False, "reason": "no_reviews_product",
+                                 "variant_count": 0},
+        "collected_at_utc": _now_utc_str(minutes=-5),
+    }
+    _write_cache_json(tmp_path, "21", raw)
+    r, reason = cache_check("21", 86400, str(tmp_path))
+    assert reason == "hit"
+    assert r["pid"] == "21"
+
+
+def test_cache_check_confirmed_zero_widget_hit(tmp_path):
+    """0 отзывов варианта (used=True, variant_count=0) + incomplete → hit."""
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "22", "incomplete": True,
+        "missing_fields": ["product.rating"],
+        "no_reviews_confirmed": True,
+        "reviews_collected": 0,
+        "reviews": [],
+        "product": {"rating_count": None, "price": {"current": 100},
+                    "rating": None},
+        "reviews_variant_mode": {"used": True, "variant_count": 0},
+        "collected_at_utc": _now_utc_str(minutes=-5),
+    }
+    _write_cache_json(tmp_path, "22", raw)
+    r, reason = cache_check("22", 86400, str(tmp_path))
+    assert reason == "hit"
+
+
+def test_cache_check_ambiguous_zero_still_incomplete(tmp_path):
+    """Нет явного сигнала нуля (rc=None, no_widget) → не confirmed, не hit:
+    кешировать нельзя, отзывы могут быть."""
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "23", "incomplete": True,
+        "missing_fields": ["product.price.current", "product.rating"],
+        "no_reviews_confirmed": False,
+        "reviews_collected": 0,
+        "reviews": [],
+        "product": {"rating_count": None},
+        "reviews_variant_mode": {"used": False, "reason": "no_widget"},
+        "collected_at_utc": _now_utc_str(minutes=-5),
+    }
+    _write_cache_json(tmp_path, "23", raw)
+    r, reason = cache_check("23", 86400, str(tmp_path))
+    assert r is None and reason == "incomplete"
+
+
+def test_cache_check_short_not_hit(tmp_path):
+    """Недогруз (rating_count=50, собрали 0) → не confirmed, не hit:
+    short в variant_review_problems запрещает кеширование."""
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "24", "incomplete": True,
+        "missing_fields": ["product.price.current"],
+        "no_reviews_confirmed": False,
+        "reviews_collected": 0,
+        "reviews": [],
+        "product": {"rating_count": 50},
+        "reviews_variant_mode": {"used": False, "reason": "no_variant_opt",
+                                 "variant_count": None},
+        "collected_at_utc": _now_utc_str(minutes=-5),
+    }
+    _write_cache_json(tmp_path, "24", raw)
+    r, reason = cache_check("24", 86400, str(tmp_path))
+    assert r is None and reason == "incomplete"
+
+
 def test_cache_check_bad_timestamp(tmp_path):
     raw = {"schema_version": "2.0", "collector_version": VERSION,
            "pid": "8", "incomplete": False,
