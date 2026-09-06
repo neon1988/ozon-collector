@@ -1,6 +1,7 @@
 """Юнит-тесты чистых функций scripts/key_daemon.py (без запуска CLI/браузера)."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -198,6 +199,108 @@ def test_reconcile_keeps_previous_meta_when_not_checked(tmp_path):
     k.reconcile_validity(prog, checked, str(tmp_path))
     assert prog["verdict_meta"]["201"]["raw_mtime_ns"] == 123
     assert prog["verdict_meta"]["101"]["raw_mtime_ns"] == 999
+
+
+# --- title-фильтр (exact-match) ---
+
+def _raw_with_title(tmp_path, pid, title):
+    (tmp_path / f"{pid}_raw.json").write_text(
+        json.dumps({"product": {"title": title}}), encoding="utf-8")
+
+
+def test_query_from_url_extracts_text():
+    assert k._query_from_url(
+        "https://www.ozon.ru/category/x/?text=Edifier+W830NB&from_global=true"
+    ) == "Edifier W830NB"
+    assert k._query_from_url(
+        "https://www.ozon.ru/search/?text=%D0%9F%D0%B5%D1%80%D1%81%D0%B8%D0%BB"
+    ) == "Персил"
+    assert k._query_from_url("https://www.ozon.ru/category/x/") is None
+    assert k._query_from_url("") is None
+    assert k._query_from_url(None) is None
+    assert k._query_from_url("https://ozon.ru/?text=") is None
+
+
+def test_reconcile_title_filter_keeps_matching(tmp_path):
+    # подходящий по title товар остаётся valid и не попадает в mismatch
+    _raw_with_title(tmp_path, "101", "Наушники Edifier W830NB беспроводные")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path), match_query="Edifier W830NB")
+    assert "101" in prog["valid_pids"]
+    assert prog["title_mismatch_pids"] == []
+
+
+def test_reconcile_title_filter_removes_nomatch(tmp_path):
+    # несоответствующий title: НЕ valid, НО и НЕ failed (title_mismatch)
+    _raw_with_title(tmp_path, "101", "Наушники Edifier W820NB")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path), match_query="W830NB")
+    assert "101" not in prog["valid_pids"]
+    assert "101" not in prog["failed_pids"]
+    assert "101" in prog["title_mismatch_pids"]
+
+
+def test_reconcile_title_filter_case_insensitive(tmp_path):
+    # регистронезависимость: фраза/название в разном регистре
+    _raw_with_title(tmp_path, "101", "EDIFIER W830NB BLACK")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path), match_query="edifier w830nb")
+    assert "101" in prog["valid_pids"]
+
+
+def test_reconcile_title_filter_disabled_without_query(tmp_path):
+    # без фразы фильтр выключен: всё как обычно (никакой магии)
+    _raw_with_title(tmp_path, "101", "Edifier W820NB")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101"]
+    checked = {"verdicts": {"101": "OK"}, "valid_add": ["101"],
+               "checked": ["101"]}
+    k.reconcile_validity(prog, checked, str(tmp_path), match_query="")
+    assert "101" in prog["valid_pids"]
+    assert prog["title_mismatch_pids"] == []
+
+
+def test_reconcile_title_filter_fallback_from_progress(tmp_path):
+    # вызов без match_query берёт фразу из progress["title_match_query"]
+    _raw_with_title(tmp_path, "101", "Edifier W830NB Pro")
+    _raw_with_title(tmp_path, "102", "Edifier W820NB")
+    prog = _manifest(tmp_path)
+    prog["title_match_query"] = "W830NB"
+    prog["discovered_pids"] = ["101", "102"]
+    checked = {"verdicts": {"101": "OK", "102": "OK"},
+               "valid_add": ["101", "102"], "checked": ["101", "102"]}
+    k.reconcile_validity(prog, checked, str(tmp_path))
+    assert "101" in prog["valid_pids"]
+    assert "102" not in prog["valid_pids"]
+    assert "102" in prog["title_mismatch_pids"]
+
+
+def test_reconcile_title_filter_does_not_grow_failed(tmp_path):
+    # title-mismatch добро-товара НЕ попадает в failed (списки разделены):
+    # один pid не подошёл по title (но OK по QA) → только в title_mismatch;
+    # другой — FAIL по QA → только в failed.
+    _raw_with_title(tmp_path, "101", "Ozon банка")
+    _raw_with_title(tmp_path, "202", "Ozon банка")
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["101", "202"]
+    checked = {"verdicts": {"101": "OK", "202": "FAIL"},
+               "valid_add": ["101"], "checked": ["101", "202"]}
+    k.reconcile_validity(prog, checked, str(tmp_path), match_query="Edifier")
+    assert "101" not in prog["valid_pids"]
+    assert "101" in prog["title_mismatch_pids"]
+    assert "101" not in prog["failed_pids"]
+    assert "202" in prog["failed_pids"]
+    assert "202" not in prog["title_mismatch_pids"]
+    # заголовок файла не содержит "Edifier", поэтому оба мимо фильтра title
 
 
 # --- compute_final ---

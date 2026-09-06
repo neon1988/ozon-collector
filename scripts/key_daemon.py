@@ -45,6 +45,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -110,6 +111,26 @@ def _sha256_text(s: str) -> str:
         return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
     except Exception:
         return ""
+
+
+def _query_from_url(url: str) -> Optional[str]:
+    """Поисковый запрос (text=) из URL выдачи Ozon, или None если его нет.
+
+    Используется как fallback для фильтра exact-match title (если задан
+    --match-title — он приоритетнее; без обоих фильтр выключен). Возвращает
+    декодированную строку (проценты и '+' уже развёрнуты) или None.
+    """
+    if not url:
+        return None
+    try:
+        q = urlparse(url)
+        params = parse_qs(q.query, keep_blank_values=False)
+        text = params.get("text")
+    except Exception:
+        return None
+    if not text or not text[0]:
+        return None
+    return text[0].strip() or None
 
 
 def _collector_consts():
@@ -317,6 +338,8 @@ def default_manifest(campaign: str, target: int, min_valid: int,
         "failed_pids": [],
         "permanently_failed_pids": [],
         "replacement_pids": [],
+        "title_mismatch_pids": [],   # товары, не прошедшие title-фильтр (не FAIL)
+        "title_match_query": "",     # фраза title-фильтра (пусто = выключен)
         "verdicts": {},            # pid -> OK|WARN|FAIL (QA по новым на лету)
         "verdict_meta": {},        # pid -> {verdict, raw_mtime_ns, raw_sha256,
                                    #         raw_size, qa_version, qa_at}
@@ -501,6 +524,8 @@ def _status_payload(progress: dict) -> dict:
         "failed": len(set(progress.get("failed_pids", []))),
         "permanently_failed": len(set(progress.get("permanently_failed_pids", []))),
         "reserve": len(progress.get("campaign_reserve_pids") or []),
+        "title_match_query": progress.get("title_match_query") or "",
+        "title_mismatch": len(set(progress.get("title_mismatch_pids", []))),
         "run": len(progress.get("runs", [])),
         "current_run": (progress.get("runs") or [None])[-1],
         "mode": progress.get("current_mode"),
@@ -1041,15 +1066,38 @@ def _fail_reason_recurring(progress: dict, pid: str, threshold: int = 2) -> bool
     return bool(info and info.get("count", 0) >= threshold)
 
 
+def _title_matches(data_dir: str, pid: str, match_query: str) -> bool:
+    """True если title товара содержит фразу (регистронезависимо).
+
+    raw отсутствует/битый или title пуст → False (такой товар не проходит
+    фильтр, но и в title_mismatch не попадает — решает структура/QA).
+    """
+    raw = load_json(Path(data_dir) / raw_pid_name(pid))
+    if not raw:
+        return False
+    title = (raw.get("product") or {}).get("title") or ""
+    return match_query.lower() in title.lower()
+
+
 def reconcile_validity(progress: dict, new_checked: dict,
-                       data_dir: str) -> dict:
+                       data_dir: str,
+                       match_query: Optional[str] = None) -> dict:
     """Обновляет valid/failed на основе вердиктов + источник истины (raw-файлы).
 
     Источник истины для валидности — наличие canonical raw (П1). Вердикт `OK`/`WARN`
     делает raw валидным; `FAIL` — бракованным; отсутствие raw — не-валид.
+
+    match_query — опциональный фильтр точного соответствия названия товара
+    (--match-title или text= из URL): товар валиден, только если
+    `raw.product.title` содержит фразу как подстроку (без учёта регистра).
+    Несоответствующие товары НЕ считаются FAIL (иначе зажгут rescan), а
+    попадают в отдельный список title_mismatch_pids (телеметрия).
+    Пустой/None match_query — фильтр выключен, поведение как обычно.
     """
     verdicts = dict(new_checked["verdicts"])
     discovered = set(progress.get("discovered_pids", []))
+    if match_query is None:
+        match_query = progress.get("title_match_query") or ""
 
     # valid: сохраняем ранее подтверждённые (в исходном порядке) + добавляем
     # вновь подтверждённые, но НЕ держим пиды с ТЕКУЩИМ вердиктом FAIL (защита
@@ -1065,6 +1113,22 @@ def reconcile_validity(progress: dict, new_checked: dict,
             seen.add(p)
     valid = [p for p in valid
              if verdicts.get(p) != "FAIL" and has_raw(data_dir, p)]
+
+    # title-фильтр (exact-match, регистронезависимо). Применяется ПОСЛЕ
+    # QA-валидности: товар может быть OK по QA, но не соответствовать фразе.
+    # Несоответствие НЕ является браком (failed) — пид просто не валиден
+    # для этого поискового запроса и не раздувает rescan-бюджет.
+    title_mismatch = list(
+        dict.fromkeys(progress.get("title_mismatch_pids", [])) or [])
+    if match_query:
+        mismatch = []
+        for p in valid:
+            if not _title_matches(data_dir, p, match_query):
+                mismatch.append(p)
+        title_mismatch = list(dict.fromkeys(title_mismatch + mismatch))
+        valid = [p for p in valid
+                 if p not in set(mismatch)]
+    progress["title_mismatch_pids"] = title_mismatch
     progress["valid_pids"] = valid
 
     # брак: пересчитываем из ТЕКУЩИХ вердиктов (не накапливаем) — если пид
@@ -1113,6 +1177,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  max_worker_restarts: int = 2,
                  session_budget_wall_clock: Optional[int] = None,
                  window_mode: Optional[str] = None,
+                 match_title: Optional[str] = None,
                  write_digest: bool = True,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
     lock = PidLock(DATA_DIR / "key_daemon.pid")
@@ -1182,6 +1247,15 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             raise SystemExit(
                 f"key_daemon: схема кампании {ident.get('schema_version')} != "
                 f"текущей {SCHEMA_VERSION}. Обновите коллектор или --force-new.")
+
+    # Фильтр точного соответствия названия товара запросу. Источник фразы —
+    # приоритет: явный --match-title → fallback на text= из URL кампании.
+    # Пустая фраза → фильтр выключен (сбор как обычно). Значение фиксируется
+    # в манифесте при создании кампании; при resume строго берётся из
+    # манифеста (источник истины), параметр запуска не переопределяет.
+    if fresh:
+        match_query = (match_title or "").strip() or _query_from_url(url)
+        progress["title_match_query"] = match_query or ""
 
     try:
         # При resume конфиг берём из манифеста (источник истины), а не из текущих
@@ -1870,6 +1944,15 @@ def parse_args(argv=None):
                     help="режим окна браузера коллектора: visible — окно "
                          "развёрнуто и видимо наверху, hidden — свёрнуто "
                          "(по умолчанию из env OZON_KEEP_WINDOW=1 → visible)")
+    ap.add_argument("--match-title", default=None,
+                    help="фильтр точного соответствия названия товара "
+                         "(регистронезависимая подстрока, применяется к "
+                         "raw.product.title): в дайджест попадают только товары, "
+                         "чей title содержит эту фразу. Если не задан — берётся "
+                         "text= из --url; если и его нет — фильтр выключен, "
+                         "сбор как обычно. Несоответствующие товары НЕ считаются "
+                         "браком. Фильтр фиксируется при создании кампании, "
+                         "при resume меняться не может.")
     ap.add_argument("--no-digest", action="store_true",
                     help="не создавать Markdown-дайджест итога кампании "
                          "(по умолчанию создаётся в --out)")
@@ -1929,6 +2012,7 @@ def main(argv=None):
         max_worker_restarts=args.max_worker_restarts,
         session_budget_wall_clock=args.session_budget_wall_clock,
         window_mode=args.window_mode,
+        match_title=args.match_title,
         write_digest=not args.no_digest)
     print(json.dumps(summarize(progress), ensure_ascii=False, indent=2))
 
