@@ -152,6 +152,7 @@ def qa_product(raw, pid):
         add("BAD_STRUCTURE", "FAIL", f"reviews имеет тип {type(reviews).__name__}")
         reviews = []
     collected = len(reviews)
+    skipped = bool(raw.get("reviews_skipped"))
 
     if str(raw.get("pid") or "") != pid:
         add("BAD_IDENTIFIER", "FAIL",
@@ -175,6 +176,20 @@ def qa_product(raw, pid):
     if challenge:
         add("CHALLENGE_PAGE", "FAIL", f"title: {title[:60]!r}")
 
+    if skipped:
+        # Режим --no-reviews: смысл raw — только карточка. Если цена и рейтинг
+        # не извлечены, «успешный» product-only сбор эквивалентен сломанному:
+        # REVIEWS_SKIPPED не должен давать безусловный OK (плохая карточка — FAIL).
+        price_map = (product.get("price") or {}) if isinstance(
+            product.get("price"), dict) else {}
+        have_price = bool(price_map.get("current") or price_map.get("bank")
+                          or product.get("price_text"))
+        have_rating = (product.get("rating") is not None) or bool(
+            (product.get("customer_opinion") or {}).get("counts"))
+        if not (have_price and have_rating):
+            add("INCOMPLETE_CARD", "FAIL",
+                "режим --no-reviews: карточка без цены и/или рейтинга")
+
     official, source = _official(raw)
     if official is None:
         mode = "UNKNOWN"
@@ -187,9 +202,12 @@ def qa_product(raw, pid):
 
     scope_ok = None
     if source == "rating_count_fallback":
-        add("FALLBACK_OFFICIAL_COUNT", "WARN",
-            f"variant_count отсутствует (reason={vm.get('reason')!r}), "
-            f"ориентир rating_count={official}")
+        if not skipped:
+            # В режиме --no-reviews отзывы не собирались, ориентиром объёма они
+            # смысла не имеют → фолбэк счётчика не предупреждаем (карточка цела).
+            add("FALLBACK_OFFICIAL_COUNT", "WARN",
+                f"variant_count отсутствует (reason={vm.get('reason')!r}), "
+                f"ориентир rating_count={official}")
         scope_ok = True
     elif source == "variant_count":
         reason = vm.get("reason")
@@ -201,7 +219,7 @@ def qa_product(raw, pid):
 
     coverage = (collected / official) if official else None
 
-    if official is not None:
+    if official is not None and not skipped:
         if collected > official and scope_ok:
             add("OVERCOUNT", "FAIL",
                 f"собрано {collected} > официальных {official} ({source})")
@@ -220,7 +238,14 @@ def qa_product(raw, pid):
 
     if collected == 0:
         confirmed_zero = bool(raw.get("no_reviews_confirmed"))
-        if confirmed_zero:
+        if skipped:
+            # Режим --no-reviews: отзывы намеренно не собирались (reviews
+            # пусты по режиму, а не по факту отсутствия). Не брак и не
+            # подтверждение нуля — только INFO. Проверки объёма выше уже
+            # пропущены (блок `official is not None and not skipped`).
+            add("REVIEWS_SKIPPED", "INFO",
+                "отзывы намеренно не собирались (режим --no-reviews)")
+        elif confirmed_zero:
             # Экстрактор подтвердил «Отзывы о товаре 0» (reviewsCount/totalScore=0
             # в state-JSON webReviewProductScore) — это валидный нулевик с
             # нормальной карточкой, а не сломанный сбор. Не FAIL.
@@ -342,6 +367,7 @@ def qa_product(raw, pid):
         "collected_at_utc": raw.get("collected_at_utc"),
         "reviews_total": collected,
         "review_count": collected - rating_only,
+        "reviews_skipped": skipped,
         "rating_only_count": rating_only,
         "stars_missing_count": stars_missing,
         "duplicate_uuid_count": dup_uuid,

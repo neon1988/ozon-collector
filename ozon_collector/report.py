@@ -458,7 +458,18 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
         rating, n, src = pre["rating"], pre["n"], pre["source"]
     else:
         rating, n, src = digest_rating(product, reviews)
-    if src == "variant":
+    if raw.get("reviews_skipped"):
+        # Отзывы намеренно не собирались (--no-reviews). Вариант-рейтинг
+        # строится из отзывов — показываем честно «недоступен» и официальный
+        # рейтинг всей карточки отдельной подписью (не выдаём его за вариант).
+        L.append(f"- Вариант-рейтинг: недоступен (режим --no-reviews)")
+        off_rating, off_count = official_rating_info(product)
+        if off_rating is not None:
+            cnt_txt = (f" · {off_count} "
+                       f"{plural(off_count, ('оценка', 'оценки', 'оценок'))}"
+                       if off_count else "")
+            L.append(f"- Ozon (вся карточка): {off_rating:.3f} / 5{cnt_txt}")
+    elif src == "variant":
         L.append(f"- Рейтинг по собранным отзывам (без «сначала низкие»): "
                  f"{rating:.3f} / 5 "
                  f"({n} {plural(n, ('оценка', 'оценки', 'оценок'))})")
@@ -561,7 +572,7 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
         L.append("Фильтр Ozon: не применён (собраны все отзывы)")
         L.append("")
     sorts_req = raw.get("reviews_sorts")
-    if sorts_req:
+    if not raw.get("reviews_skipped") and sorts_req:
         _sort_labels = {
             "published_at_desc": "новые и полезные",
             "score_desc": "сначала высокие оценки",
@@ -587,7 +598,10 @@ def render(raw: dict, dedup_replies: bool = True) -> str:
         L.append("Вариант: " + next(iter(variants)))
         L.append("")
     if not reviews:
-        L.append("_Отзывов не собрано._")
+        if raw.get("reviews_skipped"):
+            L.append("_Отзывы не собирались (режим --no-reviews)._")
+        else:
+            L.append("_Отзывов не собрано._")
         L.append("")
     else:
         # Отзывы делятся на две статистически разные роли:
@@ -1076,7 +1090,15 @@ def render_compact(raw: dict) -> str:
         rating, n, src = pre["rating"], pre["n"], pre["source"]
     else:
         rating, n, src = digest_rating(product, reviews)
-    if src == "variant":
+    if raw.get("reviews_skipped"):
+        L.append("- Вариант-рейтинг: недоступен (режим --no-reviews)")
+        off_rating, off_count = official_rating_info(product)
+        if off_rating is not None:
+            cnt_txt = (f" · {off_count} "
+                       f"{plural(off_count, ('оценка', 'оценки', 'оценок'))}"
+                       if off_count else "")
+            L.append(f"- Ozon (вся карточка): {off_rating:.3f} / 5{cnt_txt}")
+    elif src == "variant":
         L.append(f"- Рейтинг по собранным отзывам (без «сначала низкие»): "
                  f"{rating:.3f} / 5 "
                  f"({n} {plural(n, ('оценка', 'оценки', 'оценок'))})")

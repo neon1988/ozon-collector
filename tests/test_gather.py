@@ -460,3 +460,69 @@ def test_run_gather_confirmed_zero_miss_recollects(monkeypatch, capsys):
     assert len(calls) == 1
     assert res["ok"] is True
     assert res["raw"]["no_reviews_confirmed"] is True
+
+
+# ---- режим --no-reviews (skip_reviews) -------------------------------------
+
+def _skipped_raw(pid="42"):
+    """product-only raw: карточка цела, отзывы намеренно не тронуты."""
+    raw = _raw()
+    raw["reviews"] = []
+    raw["reviews_collected"] = 0
+    raw["reviews_skipped"] = True
+    raw["product"]["rating_count"] = 465
+    raw["reviews_variant_mode"] = {"used": False, "reason": "reviews_skipped",
+                                   "variant_count": None}
+    return raw
+
+
+def test_run_gather_skip_reviews_passed_to_collect(monkeypatch):
+    """Флаг skip_reviews из cfg пробрасывается в C.collect."""
+    collected = []
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma, **kw: (None, "missing"))
+    monkeypatch.setattr("ozon_collector.gather.C.collect",
+                        lambda **kw: collected.append(kw) or _skipped_raw())
+    monkeypatch.setattr("ozon_collector.gather.R.render",
+                        lambda r, **kw: "# ok")
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400, "no_ocr": True, "skip_reviews": True})
+    assert res["ok"] is True
+    assert collected and collected[0]["skip_reviews"] is True
+
+
+def test_run_gather_skip_reviews_does_not_short(monkeypatch):
+    """product-only raw в режиме skip_reviews НЕ режется как брак числа отзывов
+    (variant_review_problems пропускается), raw не удаляется."""
+    deleted = []
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma, **kw: (None, "missing"))
+    monkeypatch.setattr("ozon_collector.gather.C.collect",
+                        lambda **kw: _skipped_raw())
+    monkeypatch.setattr("ozon_collector.gather._delete_raw_file",
+                        lambda p: deleted.append(p))
+    monkeypatch.setattr("ozon_collector.gather.R.render",
+                        lambda r, **kw: "# ok")
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400, "no_ocr": True, "skip_reviews": True})
+    assert res["ok"] is True
+    assert not deleted
+    assert res["raw"]["reviews_skipped"] is True
+
+
+def test_run_gather_skip_reviews_cache_hit_keeps_full(monkeypatch):
+    """skip_reviews с кеш-хитом полного raw (с отзывами): используем кеш как
+    есть, ничего не пересобираем."""
+    full = _raw()
+    called = []
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma, **kw: (full, "hit"))
+    monkeypatch.setattr("ozon_collector.gather.C.collect",
+                        lambda **kw: called.append(1) or full)
+    monkeypatch.setattr("ozon_collector.gather.R.render",
+                        lambda r, **kw: "# ok")
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400, "no_ocr": True, "skip_reviews": True})
+    assert not called
+    assert res["cache"] == "hit"
+    assert res["ok"] is True

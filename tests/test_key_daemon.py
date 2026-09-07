@@ -2368,6 +2368,120 @@ def test_integration_resume_missing_flag_uses_cli(tmp_path, monkeypatch):
     assert (tmp_path / "r_compact.md").exists()  # fallback реально сработал
 
 
+# --- режим --no-reviews (skip_reviews) ---------------------------------------
+
+def _product_only_raw(pid):
+    """product-only raw: карточка цела, отзывы намеренно не тронуты (режим
+    --no-reviews). collected_at_utc свежий — иначе OLD_DATA даст лишний WARN."""
+    import datetime as _dt
+    now = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=1)).isoformat()
+    return {
+        "pid": str(pid),
+        "schema_version": "2.0",
+        "collector_version": "1.16.0",
+        "collected_at_utc": now,
+        "product_url": f"https://www.ozon.ru/product/{pid}",
+        "reviews_url": f"https://www.ozon.ru/product/{pid}?tab=reviews",
+        "product": {"title": "Спрей для горла с прополисом", "rating": 4.8,
+                    "rating_count": 100, "price": {"current": 156},
+                    "price_text": "156 ₽",
+                    "customer_opinion": {"recommend_percent": None,
+                                         "stars": {}, "counts": {},
+                                         "text": ""}},
+        "reviews": [], "reviews_collected": 0, "reviews_skipped": True,
+        "reviews_expected": None,
+        "reviews_sorts": ["published_at_desc", "score_asc"],
+        "reviews_variant_mode": {"used": False, "reason": "reviews_skipped",
+                                 "variant_count": None},
+        "pages": [], "review_pages": [], "source": "test",
+        "collection_telemetry": {}, "incomplete": False,
+        "missing_fields": [], "artifacts": {},
+    }
+
+
+def test_integration_no_reviews_flag_fixed_at_fresh(tmp_path, monkeypatch):
+    """--no-reviews при fresh → run_cfg.skip_reviews=True в манифесте."""
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                             {"pid": 1, "ok": True, "excluded": None}],
+                "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    out = str(tmp_path / "camp.md")
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=2, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=2,
+        reserve_count=0, max_total_hours=24.0, out=out, skip_reviews=True)
+    assert prog["run_cfg"]["skip_reviews"] is True
+
+
+def test_integration_no_reviews_resume_uses_manifest(tmp_path, monkeypatch):
+    """Режим зафиксирован в манифесте (skip_reviews=True); resume без флага
+    НЕ переключает его обратно в полный сбор (источник истины — манифест)."""
+    data_dir = _seed_manifest(tmp_path, monkeypatch)
+    camp_dir = tmp_path / "campaigns" / "testcamp"
+    prog_path = camp_dir / "progress.json"
+    init = k.load_json(prog_path)
+    init["run_cfg"]["skip_reviews"] = True
+    k.save_json(prog_path, init)
+    prog = _run_resume(data_dir, monkeypatch)            # CLI: без флага
+    assert prog["run_cfg"].get("skip_reviews") is True
+
+
+def test_integration_no_reviews_resume_cli_cannot_enable(tmp_path, monkeypatch):
+    """Манифест с skip_reviews=False → resume с --no-reviews НЕ включает режим:
+    манифест источник истины, CLI не переопределяет (манифест не трогается)."""
+    data_dir = _seed_manifest(tmp_path, monkeypatch)
+    camp_dir = tmp_path / "campaigns" / "testcamp"
+    prog_path = camp_dir / "progress.json"
+    init = k.load_json(prog_path)
+    init["run_cfg"]["skip_reviews"] = False
+    k.save_json(prog_path, init)
+    prog = _run_resume(data_dir, monkeypatch, skip_reviews=True)
+    assert prog["run_cfg"].get("skip_reviews") is False
+
+
+def test_integration_no_reviews_zero_reviews_no_rescan(tmp_path, monkeypatch):
+    """Регресс п.6: product-only raw (0 отзывов) с --no-reviews проходит QA как
+    OK (REVIEWS_SKIPPED) → valid; демон завершается целевым состоянием, БЕЗ
+    rescan-прогонов (failed пуст)."""
+    import json as _json
+    from scripts.qa_raw import scan_file, summarize as qa_summarize
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    for pid in ("0", "1"):
+        (data_dir / f"{pid}_raw.json").write_text(
+            _json.dumps(_product_only_raw(pid), ensure_ascii=False),
+            encoding="utf-8")
+
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None},
+                             {"pid": 1, "ok": True, "excluded": None}],
+                "found": 2}
+
+    def qa(batch):
+        reps = [
+            scan_file(str(data_dir / f"{p}_raw.json"), p) for p in batch]
+        s = qa_summarize(reps)
+        return {"products": len(batch), "ok": s["ok"], "warn": s["warn"],
+                "fail": s["fail"],
+                "per_pid": {r["pid"]: r["verdict"] for r in reps}}
+
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=2, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=0,   # raw-файлы — свои, не «{}»
+        reserve_count=0, max_total_hours=24.0, skip_reviews=True)
+    assert prog["final_state"] == "COMPLETED"
+    assert not prog.get("failed_pids")
+    assert not prog.get("permanently_failed_pids")
+    assert len(prog.get("running_rescans") or {}) == 0
+    assert len(prog.get("runs") or []) == 1          # только full, без rescan
+
+
 # --- _qa_clean: пустой snapshot → parse_error=False, qa не вызывается ---
 
 def test_finalize_empty_snapshot_parse_error_false(tmp_path):

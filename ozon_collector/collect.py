@@ -2252,6 +2252,7 @@ def collect(
     sorts: Optional[List[str]] = None,
     sess=None,
     overwrite: bool = False,
+    skip_reviews: bool = False,
 ) -> dict:
     """Полный сбор: карточка + отзывы варианта.
 
@@ -2262,6 +2263,9 @@ def collect(
     sorts=None — одна сортировка по умолчанию; иначе список сортировок из
     SORT_PARAMS (published_at_desc/score_desc/score_asc) — отзывы собираются
     по каждой и объединяются с дедупом по uuid (raw['reviews_sorts']).
+    skip_reviews=True — собрать только карточку, отзывы НЕ собирать
+    (raw['reviews_skipped']=True). Режим быстрого обзора: вариант-рейтинг и
+    проверки объёма отзывов неприменимы; нулевым отзывы не подтверждаются.
     sess — внешняя CDP-сессия (для переиспользования в search/gather):
     если передана, используется и НЕ закрывается; иначе создаётся своя.
     Возвращает dict."""
@@ -2299,7 +2303,14 @@ def collect(
         rurl = reviews_url or product_url + "?tab=reviews"
         rc = product.get("rating_count")
         no_count_hint = not (isinstance(rc, int) and rc > 0)
-        if isinstance(rc, int) and rc <= 0:
+        if skip_reviews:
+            # Быстрый режим: карточка уже собрана, отзывы намеренно не трогаем.
+            # Отдельный маркер reviews_skipped (не путать с реальным нулём).
+            log.info("[collect] skip_reviews=True — отзывы не собираю")
+            reviews, total_pages, page_log = [], 1, []
+            variant_mode = {"used": False, "reason": "reviews_skipped",
+                            "variant_count": None}
+        elif isinstance(rc, int) and rc <= 0:
             # У товара 0 отзывов целиком (кейс 4551551032: нет тумблера
             # варианта и пустой раздел) — прокручивать нечего, сортировки
             # и релоады бесполезны. Явный ноль из карточки доверяем.
@@ -2330,6 +2341,7 @@ def collect(
         "product": product,
         "reviews": reviews,
         "reviews_collected": len(reviews),
+        "reviews_skipped": bool(skip_reviews),
         "reviews_expected": None,
         "reviews_sorts": sorts,
         "reviews_variant_mode": variant_mode,
@@ -2368,8 +2380,11 @@ def collect(
         (isinstance(rc, int) and rc <= 0)
         or (bool(rv.get("used")) and rv.get("variant_count") == 0)
     )
+    # skip_reviews НЕ подтверждает нулевика: отзывы просто не собирались, а не
+    # проверены — иначе product-only raw закешировался бы как «отзывов нет».
     raw["no_reviews_confirmed"] = bool(
         explicit_zero
+        and not raw.get("reviews_skipped")
         and not (raw.get("reviews") or [])
         and not variant_review_problems(raw)
     )

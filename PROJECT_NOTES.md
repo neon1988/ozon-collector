@@ -67,6 +67,45 @@
      True/False/без-поля + эффект на файлы). Прогон: test_key_daemon + test_report
      322 passed, digest_from_raw+cli 11 passed, py_compile OK.
 
+ - **`--no-reviews`: product-only сбор карточки без отзывов (2026-09-07).**
+   Полный (или даже компактный) сбор отзывов по выдаче дорогой — отзывы тянут
+   минуты/часы и десятки МБ на товар. Для быстрой «обзорной» кампании нужен режим:
+   собрать только карточку товара (название, цена, рейтинг, характеристики, URL),
+   отзывы не трогать вовсе. Ортогонально `--compact` (формат дайджеста).
+   - **CLI и манифест:** `key_daemon --no-reviews` (арг один, как `--compact`).
+     Флаг фиксируется при fresh в манифесте: `progress["run_cfg"]["skip_reviews"]`;
+     resume берёт режим ИЗ МАНИФЕСТА (источник истины), CLI-параметр резюме не
+     переопределяет; смена режима — только `--reset`. Пробрасывается в сбор через
+     `gather_cfg` → `collect(..., skip_reviews=True)`.
+   - **Поведение сбора:** `collect` при `skip_reviews` делает только карточку:
+     `reviews=[]`, `reviews_skipped: true` в raw, `reviews_variant_mode` с
+     `reason="reviews_skipped"`, поле `no_reviews_confirmed` НЕ выставляется
+     (пустота отзывов — по режиму, а не подтверждение нуля). `gather` не режет
+     такой raw как брак числа отзывов (`variant_review_problems` пропускается).
+   - **QA:** `reviews_skipped` отменяет ТОЛЬКО review-specific проверки
+     (объём/OVERCOUNT/UNDER_TOLERANCE, ZERO_REVIEWS/CONFIRMED_NO_REVIEWS,
+     FALLBACK_OFFICIAL_COUNT) — вместо них INFO `REVIEWS_SKIPPED` → вердикт OK.
+     Но плохая карточка остаётся FAIL: challenge-страница (`CHALLENGE_PAGE`),
+     `BAD_STRUCTURE`/`BAD_IDENTIFIER`, и новая проверка целостности — без цены
+     и рейтинга (`INCOMPLETE_CARD`). Это гарантирует, что product-only не даёт
+     безусловный OK мусору. Rescan «0 отзывов = брак» не зажигается
+     (пустые отзывы — норма режима, QA даёт OK, товар идёт в valid).
+   - **Дайджесты:** явная пометка `_Отзывы не собирались (режим --no-reviews)._`,
+     Вариант-рейтинг честно «недоступен» (не подменяется официальным) + справочная
+     подпись `- Ozon (вся карточка): R / 5 · N оценок` (если официальные данные
+     есть). Строки sort-статистики «Собрано …» не выводятся. Сортировка компакта
+     детерминирована по официальному рейтингу DESC + pid.
+   - **Охват:** MVP — ключевые кампании (daemon) и все рендереры/report; корневой
+     `cli.py` пока НЕ проброшен (следующий отдельный шаг при необходимости).
+   - Файлы: `ozon_collector/collect.py` (`skip_reviews=`, `reviews_skipped` в raw),
+     `ozon_collector/gather.py` (проброс, пропуск variant_review_problems),
+     `scripts/key_daemon.py` (`--no-reviews`, `run_cfg.skip_reviews` в манифесте,
+     resume/fallback), `scripts/qa_raw.py` (guards, REVIEWS_SKIPPED, INCOMPLETE_CARD),
+     `ozon_collector/report.py` (пометки, официальный рейтинг, sort), тесты:
+     test_report +2 (skipped-фикстуры), test_qa_raw +4, test_gather +4,
+     test_key_daemon +4 (манифест fresh/resume, QA-integr через реальный qa_raw).
+     Прогон: test_key_daemon 227 passed, полный pytest 837 passed.
+
  - **Инцидент podarok_five: авто-включение `--match-title` из text= URL отсекало всю выдачу (2026-09-07).**
    Кампания `podarok_five` собрана по `search/?text=для девочки 5 лет подарок`. Вчерашний
    fallback-дизайн (при отсутствии явного флага брать `text=` из URL) включил фильтр

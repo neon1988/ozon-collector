@@ -142,9 +142,13 @@ def run_gather(cfg: dict, sess=None) -> dict:
                 apply_variant_mode=not cfg.get("no_variant_mode"),
                 sorts=cfg.get("sorts"),
                 sess=sess,
+                skip_reviews=cfg.get("skip_reviews", False),
             )
             log.info(f"[gather] pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
-            problems = C.variant_review_problems(raw)
+            # Проверки объёма отзывов неприменимы в режиме без отзывов
+            # (reviews намеренно пустые, а не брак сбора).
+            problems = ([] if cfg.get("skip_reviews")
+                        else C.variant_review_problems(raw))
             if problems:
                 _delete_raw_file(out_raw)
                 raise B.VariantShortError(

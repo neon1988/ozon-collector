@@ -1302,3 +1302,115 @@ def test_write_search_digest_compact_creates_file(tmp_path):
     md = out.read_text(encoding="utf-8")
     assert "Полный дайджест" in md
     assert "## Товар 9" in md
+
+
+# ---- режим --no-reviews (reviews_skipped) ----------------------------------
+
+def _skipped_raw(**extra):
+    """raw режима --no-reviews: карточка собрана, отзывы намеренно не тронуты."""
+    rating = extra.pop("rating", 4.9)
+    rating_count = extra.pop("rating_count", 1234)
+    raw = _compact_raw(reviews=[])
+    raw["product"]["rating"] = rating
+    raw["product"]["rating_count"] = rating_count
+    raw["reviews_skipped"] = True
+    raw["reviews_variant_mode"] = {"used": False, "reason": "reviews_skipped",
+                                   "variant_count": None}
+    raw.update(extra)
+    return raw
+
+
+def test_render_full_skipped_reviews_marker():
+    """Полный дайджест при reviews_skipped: явная пометка «отзывы не собирались»,
+    а не «не собрано»; строки сортировок/статистики S не выводятся."""
+    md = render(_skipped_raw(reviews=[]))
+    assert "_Отзывы не собирались (режим --no-reviews)._" in md
+    assert "_Отзывов не собрано._" not in md
+    assert "Собрано новые и полезные" not in md   # строки sorts не выводятся
+    assert "Вариант-рейтинг: недоступен (режим --no-reviews)" in md
+
+
+def test_render_full_skipped_reviews_official_rating_only():
+    """Без отзывов Вариант-рейтинг не подменяется официальным: оба показаны
+    отдельно, «нет нейтральной выборки» не актуально."""
+    raw = _skipped_raw(reviews=[])
+    raw["product"]["customer_opinion"]["counts"] = {}  # точный рейтинг из product.rating
+    md = render(raw)
+    assert ("Вариант-рейтинг: недоступен (режим --no-reviews)") in md
+    assert "- Ozon (вся карточка): 4.900 / 5 · 1234 оценки" in md
+    assert "Рейтинг по собранным отзывам" not in md
+    assert "нет нейтральной выборки" not in md
+
+
+def test_render_compact_skipped_reviews_no_variant_rating():
+    """Компакт при reviews_skipped: Вариант-рейтинг недоступен, официальная
+    подпись «вся карточка» — не выдаём за вариант."""
+    raw = _skipped_raw(reviews=[])
+    raw["product"]["customer_opinion"]["counts"] = {}  # точный рейтинг из product.rating
+    md = render_compact(raw)
+    assert "Вариант-рейтинг: недоступен (режим --no-reviews)" in md
+    assert "- Ozon (вся карточка): 4.900 / 5 · 1234 оценки" in md
+    assert "Рейтинг по собранным отзывам" not in md
+    assert "нет нейтральной выборки" not in md
+    assert "## 2. Цена и акции" in md
+
+
+def test_render_compact_skipped_keeps_card_fields():
+    """Компакт при reviews_skipped не теряет карточки: цена, характеристики,
+    официальные звёзды, URL на месте."""
+    md = render_compact(_skipped_raw(reviews=[]))
+    assert "Цена с Ozon Картой: 1 299 ₽" in md
+    assert "| Тип | Наушники |" in md
+    assert "★5: 891" in md and "★1: 6" in md
+    assert "- URL: https://www.ozon.ru/product/101" in md
+    assert "Отзывы покупателей" not in md
+
+
+def test_render_compact_skipped_without_opinion_no_fallbacks():
+    """Нет official-рейтинга и counts при reviews_skipped: только строка о том,
+    что Вариант-рейтинг недоступен, без выдуманных цифр."""
+    raw = _skipped_raw(reviews=[])
+    raw["product"]["customer_opinion"] = {"recommend_percent": None}
+    raw["product"].pop("rating", None)
+    raw["product"].pop("rating_count", None)
+    md = render_compact(raw)
+    assert "Вариант-рейтинг: недоступен (режим --no-reviews)" in md
+    assert "- Ozon (вся карточка)" not in md
+    assert "Рейтинг по собранным отзывам" not in md
+
+
+def test_sort_digest_products_skipped_uses_official_rating():
+    """Сортировка компакта без отзывов: официальный рейтинг DESC, tie-break pid —
+    без скрытого fallback на вариант-балл (variant_rating недоступен)."""
+    from ozon_collector.report import sort_digest_products
+
+    def p(pid, rating):
+        raw = _skipped_raw(reviews=[], rating=rating)
+        raw["product"]["customer_opinion"]["counts"] = {}  # рейтинг только из product.rating
+        return raw
+
+    p1 = {"pid": "1", "ok": True, "raw": p("1", 4.5)}
+    p2 = {"pid": "2", "ok": True, "raw": p("2", 4.9)}
+    p3 = {"pid": "3", "ok": True, "raw": p("3", 4.9)}
+    items = [p1, p2, p3]
+    sort_digest_products(items)
+    assert [x["pid"] for x in items] == ["2", "3", "1"]
+
+
+def test_sort_digest_products_skipped_no_rating_below():
+    """Product-only товар без официального рейтинга — ниже имеющих его (но не
+    после ошибок сбора)."""
+    from ozon_collector.report import sort_digest_products
+    bad = _skipped_raw(reviews=[])
+    bad["product"].pop("rating", None)
+    bad["product"].pop("rating_count", None)
+    bad["product"]["customer_opinion"]["counts"] = {}
+    rated = _skipped_raw(reviews=[], rating=4.0)
+    rated["product"]["customer_opinion"]["counts"] = {}
+    products = [
+        {"pid": "1", "ok": True, "raw": bad},
+        {"pid": "2", "ok": True, "raw": rated},
+        {"pid": "9", "ok": False, "raw": None},
+    ]
+    sort_digest_products(products)
+    assert [x["pid"] for x in products] == ["2", "1", "9"]

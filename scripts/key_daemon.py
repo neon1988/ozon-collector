@@ -945,6 +945,7 @@ def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
         "sorts": ["published_at_desc", "score_asc"],  # DEFAULT_SORTS
         "max_age_s": max_age_s,
         "no_ocr": True,          # --ocr не передаётся демоном
+        "skip_reviews": cfg.get("skip_reviews", False),
         "threads": 8,
         "no_preproc": False,
         "dedup_replies": True,   # без --no-dedup-replies
@@ -1160,6 +1161,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  match_title: Optional[str] = None,
                  write_digest: bool = True,
                  compact: bool = False,
+                 skip_reviews: bool = False,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
     lock = PidLock(DATA_DIR / "key_daemon.pid")
     if not lock.acquire(campaign):
@@ -1200,7 +1202,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         max_transient_retries=max_transient_retries,
         max_worker_restarts=max_worker_restarts,
         session_budget_wall_clock=session_budget_wall_clock,
-        window_mode=window_mode)
+        window_mode=window_mode,
+        skip_reviews=skip_reviews)
 
     # Валидация для НОВОЙ кампании (при resume manifest уже согласован).
     if fresh:
@@ -1250,6 +1253,17 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         progress["compact_digest"] = bool(compact)
     else:
         compact = bool(progress.get("compact_digest", compact))
+
+    # Быстрая карточка без отзывов (--no-reviews): фиксируется в run_cfg при
+    # создании кампании; при resume run_cfg читается СТРОГО из манифеста ниже
+    # (источник истины) — режим между запусками не переключается, смена — --reset.
+    # Для старых кампаний (поля в run_cfg нет) fallback на текущий CLI-аргумент
+    # только в этом запуске: манифест не перезаписывается.
+    if fresh:
+        progress.setdefault("run_cfg", {})["skip_reviews"] = bool(skip_reviews)
+    else:
+        skip_reviews = bool(progress.get("run_cfg", {}).get(
+            "skip_reviews", skip_reviews))
 
     try:
         # При resume конфиг берём из манифеста (источник истины), а не из текущих
@@ -1971,6 +1985,14 @@ def parse_args(argv=None):
                          "({root}_compact.md рядом с --out): карточка товара + "
                          "цена + характеристики + итог звёзд, БЕЗ текстов "
                          "отзывов/описаний/OCR. --no-digest отключает оба файла.")
+    ap.add_argument("--no-reviews", action="store_true",
+                    help="быстрый режим: собирать ТОЛЬКО карточку товара, "
+                         "отзывы не собираются (raw.reviews_skipped=true). "
+                         "Вариант-рейтинг недоступен. Ортогонально --compact: "
+                         "--no-reviews --compact — самый быстрый обзор. Флаг "
+                         "фиксируется при создании кампании в манифесте "
+                         "(run_cfg.skip_reviews); при resume взётся только из "
+                         "манифеста, смена режима — через --reset.")
     return ap.parse_args(argv)
 
 
@@ -2029,7 +2051,8 @@ def main(argv=None):
         window_mode=args.window_mode,
         match_title=args.match_title,
         write_digest=not args.no_digest,
-        compact=args.compact)
+        compact=args.compact,
+        skip_reviews=args.no_reviews)
     print(json.dumps(summarize(progress), ensure_ascii=False, indent=2))
 
 

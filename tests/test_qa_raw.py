@@ -307,3 +307,80 @@ def test_summarize_kpi():
     assert s["wall_limited_count"] == 1
     assert s["reviews_total_sum"] == 181
     assert s["rating_only_pattern_total"] == 0
+
+
+# ---- режим --no-reviews (reviews_skipped) ----------------------------------
+
+def _skipped_raw(pid="42", vc=0, rc=5):
+    """raw режима --no-reviews: карточка цела, отзывы намеренно не тронуты."""
+    raw = _raw(pid=pid, vc=vc, reviews=[], rc=rc)
+    raw["reviews_skipped"] = True
+    raw["reviews_variant_mode"].update(
+        {"used": False, "clicked": False, "reason": "reviews_skipped",
+         "variant_count": None, "variant_present": False})
+    return raw
+
+
+def test_reviews_skipped_ok_not_confirmed_zero():
+    """product-only НЕ нулевик и НЕ брак: INFO REVIEWS_SKIPPED, вердикт OK,
+    ZERO_REVIEWS/CONFIRMED_NO_REVIEWS отсутствуют."""
+    raw = _skipped_raw(vc=0, rc=None)
+    rep = qa_product(raw, "42")
+    codes = _codes(rep)
+    assert "REVIEWS_SKIPPED" in codes
+    assert "ZERO_REVIEWS" not in codes
+    assert "CONFIRMED_NO_REVIEWS" not in codes
+    assert rep["verdict"] == "OK"
+    assert rep["metrics"]["reviews_skipped"] is True
+    assert rep["metrics"]["reviews_total"] == 0
+
+
+def test_reviews_skipped_no_volume_warns():
+    """Пропуск отзывов не порождает volume-WARN: ни UNDER_TOLERANCE, ни
+    SHORT_TOTAL, ни FALLBACK_OFFICIAL_COUNT — вердикт OK."""
+    raw = _skipped_raw(vc=0, rc=100)
+    rep = qa_product(raw, "42")
+    codes = _codes(rep)
+    assert rep["verdict"] == "OK"
+    assert not (codes & {"UNDER_TOLERANCE", "SHORT_TOTAL",
+                         "FALLBACK_OFFICIAL_COUNT", "OVERCOUNT"})
+    assert "REVIEWS_SKIPPED" in codes
+
+
+def test_reviews_skipped_does_not_hide_broken_product():
+    """REVIEWS_SKIPPED отменяет только review-specific проверки, но НЕ делает
+    плохую карточку OK: challenge-страница остаётся FAIL."""
+    raw = _skipped_raw(vc=0, rc=None)
+    raw["product"]["title"] = f"Спрей {sorted(CHALLENGE_TITLE_MARKERS)[0]} тест"
+    rep = qa_product(raw, "42")
+    assert rep["verdict"] == "FAIL"
+    assert "CHALLENGE_PAGE" in _codes(rep)
+
+
+def test_reviews_skipped_bad_structure_still_fail():
+    """При reviews_skipped reviews не список — всё равно BAD_STRUCTURE FAIL."""
+    raw = _skipped_raw(vc=0, rc=None)
+    raw["reviews"] = "не список"
+    rep = qa_product(raw, "42")
+    assert rep["verdict"] == "FAIL"
+    assert "BAD_STRUCTURE" in _codes(rep)
+
+
+def test_reviews_skipped_incomplete_card_fail():
+    """product-only собран ради карточки: если цена и рейтинг не извлечены —
+    INCOMPLETE_CARD FAIL; REVIEWS_SKIPPED не даёт безусловный OK."""
+    raw = _skipped_raw(vc=0, rc=None)
+    raw["product"].pop("rating", None)
+    raw["product"]["price_text"] = ""
+    rep = qa_product(raw, "42")
+    assert rep["verdict"] == "FAIL"
+    assert "INCOMPLETE_CARD" in _codes(rep)
+
+
+def test_reviews_skipped_price_only_is_fail():
+    """Половина карточки (рейтинг есть, цены нет) — тоже INCOMPLETE_CARD."""
+    raw = _skipped_raw(vc=0, rc=None)
+    raw["product"]["price_text"] = ""
+    rep = qa_product(raw, "42")
+    assert rep["verdict"] == "FAIL"
+    assert "INCOMPLETE_CARD" in _codes(rep)
