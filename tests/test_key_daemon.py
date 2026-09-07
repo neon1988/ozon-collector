@@ -361,7 +361,7 @@ def test_compute_final_states():
 # --- summarize ---
 
 def _progress_filled():
-    p = k.default_manifest("x", 300, 200, "u", "o.md")
+    p = k.default_manifest("x", 300, 200, "u", "campaign.md")
     p["discovered_pids"] = ["1", "2"]
     p["valid_pids"] = ["1"]
     p["failed_pids"] = ["2"]
@@ -618,7 +618,7 @@ def test_classify_empty_need_no_qa_call(tmp_path):
 # --- default_manifest ---
 
 def test_default_manifest_fields():
-    m = k.default_manifest("camp", 300, 200, "u", "o.md",
+    m = k.default_manifest("camp", 300, 200, "u", "campaign.md",
                            max_age="7d", parallel=1)
     assert m["campaign"] == "camp"
     assert m["target_count"] == 300 and m["min_valid"] == 200
@@ -1297,7 +1297,7 @@ def _run_campaign_integration(tmp_path, monkeypatch, target, min_valid,
 
     return k.run_campaign(
         campaign="testcamp", url=kw.pop("url", "u"), target=target, min_valid=min_valid,
-        out=kw.pop("out", "o.md"), data_dir=str(data_dir), max_no_progress_runs=max_no_progress_runs,
+        out=kw.pop("out", str(data_dir / "digest.md")), data_dir=str(data_dir), max_no_progress_runs=max_no_progress_runs,
         qa_fn=qa_fn, **kw)
 
 
@@ -2170,7 +2170,7 @@ def test_integration_resume_uses_manifest_config(tmp_path, monkeypatch):
     camp_dir.mkdir(parents=True, exist_ok=True)
     k.save_json(camp_dir / "progress.json", {
         "campaign": "testcamp", "target_count": 5, "min_valid": 2,
-        "url": "u", "out": "o.md",
+        "url": "u", "out": str(tmp_path / "campaign.md"),
         "run_cfg": {"data_dir": str(data_dir), "max_age": "7d",
                     "min_reviews": 0, "parallel": 1,
                     "max_no_progress_runs": 1, "max_rescans": 2,
@@ -2204,7 +2204,7 @@ def test_integration_resume_uses_manifest_config(tmp_path, monkeypatch):
 
     prog = k.run_campaign(
         campaign="testcamp", url="u", target=5, min_valid=2,
-        out="o.md", data_dir=str(data_dir), max_no_progress_runs=10,
+        out=str(tmp_path / "campaign.md"), data_dir=str(data_dir), max_no_progress_runs=10,
         max_total_hours=24.0, qa_fn=qa)
     # манифестное max_no_progress_runs=1 → 1 прогон с прогрессом + 1 без,
     # затем остановка по no_progress. Если бы использовался параметр 10,
@@ -2291,7 +2291,7 @@ def _seed_manifest(tmp_path, monkeypatch, **extra):
     camp_dir.mkdir(parents=True, exist_ok=True)
     init = {
         "campaign": "testcamp", "target_count": 1, "min_valid": 1,
-        "url": "u", "out": "o.md",
+        "url": "u", "out": str(tmp_path / "campaign.md"),
         "run_cfg": {"data_dir": str(data_dir), "max_age": "7d",
                     "min_reviews": 0, "parallel": 1,
                     "max_no_progress_runs": 1, "max_rescans": 2,
@@ -2327,7 +2327,7 @@ def _run_resume(data_dir, monkeypatch, **kw):
     monkeypatch.setattr(k.time, "sleep", lambda s: None)
     return k.run_campaign(
         campaign="testcamp", url="u", target=1, min_valid=1,
-        out="o.md", data_dir=str(data_dir), max_total_hours=24.0,
+        out=str(data_dir / "campaign.md"), data_dir=str(data_dir), max_total_hours=24.0,
         qa_fn=qa, **kw)
 
 
@@ -2508,7 +2508,7 @@ def test_new_campaign_rejects_min_valid_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(k, "DATA_DIR", tmp_path)
     with pytest.raises(SystemExit):
         k.run_campaign(campaign="x", url="u", target=3, min_valid=0,
-                       out="o.md", data_dir=str(tmp_path / "data"),
+                       out="campaign.md", data_dir=str(tmp_path / "data"),
                        max_no_progress_runs=10)
 
 
@@ -2518,7 +2518,7 @@ def test_new_campaign_rejects_missing_url(tmp_path, monkeypatch):
     monkeypatch.setattr(k, "DATA_DIR", tmp_path)
     with pytest.raises(SystemExit):
         k.run_campaign(campaign="x", url="", target=3, min_valid=1,
-                       out="o.md", data_dir=str(tmp_path / "data"),
+                       out="campaign.md", data_dir=str(tmp_path / "data"),
                        max_no_progress_runs=10)
 
 
@@ -2533,7 +2533,7 @@ def test_resume_without_url_ok(tmp_path, monkeypatch):
     camp_dir.mkdir(parents=True, exist_ok=True)
     k.save_json(camp_dir / "progress.json", {
         "campaign": "testcamp", "target_count": 5, "min_valid": 1,
-        "url": "stored_url", "out": "o.md",
+        "url": "stored_url", "out": str(tmp_path / "campaign.md"),
         "run_cfg": {"data_dir": str(data_dir), "max_age": "7d",
                     "min_reviews": 0, "parallel": 1,
                     "max_no_progress_runs": 1, "max_rescans": 2,
@@ -2567,7 +2567,7 @@ def test_resume_without_url_ok(tmp_path, monkeypatch):
 
     prog = k.run_campaign(
         campaign="testcamp", url="", target=5, min_valid=1,
-        out="o.md", data_dir=str(data_dir), max_no_progress_runs=10,
+        out=str(tmp_path / "campaign.md"), data_dir=str(data_dir), max_no_progress_runs=10,
         max_total_hours=24.0, qa_fn=qa)
     # resume не падает на пустом url; URL из манифеста передаётся в CLI
     assert prog["final_reason"] == "no_progress"
@@ -2636,7 +2636,7 @@ def test_integration_unknown_failure_needs_attention(tmp_path, monkeypatch):
 
     prog = k.run_campaign(
         campaign="testcamp", url="u", target=3, min_valid=1,
-        out="o.md", data_dir=str(data_dir),
+        out=str(tmp_path / "campaign.md"), data_dir=str(data_dir),
         max_no_progress_runs=10, qa_fn=qa, max_total_hours=24.0)
     assert prog["final_state"] == "NEEDS_ATTENTION"
     assert prog["final_reason"] == "unknown_failure"
@@ -3270,7 +3270,7 @@ def test_run_campaign_force_reset_wipes_terminal_campaign(tmp_path, monkeypatch)
     campaigns = tmp_path / "campaigns"
     camp_dir = campaigns / "testcamp"
     camp_dir.mkdir(parents=True, exist_ok=True)
-    old = k.default_manifest("testcamp", 5, 2, "old-url", "o.md",
+    old = k.default_manifest("testcamp", 5, 2, "old-url", "campaign.md",
                              data_dir=str(data_dir))
     old["discovered_pids"] = ["999", "998"]
     old["valid_pids"] = ["999"]
@@ -3300,7 +3300,7 @@ def test_run_campaign_force_reset_wipes_terminal_campaign(tmp_path, monkeypatch)
 
     prog = k.run_campaign(
         campaign="testcamp", url="new-url", target=2, min_valid=1,
-        out="o.md", data_dir=str(data_dir), max_no_progress_runs=10,
+        out=str(tmp_path / "campaign.md"), data_dir=str(data_dir), max_no_progress_runs=10,
         max_total_hours=24.0, force_reset=True, qa_fn=qa)
 
     # старая терминальная кампания стёрта → стартовали именно новые пиды
@@ -3342,7 +3342,7 @@ def test_run_campaign_force_reset_without_existing_is_fresh(tmp_path, monkeypatc
 
     prog = k.run_campaign(
         campaign="testcamp", url="u", target=2, min_valid=1,
-        out="o.md", data_dir=str(data_dir), max_no_progress_runs=10,
+        out=str(tmp_path / "campaign.md"), data_dir=str(data_dir), max_no_progress_runs=10,
         max_total_hours=24.0, force_reset=True, qa_fn=qa)
 
     assert prog["final_state"] == "COMPLETED"
@@ -3380,7 +3380,7 @@ def test_run_campaign_force_collection_calls_emergency_shutdown(tmp_path, monkey
         with pytest.raises(CollectionInterrupted):
             k.run_campaign(
                 campaign="testcamp", url="u", target=3, min_valid=1,
-                out="o.md", data_dir=str(data_dir), max_total_hours=24.0,
+                out=str(tmp_path / "campaign.md"), data_dir=str(data_dir), max_total_hours=24.0,
                 qa_fn=lambda batch: {"products": len(batch), "ok": len(batch),
                                      "warn": 0, "fail": 0,
                                      "per_pid": {p: "OK" for p in batch}})
