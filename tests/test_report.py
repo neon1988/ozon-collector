@@ -9,7 +9,10 @@ from ozon_collector.report import (
     _review_text_sig,
     _top_reviews,
     render,
+    render_compact,
     render_search_digest,
+    render_search_digest_compact,
+    write_search_digest_compact,
 )
 
 MARK = "таких же ответ"  # общий кусок метки счётчика
@@ -1157,3 +1160,145 @@ def test_top_reviews_respects_n_and_returns_fewer():
     assert len(_top_reviews(reviews, 4)) == 4
     assert len(_top_reviews(reviews, 0)) == 0
     assert _top_reviews([], 5) == []
+
+
+# ---- краткий дайджест (--compact) ----------------------------------------
+
+def _compact_raw(**extra):
+    """Сырой словарь с обогащённой карточкой (характеристики, цена, URL)."""
+    raw = _raw(extra.pop("reviews", []))
+    raw["product"].update({
+        "title": "Наушники беспроводные",
+        "characteristics": {"Тип": "Наушники", "Цвет": "Чёрный"},
+        "price": {"bank": 1299},
+        "customer_opinion": {
+            "counts": {"1": 6, "2": 3, "3": 21, "4": 81, "5": 891},
+            "recommend_percent": 94,
+            "text": "По мнению покупателей\nКачество звука: хорошее",
+        },
+    })
+    raw["product_url"] = "https://www.ozon.ru/product/101"
+    raw["target_variant"] = {"Цвет": "чёрный"}
+    raw.update(extra)
+    return raw
+
+
+def test_render_compact_contains_whitelist():
+    """Краткая карточка содержит основное: рейтинг, негатив, цену, характеристики,
+    аспекты, рекомендуют %, официальные звёзды и URL."""
+    md = render_compact(_compact_raw())
+    assert "# Наушники" in md or "# Товар" in md
+    assert "## 1. Карточка товара" in md
+    assert "## 2. Цена и акции" in md
+    assert "## 3. Характеристики" in md
+    assert "Цена с Ozon Картой: 1 299 ₽" in md
+    assert "| Тип | Наушники |" in md
+    assert "Качество звука: хорошее" in md
+    assert "Рекомендуют: 94% покупателей" in md
+    assert "- URL: https://www.ozon.ru/product/101" in md
+    # официальное распределение звёзд, а не выборка
+    assert "★5: 891" in md and "★1: 6" in md
+
+
+def test_render_compact_excludes_heavy_sections():
+    """Краткая карточка НЕ содержит тяжёлых блоков: тексты отзывов (в т.ч.
+    score_asc), описания, OCR и метаданные (секции 4–7) отсутствуют."""
+    review = _review("Иван", [], text="УНИКАЛЬНЫЙ_ТЕКСТ_ОТЗЫВА", stars=1)
+    review["review_sorts"] = ["score_asc"]
+    raw = _compact_raw(reviews=[review])
+    raw["product"]["descriptions"] = ["Огромное описание товара"]
+    raw["gallery_ocr"] = [{"text": "OCR_РАСПОЗНАННЫЙ_ТЕКСТ"}]
+    raw["gallery_stats_text"] = "OCR: 1"
+    raw["collector_version"] = "9.9.9"
+    md = render_compact(raw)
+    assert "УНИКАЛЬНЫЙ_ТЕКСТ_ОТЗЫВА" not in md
+    assert "Огромное описание товара" not in md
+    assert "OCR_РАСПОЗНАННЫЙ_ТЕКСТ" not in md
+    assert "## 4." not in md and "## 5." not in md
+    assert "## 6." not in md and "## 7." not in md
+    assert "Отзывы покупателей" not in md
+    assert "целенаправленный поиск" not in md
+    assert "score_asc" not in md
+    assert "Метаданные" not in md
+
+
+def test_render_compact_skips_stars_without_counts():
+    """Нет официального распределения (counts) → блок звёзд не выводится,
+    рендер не падает; рейтинг — из официальных данных карточки."""
+    raw = _compact_raw(reviews=[])
+    raw["product"]["customer_opinion"] = {"recommend_percent": None}
+    md = render_compact(raw)
+    assert "★5:" not in md
+    assert "Звёзды" not in md
+    assert "## 1. Карточка товара" in md
+
+
+def test_render_compact_no_product_field_tolerated():
+    """Пустая/без title карточка: рендер не падает, секции на месте."""
+    raw = _raw([])  # product.title = "Товар", ничего больше
+    md = render_compact(raw)
+    assert "## 3. Характеристики" not in md   # характеристик нет
+    assert "# Товар" in md
+    assert "- URL: —" in md
+
+
+def _combined(products):
+    return {
+        "search": {"query": "артикулы: тест (офлайн, из raw)"},
+        "collected_at_utc": "2026-09-07T00:00:00+00:00",
+        "found": len(products),
+        "collected": sum(1 for p in products if p.get("ok")),
+        "products": products,
+    }
+
+
+def test_compact_digest_includes_failed_products():
+    """Товары с ошибкой сбора НЕ выпадают из краткого дайджеста: блок-заглушка
+    (состав кампании 1:1 с полным)."""
+    combined = _combined([
+        {"ok": False, "pid": "9", "error": "нет валидных данных (missing)"},
+    ])
+    md = render_search_digest_compact(combined)
+    assert "## Товар 9" in md
+    assert "⚠ Не удалось собрать: нет валидных данных (missing)" in md
+
+
+def test_compact_digest_empty_products_only_header():
+    """Пустая кампания: только шапка + размер; ссылка на полный опущена при
+    full_out=None."""
+    combined = _combined([])
+    md = render_search_digest_compact(combined, full_out=None)
+    assert "# Дайджест выдачи Ozon (краткий)" in md
+    assert "Полный дайджест" not in md
+    assert "## Товар" not in md
+    assert "Размер дайджеста" in md
+
+
+def test_compact_digest_order_matches_full():
+    """Порядок товаров в кратком и полном дайджесте совпадает (заголовки
+    «## Товар N: pid»), чтобы side-by-side сверка не разъезжалась."""
+    import re
+    products = []
+    for pid in ("3", "1", "2"):
+        products.append({"ok": True, "pid": pid, "raw": _raw([])})
+    combined = _combined(products)
+    full_md = render_search_digest(combined)
+    comp_md = render_search_digest_compact(combined)
+    pids_full = re.findall(r"## Товар \d+: (\d+)", full_md)
+    pids_comp = re.findall(r"## Товар \d+: (\d+)", comp_md)
+    assert pids_comp == pids_full and pids_full
+
+
+def test_write_search_digest_compact_creates_file(tmp_path):
+    """Запись краткого дайджеста в один файл (без разбиения по размеру)."""
+    combined = _combined([
+        {"ok": False, "pid": "9", "error": "нет валидных данных (missing)"},
+    ])
+    out = tmp_path / "d_compact.md"
+    written = write_search_digest_compact(
+        combined, str(out), full_out=str(tmp_path / "d.md"))
+    assert written == [str(out)]
+    assert out.exists()
+    md = out.read_text(encoding="utf-8")
+    assert "Полный дайджест" in md
+    assert "## Товар 9" in md

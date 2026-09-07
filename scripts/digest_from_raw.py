@@ -31,7 +31,9 @@ from cli import parse_pids
 from ozon_collector.report import (build_search_digest_combined,
                                    minimum_header_size_bytes,
                                    render_search_digest,
-                                   write_search_digest)
+                                   render_search_digest_compact,
+                                   write_search_digest,
+                                   write_search_digest_compact)
 
 
 def main(argv=None) -> int:
@@ -49,6 +51,11 @@ def main(argv=None) -> int:
                     help="макс. размер одного md-файла дайджеста в МиБ "
                          "(1 МиБ = 1024² байт; по умолч. 3.0; должен быть > 0, "
                          "иначе разбиение невозможно)")
+    ap.add_argument("--compact", action="store_true",
+                    help="создать краткий дайджест {root}_compact.md: карточка "
+                         "товара + цена + характеристики + итог звёзд, БЕЗ "
+                         "текстов отзывов/описаний/OCR. С --out пишет и полный, "
+                         "и краткий файл; без --out печатает краткий в stdout")
     args = ap.parse_args(argv)
 
     pids = set()
@@ -85,7 +92,6 @@ def main(argv=None) -> int:
     print(f"pid'ов: {len(pids)}, из них с валидными данными: {ok_n}")
     print("\n".join(table))
 
-    md = render_search_digest(combined)
     if args.out:
         if args.max_file_size_mb <= 0:
             ap.error("--max-file-size-mb должен быть > 0")
@@ -100,7 +106,17 @@ def main(argv=None) -> int:
         for path in written:
             size = os.path.getsize(path) / 1024
             print(f"\nДайджест сохранён: {path} ({size:.2f} КБ)")
+        if args.compact:
+            root, ext = os.path.splitext(args.out)
+            compact_out = f"{root}_compact{ext}"
+            write_search_digest_compact(combined, compact_out, full_out=args.out)
+            size = os.path.getsize(compact_out) / 1024
+            print(f"Краткий дайджест сохранён: {compact_out} ({size:.2f} КБ)")
     else:
+        if args.compact:
+            md = render_search_digest_compact(combined)
+        else:
+            md = render_search_digest(combined)
         print("\n" + md)
     return 0
 

@@ -1159,6 +1159,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  window_mode: Optional[str] = None,
                  match_title: Optional[str] = None,
                  write_digest: bool = True,
+                 compact: bool = False,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
     lock = PidLock(DATA_DIR / "key_daemon.pid")
     if not lock.acquire(campaign):
@@ -1237,6 +1238,18 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
     # берётся из манифеста (источник истины), параметр запуска не переопределяет.
     if fresh:
         progress["title_match_query"] = (match_title or "").strip()
+
+    # Краткий дайджест (--compact): флаг фиксируется при создании кампании,
+    # при resume берётся из манифеста (источник истины) — CLI не переопределяет
+    # поведение между запусками. Для кампаний, созданных до появления опции
+    # (поля в манифесте нет), — fallback на текущий аргумент CLI: используется
+    # только в этом запуске (передаётся в _write_digest отдельным параметром),
+    # манифест НЕ перезаписывается — CLI не становится постоянной настройкой
+    # старой кампании.
+    if fresh:
+        progress["compact_digest"] = bool(compact)
+    else:
+        compact = bool(progress.get("compact_digest", compact))
 
     try:
         # При resume конфиг берём из манифеста (источник истины), а не из текущих
@@ -1690,7 +1703,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         _set_state(progress, fs, "FINALIZED", reason=fr)
         if write_digest and fs != "INTERRUPTED":
             # на INTERRUPTED данные неполные — дайджест не рендерим
-            _write_digest(progress, data_dir)
+            _write_digest(progress, data_dir, compact=compact)
         notify(progress, msg)
         return progress
 
@@ -1698,15 +1711,21 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         lock.release()
 
 
-def _write_digest(progress: dict, data_dir: str) -> None:
+def _write_digest(progress: dict, data_dir: str,
+                  compact: Optional[bool] = None) -> None:
     """Markdown-дайджест собранной выдачи (по финальным accepted PID).
 
     Рендерит из лучших валидных raw на каждый pid (report.build_search_digest_combined
     + write_search_digest) в progress["out"]. Ничего не делает, если accepted
     PID пустые (например, ABANDONED без данных).
+
+    compact: флаг краткого дайджеста. Если None — берётся из манифеста
+    (progress["compact_digest"]); так resume у старых кампаний (без поля) может
+    передать fallback-значение из CLI без записи в манифест.
     """
     from ozon_collector.report import (build_search_digest_combined,
-                                       write_search_digest)
+                                       write_search_digest,
+                                       write_search_digest_compact)
     pids = list(progress.get("campaign_accepted_pids")
                 or progress.get("campaign_final_pids") or [])
     if not pids:
@@ -1716,6 +1735,14 @@ def _write_digest(progress: dict, data_dir: str) -> None:
     written = write_search_digest(combined, out)
     for path in written:
         log.info(f"дайджест сохранён: {path}")
+    compact_flag = (compact if compact is not None
+                    else bool(progress.get("compact_digest")))
+    if compact_flag:
+        root, ext = os.path.splitext(out)
+        compact_out = f"{root}_compact{ext}"
+        written = write_search_digest_compact(combined, compact_out, full_out=out)
+        for path in written:
+            log.info(f"краткий дайджест сохранён: {path}")
 
 
 def finalize_campaign(progress: dict, progress_path: Path,
@@ -1937,7 +1964,13 @@ def parse_args(argv=None):
                          "создании кампании, при resume меняться не может.")
     ap.add_argument("--no-digest", action="store_true",
                     help="не создавать Markdown-дайджест итога кампании "
-                         "(по умолчанию создаётся в --out)")
+                         "(по умолчанию создаётся в --out); отключает и "
+                         "полный, и краткий (--compact) дайджесты")
+    ap.add_argument("--compact", action="store_true",
+                    help="дополнительно создать краткий Markdown-дайджест "
+                         "({root}_compact.md рядом с --out): карточка товара + "
+                         "цена + характеристики + итог звёзд, БЕЗ текстов "
+                         "отзывов/описаний/OCR. --no-digest отключает оба файла.")
     return ap.parse_args(argv)
 
 
@@ -1995,7 +2028,8 @@ def main(argv=None):
         session_budget_wall_clock=args.session_budget_wall_clock,
         window_mode=args.window_mode,
         match_title=args.match_title,
-        write_digest=not args.no_digest)
+        write_digest=not args.no_digest,
+        compact=args.compact)
     print(json.dumps(summarize(progress), ensure_ascii=False, indent=2))
 
 

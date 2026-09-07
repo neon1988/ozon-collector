@@ -1297,7 +1297,7 @@ def _run_campaign_integration(tmp_path, monkeypatch, target, min_valid,
 
     return k.run_campaign(
         campaign="testcamp", url=kw.pop("url", "u"), target=target, min_valid=min_valid,
-        out="o.md", data_dir=str(data_dir), max_no_progress_runs=max_no_progress_runs,
+        out=kw.pop("out", "o.md"), data_dir=str(data_dir), max_no_progress_runs=max_no_progress_runs,
         qa_fn=qa_fn, **kw)
 
 
@@ -2211,6 +2211,161 @@ def test_integration_resume_uses_manifest_config(tmp_path, monkeypatch):
     # демон крутился бы 11 раз (10 без-прогресс + break).
     assert prog["final_reason"] == "no_progress"
     assert len(prog["runs"]) == 2
+
+
+# --- краткий дайджест (--compact) -----------------------------------------
+
+def test_integration_compact_writes_both_digests(tmp_path, monkeypatch):
+    """--compact → пишутся полный (--out) и краткий {root}_compact.md; флаг
+    фиксируется в манифесте."""
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(2)], "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    out = str(tmp_path / "camp.md")
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=2, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=2,
+        reserve_count=1, max_total_hours=24.0,
+        out=out, compact=True)
+    assert prog["compact_digest"] is True
+    assert (tmp_path / "camp.md").exists()             # полный
+    comp = tmp_path / "camp_compact.md"
+    assert comp.exists()                               # краткий
+    md = comp.read_text(encoding="utf-8")
+    assert "# Дайджест выдачи Ozon (краткий)" in md
+    assert f"Полный дайджест: {out}" in md
+
+
+def test_integration_without_compact_no_compact_file(tmp_path, monkeypatch):
+    """Без --compact краткий файл не появляется; полный — как раньше."""
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(2)], "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    out = str(tmp_path / "camp.md")
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=2, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=2,
+        reserve_count=1, max_total_hours=24.0, out=out)
+    assert prog["compact_digest"] is False
+    assert (tmp_path / "camp.md").exists()
+    assert not (tmp_path / "camp_compact.md").exists()
+
+
+def test_integration_no_digest_disables_both(tmp_path, monkeypatch):
+    """--no-digest гасит ОБА дайджеста, даже при --compact (правило ревью)."""
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(2)], "found": 2}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    out = str(tmp_path / "camp.md")
+    _run_campaign_integration(
+        tmp_path, monkeypatch, target=2, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=2,
+        reserve_count=1, max_total_hours=24.0,
+        out=out, compact=True, write_digest=False)
+    assert not (tmp_path / "camp.md").exists()
+    assert not (tmp_path / "camp_compact.md").exists()
+
+
+def _seed_manifest(tmp_path, monkeypatch, **extra):
+    """Манифест для resume-тестов (пустая живая кампания без final_state)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    (data_dir / "0_raw.json").write_text("{}", encoding="utf-8")
+    campaigns = tmp_path / "campaigns"
+    camp_dir = campaigns / "testcamp"
+    camp_dir.mkdir(parents=True, exist_ok=True)
+    init = {
+        "campaign": "testcamp", "target_count": 1, "min_valid": 1,
+        "url": "u", "out": "o.md",
+        "run_cfg": {"data_dir": str(data_dir), "max_age": "7d",
+                    "min_reviews": 0, "parallel": 1,
+                    "max_no_progress_runs": 1, "max_rescans": 2,
+                    "max_total_hours": 24.0, "reserve_count": 0},
+        "started_at": k.now_utc_iso(),
+        "discovered_pids": [], "valid_pids": [], "failed_pids": [],
+        "permanently_failed_pids": [], "replacement_pids": [],
+        "verdicts": {}, "verdict_meta": {}, "running_rescans": {},
+        "runs": [], "cooldown_until": None, "challenge_seq": 0,
+        "no_progress_count": 0, "final_state": None,
+        "final_reason": None, "final_note": None,
+    }
+    init.update(extra)
+    k.save_json(camp_dir / "progress.json", init)
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", campaigns)
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(k, "PYTHON", "python")
+    return data_dir
+
+
+def _run_resume(data_dir, monkeypatch, **kw):
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None}], "found": 1}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: fac(
+                            k.build_cli_args(progress, run_id, mode, targets)))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+    return k.run_campaign(
+        campaign="testcamp", url="u", target=1, min_valid=1,
+        out="o.md", data_dir=str(data_dir), max_total_hours=24.0,
+        qa_fn=qa, **kw)
+
+
+def test_integration_resume_uses_manifest_compact_flag(tmp_path, monkeypatch):
+    """Флаг compact зафиксирован при fresh (True в манифесте); resume БЕЗ
+    --compact НЕ переопределяет его (источник истины — манифест) и краткий
+    дайджест создаётся."""
+    out = str(tmp_path / "r.md")
+    data_dir = _seed_manifest(tmp_path, monkeypatch,
+                              compact_digest=True, out=out)
+    prog = _run_resume(data_dir, monkeypatch)            # CLI: compact=False
+    assert prog["compact_digest"] is True
+    assert (tmp_path / "r.md").exists()
+    assert (tmp_path / "r_compact.md").exists()
+
+
+def test_integration_resume_cli_cannot_reenable_disabled_compact(tmp_path, monkeypatch):
+    """compact_digest=False в манифесте → resume c --compact НЕ включает:
+    компакт-файл не создаётся (полный — создаётся)."""
+    out = str(tmp_path / "r.md")
+    data_dir = _seed_manifest(tmp_path, monkeypatch,
+                              compact_digest=False, out=out)
+    prog = _run_resume(data_dir, monkeypatch, compact=True)
+    assert prog["compact_digest"] is False
+    assert (tmp_path / "r.md").exists()
+    assert not (tmp_path / "r_compact.md").exists()
+
+
+def test_integration_resume_missing_flag_uses_cli(tmp_path, monkeypatch):
+    """Старый манифест без compact_digest → fallback на CLI-флаг (backward
+    compatibility): компакт создаётся В ЭТОМ запуске, но манифест НЕ
+    загрязняется значением — поле остаётся отсутствующим."""
+    out = str(tmp_path / "r.md")
+    data_dir = _seed_manifest(tmp_path, monkeypatch, out=out)
+    prog = _run_resume(data_dir, monkeypatch, compact=True)
+    assert "compact_digest" not in prog          # не записали в манифест
+    assert (tmp_path / "r.md").exists()
+    assert (tmp_path / "r_compact.md").exists()  # fallback реально сработал
 
 
 # --- _qa_clean: пустой snapshot → parse_error=False, qa не вызывается ---

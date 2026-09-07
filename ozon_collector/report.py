@@ -1035,3 +1035,208 @@ def build_search_digest_combined(pids, data_dir: str, query: str | None = None):
         "products": products,
     }
     return combined, table
+
+
+# ---- Краткий дайджест (--compact) ----------------------------------------
+# Отдельный слой рендера: НЕ переиспользует render()/render_search_digest() и
+# ничего в них не меняет. Все цифры — из существующих функций (digest_rating,
+# official_rating_info, official_negative_share, _price_block, _customer_aspects),
+# никакой пересчётной математики здесь нет.
+
+def render_compact(raw: dict) -> str:
+    """Компактная карточка товара для краткого дайджеста (--compact).
+
+    Только основное: карточка (рейтинг, негатив, категория, вариант, аспекты,
+    рекомендуют %), цена и характеристики. БЕЗ текстов отзывов, описаний и OCR.
+
+    Итог звёзд — ТОЛЬКО официальное распределение всей карточки Ozon
+    (customer_opinion.counts), а не выборка собранных отзывов: порция score_asc
+    и лимит сбора смещают выборку в худшую сторону (selection bias). Нет
+    распределения — блок не выводится, ничего не выдумываем.
+
+    Отсутствующие поля обращения случаются: строка просто не выводится,
+    рендер не падает.
+    """
+    product = raw.get("product") or {}
+    reviews = raw.get("reviews") or []
+    L = [
+        f"# {product.get('title') or raw.get('product_url') or 'Товар'}",
+        "",
+        f"- Дата сбора (UTC): {raw.get('collected_at_utc', '—')}",
+        "",
+    ]
+
+    # ---- 1. Карточка ------------------------------------------------------
+    L.append("## 1. Карточка товара")
+    L.append("")
+    if product.get("title"):
+        L.append(f"- Товар: {product['title']}")
+    pre = raw.get("_digest_rating")
+    if pre:
+        rating, n, src = pre["rating"], pre["n"], pre["source"]
+    else:
+        rating, n, src = digest_rating(product, reviews)
+    if src == "variant":
+        L.append(f"- Рейтинг по собранным отзывам (без «сначала низкие»): "
+                 f"{rating:.3f} / 5 "
+                 f"({n} {plural(n, ('оценка', 'оценки', 'оценок'))})")
+        off_rating, off_count = official_rating_info(product)
+        if off_rating is not None:
+            cnt_txt = (f" · {off_count} "
+                       f"{plural(off_count, ('оценка', 'оценки', 'оценок'))}"
+                       if off_count else "")
+            L.append(f"- Ozon (вся карточка): {off_rating:.3f} / 5{cnt_txt}")
+    elif src == "official":
+        cnt_txt = (f" ({n} {plural(n, ('оценка', 'оценки', 'оценок'))})" if n else "")
+        L.append(f"- Рейтинг карточки Ozon: {rating:.3f} / 5{cnt_txt} "
+                 f"_(нет нейтральной выборки)_")
+    neg_share, neg_total = official_negative_share(product)
+    if neg_share is not None:
+        L.append(f"- Негативных оценок (1–2★): {neg_share * 100:.1f}% · "
+                 f"по {neg_total} "
+                 f"{plural(neg_total, ('оценке', 'оценкам', 'оценкам'))} "
+                 f"(вся карточка Ozon)")
+    if product.get("category"):
+        L.append(f"- Категория: {product['category']}")
+    variant_str = _variant_str(target=raw.get("target_variant") or {})
+    if variant_str:
+        L.append(f"- Вариант: {variant_str}")
+    aspects = _customer_aspects(product.get("customer_opinion"))
+    if aspects:
+        L.append("- По мнению покупателей:")
+        for a in aspects:
+            L.append(f"  - {a}")
+    co = product.get("customer_opinion") or {}
+    rec = co.get("recommend_percent")
+    if rec is not None:
+        L.append(f"- Рекомендуют: {rec}% покупателей")
+    L.append(f"- URL: {raw.get('product_url', '—')}")
+    L.append("")
+
+    # ---- 2. Цена -----------------------------------------------------------
+    L.append("## 2. Цена и акции")
+    L.append("")
+    L.extend(_price_block(product))
+    L.append("")
+
+    # ---- 3. Характеристики --------------------------------------------------
+    chars = product.get("characteristics") or {}
+    if chars:
+        L.append("## 3. Характеристики")
+        L.append("")
+        L.append("| Параметр | Значение |")
+        L.append("|----------|----------|")
+        for k, v in chars.items():
+            L.append(f"| {k} | {v} |")
+        L.append("")
+
+    # ---- Итог звёзд по официальному распределению всей карточки Ozon --------
+    counts = co.get("counts") or {}
+    parts = []
+    total = 0
+    for star in range(5, 0, -1):
+        n = counts.get(str(star))
+        if n is None:
+            n = counts.get(star)
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            parts.append(f"★{star}: {n}")
+            total += n
+    if parts:
+        L.append(f"Звёзды (вся карточка Ozon, {total} "
+                 f"{plural(total, ('оценка', 'оценки', 'оценок'))}): "
+                 + " · ".join(parts))
+        L.append("")
+
+    return "\n".join(L).rstrip() + "\n"
+
+
+def _product_block_lines_compact(p: dict, idx: int) -> list[str]:
+    """Строки markdown-блока одного товара в кратком дайджесте.
+
+    Версия _product_block_lines для компакта: заголовок как в полном (для
+    side-by-side сверки) + render_compact(raw). Товары с ошибкой сбора не
+    выпадают — минимальная замена-заглушка, чтобы состав кампании оставался
+    1:1 с полным дайджестом.
+    """
+    L = ["---", ""]
+    if not p.get("ok"):
+        L.append(f"## Товар {p.get('pid', '?')}")
+        L.append("")
+        L.append(f"⚠ Не удалось собрать: {p.get('error', 'неизвестная ошибка')}")
+        L.append("")
+        return L
+    raw = p.get("raw") or {}
+    meta = []
+    if p.get("cache"):
+        meta.append(f"кэш: {p['cache']}")
+    if p.get("ocr"):
+        meta.append(f"ocr: {p['ocr']}")
+    meta.append(f"отзывов: {raw.get('reviews_collected', 0)}")
+    L.append(f"## Товар {idx}: {p.get('pid', '?')} ({', '.join(meta)})")
+    L.append("")
+    md = render_compact(raw)
+    for line in md.rstrip("\n").split("\n"):
+        L.append(line)
+    L.append("")
+    return L
+
+
+def render_search_digest_compact(combined: dict,
+                                 full_out: str | None = None) -> str:
+    """Краткий Markdown-дайджест выдачи Ozon (для --compact).
+
+    Один файл на всю кампанию (без разбиения по размеру): шапка с пояснением
+    формата и ссылкой на полный дайджест (full_out; если неизвестен — строка
+    опускается), затем блок каждого товара через render_compact(raw). Порядок
+    товаров — тот же, что в combined["products"] (уже отсортирован
+    sort_digest_products): состав и нумерация совпадают с полным дайджестом.
+    Исключённые по рейтингу товары в краткую форму не попадают (как и их
+    отдельная секция в полном).
+    """
+    search = combined.get("search") or {}
+    L = [
+        "# Дайджест выдачи Ozon (краткий)",
+        "",
+        "- Краткая форма: карточка + цена + характеристики + итог звёзд "
+        "(без текстов отзывов, описаний и OCR).",
+        "- Нумерация секций и порядок товаров совпадают с полным дайджестом.",
+    ]
+    if full_out:
+        L.append(f"- Полный дайджест: {full_out}")
+    if search.get("query"):
+        L.append(f"- Запрос: {search['query']}")
+    if search.get("url"):
+        L.append(f"- URL выдачи: {search['url']}")
+    L.append(f"- Дата сбора (UTC): {combined.get('collected_at_utc', '—')}")
+    L.append(f"- Найдено товаров в выдаче: "
+             f"{combined.get('found', 0)} уникальных товаров, "
+             f"собрано {combined.get('collected', 0)}.")
+    L.append("")
+
+    products = combined.get("products") or []
+    listed = [p for p in products if not p.get("excluded")]
+    for j, p in enumerate(listed, 1):
+        L.extend(_product_block_lines_compact(p, j))
+
+    L.append("---")
+    L.append("")
+    md = "\n".join(L)
+    size_kb = len(md.encode("utf-8")) / 1024
+    L.append(f"- Размер дайджеста: {size_kb:.2f} КБ")
+    return "\n".join(L)
+
+
+def write_search_digest_compact(combined: dict, out: str,
+                                full_out: str | None = None) -> list:
+    """Записать краткий дайджест (--compact) в один md-файл.
+
+    Без разбиения по размеру: компакт и так в разы меньше полного (без
+    текстов отзывов/описаний/OCR). Возвращает [out].
+    """
+    md = render_search_digest_compact(combined, full_out=full_out)
+    _write_md(md, out)
+    return [out]

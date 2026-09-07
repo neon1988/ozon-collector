@@ -34,6 +34,39 @@
      (+7 тестов). Прогон: test_key_daemon 217 passed, digest_from_raw+cli 11 passed,
      py_compile OK.
 
+ - **`--compact`: краткий дайджест изменения (карточка без стен отзывов) (2026-09-07).**
+   Многосотенные отзывы раздувают полный `*.md` до десятков МБ; для быстрой сверки
+   добавлен опциональный краткий вариант — только основное по каждому товару.
+   - **Что входит (whitelist):** PID, название, URL, вариант, категория,
+     рейтинг варианта (`digest_rating`, нейтральная выборка), официальный рейтинг
+     карточки (`official_rating_info`), доля негатива 1–2★
+     (`official_negative_share`), `recommend_percent` (если есть), блок цены,
+     полная таблица характеристик, аспекты покупателей (`_customer_aspects`,
+     из `customer_opinion.text`), распределение звёзд — ТОЛЬКО официальное
+     (`customer_opinion.counts`, без смещения score_asc; нет counts → блок звёзд
+     не выводится), URL. НЕ входят: тексты отзывов, описания, OCR/галерея,
+     секции 4–7, служебные поля — полный дайджест остаётся прежним (byte-to-byte).
+   - **Механика:** отдельные рендереры `render_compact`/`render_search_digest_compact`/
+     `write_search_digest_compact` в `report.py` (существующие функции не меняли).
+     Один файл на кампанию, без разбиения по размеру: `{root}_compact.md`
+     рядом с полным; в шапке ссылка на полный (если он есть). Товары с ошибкой
+     сбора (`ok=False`) не выпадают — блок-заглушка `## Товар {pid}` +
+     `⚠ Не удалось собрать: {error}` (состав 1:1 с полным). Порядок — как в
+     полном (общий `combined["products"]`, уже `sort_digest_products`).
+   - **CLI:** `key_daemon --compact` → полный + компакт; `--no-digest` отключает
+     ОБА дайджеста; `digest_from_raw.py --compact` — с `--out` пишет оба файла,
+     без `--out` выводит компакт в stdout. Флаг фиксируется в манифесте
+     (`progress["compact_digest"]`), resume берёт из манифеста (источник истины),
+     CLI-параметр не переопределяет; для кампаний ДО опции (поля нет) — fallback
+     на текущий CLI-флаг только в этом запуске, манифест НЕ перезаписывается
+     (CLI не становится постоянной настройкой старой кампании).
+   - Файлы: `ozon_collector/report.py`, `scripts/key_daemon.py` (`--compact`,
+     `_write_digest(..., compact=)`), `scripts/digest_from_raw.py` (`--compact`),
+     `tests/test_report.py` (8 тестов рендерера), `tests/test_key_daemon.py`
+     (6 интеграционных: оба файла, изоляция без флага, `--no-digest`, resume
+     True/False/без-поля + эффект на файлы). Прогон: test_key_daemon + test_report
+     322 passed, digest_from_raw+cli 11 passed, py_compile OK.
+
  - **Инцидент podarok_five: авто-включение `--match-title` из text= URL отсекало всю выдачу (2026-09-07).**
    Кампания `podarok_five` собрана по `search/?text=для девочки 5 лет подарок`. Вчерашний
    fallback-дизайн (при отсутствии явного флага брать `text=` из URL) включил фильтр
