@@ -45,7 +45,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
-from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -111,26 +110,6 @@ def _sha256_text(s: str) -> str:
         return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
     except Exception:
         return ""
-
-
-def _query_from_url(url: str) -> Optional[str]:
-    """Поисковый запрос (text=) из URL выдачи Ozon, или None если его нет.
-
-    Используется как fallback для фильтра exact-match title (если задан
-    --match-title — он приоритетнее; без обоих фильтр выключен). Возвращает
-    декодированную строку (проценты и '+' уже развёрнуты) или None.
-    """
-    if not url:
-        return None
-    try:
-        q = urlparse(url)
-        params = parse_qs(q.query, keep_blank_values=False)
-        text = params.get("text")
-    except Exception:
-        return None
-    if not text or not text[0]:
-        return None
-    return text[0].strip() or None
 
 
 def _collector_consts():
@@ -1088,8 +1067,9 @@ def reconcile_validity(progress: dict, new_checked: dict,
     делает raw валидным; `FAIL` — бракованным; отсутствие raw — не-валид.
 
     match_query — опциональный фильтр точного соответствия названия товара
-    (--match-title или text= из URL): товар валиден, только если
-    `raw.product.title` содержит фразу как подстроку (без учёта регистра).
+    (явный --match-title, НЕ автоматически из text= URL): товар валиден,
+    только если `raw.product.title` содержит фразу как подстроку
+    (без учёта регистра).
     Несоответствующие товары НЕ считаются FAIL (иначе зажгут rescan), а
     попадают в отдельный список title_mismatch_pids (телеметрия).
     Пустой/None match_query — фильтр выключен, поведение как обычно.
@@ -1248,14 +1228,15 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 f"key_daemon: схема кампании {ident.get('schema_version')} != "
                 f"текущей {SCHEMA_VERSION}. Обновите коллектор или --force-new.")
 
-    # Фильтр точного соответствия названия товара запросу. Источник фразы —
-    # приоритет: явный --match-title → fallback на text= из URL кампании.
-    # Пустая фраза → фильтр выключен (сбор как обычно). Значение фиксируется
-    # в манифесте при создании кампании; при resume строго берётся из
-    # манифеста (источник истины), параметр запуска не переопределяет.
+    # Фильтр точного соответствия названия товара запросу. Фраза берётся ТОЛЬКО
+    # из явного --match-title — автоматически из text= URL НЕ подхватывается:
+    # поисковый запрос описывает намерение покупателя, а не название товара
+    # (инцидент podarok_five: авто-включение отсекало всю выдачу → valid=0 и
+    # бесконечный пересбор). Пустая фраза → фильтр выключен (сбор как обычно).
+    # Значение фиксируется в манифесте при создании кампании; при resume строго
+    # берётся из манифеста (источник истины), параметр запуска не переопределяет.
     if fresh:
-        match_query = (match_title or "").strip() or _query_from_url(url)
-        progress["title_match_query"] = match_query or ""
+        progress["title_match_query"] = (match_title or "").strip()
 
     try:
         # При resume конфиг берём из манифеста (источник истины), а не из текущих
@@ -1948,11 +1929,12 @@ def parse_args(argv=None):
                     help="фильтр точного соответствия названия товара "
                          "(регистронезависимая подстрока, применяется к "
                          "raw.product.title): в дайджест попадают только товары, "
-                         "чей title содержит эту фразу. Если не задан — берётся "
-                         "text= из --url; если и его нет — фильтр выключен, "
-                         "сбор как обычно. Несоответствующие товары НЕ считаются "
-                         "браком. Фильтр фиксируется при создании кампании, "
-                         "при resume меняться не может.")
+                         "чей title содержит эту фразу. Включается ТОЛЬКО "
+                         "явно; text= из --url автоматически НЕ подхватывается "
+                         "(поисковый запрос ≠ название товара). Не задан — "
+                         "фильтр выключен, сбор как обычно. Несоответствующие "
+                         "товары НЕ считаются браком. Фильтр фиксируется при "
+                         "создании кампании, при resume меняться не может.")
     ap.add_argument("--no-digest", action="store_true",
                     help="не создавать Markdown-дайджест итога кампании "
                          "(по умолчанию создаётся в --out)")

@@ -208,17 +208,56 @@ def _raw_with_title(tmp_path, pid, title):
         json.dumps({"product": {"title": title}}), encoding="utf-8")
 
 
-def test_query_from_url_extracts_text():
-    assert k._query_from_url(
-        "https://www.ozon.ru/category/x/?text=Edifier+W830NB&from_global=true"
-    ) == "Edifier W830NB"
-    assert k._query_from_url(
-        "https://www.ozon.ru/search/?text=%D0%9F%D0%B5%D1%80%D1%81%D0%B8%D0%BB"
-    ) == "Персил"
-    assert k._query_from_url("https://www.ozon.ru/category/x/") is None
-    assert k._query_from_url("") is None
-    assert k._query_from_url(None) is None
-    assert k._query_from_url("https://ozon.ru/?text=") is None
+def test_integration_text_in_url_disables_filter_by_default(tmp_path, monkeypatch):
+    """РЕГРЕССИЯ инцидента podarok_five: URL содержит text=, но --match-title
+    НЕ задан → фильтр title выключен (title_match_query==""), сбор идёт как
+    обычно. Авто-подхват text= из URL убран намеренно (поисковый запрос ≠
+    название товара)."""
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(3)], "found": 3}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=3, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=3,
+        reserve_count=0, max_total_hours=24.0,
+        url="https://www.ozon.ru/search/?from_global=true&text=%D0%B4%D0%BB%D1%8F"
+            "%20%D0%B4%D0%B5%D0%B2%D0%BE%D1%87%D0%BA%D0%B8%205%20%D0%BB%D0%B5%D1%82"
+            "%20%D0%BF%D0%BE%D0%B4%D0%B0%D1%80%D0%BE%D0%BA")
+    assert prog["final_state"] == "COMPLETED"
+    assert prog["final_reason"] == "target_reached"
+    assert prog["title_match_query"] == ""          # фильтр ВЫКЛЮЧЕН
+    assert len(prog["valid_pids"]) == 3             # ничего не отсечено
+    assert prog["title_mismatch_pids"] == []
+
+
+def test_integration_explicit_match_title_sets_phrase(tmp_path, monkeypatch):
+    """Явный --match-title ИЗВЛЕКАЕТ из URL, а НЕ авто-текст: фраза фиксируется
+    в манифесте и применяется (товары без совпадения title → title_mismatch,
+    valid не растёт). Только явный аргумент включает фильтр."""
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(3)], "found": 3}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=3, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=3,
+        reserve_count=0, max_total_hours=24.0,
+        max_no_progress_runs=2,
+        url="https://www.ozon.ru/category/edifier-26667829/?text=Edifier+W830NB",
+        match_title="Edifier W830NB")
+    assert prog["title_match_query"] == "Edifier W830NB"  # из явного флага
+    assert set(prog["title_mismatch_pids"]) == {"0", "1", "2"}  # фильтр активен
+    assert prog["valid_pids"] == []                   # ни один не подошёл
+    assert prog["final_state"] == "ABANDONED"         # честный итог без магии
 
 
 def test_reconcile_title_filter_keeps_matching(tmp_path):
@@ -1257,7 +1296,7 @@ def _run_campaign_integration(tmp_path, monkeypatch, target, min_valid,
     monkeypatch.setattr(k.time, "sleep", lambda s: None)
 
     return k.run_campaign(
-        campaign="testcamp", url="u", target=target, min_valid=min_valid,
+        campaign="testcamp", url=kw.pop("url", "u"), target=target, min_valid=min_valid,
         out="o.md", data_dir=str(data_dir), max_no_progress_runs=max_no_progress_runs,
         qa_fn=qa_fn, **kw)
 
