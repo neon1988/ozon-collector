@@ -8,6 +8,44 @@
 > Прошлые cp1251-вставки перекодированы в UTF-8 2026-08-18 (9 строк). Никогда
 > не писать и не читать эти файлы как cp1251/другие кодировки.
 
+ - **key_daemon: автоименование кампании из --url (naming, НЕ фильтр) (2026-09-07).**
+   CLI упрощён: вместо `--campaign <имя> --out docs/<имя>.md` достаточно одного
+   `--url "...&text=запрос"` (или URL категории). Явные `--campaign`/`--out`
+   работают строго как раньше — байт-в-байт (автоименование НЕ вызывается).
+   - **Механика:** `campaign_from_url(url) -> (name, name_source, value)`.
+     Приоритет источника имени: **`text=`** в query (parse_qs сам декодирует
+     percent-encoding и `+`, повторный unquote НЕ нужен; берётся первый элемент)
+     → **сегмент категории** `/category/<slug>-<id>/` (числовой ID
+     отбрасывается: `mashinki-radioupravlyaemye-7151` → `mashinki_radioupravlyaemye`)
+     → **timestamp-fallback** `campaign_<YYYYMMDD_HHMM>` (всегда непустое имя).
+   - **`_slugify(text, max_len=50) -> str | None`:** lower → детерминированный
+     транслит (ь/ъ удаляются, ё→e, й→y, х→kh, ц→ts, ч→ch, ш→sh, щ→shch) →
+     всё вне `[a-z0-9_]` → `_` → схлопывание `_` → strip → `[:50]` → `rstrip("_")`.
+     Пустой/только-недопустимые символы → `None` → кампания уходит в
+     timestamp-fallback. Фиксированы контракты: `len(slug)<=50`, без завершающего
+     `_`, одинаковый вход всегда даёт одинаковый slug (детерминизм, регистернезависимо).
+   - **Манифест:** `default_manifest` аддитивно получил 2 top-level поля
+     `name_source` / `name_source_value` (метаданные происхождения имени:
+     `explicit` | `url_text` | `url_category` | `timestamp`). Top-level, НЕ в
+     `run_cfg` → `run_cfg_hash` и resume-конфиг не затрагиваются (имя не станет
+     `run_cfg_modified`).
+   - **Коллизия:** существующая resume-проверка `campaign_identity.url_sha256`
+     (тот же slug, др. URL) — та же ошибка, но для авто-режима добавлен hint
+     «имя сгенерировано из --url; укажите --campaign явно». Никаких `_2/_3/uuid`
+     — авто-именование должно оставаться предсказуемым.
+   - **ВАЖНЫЙ ИНВАРИАНТ (naming ≠ match-title):** `text=` из --url используется
+     ТОЛЬКО для имени кампании, для `--match-title` (фильтра названий товара)
+     никогда не подхватывается (инцидент podarok_five: авто-фильтр отсекал всю
+     выдачу → valid=0 → бесконечный пересбор). Поисковый запрос ≠ название товара.
+   - **Файлы:** `scripts/key_daemon.py` (`_SLUG_TRANSLIT`, `_slugify`,
+     `campaign_from_url`, `--campaign` required=False, `main()` авто-имя+`out`,
+     `name_source` в default_manifest/run_campaign, hint коллизии, docstring),
+     `tests/test_key_daemon.py` (+19: _slugify транслит/ьъ/спецсимволы/обрезка/None,
+     campaign_from_url percent-text/category-strip/blank-fallback/timestamp/empty/
+     deterministic/case-insensitive/invalid-only, default_manifest поля, 3 integration
+     через main(): text→slug+docs/{slug}.md, явный --campaign→explicit, timestamp).
+     Прогон: test_key_daemon 227 passed, полный pytest 837 passed, py_compile OK.
+
  - **key_daemon: опциональный фильтр exact-match товара по названию (--match-title) (2026-09-05).**
    Живая выдача по бренд-категории + `text=` приносит соседние модели/аксессуары
    (напр. по «Edifier W830NB» попадались W820NB и пр.). Ozon не умеет «точное
@@ -140,6 +178,23 @@
      менять не нужно.
    - Файл зонда: `tests/probe_search_grid.py` (карта ссылка→виджет + прокрутка как
      `_collect_links`; запуск: `python tests/probe_search_grid.py --url <выдача> --yes`).
+
+ - **Кампания podarok_five ЗАВЕРШЕНА: COMPLETED / target_reached (2026-09-07).**
+   Итог: **valid 518** (target 500, min_valid 400), failed=0, permanently_failed=0,
+   discovered 523, runs 9 (все full NORMAL_DONE, **rescans 0**). Запуск 06:14 UTC →
+   финал 10:53 UTC (~4.7 ч). Запускалась пользователем. После инцидента с
+   `--match-title` (см. выше) собрана БЕЗ фильтра; цель достигнута с запасом.
+   - **Наблюдение по стабильности: `--parallel 12` на тяжёлых карточках даёт
+     повторные `TargetClosedError` (стабильный renderer crash конкретных страниц:
+     recycle → тот же URL снова роняет renderer до `goto`/wait).** Восстановление
+     отработало штатно: 6 рециклов браузера, брак 0, единичный `SESSION_EXHAUSTED`
+     на воркере — остаток батча передан, демон продолжил. Системного дефицита нет
+     (RAM свободно 42/63 ГБ, CPU ~25%) — краши самих страниц под пиковой
+     нагрузкой. **Рекомендация для будущих широких кампаний: `--parallel 4–6`
+     (очень тяжёлые — до 1); текущий прогон не перезапускать.**
+   - **BACKLOG (вариант C, НЕ реализовано):** «крашер-PID» — если после recycle
+     тот же URL снова даёт `TargetClosedError` (2-й подряд) → skip товара без
+     траты recycle-бюджета + телеметрия крашеров в recovery. Отдельным шагом.
 
  - **Дайджест: секция отзывов разделена на «обычную» и «диагностическую» (2026-09-05).**
    После устранения ложной статистики осталось «когнитивное» искажение: LLM

@@ -22,11 +22,14 @@ from collections import deque
 from datetime import datetime, timezone
 
 from . import SCHEMA_VERSION, VERSION
+from . import cache as K
 from . import cdp
+from . import collect as C
 from . import log
 from . import process as P
 from . import search as S
 from .browser import BrowserProcessManager
+from .gather import run_gather
 from .report import sort_digest_products
 
 WORKER_LOG_DIR = "logs"
@@ -364,6 +367,54 @@ def _make_manager(spec: dict):
                                  profile_token=spec["profile_token"])
 
 
+def _batch_needs_browser(items, gather_cfg: dict) -> bool:
+    """Нужен ли ЖИВОЙ браузер для пачки (есть хоть один cache-miss).
+
+    Кэш-hit (валидный raw по cache_check, без variant_review_problems)
+    обрабатывается без браузера. Проверка повторяет логику gather.run_gather:
+    max_age_s<=0 → кэш off (все считаются miss), sorts-разнарядка и брак
+    отзывов тоже требуют пересбора живьём.
+    """
+    for _idx, pid, _url in items:
+        try:
+            raw, reason = K.cache_check(
+                pid, gather_cfg.get("max_age_s", 0),
+                sorts=gather_cfg.get("sorts"))
+        except Exception:
+            return True
+        if raw is None or reason != "hit":
+            return True
+        if C.variant_review_problems(raw):
+            return True
+    return False
+
+
+def _collect_batch_without_browser(items, gather_cfg: dict,
+                                   on_progress=None) -> list[dict]:
+    """Собрать пачку целиком из кэша, без запуска браузера (run_gather, sess=None).
+
+    Возвращает результат в формате search._collect_shard: res run_gather +
+    recycle_attempts/new_tab_attempts (обнулены — recovery-цикл не нужен).
+    on_progress — тот же колбэк, что в _run_shard (периодический progress
+    оркестратору, защита от terminate-stall).
+    """
+    out = []
+    for idx, pid, url in items:
+        cfg = dict(gather_cfg)
+        cfg["pid"] = pid
+        cfg["url"] = url
+        res = run_gather(cfg)
+        res["recycle_attempts"] = 0
+        res["new_tab_attempts"] = 0
+        out.append(res)
+        if on_progress is not None:
+            try:
+                on_progress(out, len(out), len(items))
+            except Exception:
+                pass
+    return out
+
+
 def _run_shard(spec: dict, sess, manager, items, gather_cfg: dict,
                max_recycles: int, recovery: dict, on_recovery,
                on_progress=None):
@@ -571,21 +622,26 @@ def worker_main(spec: dict, task: dict, conn, p2w_conn):
 
         # Первая пачка: ждём назначения товара.
         batch = _recv_batch(p2w_conn)
-
-        # Ленивый запуск: браузер ТОЛЬКО после назначения товара.
+        # Ленивый запуск: браузер НЕ открываем до реального cache-miss. Пачка,
+        # целиком состоящая из кэш-hit товаров, собирается run_gather(sess=None)
+        # без запуска Chromium: не тратим warmup и не гоняем окно впустую.
         # Воркеры без товаров выйдут без запуска Chrome.
-        if batch is not None:
-            sess = _make_session(spec)
-            manager = _make_manager(spec)
-            set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
-            warmup = _warmup_session(sess, label=f"worker{k}")
-            _send(conn, {"t": "warmup", "worker": k, **warmup})
+        warmup = None
 
         while batch is not None:
             num_batches += 1
             items = list(batch)
 
-            def on_progress(products, n, total):
+            if sess is None and _batch_needs_browser(items, gather_cfg):
+                log.info(f"worker{k}: стартую браузер (есть cache-miss "
+                         f"в пачке {num_batches})")
+                sess = _make_session(spec)
+                manager = _make_manager(spec)
+                set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
+                warmup = _warmup_session(sess, label=f"worker{k}")
+                _send(conn, {"t": "warmup", "worker": k, **warmup})
+
+            def _on_progress(products, n, total):
                 # периодическая передача частичных результатов текущей пачки:
                 # при terminate родитель берёт последний progress-снимок, и
                 # собранные товары не теряются.
@@ -603,10 +659,14 @@ def worker_main(spec: dict, task: dict, conn, p2w_conn):
                 }
                 _send(conn, {"t": "progress", "worker": k, "payload": partial})
 
-            results = _run_shard(
-                spec, sess, manager, items, gather_cfg,
-                max_recycles=max_recycles, recovery=recovery,
-                on_recovery=on_recovery, on_progress=on_progress)
+            if sess is None:
+                results = _collect_batch_without_browser(
+                    items, gather_cfg, on_progress=_on_progress)
+            else:
+                results = _run_shard(
+                    spec, sess, manager, items, gather_cfg,
+                    max_recycles=max_recycles, recovery=recovery,
+                    on_recovery=on_recovery, on_progress=_on_progress)
 
             agg_products.extend(
                 {"index": idx, "result": res}
@@ -792,8 +852,12 @@ def _needs_restart(wctx: WorkerContext, max_restarts: int,
                    shared_items=None) -> bool:
     """Нужен ли перезапуск воркера (аварийная гибель без доведения работы).
 
-    Перезапускаем ТОЛЬКО при реальном сбое (процесс умер без done, либо done
-    с fatal_error/ненулевым exitcode) и когда осталась незавершённая работа.
+    Перезапускаем при реальном сбое (процесс умер без done, либо done
+    с fatal_error/ненулевым exitcode) И когда осталась незавершённая работа.
+    Дополнительно перезапускаем при challenge_storm (нерешённый пазл): воркер
+    завершился формально "чисто", но без доведения своего шарда — открываем
+    новое окно и пробуем дальше (ADR §14.6: частичный шторм ≠ бан всей
+    кампании; лимит max_restarts ограничивает зомби-цикл).
     Истечение времени (deadline_halted) и успешное/ожидаемое завершение не
     перезапускаем.
 
@@ -822,6 +886,15 @@ def _needs_restart(wctx: WorkerContext, max_restarts: int,
     if pl.get("fatal_error"):
         return True
     if wctx.exitcode not in (None, 0):
+        return True
+    # Пазл-шторм (recovery_metrics.challenge_storm): воркер завершился "чисто"
+    # (exitcode 0, без fatal_error), НО сдвинулся из-за нерешённого пазла и
+    # оставил незавершённую работу. Это НЕ штатное завершение: открываем новое
+    # окно и пробуем дальше (свежий браузер = шанс снять блок). Лимит
+    # max_restarts ограничивает число таких перезапусков (защита от зомби-цикла
+    # при IP-бане Ozon).
+    rm = pl.get("recovery_metrics") or {}
+    if rm.get("challenge_storm"):
         return True
     return False
 

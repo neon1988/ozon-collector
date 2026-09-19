@@ -29,6 +29,12 @@ logs/{campaign}_daemon.log. Итог сбора читает из машиноч
         --max-age 7d --min-reviews 40 --parallel 1 \
         --min-valid 200 --max-no-progress-runs 3 --max-rescans 2 \
         --max-total-hours 12 --notify toast
+
+    # --campaign и --out можно не указывать: имя генерируется из text= в --url
+    # (транслит, ~50 символов; иначе из категории, иначе campaign_<дата_время>),
+    # а out — docs/{campaign}.md. text= используется ТОЛЬКО для имени,
+    # для title-фильтра никогда.
+    python scripts/key_daemon.py --url "https://www.ozon.ru/search/?text=..."
 """
 from __future__ import annotations
 
@@ -36,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +52,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -296,9 +304,13 @@ def validate_new_campaign(min_valid: int, target: int) -> None:
 
 
 def default_manifest(campaign: str, target: int, min_valid: int,
-                     url: str, out: str, **run_cfg) -> dict:
+                     url: str, out: str, name_source: str = "explicit",
+                     name_source_value: Optional[str] = None,
+                     **run_cfg) -> dict:
     return {
         "campaign": campaign,
+        "name_source": name_source,
+        "name_source_value": name_source_value,
         "target_count": target,
         "min_valid": min_valid,
         "url": url,
@@ -1162,6 +1174,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  write_digest: bool = True,
                  compact: bool = False,
                  skip_reviews: bool = False,
+                 name_source: str = "explicit",
+                 name_source_value: Optional[str] = None,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
     lock = PidLock(DATA_DIR / "key_daemon.pid")
     if not lock.acquire(campaign):
@@ -1203,7 +1217,9 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         max_worker_restarts=max_worker_restarts,
         session_budget_wall_clock=session_budget_wall_clock,
         window_mode=window_mode,
-        skip_reviews=skip_reviews)
+        skip_reviews=skip_reviews,
+        name_source=name_source,
+        name_source_value=name_source_value)
 
     # Валидация для НОВОЙ кампании (при resume manifest уже согласован).
     if fresh:
@@ -1221,11 +1237,18 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             url_hash = _sha256_text(url)
             stored_hash = ident.get("url_sha256")
             if stored_hash and stored_hash != url_hash:
+                if name_source != "explicit":
+                    hint = (f"имя '{campaign}' сгенерировано из --url "
+                            f"(source={name_source}); конфликт с существующей "
+                            f"кампанией — укажите --campaign явно")
+                else:
+                    hint = (f"Новая категория → используйте --campaign другое "
+                            f"имя или --force-new для принудительного "
+                            f"пересоздания.")
                 raise SystemExit(
                     f"key_daemon: кампания '{campaign}' уже существует с URL, "
                     f"отличным от переданного --url (url_sha256 не совпадает). "
-                    f"Новая категория → используйте --campaign другое имя "
-                    f"или --force-new для принудительного пересоздания.")
+                    f"{hint}")
         if not force_new and ident.get("schema_version") \
                 and ident.get("schema_version") != SCHEMA_VERSION:
             raise SystemExit(
@@ -1921,15 +1944,88 @@ def finalize_campaign(progress: dict, progress_path: Path,
     save_json(progress_path, progress)
 
 
+# --- Автогенерация имени кампании из --url (naming, НЕ фильтр) ---------------
+# Простая детерминированная транслитерация кириллицы в латиницу. Контракт:
+# одинаковый вход всегда даёт одинаковое имя (имя кампании = стабильный slug).
+# Управляется "контрактом" (фиксировано в тестах): ь/ъ удаляются, ё->e, й->y,
+# х->kh, ц->ts, ч->ch, ш->sh, щ->shch. Приоритет источника имени:
+#   text= в query -> сегмент категории (/category/<slug>-<id>/, ID отбрасывается)
+#   -> campaign_<дата_время>. Явный --campaign всегда главнее и автоименование
+#   НЕ вызывается. ВАЖНЫЙ ИНВАРИАНТ: text= используется ТОЛЬКО для имени —
+#   для --match-title (фильтра названий) он никогда не подхватывается
+#   (инцидент podarok_five: авто-фильтр отсекал всю выдачу).
+_SLUG_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+
+
+def _slugify(text: str, max_len: int = 50) -> Optional[str]:
+    """Нормализация произвольной строки в устойчивый латинский slug.
+
+    lower -> транслит -> всё кроме [a-z0-9_] -> '_' -> схлопывание '_' ->
+    strip '_' -> обрезка до max_len (без завершающего '_').
+    Возвращает None для пустого/состоящего только из недопустимых символов.
+    """
+    slug = re.sub(r"[^a-z0-9_]+", "_",
+                  text.lower().translate(_SLUG_TRANSLIT)).strip("_")
+    slug = re.sub(r"_+", "_", slug)[:max_len].rstrip("_")
+    return slug or None
+
+
+def campaign_from_url(url: str) -> tuple[Optional[str], str, Optional[str]]:
+    """Извлечь имя кампании (slug) из Ozon URL поиска/категории.
+
+    Возвращает (имя, name_source, name_source_value), где name_source:
+      'url_text'    — имя из параметра text= (value=исходный текст)
+      'url_category'— имя из сегмента категории без числового ID
+      'timestamp'   — fallback campaign_<дата_время> (имя всегда непустое)
+    """
+    default = f"campaign_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    if not url:
+        return default, "timestamp", None
+    parsed = urlparse(url)
+    # 1. text= (parse_qs уже декодирует percent-encoding и '+' — повторный
+    #    unquote не нужен). Непустой после strip() и _slugify -> источник.
+    qs = parse_qs(parsed.query)
+    texts = qs.get("text")
+    if texts:
+        source_text = (texts[0] or "").strip()
+        slug = _slugify(source_text) if source_text else None
+        if slug:
+            return slug, "url_text", source_text
+    # 2. /category/<slug>-<id>/ ... — сегмент категории, числовой ID
+    #    отбрасывается (mashinki-radioupravlyaemye-7151 -> mashinki_...).
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) >= 2 and parts[0] == "category":
+        seg = re.sub(r"-\d+$", "", parts[1])
+        slug = _slugify(seg)
+        if slug:
+            return slug, "url_category", parts[1]
+    # 3. Ничего полезного не извлеклось.
+    return default, "timestamp", None
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(prog="key-daemon", description=__doc__)
-    ap.add_argument("--campaign", required=True)
+    ap.add_argument("--campaign", default=None,
+                    help="имя кампании (каталог data/campaigns/<имя>). "
+                         "Не задан — генерируется из text= в --url "
+                         "(транслит, ~50 символов), иначе из сегмента "
+                         "категории, иначе campaign_<дата_время>. "
+                         "Влияет ТОЛЬКО на имя: text= для title-фильтра "
+                         "никогда не используется")
     ap.add_argument("--url", default=None)
     ap.add_argument("--limit", type=int, default=300)
     ap.add_argument("--min-valid", type=int, default=1,
                     help="минимум чистых PID для частичного успеха "
                          "(1 <= min_valid < --limit; для новых кампаний обязателен)")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--out", default=None,
+                    help="путь Markdown-дайджеста итога кампании "
+                         "(по умолчанию docs/{campaign}.md)")
     ap.add_argument("--max-age", default="7d")
     ap.add_argument("--min-reviews", type=int, default=40)
     ap.add_argument("--parallel", type=int, default=1)
@@ -2034,9 +2130,13 @@ def main(argv=None):
     except Exception:
         pass
     args = parse_args(argv)
-    out = args.out or f"docs/{args.campaign}.md"
+    if args.campaign:
+        campaign, name_source, name_source_value = args.campaign, "explicit", None
+    else:
+        campaign, name_source, name_source_value = campaign_from_url(args.url or "")
+    out = args.out or f"docs/{campaign}.md"
     progress = run_campaign(
-        campaign=args.campaign, url=args.url or "", target=args.limit,
+        campaign=campaign, url=args.url or "", target=args.limit,
         min_valid=args.min_valid, out=out, max_age=args.max_age,
         min_reviews=args.min_reviews, parallel=args.parallel,
         max_no_progress_runs=args.max_no_progress_runs,
@@ -2052,7 +2152,9 @@ def main(argv=None):
         match_title=args.match_title,
         write_digest=not args.no_digest,
         compact=args.compact,
-        skip_reviews=args.no_reviews)
+        skip_reviews=args.no_reviews,
+        name_source=name_source,
+        name_source_value=name_source_value)
     print(json.dumps(summarize(progress), ensure_ascii=False, indent=2))
 
 

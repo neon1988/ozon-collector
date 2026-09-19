@@ -79,6 +79,41 @@ def test_needs_restart_zero_limit():
     assert PL._needs_restart(w, max_restarts=0) is False
 
 
+def test_needs_restart_challenge_storm_restarts():
+    """Пазл-шторм (recovery_metrics.challenge_storm): перезапускаем даже при
+    exitcode 0 / без fatal_error — воркер съел шард из-за нерешённого пазла."""
+    w = _mk_worker(done=True, exitcode=0,
+                   payload={"fatal_error": None,
+                            "recovery_metrics": {"challenge_storm": True}},
+                   pending=[1, 3])
+    assert PL._needs_restart(w, max_restarts=2) is True
+
+
+def test_needs_restart_challenge_storm_limit_exhausted():
+    """Пазл-шторм подчиняется max_restarts (защита от зомби-цикла при бане)."""
+    w = _mk_worker(done=True, exitcode=0,
+                   payload={"fatal_error": None,
+                            "recovery_metrics": {"challenge_storm": True}},
+                   pending=[1, 3], restarts=2)
+    assert PL._needs_restart(w, max_restarts=2) is False
+
+
+def test_needs_restart_challenge_storm_no_pending():
+    """Пазл-шторм без незавершённой работы — перезапуск бессмыслен."""
+    w = _mk_worker(done=True, exitcode=0,
+                   payload={"fatal_error": None,
+                            "recovery_metrics": {"challenge_storm": True}},
+                   pending=[])
+    assert PL._needs_restart(w, max_restarts=2) is False
+
+
+def test_needs_restart_clean_no_challenge_not_restarted():
+    """Штатное завершение без challenge_storm остаётся не-перезапускаемым."""
+    w = _mk_worker(done=True, exitcode=0,
+                   payload={"fatal_error": None}, pending=[1, 3])
+    assert PL._needs_restart(w, max_restarts=2) is False
+
+
 # ---- _await_workers ---------------------------------------------------------
 
 def test_await_no_restart_when_limit_zero(monkeypatch):
@@ -120,6 +155,35 @@ def test_await_restarts_dead_worker(monkeypatch):
     assert calls == [(2, [1, 3])]          # перезапущен именно упавший
     assert len(out) == 2                   # ok + replacement (упавший заменён)
     assert any(w.pending_indexes == [] and w.exitcode == 0 for w in out)
+
+
+def test_await_restarts_puzzle_storm_worker(monkeypatch):
+    """Воркер, завершившийся "чисто" (exitcode 0) но с challenge_storm
+    (нерешённый пазл), перезапускается: новое окно продолжает шард."""
+    ok = _mk_worker(worker_id=1, done=True, exitcode=0,
+                    payload={"fatal_error": None, "recovery_metrics": {}},
+                    pending=[])
+    stormed = _mk_worker(worker_id=2, done=True, alive=False, exitcode=0,
+                         payload={"fatal_error": None,
+                                  "recovery_metrics": {"challenge_storm": True}},
+                         pending=[1, 3])
+    repl = _mk_worker(worker_id=2, done=True, exitcode=0,
+                      payload={"fatal_error": None}, pending=[])
+    calls = []
+    def fake_respawn(wctx, pending, items_by_index, gather_cfg,
+                     max_recycles, session_budget, on_event, worker_log=None):
+        calls.append((wctx.worker_idx, sorted(pending)))
+        return repl
+    monkeypatch.setattr(PL, "_respawn", fake_respawn)
+    deadline = time.monotonic() + 30
+    out = PL._await_workers([ok, stormed], deadline=deadline,
+                            max_worker_restarts=2,
+                            items_by_index={1: ("1001", "u")},
+                            gather_cfg={},
+                            max_recycles=2, session_budget=None,
+                            poll=0.01)
+    assert calls == [(2, [1, 3])]      # пазл-шторм воркер перезапущен с шардом
+    assert len(out) == 2
 
 
 def test_await_restart_carries_collected_products(monkeypatch):

@@ -203,3 +203,144 @@ def test_check_challenge_solver_runs_for_antibot_captcha_with_dom_puzzle():
     finally:
         monkey.undo()
     assert calls  # решатель вызывался, несмотря на сигнатуру 'antibot captcha'
+
+
+class _HoleMask:
+    """Реальный bool-массив силуэта кусочка (как _silhouette): гребёнка."""
+
+    H, W = 30, 50
+
+    def __init__(self):
+        m = np.zeros((self.H, self.W), dtype=bool)
+        m[6:self.H - 4, 5:self.W - 5] = True
+        self.shape = m.shape
+        self.nl = m
+
+
+def _make_diff_frames(hole_x, yrow=80, W=400, H=200):
+    """cdn = ровный фон с лёгким шумом, live = фон + светлый оверлей лунки."""
+    rng = np.random.default_rng(11)
+    mask = _HoleMask().nl
+    cdn = np.full((H, W), 128.0, dtype=np.float32)
+    cdn += rng.integers(0, 9, (H, W))  # CDN-фон с лёгким шумом
+    live = cdn.copy()
+    live += rng.integers(-4, 5, (H, W))  # шум захвата кадра (независимый)
+    mh, mw = mask.shape
+    over = live[yrow + 6:yrow + mh - 4, hole_x + 5:hole_x + mw - 5]
+    over[...] += 60.0
+    live = np.clip(live, 0, 255)
+    return live, cdn, mask
+
+
+@pytest.mark.parametrize("hole_x", [140, 200, 260])
+def test_detect_slot_diff_finds_hole(hole_x):
+    live, cdn, mask = _make_diff_frames(hole_x)
+    cands = puzzle._detect_slot_diff(live, cdn, mask, yrow=80, k=3)
+    assert cands, "diff-детектор должен найти оверлей лунки"
+    assert abs(cands[0][0] - hole_x) <= 2
+
+
+@pytest.mark.parametrize("hole_x", [140, 200, 260])
+def test_detect_slot_edges_finds_left_edge(hole_x):
+    live, cdn, mask = _make_diff_frames(hole_x)
+    cands = puzzle._detect_slot_edges(live, cdn, mask, yrow=80, k=3)
+    assert cands, "edge-детектор должен найти левую грань лунки"
+    # синтетика рисует лунку от hole_x+5 (over-слип) — допуск 6px
+    assert abs(cands[0][0] - hole_x) <= 6
+
+
+def test_detect_slot_edges_empty_when_identical():
+    mask = _HoleMask().nl
+    cdn = np.full((200, 400), 128.0, dtype=np.float32)
+    assert puzzle._detect_slot_edges(cdn.copy(), cdn, mask, yrow=80) == []
+
+
+def test_grip_point_inside_silhouette():
+    m = _HoleMask().nl
+    gx, gy = puzzle._grip_point(m)
+    assert 0 <= gx < m.shape[1]
+    assert 0 <= gy < m.shape[0]
+    assert m[int(round(gy)), int(round(gx))], "хват должен быть в непрозрачной зоне"
+    assert gy <= m.shape[0] * 0.85
+
+
+def test_human_path_start_end_exact():
+    pts = puzzle._human_path(10.0, 20.0, 300.0, 25.0, n=20)
+    assert len(pts) == 21
+    assert abs(pts[0][0] - 10.0) <= 1.0 and abs(pts[0][1] - 20.0) <= 1.0
+    assert pts[-1] == (300.0, 25.0)
+
+
+def test_human_path_has_jitter_not_linear():
+    pts = puzzle._human_path(10.0, 20.0, 300.0, 20.0, n=30)
+    delta = [(x2 - x1, y2 - y1) for (x1, y1), (x2, y2) in zip(pts, pts[1:])]
+    # не все шаги одинаковые (не равномерная прямая) — есть ускорение/торможение
+    steps = sorted({round(abs(dx), 1) for dx, _ in delta})
+    assert len(steps) >= 4, "траектория должна быть неравномерной (ease)"
+
+
+def test_drag_to_piece_mode_no_slider():
+    """Новый формат (без трека): драг САМОГО кусочка, grip внутри силуэта."""
+    from unittest.mock import patch
+    calls = []
+
+    class _Page:
+        def evaluate(self, js):
+            return None
+
+        @property
+        def mouse(self):
+            return self
+
+        def move(self, x, y, steps=None):
+            calls.append(("move", x, y, steps))
+            return self
+
+        def down(self):
+            calls.append(("down",))
+            return self
+
+        def up(self):
+            calls.append(("up",))
+            return self
+
+    page = _Page()
+    info = {"bg": {"r": [0, 0, 300, 100]},
+            "puzzle": {"r": [10, 20, 40, 40]}}
+    reads = {"n": 0}
+
+    def _read(page):
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return {"px": 50.0, "s": None, "ps": 10, "ss": None}
+        return {"px": 90.0, "s": None, "ps": 10, "ss": None}
+
+    with patch.object(puzzle, "_find_slider", lambda p: None), \
+         patch.object(puzzle, "_read_sl_piece", side_effect=_read):
+        with patch.object(puzzle, "_still_challenge", lambda p: True):
+            res = puzzle._drag_to(page, target_vx=300.0, info=info, bx=200, score=1.0)
+    kinds = [c[0] for c in calls]
+    assert "down" in kinds and "up" in kinds
+    assert any(k == "move" for k in kinds)
+
+
+def test_detect_slot_diff_empty_when_frames_identical():
+    mask = _HoleMask().nl
+    cdn = np.full((200, 400), 128.0, dtype=np.float32)
+    assert puzzle._detect_slot_diff(cdn.copy(), cdn, mask, yrow=80) == []
+
+
+def test_detect_slot_diff_empty_when_shot_mismatched():
+    rng = np.random.default_rng(3)
+    mask = _HoleMask().nl
+    cdn = rng.integers(0, 40, (200, 400)).astype(np.float32)
+    live = rng.integers(180, 245, (200, 400)).astype(np.float32)
+    # высокий med (разные регионы) → гейт, не мусорный кандидат
+    assert puzzle._detect_slot_diff(live, cdn, mask, yrow=80) == []
+
+
+def test_detect_slot_diff_negative_for_shape_mismatch():
+    mask = _HoleMask().nl
+    cdn = np.full((200, 400), 128.0, dtype=np.float32)
+    live = np.full((180, 380), 128.0, dtype=np.float32)
+    assert puzzle._detect_slot_diff(live, cdn, mask, yrow=80) == []

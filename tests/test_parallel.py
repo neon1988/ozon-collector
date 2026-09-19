@@ -881,3 +881,115 @@ def test_collect_parallel_force_link_stop_propagates(monkeypatch):
         assert exc.forced
     else:
         raise AssertionError("ожидали CollectionInterrupted (forced)")
+
+
+# ---- ленивый браузер: пачка из кэша не требует запуска Chromium ------------
+
+def _cache_entry_ok(pid="1000"):
+    return {"pid": pid, "product": {"title": f"Товар {pid}"},
+            "reviews": []}
+
+
+class _FakeCache:
+    """Матрица cache_check: pid → (raw, reason)."""
+
+    def __init__(self, hits: set, stale: set = None):
+        self.hits = hits
+        self.stale = stale or set()
+        self.calls = []
+
+    def __call__(self, pid, max_age_s, data_dir="data", sorts=None):
+        self.calls.append((pid, max_age_s))
+        if pid in self.stale:
+            return None, "stale"
+        if pid in self.hits:
+            return _cache_entry_ok(pid), "hit"
+        return None, "miss"
+
+
+def test_batch_needs_browser_all_cache_hit(monkeypatch):
+    """Вся пачка cache=hit → браузер НЕ нужен (сбор из кэша без Chromium)."""
+    cc = _FakeCache(hits={"1000", "1001", "1002"})
+    monkeypatch.setattr(PL.K, "cache_check", cc)
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    items = _items(3)
+    assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is False
+
+
+def test_batch_needs_browser_miss_requires_browser(monkeypatch):
+    """Хоть один cache-miss в пачке → браузер нужен."""
+    cc = _FakeCache(hits={"1000", "1001"})
+    monkeypatch.setattr(PL.K, "cache_check", cc)
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    items = _items(3)  # 1002 не в кэше
+    assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is True
+
+
+def test_batch_needs_browser_stale_requires_browser(monkeypatch):
+    """stale = кэш устарел → пересбор живьём → браузер нужен."""
+    cc = _FakeCache(hits={"1000"}, stale={"1001"})
+    monkeypatch.setattr(PL.K, "cache_check", cc)
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    items = _items(2)
+    assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is True
+
+
+def test_batch_needs_browser_review_break_requires_browser(monkeypatch):
+    """cache=hit, но брак отзывов (variant_review_problems) → пересбор → браузер."""
+    cc = _FakeCache(hits={"1000", "1001"})
+    monkeypatch.setattr(PL.K, "cache_check", cc)
+    monkeypatch.setattr(PL.C, "variant_review_problems",
+                        lambda raw: ["мало отзывов"])
+    items = _items(2)
+    assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is True
+
+
+def test_batch_needs_browser_cache_off(monkeypatch):
+    """max_age_s<=0 → кэш off → каждый товар считается miss → браузер нужен.
+
+    Поведение по умолчанию (gather_cfg без max_age_s) не должно меняться.
+    """
+    cc = _FakeCache(hits=set())
+    monkeypatch.setattr(PL.K, "cache_check", cc)
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    items = _items(2)
+    assert PL._batch_needs_browser(items, {}) is True
+
+
+def test_batch_needs_browser_cache_error_conservative(monkeypatch):
+    """Ошибка cache_check → консервативно требуем браузер (не теряем сбор)."""
+    def _boom(pid, max_age_s, data_dir="data", sorts=None):
+        raise OSError("cache read failed")
+
+    monkeypatch.setattr(PL.K, "cache_check", _boom)
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    items = _items(2)
+    assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is True
+
+
+def test_collect_batch_without_browser_adds_format_fields(monkeypatch):
+    """Кэш-only пачка возвращает res в формате _collect_shard (recycle_attempts
+    и new_tab_attempts обнулены, строгий порядок items)."""
+    from ozon_collector import gather as G
+
+    calls = []
+
+    def _fake_run_gather(cfg, sess=None):
+        assert sess is None   # без браузера
+        calls.append((cfg["pid"], cfg["url"]))
+        return {"pid": cfg["pid"], "ok": True, "cache": "hit", "ocr": "off",
+                "raw": _cache_entry_ok(cfg["pid"]), "markdown": ""}
+
+    monkeypatch.setattr(G, "run_gather", _fake_run_gather)
+    monkeypatch.setattr(PL, "run_gather", _fake_run_gather)
+
+    items = _items(2)
+    out = PL._collect_batch_without_browser(
+        items, {"max_age_s": 3600, "sorts": ["score_desc"]})
+    assert len(out) == 2
+    assert all(r["ok"] and r["cache"] == "hit" for r in out)
+    assert all(r["recycle_attempts"] == 0 and r["new_tab_attempts"] == 0
+               for r in out)
+    # строгий порядок как в items
+    assert [r["pid"] for r in out] == [pid for _i, pid, _u in items]
+    assert calls == [(pid, url) for _i, pid, url in items]

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 
@@ -3503,3 +3504,157 @@ def test_run_campaign_force_collection_calls_emergency_shutdown(tmp_path, monkey
         k._STOP_EVENT = prev_s
     assert calls, "ожидали вызов _emergency_shutdown при FORCE (collection)"
     assert calls[0] == "collection"
+
+
+# --- автогенерация имени кампании из --url (naming, НЕ фильтр) ----------------
+
+def test_slugify_translit_basic():
+    assert k._slugify("машинка на пульте управления для девочек") == (
+        "mashinka_na_pulte_upravleniya_dlya_devochek")
+
+
+def test_slugify_soft_hard_signs_removed():
+    assert k._slugify("пальто") == "palto"
+    assert k._slugify("объём") == "obem"
+
+
+def test_slugify_special_chars_collapsed():
+    assert k._slugify("Машинка&/ на (пульте)  ---") == "mashinka_na_pulte"
+
+
+def test_slugify_truncation_no_trailing_underscore():
+    long_text = "машинка очень хорошая большая модель для девочек " * 3
+    slug = k._slugify(long_text)
+    assert len(slug) <= 50
+    assert not slug.endswith("_")
+
+
+def test_slugify_only_invalid_returns_none():
+    assert k._slugify("###") is None
+    assert k._slugify("") is None
+    assert k._slugify("   ") is None
+
+
+def test_campaign_from_url_text_percent_encoded():
+    url = ("https://www.ozon.ru/search/?from_global=true&text="
+           "%D0%BC%D0%B0%D1%88%D0%B8%D0%BD%D0%BA%D0%B0+%D0%BD%D0%B0+"
+           "%D0%BF%D1%83%D0%BB%D1%8C%D1%82%D0%B5+"
+           "%D1%83%D0%BF%D1%80%D0%B0%D0%B2%D0%BB%D0%B5%D0%BD%D0%B8%D1%8F+"
+           "%D0%B4%D0%BB%D1%8F+%D0%B4%D0%B5%D0%B2%D0%BE%D1%87%D0%B5%D0%BA")
+    name, source, value = k.campaign_from_url(url)
+    assert name == "mashinka_na_pulte_upravleniya_dlya_devochek"
+    assert source == "url_text"
+    assert value == "машинка на пульте управления для девочек"
+
+
+def test_campaign_from_url_category_strips_id():
+    url = ("https://www.ozon.ru/category/mashinki-radioupravlyaemye-7151/"
+           "?category_was_predicted=true")
+    name, source, value = k.campaign_from_url(url)
+    assert name == "mashinki_radioupravlyaemye"
+    assert source == "url_category"
+    assert value == "mashinki-radioupravlyaemye-7151"
+
+
+def test_campaign_from_url_blank_text_falls_to_category():
+    url = "https://www.ozon.ru/category/mashinki-7151/?text=%20&from_global=true"
+    name, source, _ = k.campaign_from_url(url)
+    assert name == "mashinki"
+    assert source == "url_category"
+
+
+def test_campaign_from_url_timestamp_fallback():
+    name, source, value = k.campaign_from_url("https://ozon.ru/somepage")
+    assert re.fullmatch(r"campaign_\d{8}_\d{4}", name)
+    assert source == "timestamp" and value is None
+
+
+def test_campaign_from_url_empty_url_timestamp():
+    name, source, _ = k.campaign_from_url("")
+    assert re.fullmatch(r"campaign_\d{8}_\d{4}", name)
+    assert source == "timestamp"
+
+
+def test_campaign_from_url_deterministic_same_url():
+    url = "https://www.ozon.ru/search/?text=%D0%BC%D0%B0%D1%88%D0%B8%D0%BD%D0%BA%D0%B0"
+    assert k.campaign_from_url(url)[0] == k.campaign_from_url(url)[0]
+
+
+def test_campaign_from_url_case_insensitive():
+    a = k.campaign_from_url("https://x/search/?text=%D0%9C%D0%B0%D1%88%D0%B8%D0%BD%D0%BA%D0%B0")[0]
+    b = k.campaign_from_url("https://x/search/?text=%D0%BC%D0%B0%D1%88%D0%B8%D0%BD%D0%BA%D0%B0")[0]
+    assert a == b == "mashinka"
+
+
+def test_campaign_from_url_text_only_invalid_chars_falls_back():
+    url = "https://www.ozon.ru/search/?text=%23%23%23"
+    name, source, _ = k.campaign_from_url(url)
+    assert re.fullmatch(r"campaign_\d{8}_\d{4}", name)
+    assert source == "timestamp"
+
+
+def test_default_manifest_name_source_fields():
+    m = k.default_manifest("camp", 10, 5, "u", "camp.md",
+                           name_source="url_text", name_source_value="запрос")
+    assert m["name_source"] == "url_text"
+    assert m["name_source_value"] == "запрос"
+    assert "run_cfg" in m and "name_source" not in m["run_cfg"]
+
+
+def _fake_completed_run(captured, campaign):
+    return {"campaign": campaign, "target_count": 5, "min_valid": 1,
+            "valid_pids": [], "discovered_pids": [], "failed_pids": [],
+            "permanently_failed_pids": [], "runs": [],
+            "final_state": "COMPLETED", "final_reason": "target_reached"}
+
+
+def test_main_auto_name_from_text(monkeypatch):
+    captured = {}
+
+    def fake_run(**kw):
+        captured["campaign"] = kw["campaign"]
+        captured["out"] = kw["out"]
+        captured["url"] = kw["url"]
+        captured["name_source"] = kw["name_source"]
+        captured["name_source_value"] = kw["name_source_value"]
+        return _fake_completed_run(captured, kw["campaign"])
+
+    monkeypatch.setattr(k, "run_campaign", fake_run)
+    k.main(["--url", "https://www.ozon.ru/search/?text=%D0%9C%D0%B0%D1%88%D0%B8%D0%BD%D0%BA%D0%B0",
+            "--limit", "5", "--min-valid", "1"])
+    assert captured["campaign"] == "mashinka"
+    assert captured["out"] == "docs/mashinka.md"
+    assert captured["name_source"] == "url_text"
+    assert captured["name_source_value"] == "Машинка"
+
+
+def test_main_explicit_campaign_ignores_text(monkeypatch):
+    captured = {}
+
+    def fake_run(**kw):
+        captured["campaign"] = kw["campaign"]
+        captured["out"] = kw["out"]
+        captured["name_source"] = kw["name_source"]
+        return _fake_completed_run(captured, kw["campaign"])
+
+    monkeypatch.setattr(k, "run_campaign", fake_run)
+    k.main(["--campaign", "prezervativy",
+            "--url", "https://www.ozon.ru/search/?text=%D0%9C%D0%B0%D1%88%D0%B8%D0%BD%D0%BA%D0%B0",
+            "--limit", "5", "--min-valid", "1", "--out", "docs/p.md"])
+    assert captured["campaign"] == "prezervativy"
+    assert captured["out"] == "docs/p.md"
+    assert captured["name_source"] == "explicit"
+
+
+def test_main_timestamp_fallback(monkeypatch):
+    captured = {}
+
+    def fake_run(**kw):
+        captured["campaign"] = kw["campaign"]
+        captured["name_source"] = kw["name_source"]
+        return _fake_completed_run(captured, kw["campaign"])
+
+    monkeypatch.setattr(k, "run_campaign", fake_run)
+    k.main(["--url", "https://ozon.ru/somepage", "--limit", "5", "--min-valid", "1"])
+    assert re.fullmatch(r"campaign_\d{8}_\d{4}", captured["campaign"])
+    assert captured["name_source"] == "timestamp"

@@ -78,6 +78,29 @@ def search_url(query: str) -> str:
     return f"https://www.ozon.ru/search/?text={q}&from_global=true"
 
 
+# Сколько ждём, пока после челленджа реально отрисуется выдача (товары в
+# tileGridDesktop), прежде чем решить, что это подмена, а не настоящая страница.
+FEED_APPEAR_TRIES = 6
+FEED_APPEAR_WAIT_MS = 1500
+
+
+def _feed_appeared(sess, tries: int = FEED_APPEAR_TRIES,
+                   wait_ms: int = FEED_APPEAR_WAIT_MS) -> bool:
+    """True, если в выдаче РЕАЛЬНО есть хоть один товар (tileGridDesktop).
+
+    Проверяет текущую страницу (без скроллов) до tries попыток с паузой —
+    даёт JS-рендеру сетки время. False — выдача пустая ИЛИ страница-заглушка.
+    """
+    for _ in range(max(1, tries)):
+        try:
+            if sess.eval(SEARCH_JS):
+                return True
+        except Exception:
+            pass
+        time.sleep(wait_ms / 1000.0)
+    return False
+
+
 def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
                    max_scrolls: int = 40, scroll_by: int = 1500,
                    wait_ms: int = 1000, quiet_after: int = 2,
@@ -292,6 +315,20 @@ def _collect_links_with_recovery(sess, manager, url: str, limit: int,
             sess.goto(url)
             if getattr(sess, "page", None) is not None:
                 C.check_challenge(sess.page, "search_page")
+            # Выдача должна РЕАЛЬНО появиться (tileGridDesktop с товарами), а не
+            # «пазл снят, но всё ещё бот-заглушка/подмена». Пустая сетка после
+            # челленджа — это НЕ успех: не начинаем сбор товаров.
+            if not _feed_appeared(sess):
+                try:
+                    sig = C.detect_challenge(getattr(sess, "page", None))
+                except Exception:
+                    sig = None
+                if sig:
+                    raise B.AccessChallengeError(
+                        f"после челленджа выдача не появилась: {sig}")
+                log.warning("[search] выдача не отрисовалась (сетка пуста без "
+                            "бот-маркеров) — возвращаю 0 товаров")
+                return []
             return _collect_links(sess, limit, stop_event=stop_event,
                                   force_event=force_event)
         except Exception as e:
