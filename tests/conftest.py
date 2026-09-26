@@ -33,6 +33,22 @@ if sys.platform == "win32":
 from ozon_collector.collect import PRODUCT_JS, REVIEWS_JS, VARIANT_MODE_JS  # noqa: E402
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, TESTS_DIR)
+
+import _procguard as _procguard  # noqa: E402
+
+
+def pytest_unconfigure(config):
+    """После сессии — убрать всё, что тесты оставили жить (живой случай 2026-09-26).
+
+    Хук, а не фикстура: срабатывает и когда что-то упало в teardown, и когда
+    pytest завершился с ошибкой. Убиваются ТОЛЬКО потомки текущего процесса
+    pytest (обход дерева pid -> ppid), поэтому живой демон (запущен раньше,
+    другой pid) в выборку не попадает по построению; вдобавок его pid
+    читается из `data/key_daemon.pid` и защищается явно. Отключается
+    `KD_KEEP_TEST_PROCS=1`. Отчёт: stderr + `logs/test_reap.log`.
+    """
+    _procguard.run_and_log("session-end", _procguard.reap_own_processes())
 
 
 @pytest.fixture(autouse=True)
@@ -69,6 +85,10 @@ def pytest_configure(config):
         "markers",
         f"{ALLOW_LAUNCH_MARK}: тесту разрешён реальный вызов "
         f"_launch_script (лаунчер/Popen замоканы в самом тесте)")
+    config.addinivalue_line(
+        "markers",
+        "manual: ручной/демо-прогон, не запускать в обычном наборе "
+        "(`-m manual` или `-m 'not manual')")
 
 
 @pytest.fixture(autouse=True)

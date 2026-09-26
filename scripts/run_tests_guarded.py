@@ -12,6 +12,13 @@
     python scripts/run_tests_guarded.py --timeout 600 tests
     python scripts/run_tests_guarded.py --timeout 0 tests      # отключить watchdog
 
+Мусор после прогонов: кроме дерева pytest по hard timeout, обёртка
+ДО и ПОСЛЕ прогона вызывает `sweep_stale()` из `tests/_procguard.py` — он
+убирает хвосты ПРОШЛЫХ упавших прогонов (осиротевшие пульты Playwright,
+браузеры с профилем из pytest-tmp, spawn-воркеры multiprocessing), у которых
+родитель мёртв и в дерево попасть уже нельзя. Внутри самого pytest тем же
+занимается session-фикстура `_reap_processes_after_session`.
+
 Коды возврата:
     0   — pytest завершился успешно
     N   — pytest завершился с кодом N (сохранён как есть)
@@ -24,9 +31,19 @@ import subprocess
 import sys
 import time
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "tests"))
+
+import _procguard as _procguard  # noqa: E402
+
 
 DEFAULT_TIMEOUT_SEC = 300
 TIMEOUT_EXIT_CODE = 124
+
+
+def _sweep(action: str) -> None:
+    """Убрать осиротевшие тестовые процессы (до/после прогона)."""
+    _procguard.run_and_log(action, _procguard.sweep_stale())
 
 
 def _ignore_console_ctrl_c() -> None:
@@ -93,6 +110,8 @@ def main() -> int:
     print(f"[Watchdog] exec: {' '.join(cmd)}")
     print(f"[Watchdog] timeout: {timeout_sec if timeout_sec else 'disabled'} sec", flush=True)
 
+    _sweep("pre-run")
+
     process = subprocess.Popen(cmd)
     start = time.time()
 
@@ -123,6 +142,7 @@ def main() -> int:
     finally:
         if process.poll() is None:
             _kill_tree(process.pid)
+        _sweep("post-run")
 
 
 if __name__ == "__main__":
