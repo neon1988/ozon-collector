@@ -323,31 +323,61 @@ def resolve_canary_url(preferred: Optional[str] = None,
 # поэтому тратить на него reload×3 + new_tab + recycle (~15-20 мин) бессмысленно.
 IP_BLOCK_STATUSES = (403, 429, 503)
 
+# HEAD и GET к origin — РАЗНЫЕ ответы, и это не деталь реализации. Замер
+# 2026-09-26 (scripts/probe_head.py, обычный Chrome, живой ozon.ru):
+#   HEAD /            -> 405 Method Not Allowed   (и 403, когда WAF уже в challenge)
+#   GET  /            -> 200, 475 КБ страницы
+#   GET  / (challenge)-> 200, title «Похоже, нет соединения»
+# То есть 403 на HEAD НЕ доказывает бан IP: это ответ WAF на метод, а не на
+# репутацию адреса. Признавая его баном, мы превращали каждый challenge в
+# «сетевой бан IP → SESSION_BLOCKED → abort run» и выбрасывали оставшиеся
+# товары без попытки recycle. Поэтому блок статуса подтверждается GET'ом:
+# бан засчитывается, только если оба метода отвечают блок-статусом.
+BLOCK_PROBE_JS = """async () => {
+  try {
+    const url = location.origin + '/';
+    const head = (await fetch(url, {
+      method: 'HEAD', cache: 'no-store', credentials: 'include'})).status;
+    if (head === 200 || head === 405) return {head: head, get: head};
+    const r = await fetch(url, {
+      method: 'GET', cache: 'no-store', credentials: 'include',
+      headers: {'Range': 'bytes=0-2047'}});
+    return {head: head, get: r.status};
+  } catch (e) { return null; } }"""
+
 
 def _network_block_status(sess) -> int | None:
     """HTTP-статус origin из контекста страницы; None = неизвестно/не блок.
 
-    Один HEAD-запрос из уже открытой вкладки (без навигации, с куками сессии):
-    дёшево и не палитcя как отдельный переход. Любая ошибка → None, т.е.
-    поведение остаётся прежним — мы только экономим время там, где уверены.
+    HEAD-запрос из уже открытой вкладки (без навигации, с куками сессии) дёшев
+    и не палится как отдельный переход, но ОДИН HEAD не доказывает бан IP —
+    см. BLOCK_PROBE_JS. Если HEAD ответил блок-статусом, подтверждаем GET'ом
+    (Range, чтобы не тянуть мегабайты): расхождение HEAD/GET = не бан.
+    Любая ошибка → None, т.е. поведение остаётся прежним — мы экономим время
+    только там, где уверены, и не теряем товары там, где не уверены.
     """
     page = getattr(sess, "page", None)
     if page is None:
         return None
     try:
-        st = page.evaluate("""async () => {
-          try {
-            const r = await fetch(location.origin + '/', {
-              method: 'HEAD', cache: 'no-store', credentials: 'include'});
-            return r.status;
-          } catch (e) { return null; } }""")
+        st = page.evaluate(BLOCK_PROBE_JS)
     except Exception as e:
         log.debug(f"ip-block probe failed: {type(e).__name__}: {e}")
         return None
+    if not isinstance(st, dict):
+        return None
     try:
-        return int(st) if st is not None else None
+        head = int(st.get("head"))
+        got = int(st.get("get"))
     except (TypeError, ValueError):
         return None
+    if head not in IP_BLOCK_STATUSES:
+        return head
+    if got in IP_BLOCK_STATUSES:
+        return head
+    log.info(f"HEAD {head} не подтверждён GET {got} — бан IP не засчитан, "
+             f"лестница recovery продолжается")
+    return None
 
 
 def _ip_blocked(sess) -> int | None:
