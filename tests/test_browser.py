@@ -60,6 +60,7 @@ def _rec(pid=1000, key="k"):
 
 # ---- _launch_script / выбор браузера (OZON_CHROME_PATH) ---------------------
 
+@pytest.mark.allow_browser_launch
 def test_launch_script_injects_chrome_override(monkeypatch, tmp_path):
     import subprocess
 
@@ -84,6 +85,7 @@ def test_launch_script_injects_chrome_override(monkeypatch, tmp_path):
     assert captured["env"]["CHROME"] == r"D:\browsers\cft\chrome.exe"
 
 
+@pytest.mark.allow_browser_launch
 def test_launch_script_no_override_keeps_env(monkeypatch, tmp_path):
     import subprocess
 
@@ -105,6 +107,7 @@ def test_launch_script_no_override_keeps_env(monkeypatch, tmp_path):
     assert "CHROME" not in captured["env"]
 
 
+@pytest.mark.allow_browser_launch
 def test_launch_script_keeps_predefined_chrome(monkeypatch, tmp_path):
     import subprocess
 

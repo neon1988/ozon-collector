@@ -128,6 +128,7 @@ def test_browser_module_tail_helpers(tmp_path):
         tmp_path, "\n", name="empty.log"))
 
 
+@pytest.mark.allow_browser_launch
 def test_launch_browser_writes_fixed_path_per_port(monkeypatch):
     """Лог автозапуска: один путь на порт, truncate при каждом запуске."""
     from ozon_collector import launchlog as LL
@@ -162,6 +163,7 @@ def test_read_log_tail_variants(tmp_path):
     assert LL.read_log_tail(str(tmp_path / "none.log")) == ""
 
 
+@pytest.mark.allow_browser_launch
 def test_browser_launch_script_uses_same_log_path(monkeypatch):
     """browser.py и cdp.py пишут в ОДИН лог на порт (параллельность)."""
     from ozon_collector import launchlog as LL

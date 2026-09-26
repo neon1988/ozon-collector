@@ -57,6 +57,7 @@ class TestLaunchAndWait:
             assert "launch_chrome" in str(e.value)
 
 
+@pytest.mark.allow_browser_launch
 class TestLaunchBrowser:
     def test_port_from_url(self, monkeypatch):
         captured = {}

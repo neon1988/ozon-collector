@@ -1275,6 +1275,12 @@ def test_collect_search_challenge_event_has_telemetry(monkeypatch):
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     # при первом new_tab сессия восстанавливается → второй вызов успешен
     sess._managed = 2
+    # owner=external: recycle НЕ перезапускает процесс браузера (ADR §14.1) —
+    # иначе тест доходит до BrowserProcessManager.restart() и поднимает
+    # настоящий Chrome на 9222 (живой случай 2026-09-26, PID 5084).
+    sess.browser_owner = "external"
+    sess.ensure_single_worker_tab = lambda: None
+    sess.reconnect = lambda: None
     c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     ev = c["recovery"]["events"][0]
     assert ev["kind"] == "new_tab"

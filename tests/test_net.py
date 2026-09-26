@@ -115,6 +115,7 @@ def launcher(monkeypatch, tmp_path):
     return spy
 
 
+@pytest.mark.allow_browser_launch
 def test_launcher_receives_proxy_env(launcher, monkeypatch):
     """cdp._launch_browser кладёт PROXY в env лаунчера только для воркера."""
     monkeypatch.setenv("OZON_PROXY_URLS", "http://p1:1,http://p2:2")
@@ -124,6 +125,7 @@ def test_launcher_receives_proxy_env(launcher, monkeypatch):
     assert launcher.env["PORT"] == "9223"
 
 
+@pytest.mark.allow_browser_launch
 def test_launcher_skips_worker_without_proxy(launcher, monkeypatch):
     monkeypatch.setenv("OZON_PROXY_URLS", "http://p1:1,http://p2:2")
     cdp._launch_browser("http://127.0.0.1:9223", profile_path="p",
@@ -131,6 +133,7 @@ def test_launcher_skips_worker_without_proxy(launcher, monkeypatch):
     assert "PROXY" not in launcher.env
 
 
+@pytest.mark.allow_browser_launch
 def test_launcher_skips_broken_proxy(launcher, monkeypatch):
     """Опечатка в прокси = warning + старт БЕЗ прокси, а не падение."""
     monkeypatch.setenv("OZON_PROXY_URL", "ftp://bad:21")
@@ -139,6 +142,7 @@ def test_launcher_skips_broken_proxy(launcher, monkeypatch):
     assert "PROXY" not in launcher.env
 
 
+@pytest.mark.allow_browser_launch
 def test_main_profile_never_gets_proxy(launcher, monkeypatch):
     monkeypatch.setenv("OZON_PROXY_URLS", "http://p1:1")
     cdp._launch_browser("http://127.0.0.1:9222", profile_path="p",

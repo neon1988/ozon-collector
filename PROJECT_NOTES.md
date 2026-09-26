@@ -4078,3 +4078,44 @@ BOM + CRLF сохранены, `ParseFile` = OK).
 
 Важно: работающий демон PID 59144 запущен на коде без чекпоинта — фикс
 применится при рестарте. `inflight.json` накапливается только у новых прогонов.
+
+### P0 (2026-09-26, вечер 2): тест поднимал НАСТОЯЩИЙ Chrome и не закрывал его
+
+Живой случай: во время `pytest` на рабочем столе открылось окно Chrome с
+профилем `ozon-profile` на 9222 (PID 5084) и осталось жить после прогона.
+Первый след — лог демона в порядок не попал (окна воркеров на 9223-9230 имеют
+свои профили `ozon-profile-worker-N`); виновник нашёлся по
+`D:\Temp\pytest-of-*\...\launchlogs\ozon_launch_9222.log` (conftest перенаправляет
+launch-логи в tmp_path теста — это и выдало тестовый запуск).
+
+Путь (воспроизведён со стектрейсом): `test_search.py:1278 collect_search` →
+`search.py:849 _collect_shard` → `search.py:220 _recycle_browser` →
+`browser.py:752 restart` → `browser.py:677 launch` → `cdp._launch_browser` →
+лаунчер поднял реальный Chrome. Тест при этом был ЗЕЛЁНЫМ: recycle падал на
+`'_FakeSess' object has no attribute 'reconnect'`, но браузер к этому моменту
+уже был запущен. Молчаливый хвост опаснее падения — его замечают только глазами.
+
+Решение — fail-fast вместо тихого браузера:
+  - автофикстура `_forbid_real_browser_launch` в `tests/conftest.py` подменяет
+    `browser._launch_script` и `cdp._launch_browser` на `pytest.fail` с рецептом
+    (замокать `_recycle_browser`/`browser_processes`/`Session`). Исключение —
+    маркер `allow_browser_launch`, для тестов, где лаунчер нужен по существу
+    (все они мокают `subprocess.Popen` или проверяют путь до Popen: 3 в
+    `test_browser.py`, 3 в `test_cdp_launch.py::TestLaunchBrowser`, 2 в
+    `test_launch_diagnostics.py`, 4 в `test_net.py`);
+  - `test_collect_search_challenge_event_has_telemetry` починен точечно:
+    `browser_owner="external"` + заглушки `ensure_single_worker_tab`/`reconnect`,
+    поэтому recycle идёт по ветке «только новая вкладка» (ADR §14.1) и не
+    доходит до `restart()`;
+  - 3 новых теста в `tests/test_browser_guard.py`: guard блокирует лаунчер,
+    блокирует `cdp._launch_browser`, маркер отключает guard.
+
+Проверено: полный прогон 1348 passed, 4 skipped, 1 xfailed. После прогона —
+порт 9222 не слушается, chrome с `ozon-profile` 0 штук, свежих launch-логов с
+непустым содержимым нет. Заодно выяснилось, что Playwright в тестах утечки не
+оставляет (фикстура `browser` закрывает headless-shell штатно; его имя —
+`chrome-headless-shell.exe`, а НЕ `chrome.exe`, из-за чего первый детектор
+промахнулся), а вот осиротевшие `node.exe` playwright-драйвера от
+`multiprocessing`-воркеров интеграционных тестов key_daemon — висят (2 штуки
+от прогона 15:06). Полные прогоны правильно запускать через
+`scripts/run_tests_guarded.py` — он убивает дерево процессов по hard timeout.

@@ -61,6 +61,45 @@ def _redirect_launch_logs(tmp_path, monkeypatch):
     monkeypatch.setenv("OZON_LAUNCH_LOG_DIR", str(logs))
 
 
+ALLOW_LAUNCH_MARK = "allow_browser_launch"
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        f"{ALLOW_LAUNCH_MARK}: тесту разрешён реальный вызов "
+        f"_launch_script (лаунчер/Popen замоканы в самом тесте)")
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_browser_launch(request, monkeypatch):
+    """Запретить тестам поднимать НАСТОЯЩИЙ браузер.
+
+    Живой случай 2026-09-26: `test_collect_search_challenge_event_has_telemetry`
+    дошёл до `_recycle_browser` → `BrowserProcessManager.restart()` →
+    `launch()` → лаунчер поднял реальный Chrome с профилем `ozon-profile` на
+    9222 (PID 5084) прямо рядом с окнами демона. Тест был зелёным, а окно
+    осталось жить после pytest — «браузер, который открылся во время тестов и
+    не закрылся». Молчаливый хвост опаснее падения: его замечают только
+    глазами. Поэтому непокрытый моком вызов лаунчера → fail с рецептом.
+    """
+    if request.node.get_closest_marker(ALLOW_LAUNCH_MARK):
+        return
+    from ozon_collector import browser as _B
+    from ozon_collector import cdp as _C
+
+    def _deny(*_a, **_kw):
+        pytest.fail(
+            "тест дёрнул реальный запуск браузера — после pytest останется "
+            "окно Chrome на 9222. Замокай _recycle_browser/browser_processes/"
+            "Session либо поставь маркер "
+            f"{ALLOW_LAUNCH_MARK}, если лаунчер нужен по существу.",
+            pytrace=False)
+
+    monkeypatch.setattr(_B, "_launch_script", _deny)
+    monkeypatch.setattr(_C, "_launch_browser", _deny)
+
+
 @pytest.fixture(autouse=True)
 def _assume_browser_alive(monkeypatch):
     """По умолчанию CDP воркера считается ЖИВЫМ: тесты не зависят от портов.
