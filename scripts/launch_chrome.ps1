@@ -65,6 +65,10 @@ $chromeArgs = @(
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-features=OptimizationHints,MediaRouter",
+    # Язык интерфейса и Accept-Language — ru-RU независимо от локали машины и
+    # профиля. Система сейчас ru-RU, поэтому поведение не меняется, но при
+    # смене локали ОС браузер не уедет в en-US (антибот это видит).
+    "--lang=ru-RU",
     "--window-size=1440,900",
     # Не показывать баббл «Восстановить страницы?» после насильственного
     # завершения Chrome (kill коллектором) и инфобар WebDriver — они мешают.

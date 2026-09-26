@@ -57,6 +57,17 @@ def test_ps1_has_required_flags():
         assert needle in t, f"launch_chrome.ps1 потерял {needle}"
 
 
+def test_ps1_pins_russian_locale():
+    """--lang=ru-RU: Accept-Language/navigator.language не должен зависеть от
+    локали машины. Антибот отличает en-US профиль от ru-RU (ADR §19, 2026-09-26)."""
+    t = _text(PS1)
+    args = [ln for ln in t.splitlines() if ln.strip().startswith('"')]
+    assert any("--lang=ru-RU" in ln for ln in args), (
+        "launch_chrome.ps1 не фиксирует --lang=ru-RU")
+    assert any("--window-size=" in ln for ln in args), (
+        "launch_chrome.ps1 не задаёт размер окна")
+
+
 def test_ps1_supports_proxy_env():
     """cdp.py/browser.py кладут PROXY в env — .ps1 обязан его принять."""
     t = _text(PS1)

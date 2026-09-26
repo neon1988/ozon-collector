@@ -4303,7 +4303,7 @@ cache-miss» была верной, но пачки резались FIFO: ка�
 всю пачку). Отсюда правило: `head = 0 if sess is not None`.
 
 Проверено: `test_dispatch_idle_workers_keep_browser_budget` — 8 воркеров,
-40 товаров (32 hit + 8 miss) → **2 браузера вместо 8**. Плюс 13 тестов на
+40 товаров (32 hit + 8 miss) → **2 браузера вместо 8**. Плюс 15 тестов на
 `_first_browser_index`/`_process_batch`/`_take_batch` (середина пачки, все
 hit, переиспользование сессии, miss первым, отчёты после разреза, кэш вердиктов,
 fallback без простоя, целостность очереди). Фокус: 191 passed. lizard:
@@ -4313,3 +4313,30 @@ fallback без простоя, целостность очереди). Фоку
 Урок: «мы не собираем с браузера то, что в кэше» недостаточно. Браузер
 поднимает не товар, а ВОРКЕР, а воркер получает пачку. Экономия достигается
 на раздаче.
+
+### P2 (2026-09-26) — аудит флагов Chrome по «антибот-чеклисту»
+
+Сверили `launch_chrome.ps1` со списком типовых признаков автоматизации. Итог:
+из пяти пунктов не закрыт был один — локаль.
+
+- CDP к системному Chrome (не Playwright-Chromium) — да, `connect_over_cdp`.
+- JS-инъекций нет: 0 совпадений по `add_init_script`/`defineProperty`/
+  `webdriver` в `ozon_collector/`; `--enable-automation` и `--no-sandbox`
+  встречаются только в комментариях, аргументами не передаются
+  (`test_both_use_automation_disabled` это стережёт).
+- Окно видимое: стартует со `SW_HIDE`, затем `Invoke-MinimizeNoActivate ... $true`
+  = `SW_RESTORE` + `HWND_TOPMOST`; `WS_EX_NOACTIVATE` не даёт воркерам воровать
+  фокус. `headless` не используется.
+- Постоянный профиль + прогрев главной 4 с — да, гибридный сбор через
+  `composer-api` из вкладки в логах как `[comments-api]`.
+- Локаль бралась из системы. Добавили `--lang=ru-RU`: локаль ОС может смениться
+  при обновлении/новой машине, а `Accept-Language`/`navigator.language` — часть
+  отпечатка. На текущей машине поведение не меняется (система ru-RU, зона
+  Russian Standard Time).
+
+Заглушка «Похоже, нет соединения» уже стоит первым в `CHALLENGE_TITLE_MARKERS`
+(`constants.py:11`) → `AccessChallengeError` → recyclable/retry, а не «0 отзывов».
+То есть наблюдение из лога (`0 отзывов при прокрутке — reload`) — это НЕ заглушка:
+заглушка отрисовала бы `access_challenge` в логе воркера.
+
+Проверено: `test_launch_scripts.py` 17 passed.
