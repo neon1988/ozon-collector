@@ -460,6 +460,33 @@ def _make_manager(spec: dict):
                                  profile_token=spec["profile_token"])
 
 
+def _item_needs_browser(item, gather_cfg: dict) -> bool:
+    """Нужен ли браузер для ОДНОГО товара (обратная сторона cache_check).
+
+    Повторяет логику gather.run_gather: max_age_s<=0 → кэш off (все miss),
+    sorts-разнарядка и брак отзывов тоже требуют пересбора живьём. Любое
+    исключение считаем за miss: дешевле поднять браузер, чем потерять товар.
+    """
+    _idx, pid, _url = item
+    try:
+        raw, reason = K.cache_check(
+            pid, gather_cfg.get("max_age_s", 0),
+            sorts=gather_cfg.get("sorts"))
+    except Exception:
+        return True
+    if raw is None or reason != "hit":
+        return True
+    return bool(C.variant_review_problems(raw))
+
+
+def _first_browser_index(items, gather_cfg: dict) -> int:
+    """Индекс первого cache-miss в пачке (len(items) → браузер не нужен)."""
+    for i, item in enumerate(items):
+        if _item_needs_browser(item, gather_cfg):
+            return i
+    return len(items)
+
+
 def _batch_needs_browser(items, gather_cfg: dict) -> bool:
     """Нужен ли ЖИВОЙ браузер для пачки (есть хоть один cache-miss).
 
@@ -468,18 +495,7 @@ def _batch_needs_browser(items, gather_cfg: dict) -> bool:
     max_age_s<=0 → кэш off (все считаются miss), sorts-разнарядка и брак
     отзывов тоже требуют пересбора живьём.
     """
-    for _idx, pid, _url in items:
-        try:
-            raw, reason = K.cache_check(
-                pid, gather_cfg.get("max_age_s", 0),
-                sorts=gather_cfg.get("sorts"))
-        except Exception:
-            return True
-        if raw is None or reason != "hit":
-            return True
-        if C.variant_review_problems(raw):
-            return True
-    return False
+    return _first_browser_index(items, gather_cfg) < len(items)
 
 
 def _collect_batch_without_browser(items, gather_cfg: dict,
@@ -723,45 +739,33 @@ def worker_main(spec: dict, task: dict, conn, p2w_conn):
         # Воркеры без товаров выйдут без запуска Chrome.
         warmup = None
 
+        def _ensure_session():
+            """Поднять браузер воркера + прогреть сессию."""
+            s = _make_session(spec)
+            m = _make_manager(spec)
+            set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
+            wu = _warmup_session(s, label=f"worker{k}")
+            _send(conn, {"t": "warmup", "worker": k, **wu})
+            return s, m
+
+        def _report(payload):
+            _send(conn, {"t": "progress", "worker": k, "payload": payload})
+
+        shard_cfg = {"max_recycles": max_recycles, "recovery": recovery,
+                     "on_recovery": on_recovery}
+
         while batch is not None:
             num_batches += 1
             items = list(batch)
 
-            if sess is None and _batch_needs_browser(items, gather_cfg):
-                log.info(f"worker{k}: стартую браузер (есть cache-miss "
-                         f"в пачке {num_batches})")
-                sess = _make_session(spec)
-                manager = _make_manager(spec)
-                set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
-                warmup = _warmup_session(sess, label=f"worker{k}")
-                _send(conn, {"t": "warmup", "worker": k, **warmup})
-
-            def _on_progress(products, n, total):
-                # периодическая передача частичных результатов текущей пачки:
-                # при terminate родитель берёт последний progress-снимок, и
-                # собранные товары не теряются.
-                if n % PROGRESS_EVERY != 0:
-                    return
-                partial = {
-                    "products": [
-                        {"index": idx, "result": res}
-                        for (idx, _pid, _url), res in zip(items, products)],
-                    "processed_indexes": [
-                        idx for idx, _p, _u in (items or [])[:len(products)]],
-                    "failed_indexes": [
-                        idx for (idx, _p, _u), res in zip(items, products)
-                        if not res["ok"]],
-                }
-                _send(conn, {"t": "progress", "worker": k, "payload": partial})
-
-            if sess is None:
-                results = _collect_batch_without_browser(
-                    items, gather_cfg, on_progress=_on_progress)
-            else:
-                results = _run_shard(
-                    spec, sess, manager, items, gather_cfg,
-                    max_recycles=max_recycles, recovery=recovery,
-                    on_recovery=on_recovery, on_progress=_on_progress)
+            # Ленивый запуск: cache-hit'ы отдаём с диска, браузер поднимаем
+            # только дойдя до первого cache-miss — хоть он и в середине пачки.
+            # Раньше браузер поднимался заранее (на всю пачку, если в ней есть
+            # хоть один miss), прогревался и ждал первого живого товара.
+            results, sess, manager = _process_batch(
+                spec, items, gather_cfg, sess, manager,
+                ensure_session=_ensure_session, report=_report,
+                shard_cfg=shard_cfg)
 
             agg_products.extend(
                 {"index": idx, "result": res}
@@ -1141,6 +1145,101 @@ def _attach_scheduler_metrics(wctxs, requeue_metrics: dict) -> None:
         }
 
 
+def _process_batch(spec, items, gather_cfg, sess, manager, *,
+                   ensure_session, report, shard_cfg):
+    """Обработать пачку с ленивым стартом браузера. Возвращает (results, sess, manager).
+
+    cache-hit префикс пачки отдаётся с диска (без Chromium), браузер поднимается
+    на первом cache-miss и дальше пачка идёт через _run_shard. Если браузер уже
+    поднят — вся пачка в _run_shard без разбора.
+
+    ensure_session() -> (sess, manager) — поднимает браузер + прогрев.
+    report(payload) — отправка progress в оркестратор (уже с глобальными
+    индексами: индексы prefix не должны сдвинуться после split пачки).
+    shard_cfg — {max_recycles, recovery, on_recovery} для _run_shard.
+
+    results идут строго в порядке items, независимо от того, где разрезалась
+    пачка: без этого merge_shard_results/QA получают неверные индексы.
+    """
+    head = (0 if sess is not None
+            else _first_browser_index(items, gather_cfg))
+
+    def _progress(products, offset, n):
+        if n % PROGRESS_EVERY != 0:
+            return
+        sub = items[offset:offset + len(products)]
+        report({
+            "products": [
+                {"index": idx, "result": res}
+                for (idx, _pid, _url), res in zip(sub, products)],
+            "processed_indexes": [idx for (idx, _p, _u) in sub],
+            "failed_indexes": [
+                idx for (idx, _p, _u), res in zip(sub, products)
+                if not res["ok"]],
+        })
+
+    results = []
+    if head:
+        results.extend(_collect_batch_without_browser(
+            items[:head], gather_cfg, on_progress=lambda p, n, t: _progress(p, 0, n)))
+    if head < len(items):
+        if sess is None:
+            log.info(f"worker{spec['worker_id']}: стартую браузер (cache-miss "
+                     f"на товаре {head + 1} из {len(items)})")
+            sess, manager = ensure_session()
+        results.extend(_run_shard(
+            spec, sess, manager, items[head:], gather_cfg,
+            max_recycles=shard_cfg["max_recycles"],
+            recovery=shard_cfg["recovery"],
+            on_recovery=shard_cfg["on_recovery"],
+            on_progress=lambda p, n, t: _progress(p, head, n)))
+    return results, sess, manager
+
+
+def _take_batch(queue, size: int, prefer_miss: bool, gather_cfg: dict,
+                worker_idx: int, owner: dict, verdicts: dict) -> list:
+    """Достать из очереди пачку, отдавая приоритет нужному типу товаров.
+
+    Воркер с браузером (prefer_miss=True) получает первыми cache-miss, воркер
+    без браузера — cache-hit'ы, чтобы отработать вообще без Chromium. Причина:
+    FIFO раздавал каждому воркеру по одному miss'у, и при 8 воркерах
+    поднимались 8 окон ради 8 товаров из кэша (в бою 26.09: 6 missing +
+    2 incomplete на 40 товаров → 8 браузеров вместо двух). Если товаров
+    приоритетного типа не осталось — отдаём что есть, воркер не должен
+    простаивать вхолостую.
+
+    Недобор НЕ добираем товарами другого типа: короткая пачка дешевле, чем
+    гонять воркер с браузером по кэшу (лишний round-trip и потеря ленивости —
+    hit'ы предназначены воркерам без Chromium).
+
+    verdicts — кэш «нужен ли браузер» по pid на прогон: cache_check читает
+    JSON с диска, а раздач на прогон столько же, сколько пачек.
+    """
+    def _needs(item) -> bool:
+        pid = item[1]
+        if pid not in verdicts:
+            verdicts[pid] = _item_needs_browser(item, gather_cfg)
+        return verdicts[pid]
+
+    picked: list = []
+    rest: list = []
+    for item in queue:
+        if len(picked) >= size:
+            rest.append(item)
+        elif _needs(item) == prefer_miss:
+            picked.append(item)
+        else:
+            rest.append(item)
+    if not picked:
+        picked = rest[:size]
+        rest = rest[size:]
+    for item in picked:
+        owner[int(item[0])] = worker_idx
+    queue.clear()
+    queue.extend(rest)
+    return picked
+
+
 def _await_workers(wctxs: list, deadline: float,
                    max_worker_restarts: int, items_by_index: dict,
                    gather_cfg: dict, max_recycles: int,
@@ -1180,6 +1279,9 @@ def _await_workers(wctxs: list, deadline: float,
         and owner is not None and pid_by_idx is not None
         and url_by_idx is not None)
 
+    # Кэш вердиктов «нужен ли браузер» по pid на прогон (см. _take_batch).
+    verdicts: dict = {}
+
     def _send_to_worker(wctx, msg: dict) -> bool:
         """Отправить пачку/команду воркеру через parent→worker pipe.
 
@@ -1208,12 +1310,10 @@ def _await_workers(wctxs: list, deadline: float,
             wctx.waiting_for_batch = False
             _send_to_worker(wctx, {"t": "none"})
             return
-        batch = []
-        while shared_items and len(batch) < batch_size:
-            item = shared_items.popleft()
-            idx = int(item[0])
-            owner[idx] = wctx.worker_idx
-            batch.append(item)
+        batch = _take_batch(shared_items, batch_size,
+                            prefer_miss=wctx.browsers_started > 0,
+                            gather_cfg=gather_cfg, worker_idx=wctx.worker_idx,
+                            owner=owner, verdicts=verdicts)
         if batch:
             wctx.waiting_for_batch = False
             if not _send_to_worker(wctx, {"t": "next", "batch": batch}):

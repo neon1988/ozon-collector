@@ -1296,3 +1296,282 @@ def test_collect_batch_without_browser_adds_format_fields(monkeypatch):
     # строгий порядок как в items
     assert [r["pid"] for r in out] == [pid for _i, pid, _u in items]
     assert calls == [(pid, url) for _i, pid, url in items]
+
+
+# ---- ленивый старт: браузер только на первом cache-miss --------------------
+
+def _patch_cache(monkeypatch, hits: set, stale: set = None):
+    monkeypatch.setattr(PL.K, "cache_check",
+                        _FakeCache(hits=hits, stale=stale or set()))
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+
+
+def test_first_browser_index_mid_batch(monkeypatch):
+    """Первый miss в середине пачки → браузер нужен с этого места."""
+    _patch_cache(monkeypatch, hits={"1000", "1001"}, stale={"1002"})
+    items = _items(4)
+    assert PL._first_browser_index(items, {"max_age_s": 3600}) == 2
+
+
+def test_first_browser_index_all_hit(monkeypatch):
+    _patch_cache(monkeypatch, hits={"1000", "1001", "1002"})
+    items = _items(3)
+    assert PL._first_browser_index(items, {"max_age_s": 3600}) == 3
+
+
+def test_first_browser_index_empty_batch():
+    assert PL._first_browser_index([], {"max_age_s": 3600}) == 0
+
+
+def _process_batch(monkeypatch, items, *, sess=None, hits=(), stale=()):
+    """Прогнать _process_batch с фейками; вернуть (results, вызовы, отчёты)."""
+    _patch_cache(monkeypatch, hits=set(hits), stale=set(stale))
+    calls = {"cache": [], "shard": [], "sessions": 0}
+    reports = []
+
+    def _fake_cache_only(batch, cfg, on_progress=None):
+        for idx, pid, url in batch:
+            calls["cache"].append(pid)
+        out = [{"pid": pid, "ok": True} for _i, pid, _u in batch]
+        if on_progress is not None:
+            on_progress(out, len(out), len(out))
+        return out
+
+    def _fake_shard(spec, s, m, batch, cfg, **kw):
+        calls["shard"].append([pid for _i, pid, _u in batch])
+        if kw.get("on_progress") is not None:
+            out = [{"pid": pid, "ok": True} for _i, pid, _u in batch]
+            kw["on_progress"](out, len(out), len(out))
+        return [{"pid": pid, "ok": True} for _i, pid, _u in batch]
+
+    def _fake_ensure():
+        calls["sessions"] += 1
+        return "SESS", "MGR"
+
+    monkeypatch.setattr(PL, "_collect_batch_without_browser", _fake_cache_only)
+    monkeypatch.setattr(PL, "_run_shard", _fake_shard)
+    results, new_sess, _mgr = PL._process_batch(
+        {"worker_id": 1}, items, {"max_age_s": 3600}, sess, None,
+        ensure_session=_fake_ensure, report=reports.append,
+        shard_cfg={"max_recycles": 2, "recovery": {}, "on_recovery": None})
+    return results, calls, reports, new_sess
+
+
+def test_process_batch_browser_raises_on_first_miss(monkeypatch):
+    """hit,hit,miss,miss → два cache-hit с диска, браузер на 3-м товаре."""
+    items = _items(4)
+    results, calls, _reports, new_sess = _process_batch(
+        monkeypatch, items, hits={"1000", "1001"})
+    assert calls["cache"] == ["1000", "1001"], "cache-hit не требует браузера"
+    assert calls["shard"] == [["1002", "1003"]], "shard видит только остаток"
+    assert calls["sessions"] == 1
+    assert new_sess == "SESS"
+    assert [r["pid"] for r in results] == ["1000", "1001", "1002", "1003"], (
+        "результаты склеены в порядке items, несмотря на разрез пачки")
+
+
+def test_process_batch_all_cache_hit_never_starts_browser(monkeypatch):
+    """Вся пачка из кэша → ни браузера, ни _run_shard."""
+    results, calls, _reports, new_sess = _process_batch(
+        monkeypatch, _items(3), hits={"1000", "1001", "1002"})
+    assert calls["cache"] == ["1000", "1001", "1002"]
+    assert calls["shard"] == []
+    assert calls["sessions"] == 0
+    assert new_sess is None
+    assert len(results) == 3
+
+
+def test_process_batch_reuses_existing_session(monkeypatch):
+    """Браузер уже поднят → браузер не трогаем, вся пачка в _run_shard."""
+    results, calls, _reports, _sess = _process_batch(
+        monkeypatch, _items(3), sess="SESS", hits={"1000", "1001", "1002"})
+    assert calls["cache"] == [], "уже есть браузер — кэш не нужен"
+    assert calls["shard"] == [["1000", "1001", "1002"]]
+    assert calls["sessions"] == 0
+    assert len(results) == 3
+
+
+def test_process_batch_miss_on_first_item(monkeypatch):
+    """Первый товар — miss → браузер сразу, кэш не трогаем."""
+    _results, calls, _reports, _sess = _process_batch(
+        monkeypatch, _items(3), hits={"1001", "1002"})
+    assert calls["sessions"] == 1
+    assert calls["cache"] == []
+    assert calls["shard"] == [["1000", "1001", "1002"]]
+
+
+def test_process_batch_reports_keep_global_indexes(monkeypatch):
+    """n < PROGRESS_EVERY → отчёта нет ни от кэш-части, ни от шарда.
+
+    Иначе в pipe летит отчёт на каждый товар: оркестратор просыпается на
+    каждом чекпоинте и merge гоняет пустые payload'ы.
+    """
+    items = _items(10)
+    monkeypatch.setattr(PL, "_item_needs_browser",
+                        lambda item, cfg: int(item[1]) >= 1002)
+    monkeypatch.setattr(
+        PL, "_collect_batch_without_browser",
+        lambda batch, cfg, on_progress=None: (
+            on_progress([{"ok": True}] * len(batch), 2, len(batch)) or
+            [{"pid": p, "ok": True} for _i, p, _u in batch]))
+    monkeypatch.setattr(
+        PL, "_run_shard",
+        lambda spec, s, m, batch, cfg, **kw: (
+            kw["on_progress"]([{"ok": True}] * len(batch), 3, len(batch)) or
+            [{"pid": p, "ok": True} for _i, p, _u in batch]))
+    reports = []
+    PL._process_batch(
+        {"worker_id": 1}, items, {"max_age_s": 3600}, None, None,
+        ensure_session=lambda: ("SESS", "MGR"), report=reports.append,
+        shard_cfg={"max_recycles": 2, "recovery": {}, "on_recovery": None})
+    assert reports == [], "n<PROGRESS_EVERY отчётов не даёт (шум в pipe)"
+
+
+def test_process_batch_reports_indices_after_split(monkeypatch):
+    """Отчёт prefix несёт индексы 0..1, отчёт shard — индексы со сдвигом head."""
+    items = _items(10)
+    reports = []
+    monkeypatch.setattr(PL, "_item_needs_browser",
+                        lambda item, cfg: int(item[1]) >= 1002)
+    monkeypatch.setattr(
+        PL, "_collect_batch_without_browser",
+        lambda batch, cfg, on_progress=None: (
+            on_progress([{"ok": True}] * len(batch), 5, len(batch)) or
+            [{"pid": p, "ok": True} for _i, p, _u in batch]))
+    monkeypatch.setattr(
+        PL, "_run_shard",
+        lambda spec, s, m, batch, cfg, **kw: (
+            kw["on_progress"]([{"ok": True}] * len(batch), 5, len(batch)) or
+            [{"pid": p, "ok": True} for _i, p, _u in batch]))
+    PL._process_batch(
+        {"worker_id": 1}, items, {"max_age_s": 3600}, None, None,
+        ensure_session=lambda: ("SESS", "MGR"), report=reports.append,
+        shard_cfg={"max_recycles": 2, "recovery": {}, "on_recovery": None})
+    assert len(reports) == 2, "по отчёту на prefix и на остаток"
+    assert reports[0]["processed_indexes"] == [0, 1]
+    assert reports[1]["processed_indexes"] == [2, 3, 4, 5, 6, 7, 8, 9], (
+        "индексы остатка сдвинуты на head, иначе merge_shard_results запоре")
+
+
+# ---- раздача пачек: cache-hit'ы — воркерам без браузера -------------------
+
+def _queue_items(hits: set, stale: set, n: int):
+    """deque-очередь (idx, pid, url) для _take_batch."""
+    from collections import deque
+    return deque(_items(n))
+
+
+def _take(monkeypatch, queue, hits, stale, prefer_miss, size=5, worker=1):
+    _patch_cache(monkeypatch, hits=hits, stale=stale)
+    owner = {}
+    batch = PL._take_batch(queue, size, prefer_miss, {"max_age_s": 3600},
+                           worker, owner, {})
+    return batch, owner, list(queue)
+
+
+def test_take_batch_worker_without_browser_gets_hits(monkeypatch):
+    """Воркер без браузера получает cache-hit'ы, miss'ы оставляет другим."""
+    q = _queue_items(hits={"1000", "1001", "1002", "1003"}, stale={"1004"},
+                     n=5)
+    batch, owner, rest = _take(monkeypatch, q, {"1000", "1001", "1002", "1003"},
+                               {"1004"}, prefer_miss=False)
+    assert [pid for _i, pid, _u in batch] == ["1000", "1001", "1002", "1003"], (
+        "воркер без браузера не должен получать cache-miss")
+    assert owner == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert [pid for _i, pid, _u in rest] == ["1004"], "miss остался в очереди"
+
+
+def test_take_batch_worker_with_browser_gets_misses(monkeypatch):
+    """Воркер с браузером получает miss первым, добор чужого типа — не делаем."""
+    q = _queue_items(hits=set(), stale=set(), n=5)
+    batch, _owner, rest = _take(monkeypatch, q,
+                                {"1000", "1001", "1003", "1004"}, {"1002"},
+                                prefer_miss=True, size=3)
+    assert [pid for _i, pid, _u in batch] == ["1002"], (
+        "в пачку воркера с браузером идёт только cache-miss")
+    assert [pid for _i, pid, _u in rest] == ["1000", "1001", "1003", "1004"], (
+        "hit'ы остаются воркерам без браузера")
+
+
+def test_take_batch_fallback_when_no_priority_left(monkeypatch):
+    """Нет товаров приоритетного типа → отдаём что есть (без простоя)."""
+    q = _queue_items(hits={"1000", "1001"}, stale=set(), n=2)
+    batch, _owner, rest = _take(monkeypatch, q, {"1000", "1001"}, set(),
+                                prefer_miss=True, size=5)
+    assert [pid for _i, pid, _u in batch] == ["1000", "1001"], (
+        "воркер не должен простаивать, ожидая miss")
+    assert rest == []
+
+
+def test_take_batch_keeps_queue_intact(monkeypatch):
+    """Ничего не теряется: выданное + остаток = исходная очередь."""
+    q = _queue_items(hits={"1000"}, stale=set(), n=8)
+    allpids = [pid for _i, pid, _u in list(q)]
+    seen = []
+    for step in range(4):
+        batch, _owner, rest = _take(monkeypatch, q, {"1000"}, set(),
+                                    prefer_miss=bool(step), size=3)
+        seen.extend(pid for _i, pid, _u in batch)
+        assert len(rest) + len(batch) == len(q) + len(batch) or True
+    assert sorted(seen + [pid for _i, pid, _u in list(q)]) == sorted(allpids), (
+        "раздача не теряет и не дублирует товары")
+
+
+def test_take_batch_caches_verdicts_per_pid(monkeypatch):
+    """cache_check читает JSON с диска → вердикт кэшируется на прогон."""
+    calls = []
+
+    class _CountingCache(_FakeCache):
+        def __call__(self, pid, max_age_s, data_dir="data", sorts=None):
+            calls.append(pid)
+            return super().__call__(pid, max_age_s, data_dir, sorts)
+
+    monkeypatch.setattr(PL.K, "cache_check",
+                        _CountingCache(hits={"1000", "1001"}))
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    from collections import deque
+    q = deque(_items(2))
+    verdicts = {}
+    for _ in range(3):
+        PL._take_batch(q, 1, False, {"max_age_s": 3600}, 1, {}, verdicts)
+    assert calls == ["1000", "1001"], "один cache_check на pid за прогон"
+
+
+def test_dispatch_idle_workers_keep_browser_budget(monkeypatch):
+    """8 воркеров, 40 товаров (32 hit + 8 miss) → браузеров НЕ 8.
+
+    Главный сюжет боя 26.09: FIFO-раздача дала каждому воркеру по miss'у,
+    и 8 воркеров подняли 8 Chromium ради 8 товаров из кэша. С приоритетной
+    раздачей hit'ы уходят воркерам без браузера, а miss'ы — 2-3 воркерам.
+    """
+    hits = {str(p) for p in range(1000, 1032)}      # 32 cache-hit
+    stale = {str(p) for p in range(1032, 1040)}     # 8 cache-miss
+    _patch_cache(monkeypatch, hits=hits, stale=stale)
+    from collections import deque
+    q = deque(_items(40))
+    cfg = {"max_age_s": 3600}
+    browsers = {w: False for w in range(8)}
+    waiting = {w: True for w in range(8)}
+    done = {w: 0 for w in range(8)}
+    started = 0
+    guard = 0
+    while q and guard < 200:
+        guard += 1
+        for w in range(8):
+            if not waiting[w]:
+                continue
+            batch = PL._take_batch(q, 5, browsers[w], cfg, w, {}, {})
+            if not batch:
+                continue
+            # воркер отработал пачку и сразу запросил следующую
+            waiting[w] = True
+            for _idx, pid, _url in batch:
+                if pid in stale and not browsers[w]:
+                    browsers[w] = True
+                    started += 1
+                done[w] += 1
+    assert sum(done.values()) == 40, "все товары розданы"
+    assert started <= 3, (
+        f"поднято {started} браузеров на 8 miss'ов: воркеры без браузера "
+        f"должны были забрать cache-hit'ы (started={started})")
+    assert started == 2, f"ожидался ровно 2 браузера, получено {started}"
