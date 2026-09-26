@@ -127,12 +127,32 @@ def test_launcher_name_platform():
 
 
 def test_ps1_refuses_busy_port_before_start():
-    """Порт уже отвечает -> отказ, иначе ложный OK от чужого Chromium."""
+    """Порт занят -> отказ ДО CreateProcess, иначе ложный OK и тихий уход в [::1].
+
+    Гейт ловит ЛЮБОГО слушателя порта (Get-NetTCPConnection), а не только
+    HTTP-ответ /json/version: в бою порт держал посторонний процесс, /json/version
+    молчал, гейт считал порт свободным, а Chrome поднял DevTools на [::1] и стал
+    невидим для коллектора (он ходит на 127.0.0.1).
+    """
     ps1 = _text(PS1)
-    assert "LAUNCHER-WARN: port $Port ALREADY responds before start" in ps1
-    assert "aborted - otherwise a foreign process fakes success" in ps1
+    assert "port $Port is NOT free" in ps1
+    assert "Get-NetTCPConnection -State Listen -LocalPort $Port" in ps1
+    assert "refusing to start" in ps1
     # гейт стоит ДО создания процесса, иначе смысла нет
-    assert ps1.index("ALREADY responds") < ps1.index("[ChromeLaunch]::Launch")
+    assert ps1.index("is NOT free") < ps1.index("[ChromeLaunch]::Launch")
+
+
+def test_ps1_explains_ipv6_escape():
+    """Причина отказа объяснена: Chrome ушёл бы в [::1] и стал невидим."""
+    ps1 = _text(PS1)
+    assert "Chrome would bind [::1] instead" in ps1
+
+
+def test_ps1_reports_port_listener_on_failure():
+    """В блоке неудачи видно, кто слушает порт: уводит диагностику не туда."""
+    ps1 = _text(PS1)
+    assert "port $Port IS LISTENING by pid=" in ps1
+    assert "port $Port is free - Chromium died for another reason" in ps1
 
 
 def test_ps1_fails_loudly_when_cdp_never_comes_up():

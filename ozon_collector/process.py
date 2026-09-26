@@ -1250,6 +1250,24 @@ def wait_exit(identity: ProcessIdentity, wait_s: float = 3.0) -> bool:
     return _linux_wait_exit(identity, wait_s)
 
 
+def kill_identities(identities, wait_s: float = 3.0) -> list[int]:
+    """Завершить процессы по чистым identity (best-effort, с проверкой PID-reuse).
+
+    kill_records работает по ProcessRecord (реестр созданного нами браузера).
+    Здесь — найденные ДО запуска держатели профиля: у них нет записи, но
+    identity (pid + start_key) получена тем же способом, поэтому проверка
+    «процесс всё ещё тот же» та же самая. Возвращает pid реально завершённых.
+    """
+    gone: list[int] = []
+    for ident in identities:
+        if not identity_alive(ident):
+            continue
+        if (_win_kill(ident, wait_s) if os.name == "nt"
+                else _linux_kill(ident, wait_s)):
+            gone.append(ident.pid)
+    return gone
+
+
 def kill_records(records, wait_s: float = 3.0) -> list[ProcessRecord]:
     """Best-effort завершение процессов записей records (только наших).
 

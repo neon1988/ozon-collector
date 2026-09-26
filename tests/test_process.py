@@ -235,6 +235,31 @@ def test_kill_records_already_dead_mark_verified():
     assert rec.lifecycle == P.Lifecycle.VERIFIED_DEAD
 
 
+# ---- kill_identities (свободный профиль) -----------------------------------
+
+def test_kill_identities_kills_and_reports_pid():
+    proc = _spawn_sleeper()
+    try:
+        ident = P.process_identity(proc.pid)
+        assert ident is not None
+        assert P.kill_identities([ident], wait_s=5) == [proc.pid]
+        assert P.identity_alive(ident) is False
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_kill_identities_skips_dead():
+    """Мёртвый (или переиспользованный pid с чужим start_key) — не трогаем."""
+    assert P.kill_identities(
+        [P.ProcessIdentity(pid=999999999, start_key="x")], wait_s=0.2) == []
+
+
+def test_kill_identities_empty():
+    assert P.kill_identities([], wait_s=0.2) == []
+
+
 # ---- Linux-only: pidfd exit detection (non-child) --------------------------
 
 @pytest.mark.skipif(not IS_POSIX, reason="pidfd доступен только на Linux")

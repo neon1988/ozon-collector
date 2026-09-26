@@ -57,6 +57,99 @@ class TestLaunchAndWait:
             assert "launch_chrome" in str(e.value)
 
 
+class TestFreeStaleProfile:
+    """Освобождение профиля, который держит нерабочий экземпляр браузера."""
+
+    def _install(self, monkeypatch, procs=None, killed=None, marker=True,
+                 raises=None):
+        """procs — что вернёт browser_processes; killed — что вернёт kill."""
+        def fake_procs(cdp_url, profile_token=None):
+            if raises is not None:
+                raise raises
+            return list(procs or [])
+
+        m_kill = mock.Mock(return_value=list(killed or []))
+        monkeypatch.setattr(cdp.P, "browser_processes", fake_procs)
+        monkeypatch.setattr(cdp.P, "kill_identities", m_kill)
+        monkeypatch.setattr(cdp, "_launch_marker", lambda p: marker)
+        return m_kill
+
+    def test_no_holders_is_noop(self, monkeypatch):
+        m_kill = self._install(monkeypatch)
+        assert cdp._free_stale_profile("http://127.0.0.1:9222", "ozon-profile") == []
+        m_kill.assert_not_called()
+
+    def test_our_profile_holder_is_killed(self, monkeypatch):
+        holders = [cdp.P.ProcessIdentity(pid=111, start_key="k1"),
+                   cdp.P.ProcessIdentity(pid=222, start_key="k2")]
+        m_kill = self._install(monkeypatch, procs=holders, killed=[111, 222])
+        freed = cdp._free_stale_profile("http://127.0.0.1:9222", "ozon-profile")
+        assert freed == [111, 222]
+        m_kill.assert_called_once_with(holders)
+
+    def test_foreign_profile_untouched(self, monkeypatch):
+        """Без маркера запуска профиль считается чужим — окно не рвём."""
+        holders = [cdp.P.ProcessIdentity(pid=333, start_key="k3")]
+        m_kill = self._install(monkeypatch, procs=holders, killed=[333],
+                              marker=False)
+        assert cdp._free_stale_profile("http://127.0.0.1:9222", "ozon-profile") == []
+        m_kill.assert_not_called()
+
+    def test_listing_error_is_not_fatal(self, monkeypatch):
+        m_kill = self._install(monkeypatch, raises=RuntimeError("WMI down"))
+        assert cdp._free_stale_profile("http://127.0.0.1:9222", "ozon-profile") == []
+        m_kill.assert_not_called()
+
+
+class TestLaunchAndWaitRetry:
+    """Необратимый сценарий: профиль держит мёртвый-по-CDP экземпляр."""
+
+    def _install(self, alive_seq, freed):
+        """Возвращает (patcher_launch, mock_free) — вход в ExitStack."""
+        p_alive, p_launch, p_popen = _patch_alive(alive_seq)
+        m_free = mock.Mock(return_value=freed)
+        return p_alive, p_launch, p_popen, m_free
+
+    def test_retries_after_freeing_profile(self, monkeypatch):
+        # alive: мёртв на старте, мёртв в цикле 1-й попытки, жив во 2-й
+        p_alive, p_launch, p_popen, m_free = self._install([False, False, True],
+                                                           [4242])
+        with ExitStack() as s:
+            m = s.enter_context(p_launch)
+            for p in (p_alive, p_popen):
+                s.enter_context(p)
+            monkeypatch.setattr(cdp, "_free_stale_profile", m_free)
+            assert cdp.launch_and_wait("http://127.0.0.1:9999", wait_s=5) is True
+            assert m.call_count == 2, "профиль освободили — запускаемся заново"
+
+    def test_no_retry_when_nothing_to_free(self, monkeypatch):
+        with ExitStack() as s:
+            p_alive, p_launch, p_popen = _patch_alive([False])
+            m = s.enter_context(p_launch)
+            for p in (p_alive, p_popen):
+                s.enter_context(p)
+            m_free = s.enter_context(
+                mock.patch.object(cdp, "_free_stale_profile", return_value=[]))
+            with pytest.raises(RuntimeError) as e:
+                cdp.launch_and_wait("http://127.0.0.1:9999", wait_s=0.1)
+            assert m.call_count == 1
+            m_free.assert_called_once()
+            assert "профиль свободен" in str(e.value)
+
+    def test_error_reports_freed_pids(self, monkeypatch):
+        with ExitStack() as s:
+            p_alive, p_launch, p_popen = _patch_alive([False])
+            m = s.enter_context(p_launch)
+            for p in (p_alive, p_popen):
+                s.enter_context(p)
+            s.enter_context(mock.patch.object(cdp, "_free_stale_profile",
+                                              return_value=[777]))
+            with pytest.raises(RuntimeError) as e:
+                cdp.launch_and_wait("http://127.0.0.1:9999", wait_s=0.1)
+            assert m.call_count == 2, "освободили профиль — вторая попытка"
+            assert "освобождён от pid=[777]" in str(e.value)
+
+
 @pytest.mark.allow_browser_launch
 class TestLaunchBrowser:
     def test_port_from_url(self, monkeypatch):

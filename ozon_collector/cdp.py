@@ -282,6 +282,58 @@ def _launcher_tail_after_grace(path, grace_s: float = 3.0,
     return tail
 
 
+def _await_browser(cdp_url: str, run: LaunchRun, deadline: float) -> bool:
+    """Ждать готовности CDP до deadline. False — не дождались.
+
+    Отдельный хелпер, потому что попытка запуска может повторяться (см.
+    _free_stale_profile): тело цикла и fail-fast на умершем лаунчере должны
+    быть одними и теми же.
+    """
+    while time.monotonic() < deadline:
+        if browser_alive(cdp_url):
+            return True
+        if run.proc.poll() is not None:
+            # Лаунчер завершился: он уже знает, поднялся браузер или нет
+            # (exit 1 + LAUNCHER-ERROR). Ждать остаток wait_s бессмысленно —
+            # раньше неудачный старт стоил полные 30с на попытку.
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def _free_stale_profile(cdp_url: str, profile_token: str) -> list[int]:
+    """Снять держателей нашего профиля, когда CDP не отвечает. pid завершённых.
+
+    Живой browser-процесс на нашем profile+port, у которого CDP не поднялся, для
+    коллектора бесполезен: следующий Chrome уйдёт в него (профиль занят) и сразу
+    умрёт — ровно тот «EXITED, CDP never came up», что наблюдался вживую: порт в
+    момент старта держателя был занят, DevTools не поднялся, а профиль остался
+    захваченным навсегда, три ретрая подряд.
+
+    Убиваем ТОЛЬКО наш профиль: токен в --user-data-dir + маркер запуска
+    .ozon_collector_launched (ручное окно пользователя не трогаем). Вызывается
+    только после неудачного запуска, когда browser_alive == False.
+    """
+    try:
+        holders = P.browser_processes(cdp_url, profile_token=profile_token)
+    except Exception as e:                       # перечисление не критично
+        log.warning("[cdp] не удалось перечислить процессы профиля "
+                    f"{profile_token!r}: {type(e).__name__}: {e}")
+        return []
+    if not holders:
+        return []
+    if not _launch_marker(P.profile_path(profile_token)):
+        log.warning(f"[cdp] профиль {profile_token!r} занят посторонним "
+                    f"браузером (pid={[h.pid for h in holders]}), маркера "
+                    f"запуска нет — чужое окно не трогаю")
+        return []
+    pids = [h.pid for h in holders]
+    freed = P.kill_identities(holders)
+    log.warning(f"[cdp] профиль {profile_token!r} держал нерабочий браузер "
+                f"(CDP не отвечает): снят pid={pids} -> освобождён={freed}")
+    return freed
+
+
 def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
                     wait_s: float = 30.0,
                     profile_token: str | None = None) -> bool:
@@ -290,6 +342,10 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
     Возвращает True, если браузер жив после ожидания (запущен нами или уже был).
     При недоступности — RuntimeError с подсказкой ручного запуска.
     profile_token — токен профиля воркера (None = дефолтный профиль).
+
+    Одна попытка доводится до конца: если запуск упал, а профиль при этом
+    держал нерабочий экземпляр — снимаем его и пробуем ещё раз (иначе падение
+    необратимо, т.к. каждый следующий запуск умирает о тот же профиль).
     """
     if browser_alive(cdp_url):
         return True
@@ -298,43 +354,47 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
     profile_path = None
     if profile_token:
         profile_path = P.profile_path(profile_token)
+    token = profile_token or P.PROFILE_TOKEN
     run = _launch_browser(cdp_url, profile_path=profile_path,
                           profile_token=profile_token)
     logf = run.path
-    deadline = time.monotonic() + wait_s
+    ok = _await_browser(cdp_url, run, time.monotonic() + wait_s)
+    freed: list[int] = []
+    if not ok:
+        freed = _free_stale_profile(cdp_url, token)
+        if freed:
+            run = _launch_browser(cdp_url, profile_path=profile_path,
+                                  profile_token=profile_token)
+            ok = _await_browser(cdp_url, run, time.monotonic() + wait_s)
     try:
-        while time.monotonic() < deadline:
-            if browser_alive(cdp_url):
-                return True
-            if run.proc.poll() is not None:
-                # Лаунчер завершился: он уже знает, поднялся браузер или нет
-                # (exit 1 + LAUNCHER-ERROR). Ждать остаток wait_s бессмысленно —
-                # раньше неудачный старт стоил полные 30с на попытку.
-                break
-            time.sleep(0.5)
-        # Подсказка — платформенная (DISPLAY значим только для X-сервера),
-        # плюс фактический вывод лаунчера: иначе «не поднялся за 30с» без
-        # причины (ревизия 2.9: так и не увидели обнулённый launch_chrome.ps1).
-        if os.name == "nt":
-            hint = (r"проверьте Chromium и профиль (частая причина: профиль "
-                    r"уже открыт другим Chrome, либо порт занят старым), либо "
-                    r"запустите вручную: powershell -ExecutionPolicy Bypass "
-                    r"-File scripts\launch_chrome.ps1")
-        else:
-            hint = ("проверьте DISPLAY/Xvfb и Chromium, либо запустите вручную: "
-                    "sh scripts/launch_chrome.sh")
-        code = run.proc.poll()
-        exit_note = ("лаунчер ещё работает" if code is None
-                     else f"код возврата лаунчера={code}")
-        raise RuntimeError(
-            f"CDP-браузер не поднялся за {wait_s:.0f}с на {cdp_url} "
-            f"({exit_note}); {hint}"
-            + f"\nвывод {_launch_script_name()} ({logf}):"
-            + _launcher_tail_after_grace(logf))
+        if not ok:
+            # Подсказка — платформенная (DISPLAY значим только для X-сервера),
+            # плюс фактический вывод лаунчера: иначе «не поднялся за 30с» без
+            # причины (ревизия 2.9: так и не увидели обнулённый launch_chrome.ps1).
+            if os.name == "nt":
+                hint = (r"проверьте Chromium и профиль (частая причина: профиль "
+                        r"уже открыт другим Chrome, либо порт занят старым), либо "
+                        r"запустите вручную: powershell -ExecutionPolicy Bypass "
+                        r"-File scripts\launch_chrome.ps1")
+            else:
+                hint = ("проверьте DISPLAY/Xvfb и Chromium, либо запустите вручную: "
+                        "sh scripts/launch_chrome.sh")
+            code = run.proc.poll()
+            exit_note = ("лаунчер ещё работает" if code is None
+                         else f"код возврата лаунчера={code}")
+            freed_note = (f"; профиль освобождён от pid={freed}" if freed
+                          else "; профиль свободен по нашим процессам — "
+                               "виновник вне коллектора")
+            raise RuntimeError(
+                f"CDP-браузер не поднялся за {wait_s:.0f}с на {cdp_url} "
+                f"({exit_note}); {hint}{freed_note}"
+                + f"\nвывод {_launch_script_name()} ({logf}):"
+                + _launcher_tail_after_grace(logf))
     finally:
         # лог не удаляем намеренно: после неудачи это улика, путь известен
         # (_LL.launcher_log_path) и печатается в тексте ошибки выше
         pass
+    return True
 
 
 class Session:

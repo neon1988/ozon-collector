@@ -154,19 +154,30 @@ public class ChromeLaunch {
 }
 "@
 
-# --- Гейт: порт уже отвечает ДО запуска -----------------------------------
-# Чужой/старый Chromium на этом порту даёт ложный "OK": /json/version отвечает,
-# но это не наш браузер, а наш PID умирает (профиль уже открыт другим
-# экземпляром и Chromium уходит в него). Лучше явный отказ, чем тихий обман.
-$portBusy = $false
+# --- Гейт: порт ДОЛЖЕН быть полностью свободен ------------------------------
+# Проверяем НЕ ТОЛЬКО HTTP-ответ /json/version, но и сам TCP-listener. Ловушка,
+# найденная в бою: порт был занят посторонним процессом, /json/version не
+# отвечал (гейт считал порт свободным), Chrome стартовал, НО не смог привязать
+# DevTools к 127.0.0.1 и тихо ушёл в [::1] — CDP там живой, но коллектор
+# (который ходит на 127.0.0.1) «не видит» браузера, запускает новый, а тот
+# умирает о занятый профиль. Три ретрая в никуда вместо одного честного отказа.
+# Плюс чужой/старый Chromium на этом порту даёт ложный "OK" на /json/version.
+$listener = $null
+try {
+    $listener = Get-NetTCPConnection -State Listen -LocalPort $Port `
+                  -ErrorAction Stop | Select-Object -First 1
+} catch { }
+$httpBusy = $false
 try {
     $null = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
-    $portBusy = $true
+    $httpBusy = $true
 } catch { }
-if ($portBusy) {
-    Write-Host "LAUNCHER-WARN: port $Port ALREADY responds before start (stale Chromium?)" -ForegroundColor Yellow
-    Write-Host "LAUNCHER-WARN: chrome=$Chrome profile=$Profile" -ForegroundColor Yellow
-    Write-Host "LAUNCHER-ERROR: aborted - otherwise a foreign process fakes success" -ForegroundColor Red
+if ($listener -or $httpBusy) {
+    $lp = if ($listener) { $listener.OwningProcess } else { "?" }
+    $lname = try { (Get-Process -Id $lp -ErrorAction Stop).ProcessName } catch { "?" }
+    Write-Host "LAUNCHER-ERROR: port $Port is NOT free (listener pid=$lp $lname, /json/version responds=$httpBusy) - refusing to start" -ForegroundColor Red
+    Write-Host "LAUNCHER-ERROR: Chrome would bind [::1] instead and go invisible to CDP on 127.0.0.1" -ForegroundColor Red
+    Write-Host "LAUNCHER-ERROR: chrome=$Chrome profile=$Profile" -ForegroundColor Red
     exit 1
 }
 
@@ -324,11 +335,26 @@ $proxyNote = if ($Proxy) {
 # едет через кодировку консоли и в логе нечитаема.
 if (-not $ready) {
     $alive = $null -ne (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)
+    # Кто слушает порт СЕЙЧАС: разделяем «порт занят чужим» (наш Chrome не смог
+    # привязать DevTools) и «порт свободен» (профиль захвачен другим
+    # экземпляром — наш pid умер, уйдя в него). Раньше обе причины выглядели
+    # одинаково («EXITED, CDP never came up») и диагностика уводила не туда.
+    $listenerPid = $null
+    try {
+        $listenerPid = (Get-NetTCPConnection -State Listen -LocalPort $Port `
+                       -ErrorAction SilentlyContinue |
+                       Select-Object -First 1).OwningProcess
+    } catch { }
     if ($alive) {
         Write-Host "LAUNCHER-ERROR: Chromium pid=$targetPid is ALIVE but http://127.0.0.1:$Port/json/version is silent" -ForegroundColor Red
         Write-Host "LAUNCHER-ERROR: port $Port taken by another process? chrome=$Chrome profile=$Profile" -ForegroundColor Red
     } else {
         Write-Host "LAUNCHER-ERROR: Chromium pid=$targetPid EXITED, CDP never came up on port $Port" -ForegroundColor Red
+        if ($listenerPid) {
+            Write-Host "LAUNCHER-ERROR: port $Port IS LISTENING by pid=$listenerPid (not CDP) - our Chromium could not bind DevTools" -ForegroundColor Red
+        } else {
+            Write-Host "LAUNCHER-ERROR: port $Port is free - Chromium died for another reason (profile captured by a live instance is the usual one)" -ForegroundColor Red
+        }
         Write-Host "LAUNCHER-ERROR: profile already open in another Chrome? profile=$Profile" -ForegroundColor Red
         Write-Host "LAUNCHER-ERROR: need own profile per campaign (--user-data-dir) and a free port" -ForegroundColor Red
     }
