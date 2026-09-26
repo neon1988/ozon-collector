@@ -445,7 +445,7 @@ def test_preflight_keeps_geckodriver_with_live_our_firefox(monkeypatch):
 # ---- worker-макет (spawn) -------------------------------------------------------
 
 def _spawn_workers(specs, items, monkeypatch, tmp_path, scenario,
-                   timeout=60):
+                   timeout=60, gather_cfg=None):
     monkeypatch.setenv("OZON_PROFILE_BASE", str(tmp_path))
     monkeypatch.setenv("OZON_WORKER_DOUBLES", "1")
     monkeypatch.setenv("OZON_WORKER_TEST_SCENARIO", scenario)
@@ -453,7 +453,7 @@ def _spawn_workers(specs, items, monkeypatch, tmp_path, scenario,
     shards = PL.shard_items(items, len(specs))
     wctxs = []
     for k, spec in enumerate(specs, 1):
-        task = {"items": [], "gather_cfg": {},
+        task = {"items": [], "gather_cfg": dict(gather_cfg or {}),
                 "max_recycles": 2, "scroll_jitter_seed": 1}
         wctxs.append(PL._spawn_ctx(spec, task))
     # Диспетчер динамической пакетной раздачи (тестовый макет _await_workers):

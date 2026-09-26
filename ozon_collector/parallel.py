@@ -293,6 +293,12 @@ class WorkerContext:
         # completed_indexes. Отдельная очередь — чтобы не было гонки reader
         # thread ↔ основной цикл по модификации общих completed_indexes.
         self.batch_completed: list[int] = []
+        # Ленивый запуск браузера (контракт «не поднимать окно раньше, чем
+        # понадобятся данные со страницы»): счётчик warmup-событий воркера.
+        # 0 = браузер не поднимался (все пачки из кэша), 1 = поднят один раз
+        # и переиспользуется. Наполняется reader-потоком из {t:"warmup"}.
+        self.browsers_started: int = 0
+        self.warmups: list[dict] = []
 
     @property
     def worker_idx(self) -> int:
@@ -319,6 +325,10 @@ def _reader_loop(wctx: WorkerContext, on_event=None):
                 _update_pending(wctx)
             elif t == "task_request":
                 wctx.waiting_for_batch = True
+            elif t == "warmup":
+                # Воркер реально поднял браузер (Session → launch_and_wait).
+                wctx.browsers_started += 1
+                wctx.warmups.append(msg)
             elif t == "done_batch":
                 pl = msg.get("payload") or {}
                 wctx.payload = pl
