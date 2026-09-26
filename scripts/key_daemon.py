@@ -100,6 +100,13 @@ CHALLENGE_PARTIAL_PAUSE_S = 20
 # т.к. это временные сбои subprocess, а не устойчивый кризис счётчика.
 TRANSIENT_RETRY_BACKOFF_S = 4
 QA_BATCH_SIZE = 100
+# Инкрементальный чекпоинт прогона (2026-09-26). Манифест пишется только на
+# границах прогона, а прогон с 8 воркерами идёт часами: падение демона теряло
+# весь собранный прогресс, resume начинал с нуля (живой случай fonari_ 1ч20м
+# прогресс = 336 pid, в манифесте 0). Чекпоинт пишет inflight.json и НЕ трогает
+# progress.json — иначе гонка с главным потоком. 0 = выключить (тесты).
+CHECKPOINT_EVERY_S = int(os.environ.get("KD_CHECKPOINT_EVERY", "60") or 60)
+INFLIGHT_NAME = "inflight.json"
 TERMINAL_STATES = {"COMPLETED", "COMPLETED_MIN", "ABANDONED", "NEEDS_ATTENTION",
                    "INTERRUPTED"}
 OK_VERDICTS = {"OK", "WARN"}
@@ -280,6 +287,30 @@ def has_raw(data_dir: str, pid: str) -> bool:
     return (Path(data_dir) / raw_pid_name(pid)).is_file()
 
 
+def raw_pids_since(data_dir: str, since_ts: float) -> list[str]:
+    """Каноничные pid, чей raw появился/обновился не раньше since_ts.
+
+    Источник истины тот же, что у has_raw, — canonical raw на диске. Бэкапы
+    ({pid}_raw.<stamp>.N.json) и мусор (gallery_*, не цифра) отсекаются
+    префиксом `isdigit`, поэтому регекс не нужен. since_ts <= 0 → все pid.
+    """
+    d = Path(data_dir)
+    if not d.is_dir():
+        return []
+    out = []
+    try:
+        for f in d.glob("*_raw.json"):
+            pid = f.name[: -len("_raw.json")]
+            if not pid.isdigit():
+                continue
+            if since_ts and f.stat().st_mtime < since_ts:
+                continue
+            out.append(pid)
+    except OSError:
+        return []
+    return normalize_pids(out)
+
+
 def _raw_mtime(data_dir: str, pid: str) -> Optional[float]:
     """st_mtime (float, секунды) canonical raw, или None если файла нет."""
     try:
@@ -455,6 +486,114 @@ def save_json(path, data) -> None:
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def _start_checkpoint(camp_dir, data_dir: str, every_s: float,
+                      campaign: Optional[str] = None) -> dict:
+    """Фоновый чекпоинт прогресса на время блокирующего сбора.
+
+    Живёт в отдельном потоке и пишет ТОЛЬКО свой снапшот inflight.json —
+    progress.json остаётся собственностью главного потока (иначе read-modify-
+    write гонка: главный поток мутирует манифест в сотнях мест). Снапшот
+    мержится в манифест на границе прогона и при следующем старте демона
+    (resume), поэтому падение не обнуляет часы работы.
+
+    Вердикты/QA здесь НЕ делаются (это спавн qa_raw на сотни pid каждые 60с):
+    у восстановленного pid есть canonical raw, поэтому вердикт и valid
+    пересчитаются в classify_new_pids без браузера.
+
+    handle: {"path", "thread", "pids", "stop"} — pids для лога/тестов.
+    """
+    path = Path(camp_dir) / INFLIGHT_NAME
+    handle = {"path": path, "thread": None, "pids": [], "stop": None,
+              "error": None}
+    if not every_s or every_s <= 0:
+        return handle
+
+    stop = threading.Event()
+    handle["stop"] = stop
+    since = time.time()
+    seen: set[str] = set()
+
+    def _loop() -> None:
+        while not stop.wait(every_s):
+            try:
+                fresh = [p for p in raw_pids_since(data_dir, since)
+                         if p not in seen]
+                if not fresh:
+                    continue
+                seen.update(fresh)
+                handle["pids"] = normalize_pids(handle["pids"] + fresh)
+                save_json(path, {
+                    "campaign": campaign, "since": since,
+                    "checkpoint_at": now_utc_iso(), "pids": handle["pids"],
+                })
+                log.info(f"[checkpoint] raw на диске: +{len(fresh)} pid "
+                         f"(в inflight {len(handle['pids'])})")
+            except Exception as exc:  # чекпоинт не имеет права убить демон
+                handle["error"] = repr(exc)
+                log.warning(f"[checkpoint] сбой (продолжаю без чекпоинта): {exc}")
+
+    t = threading.Thread(target=_loop, name="kd-checkpoint", daemon=True)
+    t.start()
+    handle["thread"] = t
+    return handle
+
+
+def stop_checkpoint(handle: dict) -> None:
+    """Остановить чекпоинт и дождаться конца итерации (best-effort)."""
+    if not handle:
+        return
+    stop = handle.get("stop")
+    if stop is not None:
+        stop.set()
+    t = handle.get("thread")
+    if t is not None and t.is_alive():
+        t.join(timeout=5.0)
+
+
+def _merge_inflight(progress: dict, path) -> list[str]:
+    """Влить pid из inflight.json в discovered_pids манифеста.
+
+    Возвращает pid, которых раньше в манифесте не было. Без файла/битого
+    файла — no-op: потеря чекпоинта не должна ломать демон (манифест —
+    источник истины).
+    """
+    snap = load_json(path)
+    if not snap:
+        return []
+    pids = normalize_pids(snap.get("pids") or [])
+    if not pids:
+        return []
+    known = set(progress.get("discovered_pids", []))
+    fresh = [p for p in pids if p not in known]
+    if fresh:
+        progress["discovered_pids"] = normalize_pids(
+            list(progress.get("discovered_pids", [])) + fresh)
+    return fresh
+
+
+def _reconcile_inflight(progress: dict, path, data_dir: str,
+                        qa_fn: Optional[Callable[[list[str]], dict]] = None,
+                        ctx: str = "") -> list[str]:
+    """Влить inflight.json в манифест И сразу поставить pid вердикты.
+
+    Просто добавить pid в discovered НЕЛЬЗЯ: следующий прогон внесёт его в
+    skip_pids, но ни в valid, ни в failed он не попадёт — вердикт ставит
+    classify_new_pids по ok_pids прогона, а не по discovered. Товар зависнет
+    «известным, но невалидным» навсегда, и цель кампании недостижима. Поэтому
+    новые pid сразу получают QA: браузер не нужен, canonical raw уже на диске.
+    """
+    fresh = _merge_inflight(progress, path)
+    if not fresh:
+        return []
+    checked = classify_new_pids(progress, fresh, qa_fn=qa_fn)
+    if checked.get("parse_error"):
+        log.error(f"{ctx} inflight: QA-сводка недостоверна — вердикты не "
+                  f"применены ({len(fresh)} pid ждут следующего цикла)")
+        return fresh
+    reconcile_validity(progress, checked, data_dir)
+    return fresh
 
 
 def parse_qa_stdout(stdout: str) -> dict:
@@ -1508,6 +1647,16 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         _set_state(progress, "STARTING", "DAEMON_STARTED",
                    fresh=fresh, target=target)
         _recover_interrupted_run(progress, data_dir, qa_fn=qa_fn)
+        # Resume после падения: pid, собранные ПОСЛЕ последнего сохранения
+        # манифеста, лежат в inflight.json (чекпоинт пишет их во время
+        # прогона). Возвращаем в discovered — иначе те же товары собираются
+        # заново (часы браузерного времени впустую).
+        _recovered = _reconcile_inflight(progress, camp_dir / INFLIGHT_NAME,
+                                        data_dir, qa_fn=qa_fn, ctx="resume:")
+        if _recovered:
+            log.warning(f"resume: восстановлено {len(_recovered)} pid из "
+                        f"{INFLIGHT_NAME} (манифест их не видел)")
+            _emit_event(progress, "INFLIGHT_RECOVERED", pids=len(_recovered))
         save_json(progress_path, progress)
 
         while True:
@@ -1641,6 +1790,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             _journal_stage(progress, run_id, "run_started")
 
             log.info(f"[{run_id}] in-process сбор ({mode}) старт")
+            checkpoint = _start_checkpoint(
+                camp_dir, data_dir, CHECKPOINT_EVERY_S, campaign=campaign)
             try:
                 combined = _inproc_collect(progress, run_id, mode, targets)
                 exit_code = 0
@@ -1681,6 +1832,17 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 # транзиентные ретраи → NEEDS_ATTENTION, а не тихий ABANDONED.
                 combined = {"products": [], "found": 0, "inproc_crash": str(exc)}
                 exit_code = 1
+            finally:
+                stop_checkpoint(checkpoint)
+            # Граница прогона: вливаем pid, накопленные чекпоинтом. Нужно ДО
+            # подсчёта new_disc/new_valid и до save_json, иначе товары,
+            # собранные в последние минуты прогона (или упавшей веткой:
+            # UNKNOWN_FAILURE/CHALLENGE_STORM с пустым combined), не попадут
+            # в манифест и следующий прогон соберёт их заново.
+            _late = _reconcile_inflight(progress, camp_dir / INFLIGHT_NAME,
+                                        data_dir, qa_fn=qa_fn, ctx=f"[{run_id}]")
+            if _late:
+                log.info(f"[{run_id}] inflight → discovered: +{len(_late)} pid")
 
             status = classify_status(exit_code, combined)
             _journal_stage(progress, run_id, "run_completed",

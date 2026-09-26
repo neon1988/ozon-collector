@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import threading
+import time
 from datetime import datetime
 
 import pytest
@@ -4132,3 +4133,150 @@ class TestEmptySearchStatus:
     def test_classify_no_recovery_key_is_normal(self):
         assert k.classify_status(0, {"found": 0, "products": []}) == \
             "NORMAL_DONE"
+
+# --- инкрементальный чекпоинт прогона: inflight.json (P0 fonari_ 2026-09-26) ---
+
+def _qa_all_ok(batch):
+    return _make_qa(products=len(batch), ok=len(batch), warn=0, fail=0,
+                    per_pid={p: "OK" for p in batch})
+
+
+def test_raw_pids_since_ignores_backups_and_junk(tmp_path):
+    now = time.time()
+    old = tmp_path / "333_raw.json"
+    old.write_text("{}", encoding="utf-8")
+    os.utime(old, (now - 500, now - 500))
+    (tmp_path / "111_raw.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "222_raw.20260926-1.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "gallery_123").write_text("x", encoding="utf-8")
+    assert k.raw_pids_since(str(tmp_path), now - 100) == ["111"]
+    assert sorted(k.raw_pids_since(str(tmp_path), 0)) == ["111", "333"]
+    assert k.raw_pids_since(str(tmp_path / "нет"), 0) == []
+
+
+def test_checkpoint_thread_writes_inflight_and_stop_is_clean(tmp_path):
+    camp = tmp_path / "camp"
+    camp.mkdir()
+    h = k._start_checkpoint(camp, str(tmp_path), 0.05, campaign="c")
+    try:
+        (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+        path = camp / k.INFLIGHT_NAME
+        deadline = time.time() + 5
+        while time.time() < deadline and not path.is_file():
+            time.sleep(0.05)
+        assert path.is_file(), "чекпоинт не записал inflight.json"
+    finally:
+        k.stop_checkpoint(h)
+    assert not h["thread"].is_alive()
+    assert h["error"] is None
+    snap = k.load_json(path)
+    assert snap["pids"] == ["101"]
+    assert snap["campaign"] == "c" and snap["checkpoint_at"]
+    assert not list(camp.glob("*.tmp")), "остался временный файл"
+
+
+def test_checkpoint_disabled_by_zero_interval(tmp_path):
+    camp = tmp_path / "camp"
+    camp.mkdir()
+    h = k._start_checkpoint(camp, str(tmp_path), 0)
+    assert h["thread"] is None
+    assert not (camp / k.INFLIGHT_NAME).exists()
+
+
+def test_checkpoint_survives_scan_error_and_keeps_running(tmp_path, monkeypatch):
+    camp = tmp_path / "camp"
+    camp.mkdir()
+    boom = [True]
+
+    def _boom(*_a, **_kw):
+        if boom[0]:
+            raise OSError("диск умер")
+        return []
+
+    monkeypatch.setattr(k, "raw_pids_since", _boom)
+    h = k._start_checkpoint(camp, str(tmp_path), 0.05, campaign="c")
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and h["error"] is None:
+            time.sleep(0.05)
+        assert h["error"] and "диск умер" in h["error"]
+        assert h["thread"].is_alive(), "чекпоинт умер от своей ошибки"
+    finally:
+        boom[0] = False
+        k.stop_checkpoint(h)
+
+
+def test_reconcile_inflight_promotes_to_valid(tmp_path):
+    camp = tmp_path / "camp"
+    camp.mkdir()
+    for pid in ("101", "102"):
+        (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    k.save_json(camp / k.INFLIGHT_NAME,
+                {"campaign": "c", "pids": ["101", "102"]})
+    prog = _manifest(tmp_path)
+    fresh = k._reconcile_inflight(prog, camp / k.INFLIGHT_NAME,
+                                  str(tmp_path), qa_fn=_qa_all_ok)
+    assert fresh == ["101", "102"]
+    assert prog["discovered_pids"] == ["101", "102"]
+    assert prog["valid_pids"] == ["101", "102"]
+    assert not prog["failed_pids"]
+    assert prog["verdict_meta"]["101"]["verdict"] == "OK"
+
+
+def test_reconcile_inflight_is_idempotent_and_bounded_to_manifest(tmp_path):
+    camp = tmp_path / "camp"
+    camp.mkdir()
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    k.save_json(camp / k.INFLIGHT_NAME, {"pids": ["101"]})
+    prog = _manifest(tmp_path)
+    k._reconcile_inflight(prog, camp / k.INFLIGHT_NAME, str(tmp_path),
+                          qa_fn=_qa_all_ok)
+    calls = []
+    again = k._reconcile_inflight(prog, camp / k.INFLIGHT_NAME, str(tmp_path),
+                                  qa_fn=lambda b: calls.append(b) or {})
+    assert again == [] and not calls, "повторный merge не должен звать QA"
+    assert prog["discovered_pids"] == ["101"]
+
+
+def test_reconcile_inflight_without_file_is_noop(tmp_path):
+    prog = _manifest(tmp_path)
+    assert k._reconcile_inflight(prog, tmp_path / "нет.json", str(tmp_path),
+                                 qa_fn=_qa_all_ok) == []
+    assert prog["discovered_pids"] == []
+
+
+def test_reconcile_inflight_parse_error_keeps_pid_discovered(tmp_path):
+    camp = tmp_path / "camp"
+    camp.mkdir()
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    k.save_json(camp / k.INFLIGHT_NAME, {"pids": ["101"]})
+    prog = _manifest(tmp_path)
+    fresh = k._reconcile_inflight(
+        prog, camp / k.INFLIGHT_NAME, str(tmp_path),
+        qa_fn=lambda b: _make_qa(products=len(b) + 3, ok=0, warn=0, fail=0,
+                                per_pid={}))
+    assert fresh == ["101"]
+    assert prog["discovered_pids"] == ["101"]
+    assert prog["valid_pids"] == [], "недостоверный QA не должен давать valid"
+    assert "101" not in prog["failed_pids"]
+
+
+def test_checkpoint_never_writes_progress_manifest(tmp_path):
+    camp = tmp_path / "camp"
+    camp.mkdir()
+    prog = _manifest(tmp_path)
+    prog["discovered_pids"] = ["999"]
+    k.save_json(camp / "progress.json", prog)
+    h = k._start_checkpoint(camp, str(tmp_path), 0.05, campaign="c")
+    try:
+        (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+        deadline = time.time() + 5
+        target = camp / k.INFLIGHT_NAME
+        while time.time() < deadline and not target.is_file():
+            time.sleep(0.05)
+        time.sleep(0.2)
+        on_disk = k.load_json(camp / "progress.json")
+    finally:
+        k.stop_checkpoint(h)
+    assert on_disk["discovered_pids"] == ["999"]
+    assert h["pids"] == ["101"]
