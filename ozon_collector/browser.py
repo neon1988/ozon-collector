@@ -11,8 +11,11 @@ Recovery-автомата (R1/R2, retry) — в search.py; здесь строи
   unknown          -> no recycle
 
 probe: BROWSER_DEAD / BROWSER_UNHEALTHY / RENDERER_FAILURE / TARGET_LOST /
-       HEALTHY / UNKNOWN. BROWSER_UNHEALTHY (identity жив, но независимый CDP
-       HTTP-проб не отвечает) НЕ считается смертью Chromium — до retries ретраев.
+       HEALTHY / UNKNOWN. BROWSER_DEAD выводится только когда доказуемо нет
+       процесса на (порт, профиль) и нет нашего инстанса в снимке.
+       BROWSER_UNHEALTHY (процесс жив, но независимый CDP HTTP-проб не
+       отвечает, либо владение недоказуемо — external-браузер) НЕ считается
+       смертью Chromium — до retries ретраев.
 """
 from __future__ import annotations
 
@@ -346,6 +349,31 @@ class BrowserProbe:
         except Exception:
             return None
 
+    def os_process_alive(self, cdp_url: str, profile_token: str | None = None,
+                         kind: str | None = None) -> bool:
+        """Жив ли процесс браузера на (порт, профиль) — живой OS-запрос.
+
+        Единственный источник истины для «браузер мёртв»:
+          * снимок `sess.browser_pid` протухает (рестарт manager'ом без reconnect)
+            и его нет у external-браузера / Firefox-private / при гонке перечисления
+            сразу после launch → probe не может отличить смерть от молчания CDP;
+          * CDP HTTP молчит и у ЖИВОГО браузера (transient), поэтому один только
+            HTTP-сигнал death не доказывает (та же логика, что в watchdog).
+
+        fail-safe: не смогли перечислить процессы → считаем живыми, чтобы никогда
+        не объявить смерть по недостоверному сигналу.
+        """
+        token = profile_token or P.PROFILE_TOKEN
+        if (kind or "chrome") == "firefox":
+            try:
+                return bool(P.firefox_browser_processes(token))
+            except Exception:
+                return True
+        try:
+            return bool(P.browser_processes(cdp_url, profile_token=token))
+        except Exception:
+            return True
+
     def page_target_state(self, sess) -> str | None:
         """Состояние target сессии: 'alive' | 'gone' | None (неизвестно)."""
         page = getattr(sess, "page", None)
@@ -368,14 +396,17 @@ class BrowserProbe:
     def probe(self, sess, signature: bool) -> tuple[str, int]:
         """Health probe. Возвращает (ProbeState, http_attempts).
 
-        Идентичность процесса берём из `sess.browser_pid` (так называется
-        поле cdp.Session, где лежит P.ProcessIdentity). `None` = браузер
-        запущен не нами (внешний/чужой) → владение не проверяем, судим
-        только по CDP HTTP: это и есть сигнал живости.
+        Порядок сигналов: снимок процесса (бесплатно) → CDP HTTP → живой
+        OS-запрос. Смерть браузера выводится ТОЛЬКО когда нет процесса на
+        (порт, профиль) И нет нашего инстанса в снимке, то есть когда доказуемо
+        не просто «CDP молчит», а «процесса нет».
+
+        `browser_owner == "external"` (ADR §14.1): профиль не наш, в перечислении
+        его процесса не будет НИКОГДА, поэтому для чужого браузера смерть
+        недоказуема — судим только по молчанию CDP (BROWSER_UNHEALTHY).
         """
         ident = getattr(sess, "browser_pid", None)
-        if ident is not None and not P.identity_alive(ident):
-            return ProbeState.BROWSER_DEAD, 0
+        ident_alive = ident is not None and P.identity_alive(ident)
         attempts = 0
         cdp_ok = False
         for attempt in range(self.retries + 1):
@@ -386,6 +417,18 @@ class BrowserProbe:
             if attempt < self.retries:
                 time.sleep(self.interval)
         if not cdp_ok:
+            owner = getattr(sess, "browser_owner", "collector")
+            if owner != "external" and not ident_alive and not \
+                    self.os_process_alive(sess.cdp_url,
+                                          getattr(sess, "profile_token", None),
+                                          getattr(sess, "kind", "chrome")):
+                log.warning("[probe] CDP молчит и процесса браузера на "
+                            "(порт, профиль) нет → BROWSER_DEAD",
+                            extra={"cdp": sess.cdp_url,
+                                   "snapshot_pid": getattr(ident, "pid", None),
+                                   "owner": owner})
+                return ProbeState.BROWSER_DEAD, attempts
+            # процесс жив (или владение недоказуемо) → CDP-молчание транзиентно
             return ProbeState.BROWSER_UNHEALTHY, attempts
         state = self.page_target_state(sess)
         if state == "gone":
@@ -558,13 +601,19 @@ class BrowserWatchdog:
 
         Firefox (kind='firefox'): CDP HTTP не существует — живость = есть ли
         firefox-процесс на нашем профиле (geckodriver/Selenium).
+
+        Живой OS-запрос общий с BrowserProbe.probe (os_process_alive) — одна
+        реализация «процесса на (порт, профиль) нет», чтобы probe и watchdog
+        не разошлись в критерии смерти.
         """
         if self.kind == "firefox":
-            return bool(P.firefox_browser_processes(self.profile_token))
+            # CDP у firefox не существует: не тратим http_timeout на не-CDP порт
+            return self.probe.os_process_alive(self.cdp_url, self.profile_token,
+                                               self.kind)
         if self.probe.cdp_http_ok(self.cdp_url):
             return True
-        return bool(P.browser_processes(self.cdp_url,
-                                        profile_token=self.profile_token))
+        return self.probe.os_process_alive(self.cdp_url, self.profile_token,
+                                            self.kind)
 
 
 # ---- управление процессом браузера -----------------------------------------

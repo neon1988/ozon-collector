@@ -435,6 +435,17 @@ OS-identity процесса + CDP HTTP `/json/version` + состоянию tar
 kind}]}`. В консоли видно `[search] товар N/M: renderer_failure → recycle
 браузера (попытка 1/2)`.
 
+`browser_dead` (инфраструктура, не soft block): если CDP не отвечает **и**
+процесса браузера на паре (debug-порт, профиль) нет, товар не уходит в recycle —
+восстанавливать нечего, а recycle только жёг бы session-бюджет до
+`SESSION_EXHAUSTED`. Такой товар даёт `error_kind=browser_dead`,
+`failure_type=infra_failure`, и оркестратор респаунит воркера со свежим
+браузером (`parallel._needs_restart`). Проверка смерти — живой OS-запрос
+(`process.browser_processes`), а не снимок `Session.browser_pid`: снимок
+протухает при рестарте без `reconnect` и отсутствует у внешнего браузера.
+У чужого браузера (`browser_owner=external`) смерть недоказуема — там
+`browser_dead` не выводится (ADR §14.1).
+
 ### Canary по классу сущности + API-предсрез отзывов (ревизия 2.8)
 
 **Canary.** После recycle «по доступу» сессия проверяется не всегда на главной:

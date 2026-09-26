@@ -28,10 +28,26 @@ class _FakePage:
 
 class _FakeSess:
     def __init__(self, cdp_url="http://127.0.0.1:9222",
-                 identity=None, page=None):
+                 identity=None, page=None, owner="collector",
+                 profile_token="ozon-profile", kind="chrome"):
         self.cdp_url = cdp_url
         self.browser_pid = identity      # имя поля — как в cdp.Session
         self.page = page
+        self.browser_owner = owner        # ADR §14.1
+        self.profile_token = profile_token
+        self.kind = kind
+
+
+def _no_os_procs(monkeypatch):
+    """Ни одного процесса браузера на (порт, профиль) — браузер мёртв."""
+    monkeypatch.setattr(P, "browser_processes",
+                        lambda url, profile_token=None: [])
+    monkeypatch.setattr(P, "firefox_browser_processes", lambda token: [])
+
+
+def _cdp_down(monkeypatch):
+    monkeypatch.setattr(B.BrowserProbe, "cdp_http_ok", lambda self, url: False)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
 
 
 def _identity(pid=1000, key="k"):
@@ -421,9 +437,84 @@ def test_probe_never_reads_foreign_identity_attr():
 
 def test_probe_browser_dead_identity_gone(monkeypatch):
     monkeypatch.setattr(P, "identity_alive", lambda i: False)
+    _cdp_down(monkeypatch)
+    _no_os_procs(monkeypatch)
     sess = _FakeSess(identity=_identity())
     state, attempts = B.BrowserProbe().probe(sess, signature=False)
     assert state == B.ProbeState.BROWSER_DEAD
+
+
+def test_probe_browser_dead_without_snapshot(monkeypatch):
+    """Снимка browser_pid нет, но процесса тоже нет → смерть доказуема.
+
+    Регресс: раньше ident=None означал «владение не проверяем», поэтому мёртвый
+    браузер без снимка (external, Firefox-private, гонка перечисления сразу
+    после launch) уезжал в BROWSER_UNHEALTHY — телеметрия врала, что браузер
+    жив, и диагностика инцидента теряла время.
+    """
+    _cdp_down(monkeypatch)
+    _no_os_procs(monkeypatch)
+    state, _ = B.BrowserProbe().probe(_FakeSess(identity=None), signature=False)
+    assert state == B.ProbeState.BROWSER_DEAD
+
+
+def test_probe_unhealthy_when_process_alive_but_cdp_silent(monkeypatch):
+    """Процесс на (порт, профиль) есть, CDP молчит → транзиент, не смерть."""
+    _cdp_down(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes",
+                        lambda url, profile_token=None: [_identity()])
+    state, attempts = B.BrowserProbe(retries=2, interval=0.01).probe(
+        _FakeSess(identity=None), signature=False)
+    assert state == B.ProbeState.BROWSER_UNHEALTHY
+    assert attempts == 3          # retries+1 попыток
+
+
+def test_probe_never_calls_browser_dead_for_external_owner(monkeypatch):
+    """ADR §14.1: чужой браузер — смерть недоказуема, рестарт запрещён.
+
+    У external профиль не наш, поэтому в перечислении его процесса не будет
+    никогда: без этой защиты probe объявил бы BROWSER_DEAD и воркер пошёл бы
+    перезапускать/убивать НЕ НАШ процесс.
+    """
+    _cdp_down(monkeypatch)
+    _no_os_procs(monkeypatch)
+    state, _ = B.BrowserProbe().probe(
+        _FakeSess(identity=None, owner="external"), signature=False)
+    assert state == B.ProbeState.BROWSER_UNHEALTHY
+
+
+def test_probe_stale_snapshot_does_not_kill_live_browser(monkeypatch):
+    """Протухший снимок (рестарт без reconnect) ≠ смерть.
+
+    Снимок указывает на мёртвый PID, но на (порт, профиль) есть живой процесс:
+    BROWSER_DEAD здесь означал бы убийство/рестарт здорового браузера.
+    """
+    _cdp_down(monkeypatch)
+    monkeypatch.setattr(P, "identity_alive", lambda i: False)
+    monkeypatch.setattr(P, "browser_processes",
+                        lambda url, profile_token=None: [_identity(pid=2000)])
+    state, _ = B.BrowserProbe().probe(
+        _FakeSess(identity=_identity(pid=1000)), signature=False)
+    assert state == B.ProbeState.BROWSER_UNHEALTHY
+
+
+def test_os_process_alive_failsafe_on_enumeration_error(monkeypatch):
+    """Не смогли перечислить процессы → считаем живыми (никогда не death)."""
+    def boom(*a, **kw):
+        raise RuntimeError("wmi down")
+
+    monkeypatch.setattr(P, "browser_processes", boom)
+    monkeypatch.setattr(P, "firefox_browser_processes", boom)
+    assert B.BrowserProbe().os_process_alive("http://127.0.0.1:9222") is True
+
+
+def test_os_process_alive_uses_firefox_lookup(monkeypatch):
+    seen = []
+    monkeypatch.setattr(P, "firefox_browser_processes",
+                        lambda token: seen.append(token) or [_identity()])
+    assert B.BrowserProbe().os_process_alive(
+        "http://127.0.0.1:9222", "ozon-profile", "firefox") is True
+    assert seen == ["ozon-profile"]
 
 
 def test_probe_browser_unhealthy_no_http(monkeypatch):

@@ -3997,3 +3997,38 @@ BOM + CRLF сохранены, `ParseFile` = OK).
 Скилл `.skills/ozon-dead-browser-vs-dead-tab/SKILL.md` (+ строка в `SKILLS.md`).
 
 - **Дайджест из кеша (инструмент).** Прогон `fonari_dlya_velosipedov` упал на финальной фазе (главный профиль держал осиротевший Chromium → `Chromium pid=… EXITED, CDP never came up on port 9222`, 3/3 ретрая), при этом 336 товаров / 23 валидных уже лежали в `data/`, а `docs/digests/fonari_dlya_velosipedov.md` не был создан (демон пишет дайджест в финале). Перезапускать кампанию ради markdown не нужно: `python scripts/digest_from_cache.py <campaign>` рендерит его из `valid_pids` + `data/*_raw*.json` через штатный `key_daemon._write_digest` → `report.build_search_digest_combined`, без сети, браузера и правки манифеста. Проверено: 23/23 pid, 794 481 байт, лишних нет. Манифест при этом остался `final_state=NEEDS_ATTENTION (unknown_failure)` — данные целы, рестарт по решению пользователя.
+
+- **BrowserProbe: смерть браузера по живому OS-запросу, а не по снимку `Session.browser_pid`.**
+  Гипотеза «`Session` не заполняет `browser_pid`, поэтому probe слеп к identity»
+  была НЕВЕРНОЙ: поле заполняется в `cdp.Session._connect()` (строка
+  `self.browser_pid = _browser_pid(...)`) и обновляется в `reconnect()`.
+  Настоящий дефект другой — probe судил о смерти по СНИМКУ этого поля:
+  - `ident is not None and not identity_alive(ident)` → `BROWSER_DEAD`: снимок
+    берётся на момент `_connect()`, поэтому рестарт браузера менеджером без
+    `reconnect()` ( reconnect бросил исключение) даёт ложную смерть → воркер
+    пошёл бы перезапускать/убивать ЗДОРОВЫЙ браузер;
+  - `ident is None` → владение «не проверяем», мёртвый браузер уезжал в
+    `BROWSER_UNHEALTHY` (внешний браузер, Firefox-private, гонка перечисления
+    сразу после launch) → телеметрия врала «браузер жив», и разбор инцидента
+    терял время именно на этой формулировке.
+  Оба состояния отдавались в `error_probe_state` (манифест/дайджест/лог), хотя
+  на маршрут восстановления не влияли: и `BROWSER_DEAD`, и `BROWSER_UNHEALTHY`
+  мапятся в `kind="browser"`, а реальную проверку смерти делает `search._cdp_dead()`.
+
+  Фикс: `BrowserProbe.os_process_alive(cdp_url, profile_token, kind)` — живой
+  запрос `process.browser_processes` по паре (debug-порт, профиль); он же
+  теперь источник истины в `BrowserWatchdog._sample()` (было копипастой, общий
+  критерий у probe и watchdog). `probe()`: снимок → CDP-retries → живой OS-запрос;
+  `BROWSER_DEAD` выводится только когда нет процесса на (порт, профиль) И наш
+  инстанс из снимка не жив. Ошибка перечисления → считаем живыми (fail-safe:
+  ложная смерть хуже молчания). У `browser_owner=external` профиль не наш,
+  процесса в списке не будет НИКОГДА → `BROWSER_DEAD` недоказуем и не
+  выводится (ADR §14.1), наружу `BROWSER_UNHEALTHY`.
+
+  Проверено: 6 новых тестов в `test_browser.py` (dead без снимка, external не
+  получает DEAD, протухший снимок не убивает живой браузер, транзиент при живом
+  процессе, fail-safe перечисления, firefox-ветка), `_sample` для firefox
+  по-прежнему не тратит `http_timeout` на не-CDP порт, lizard: `probe` CCN 12,
+  `os_process_alive` CCN 6, `_sample` CCN 3. Регресс-тест
+  `test_probe_no_identity_falls_back_to_cdp` сохранён: при живом CDP
+  перечисление процессов не вызывается вовсе.

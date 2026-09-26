@@ -52,6 +52,17 @@ session budget recycle исчерпан → SESSION_EXHAUSTED      # на КАЖ
 5. **Тесты не зависят от живых портов.** `browser_alive` — реальный HTTP, поэтому
    autouse-фикстура в `tests/conftest.py` подменяет его на `True`; тесты про
    `browser_dead` переопределяют точечно на `False`.
+6. **Смерть суди по живому OS-запросу, не по снимку.** `Session.browser_pid`
+   — это снимок на момент `_connect()`: он протухает, если браузер перезапустили
+   без `reconnect()` (тогда `identity_alive` даёт ложную смерть → restарт
+   ЗДОРОВОГО браузера), и его нет у external-браузера / Firefox-private / при
+   гонке перечисления сразу после launch (тогда смерть не видна вовсе и
+   телеметрия врёт `browser_unhealthy`). Один критерий на probe и watchdog —
+   `BrowserProbe.os_process_alive()`: `process.browser_processes` по паре
+   (debug-порт, профиль). Ошибка перечисления → считаем живыми (fail-safe).
+   У `browser_owner=external` профиль не наш, процесса в списке не будет
+   НИКОГДА → `BROWSER_DEAD` недоказуем, наружу только `BROWSER_UNHEALTHY`
+   (ADR §14.1).
 
 ## Примеры
 ✅ Мёртвый CDP: `error_kind=browser_dead`, `failure_type=infra_failure`,
@@ -63,12 +74,22 @@ session budget recycle исчерпан → SESSION_EXHAUSTED      # на КАЖ
    `SESSION_EXHAUSTED` (soft) + пауза демона + потерянный шард.
 ❌ Перезапуск воркера по `fatal_error`/exitcode: воркер ведь выходит «чисто» —
    без `recovery_metrics` он не перезапустится никогда.
+❌ `identity_alive(sess.browser_pid) == False` как признак смерти: снимок
+   протухает → рестарт живого браузера; его нет → смерть не видна.
+❌ `BROWSER_DEAD` для `browser_owner=external`: чужой процесс в перечислении
+   по нашему профилю не появится никогда → это ложная смерть.
 
 ## Связанные
 - `search._cdp_dead()` — хелпер (двойная проверка смерти CDP).
 - `parallel._needs_restart()` — триггер респауна (`browser_dead`).
-- `tests/test_search.py::test_collect_search_browser_dead_*` (4 кейса) и
+- `browser.BrowserProbe.os_process_alive()` — общий критерий смерти для
+  `probe()` и `BrowserWatchdog._sample()`.
+- `tests/test_browser.py::test_probe_*` (6 кейсов: dead без снимка, external,
+  протухший снимок, транзиент при живом процессе, fail-safe перечисления,
+  firefox-ветка) и
+  `tests/test_search.py::test_collect_search_browser_dead_*` (4 кейса),
   `tests/test_parallel_restart.py::test_needs_restart_browser_dead_*` (3 кейса).
-- `PROJECT_NOTES.md` → «P0: мёртвый браузер воркера = SESSION_EXHAUSTED на каждом товаре».
+- `PROJECT_NOTES.md` → «P0: мёртвый браузер воркера = SESSION_EXHAUSTED на каждом товаре»
+  и «BrowserProbe: смерть по живому OS-запросу».
 - Скилл `powershell-file-traps` → «Launchers: fail loudly» (как не убить браузер
   воркера при уборке: проверять `ParentProcessId`, а не имя профиля).
