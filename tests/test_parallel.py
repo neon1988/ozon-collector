@@ -361,6 +361,87 @@ def test_preflight_cleanup_failure_reports_error(monkeypatch, profile_base):
     assert any("не удалось убрать осиротевший" in e for e in errs)
 
 
+def test_preflight_cleans_orphaned_firefox(monkeypatch, profile_base, capsys):
+    """Firefox-воркер: осиротевшие процессы на профиле гасим через P.kill_records.
+
+    Регрессия 2026-09-25: тут был B.force_stop(token) — модульной функции в
+    browser.py нет (force_stop есть только методом BrowserProcessManager),
+    поэтому КАЖДЫЙ firefox-воркер ронял preflight с AttributeError и
+    параллельный сбор не стартовал.
+    """
+    _free_ports(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
+    monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
+    orphan = P.ProcessIdentity(pid=222, start_key="k222")
+    monkeypatch.setattr(
+        P, "firefox_browser_processes",
+        lambda token: [orphan] if token == "ozon-profile-worker-1" else [])
+    monkeypatch.setattr(P, "orphaned_geckodriver_processes", lambda: [])
+    killed = []
+    monkeypatch.setattr(P, "kill_records",
+                        lambda recs, **kw: killed.extend(recs) or [])
+    spec = dict(PL.worker_spec(1), kind="firefox", port=None, cdp_url=None)
+    errs = PL.preflight_check([spec])
+    assert errs == []
+    assert [r.identity for r in killed] == [orphan]
+    assert "убран осиротевший Firefox" in capsys.readouterr().out
+
+
+def test_preflight_firefox_cleanup_failure_reports_error(monkeypatch,
+                                                          profile_base):
+    _free_ports(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
+    monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
+    orphan = P.ProcessIdentity(pid=333, start_key="k333")
+    monkeypatch.setattr(P, "firefox_browser_processes", lambda token: [orphan])
+    monkeypatch.setattr(P, "orphaned_geckodriver_processes", lambda: [])
+    monkeypatch.setattr(P, "kill_records",
+                        lambda recs, **kw: (_ for _ in ()).throw(
+                            RuntimeError("boom")))
+    spec = dict(PL.worker_spec(1), kind="firefox", port=None, cdp_url=None)
+    errs = PL.preflight_check([spec])
+    assert any("не удалось убрать осиротевший Firefox" in e for e in errs)
+
+
+def test_preflight_cleans_orphaned_geckodriver(monkeypatch, profile_base, capsys):
+    """Осиротевший geckodriver (родитель нашего Firefox) гасим в preflight.
+
+    Замер 2026-09-25: после прерванных прогонов осталось 14 geckodriver — они
+    держали 11 лишних окон Firefox. Атрибуция только по потомкам: драйвер с
+    живым firefox-ребёнком на нашем профиле НЕ трогаем (может быть живой
+    параллельный запуск).
+    """
+    _free_ports(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
+    monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
+    monkeypatch.setattr(P, "firefox_browser_processes", lambda token: [])
+    gecko = P.ProcessIdentity(pid=777, start_key="kg")
+    monkeypatch.setattr(P, "orphaned_geckodriver_processes", lambda: [gecko])
+    killed = []
+    monkeypatch.setattr(P, "kill_records",
+                        lambda recs, **kw: killed.extend(recs) or [])
+    spec = dict(PL.worker_spec(1), kind="firefox", port=None, cdp_url=None)
+    errs = PL.preflight_check([spec])
+    assert errs == []
+    assert [r.identity for r in killed] == [gecko]
+    assert "убрано осиротевших geckodriver" in capsys.readouterr().out
+
+
+def test_preflight_keeps_geckodriver_with_live_our_firefox(monkeypatch):
+    _free_ports(monkeypatch)
+    monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
+    monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
+    monkeypatch.setattr(P, "firefox_browser_processes", lambda token: [])
+    gecko = P.ProcessIdentity(pid=888, start_key="kg")
+    monkeypatch.setattr(P, "orphaned_geckodriver_processes", lambda: [])
+    killed = []
+    monkeypatch.setattr(P, "kill_records",
+                        lambda recs, **kw: killed.extend(recs) or [])
+    spec = dict(PL.worker_spec(1), kind="firefox", port=None, cdp_url=None)
+    assert PL.preflight_check([spec]) == []
+    assert killed == []
+
+
 # ---- worker-макет (spawn) -------------------------------------------------------
 
 def _spawn_workers(specs, items, monkeypatch, tmp_path, scenario,
@@ -605,10 +686,10 @@ def test_bootstrap_seeds_worker(profile_base, monkeypatch):
 def test_bootstrap_refreshes_existing_session(profile_base, monkeypatch):
     main = _mk_main_profile(profile_base)
     P.bootstrap_worker_profiles(
-        [1], main_profile=str(main),
+        [1], main_profile=str(main), min_interval_s=0.0,
         main_alive_check=lambda: False, worker_alive_check=lambda k: False)
     bs = P.bootstrap_worker_profiles(
-        [1], main_profile=str(main),
+        [1], main_profile=str(main), min_interval_s=0.0,
         main_alive_check=lambda: False, worker_alive_check=lambda k: False)
     assert bs[1].startswith("refreshed")
     wp = P.worker_profile_path(1)
@@ -640,6 +721,228 @@ def test_bootstrap_no_main_cookies(profile_base):
         [1], main_profile=str(profile_base / "ozon-profile"),
         main_alive_check=lambda: False, worker_alive_check=lambda k: False)
     assert bs[1] == "skipped:no_main_cookies"
+
+
+def _mk_ff_cookies_db(path, names):
+    import sqlite3
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(path))
+    con.execute("create table moz_cookies (host text, name text)")
+    for n in names:
+        con.execute("insert into moz_cookies values ('.ozon.ru', ?)", (n,))
+    con.commit()
+    con.close()
+
+
+def _mk_ff_main_profile(base, session=True):
+    main = base / "ozon-profile.firefox"
+    main.mkdir(parents=True)
+    names = (["__Secure-access-token", "rfuid", "xcid", "guest"]
+             if session else ["is_cookies_accepted"])
+    _mk_ff_cookies_db(main / "cookies.sqlite", names)
+    (main / "key4.db").write_bytes(b"key4")
+    (main / "logins.json").write_text("{}", encoding="utf-8")
+    return main
+
+
+def test_ff_has_ozon_session_true_false(tmp_path):
+    main = _mk_ff_main_profile(tmp_path / "sess", session=True)
+    assert P.firefox_has_ozon_session(str(main)) is True
+    anon = _mk_ff_main_profile(tmp_path / "anon", session=False)
+    assert P.firefox_has_ozon_session(str(anon)) is False
+    assert P.firefox_has_ozon_session(str(tmp_path / "empty")) is False
+
+
+def test_ff_bootstrap_seeds_worker(profile_base):
+    """Firefox-воркер получает сессию main: cold profile → «нет соединения»."""
+    main = _mk_ff_main_profile(profile_base)
+    bs = P.bootstrap_firefox_worker_profiles(
+        [1, 2], main_profile=str(main),
+        main_alive_check=lambda: False, worker_alive_check=lambda k: False)
+    assert bs[1].startswith("seeded") and bs[2].startswith("seeded")
+    wp = P.firefox_profile_path(P.worker_profile_token(1))
+    for name in ("cookies.sqlite", "key4.db", "logins.json"):
+        assert os.path.exists(os.path.join(wp, name)), name
+    assert P.firefox_has_ozon_session(wp) is True
+
+
+def test_ff_bootstrap_refreshes_existing_session(profile_base):
+    main = _mk_ff_main_profile(profile_base)
+    P.bootstrap_firefox_worker_profiles(
+        [1], main_profile=str(main), min_interval_s=0.0,
+        main_alive_check=lambda: False, worker_alive_check=lambda k: False)
+    bs = P.bootstrap_firefox_worker_profiles(
+        [1], main_profile=str(main), min_interval_s=0.0,
+        main_alive_check=lambda: False, worker_alive_check=lambda k: False)
+    assert bs[1].startswith("refreshed")
+
+
+def test_ff_bootstrap_skips_running_browsers(profile_base):
+    main = _mk_ff_main_profile(profile_base)
+    bs = P.bootstrap_firefox_worker_profiles(
+        [1], main_profile=str(main),
+        main_alive_check=lambda: True, worker_alive_check=lambda k: False)
+    assert bs[1] == "skipped:main_browser_running"
+    assert not os.path.exists(
+        P.firefox_profile_path(P.worker_profile_token(1)))
+    bs = P.bootstrap_firefox_worker_profiles(
+        [1], main_profile=str(main),
+        main_alive_check=lambda: False, worker_alive_check=lambda k: True)
+    assert bs[1] == "skipped:worker_browser_running"
+
+
+def test_ff_bootstrap_no_main_cookies(profile_base):
+    (profile_base / "ozon-profile.firefox").mkdir()
+    bs = P.bootstrap_firefox_worker_profiles(
+        [1], main_profile=str(profile_base / "ozon-profile.firefox"),
+        main_alive_check=lambda: False, worker_alive_check=lambda k: False)
+    assert bs[1] == "skipped:no_main_cookies"
+
+
+def test_bootstrap_writes_seed_meta(profile_base):
+    """Сидинг оставляет метаданные: seeded_at/source/files (ADR §14.7)."""
+    main = _mk_main_profile(profile_base)
+    P.bootstrap_worker_profiles(
+        [1], main_profile=str(main),
+        main_alive_check=lambda: False, worker_alive_check=lambda k: False)
+    meta = P._read_seed_meta(P.worker_profile_path(1))
+    assert meta["browser"] == "chrome"
+    assert meta["had_session"] is False
+    assert meta["seeded_at"] > 0
+    assert "Cookies" in meta["files"]
+
+
+def test_bootstrap_skips_fresh_seed(profile_base):
+    """Повторный вызов в TTL не перезаписывает свежую копию (ADR §14.7)."""
+    main = _mk_main_profile(profile_base)
+    args = dict(main_profile=str(main), main_alive_check=lambda: False,
+                worker_alive_check=lambda k: False)
+    assert P.bootstrap_worker_profiles([1], **args)[1].startswith("seeded")
+    assert P.bootstrap_worker_profiles([1], **args)[1] == "skipped:seed_fresh"
+
+
+def test_bootstrap_post_storm_hold(profile_base):
+    """После фулл-шторма прогретый воркер не пересеивается (ADR §14.7).
+
+    Холодный воркер сеется даже под hold (иначе блок «нет соединения»),
+    прогретый — держит свою сессию; за окном hold пересев снова разрешён.
+    """
+    main = _mk_main_profile(profile_base)
+    args = dict(main_profile=str(main), main_alive_check=lambda: False,
+                worker_alive_check=lambda k: False, min_interval_s=0.0)
+    assert P.bootstrap_worker_profiles([1], **args)[1].startswith("seeded")
+    fresh_storm = P.bootstrap_worker_profiles(
+        [1], post_storm_at=time.time() - 60, **args)
+    assert fresh_storm[1] == "skipped:post_storm_hold"
+    cold = P.bootstrap_worker_profiles(
+        [2], post_storm_at=time.time() - 60, **args)
+    assert cold[2].startswith("seeded")
+    old_storm = P.bootstrap_worker_profiles(
+        [1], post_storm_at=time.time() - 7200, **args)
+    assert old_storm[1].startswith("refreshed")
+
+
+def test_ff_bootstrap_policy_matches_chrome(profile_base):
+    """Firefox-путь политики идентичен Chromium (один контракт статусов)."""
+    main = _mk_ff_main_profile(profile_base)
+    args = dict(main_profile=str(main), main_alive_check=lambda: False,
+                worker_alive_check=lambda k: False)
+    assert P.bootstrap_firefox_worker_profiles([1], **args)[1].startswith("seeded")
+    meta = P._read_seed_meta(P.firefox_profile_path(P.worker_profile_token(1)))
+    assert meta["browser"] == "firefox"
+    assert "cookies.sqlite" in meta["files"]
+    assert P.bootstrap_firefox_worker_profiles([1], **args)[1] \
+        == "skipped:seed_fresh"
+    hold = P.bootstrap_firefox_worker_profiles(
+        [1], post_storm_at=time.time() - 60, min_interval_s=0.0, **args)
+    assert hold[1] == "skipped:post_storm_hold"
+
+
+def test_kpi_summary_aggregates_workers():
+    """combined.kpi суммирует телеметрию пула и считает rate (ADR §14.7)."""
+    payloads = [
+        {"recovery_metrics": {
+            "recycles": 1, "new_tab_attempts": 2, "session_blocked": 1,
+            "access_stats": {"challenges": 3},
+            "puzzle": {"attempts": 4, "failures": 1}}},
+        {"recovery_metrics": {
+            "recycles": 0, "new_tab_attempts": 1, "session_blocked": 0,
+            "access_stats": {"challenges": 1},
+            "puzzle": {"attempts": 2, "failures": 2}}},
+    ]
+    kpi = PL._kpi_summary(payloads, attempted=100)
+    assert kpi["total_challenges"] == 4
+    assert kpi["total_recoveries"] == 4
+    assert kpi["session_blocked"] == 1
+    assert kpi["puzzle_attempts"] == 6
+    assert kpi["puzzle_solved"] == 3
+    assert kpi["puzzle_solve_rate"] == 0.5
+    assert kpi["challenge_rate_per_100"] == 4.0
+    empty = PL._kpi_summary([], attempted=0)
+    assert empty["puzzle_solve_rate"] is None
+    assert empty["challenge_rate_per_100"] is None
+
+
+def test_worker_start_stagger_bounds():
+    """Старт воркеров разнесён: base=0 → 0, иначе uniform(0.5..1.5)·base."""
+    assert PL._start_stagger_s(2, base=0.0) == 0.0
+    assert PL._start_stagger_s(2, base=-1.0) == 0.0
+    vals = [PL._start_stagger_s(3) for _ in range(1)]
+    assert 0.35 <= vals[0] <= 1.05           # WORKER_START_STAGGER_S=0.7
+    # детерминированный seed: тот же ключ → та же пауза
+    assert PL._start_stagger_s(3) == vals[0]
+    # выключается константой модуля (тесты/отладка)
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(PL, "WORKER_START_STAGGER_S", 0.0)
+    try:
+        assert PL._start_stagger_s(4) == 0.0
+    finally:
+        monkey.undo()
+
+
+def test_kpi_summary_counts_exhausted_and_storms():
+    """KPI считает session_exhausted и puzzle-штормы (ADR §14.7)."""
+    payloads = [
+        {"recovery_metrics": {"session_exhausted": 2,
+                              "challenge_storm": {"puzzle_persistent": True}}},
+        {"recovery_metrics": {"session_exhausted": 1}},
+        {"recovery_metrics": {}},
+    ]
+    kpi = PL._kpi_summary(payloads, attempted=10)
+    assert kpi["session_exhausted"] == 3
+    assert kpi["puzzle_storms"] == 1
+    assert kpi["challenge_rate_per_100"] == 0.0     # challenges=0 при 10 товарах
+
+
+def test_kpi_summary_survives_garbage_metrics():
+    """Мусор в recovery_metrics не роняет агрегат (null-safe int)."""
+    kpi = PL._kpi_summary([{"recovery_metrics": {
+        "recycles": "x", "new_tab_attempts": None, "session_blocked": {},
+        "access_stats": None, "puzzle": "nope"}}], attempted=0)
+    assert kpi["total_challenges"] == 0
+    assert kpi["total_recoveries"] == 0
+    assert kpi["puzzle_attempts"] == 0
+
+
+def test_stop_main_browser_kills_firefox_by_token(monkeypatch):
+    ident = P.ProcessIdentity(4242, "k1")
+    killed = []
+
+    monkeypatch.setattr(P, "firefox_browser_processes",
+                        lambda token: [ident])
+    monkeypatch.setattr(P, "kill_records",
+                        lambda records, wait_s=3.0: killed.extend(records)
+                        or records)
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "firefox")
+    PL._stop_main_browser()
+    assert len(killed) == 1
+    assert killed[0].identity is ident
+
+
+def test_stop_main_browser_noop_without_processes(monkeypatch):
+    monkeypatch.setattr(P, "firefox_browser_processes", lambda token: [])
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "firefox")
+    PL._stop_main_browser()
 
 
 class _FakePage:

@@ -25,14 +25,14 @@ logs/{campaign}_daemon.log. Итог сбора читает из машиноч
 
 Использование:
     python scripts/key_daemon.py --campaign prezervativy \
-        --url "<URL>" --limit 300 --out docs/prezervativy.md \
+        --url "<URL>" --limit 300 --out docs/digests/prezervativy.md \
         --max-age 7d --min-reviews 40 --parallel 1 \
         --min-valid 200 --max-no-progress-runs 3 --max-rescans 2 \
         --max-total-hours 12 --notify toast
 
     # --campaign и --out можно не указывать: имя генерируется из text= в --url
     # (транслит, ~50 символов; иначе из категории, иначе campaign_<дата_время>),
-    # а out — docs/{campaign}.md. text= используется ТОЛЬКО для имени,
+    # а out — docs/digests/{campaign}.md. text= используется ТОЛЬКО для имени,
     # для title-фильтра никогда.
     python scripts/key_daemon.py --url "https://www.ozon.ru/search/?text=..."
 """
@@ -58,6 +58,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from ozon_collector import log
+from ozon_collector import net
+from ozon_collector.browser import AccessChallengeError
 from ozon_collector.search import CollectionInterrupted
 
 DATA_DIR = ROOT / "data"
@@ -145,14 +147,80 @@ COLLECTOR_VERSION = _COLLECTOR_VERSION
 # ---------------------------------------------------------------------------
 
 def classify_status(exit_code: int, combined: Optional[dict]) -> str:
-    """Классифицирует итог одного прогона сбора (по combined + exit-коду, не по логу)."""
+    """Классифицирует итог одного прогона сбора (по combined + exit-коду, не по логу).
+
+    EMPTY_SEARCH (ревизия 2.9): прогон не упал, но сетка выдачи не отрисовалась
+    (recovery.search_grid_empty) → 0 ссылок → 0 товаров. Это НЕ «успех»:
+    раньше такой прогон писался NORMAL_DONE и в status.json выглядел здоровым.
+    Считается стагнацией (как NORMAL_DONE без прогресса), но не прогрессом,
+    поэтому явная метка видна оператору и в логе, и в status.json.
+    """
     if combined and "aborted" in combined:
         return "CHALLENGE_STORM"
     if exit_code == 0:
+        if (combined or {}).get("recovery", {}).get("search_grid_empty"):
+            return "EMPTY_SEARCH"
         return "NORMAL_DONE"
     if combined is None:
         return "CRASH"
     return "UNKNOWN_FAILURE"
+
+
+def _storm_escalates(aborted: dict, parallel: int) -> tuple[bool, bool]:
+    """(all_stormed, escalate) — пора ли жечь cooldown кампании (ревизия 2.9).
+
+    Вынесено из run_campaign, чтобы правило было тестируемым и не расходилось
+    с логикой soft/hard:
+      * all_stormed — шторм у ВСЕХ воркеров (или одиночный прогон parallel=1);
+      * escalate — all_stormed И вид блока hard. soft (SESSION_EXHAUSTED) не
+        эскалирует даже при шторме всех воркеров: эскалация зарезервирована
+        для настоящих блокировок, иначе «усталая» сессия выжигает
+        profile_cooldown и Storm-Streak на ровном месте.
+    """
+    all_stormed = bool(parallel == 1 or aborted.get("all_workers"))
+    soft = _storm_block_kind(aborted) == "soft"
+    return all_stormed, (all_stormed and not soft)
+
+
+def _storm_block_kind(aborted: dict) -> str:
+    """soft | hard — вид блокировки прогона (ADR §14.6, ревизия 2.9).
+
+    hard (по умолчанию, в т.ч. при нехватке данных): SESSION_BLOCKED,
+    ip_blocked, challenge не снят после лестницы, нерешённый пазл.
+    soft: SESSION_EXHAUSTED — бюджет сессии исчерпан (усталость от серии
+    проверок, а не доказанный бан). Разница в реакции: soft → короткая пауза
+    БЕЗ profile_cooldown и БЕЗ роста storm_streak; hard → adaptive-карантин.
+
+    Правило асимметрии: любое сомнение трактуется как hard — в прошлом
+    «мягкая» трактовка маскировала бы настоящий бан до растения серии.
+    """
+    if aborted.get("block_kind") in ("soft", "hard"):
+        return aborted["block_kind"]
+    if aborted.get("reason") == "session_exhausted":
+        return "soft"
+    if aborted.get("puzzle_persistent"):
+        return "hard"
+    return "hard"
+
+
+def _storm_label(signature: Optional[str], aborted: dict) -> str:
+    """Причина шторма для status.json/тоста/лога (оператор должен видеть ЧТО вернула Ozon).
+
+    Приоритет: нерешённый пазл (recovery.challenge_storm.puzzle_persistent из
+    search.py) → сигнатура страницы (title:..., http_status) → список
+    штормивших воркеров → честное «неизвестно». Без этого пазл-штормы давали
+    в last_error «сигнатура неизвестна» — диагноз невозможен.
+    """
+    if aborted.get("puzzle_persistent"):
+        n = aborted.get("puzzle_failures")
+        return (f"puzzle_storm: пазл не решён ({n} неудач)"
+                if n else "puzzle_storm: пазл не решён")
+    if signature:
+        return signature
+    workers = aborted.get("workers_stormed")
+    if workers:
+        return f"access_challenge (воркеры {workers})"
+    return "access_challenge (сигнатура неизвестна)"
 
 
 def extract_discovered_pids(combined: Optional[dict]) -> list[str]:
@@ -352,6 +420,7 @@ def default_manifest(campaign: str, target: int, min_valid: int,
         "profile_cooldown": {    # ADR §14.4: отдельно от storm (почему стоит)
             "until": None, "reason": None,
             "challenge_count": 0, "last_signature": None,
+            "last_full_storm_at": None,   # epoch фулл-шторма → hold пересева
         },
         "no_progress_count": 0,
         "transient_failures": 0,
@@ -441,15 +510,49 @@ def summarize(progress: dict) -> dict:
 # инфраструктура процесса
 # ---------------------------------------------------------------------------
 
+_STILL_ACTIVE = 259
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _alive_win(pid: int) -> bool:
+    """Живость процесса в Windows без TerminateProcess.
+
+    os.kill(pid, 0) здесь НЕ безобидный запрос: CPython на Windows вызывает
+    TerminateProcess(handle, 0), то есть УБИВАЕТ процесс. Замер 2026-09-25:
+    на этом pytest убивал сам себя в тестах pidlock (обрыв прогона на ~42%),
+    а демон при проверке pid-файла убил бы предыдущий живой инстанс вместо
+    отказа запускаться. Поэтому OpenProcess + GetExitCodeProcess."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,
+                                       False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as e:
+        log.debug(f"_alive_win({pid}): {type(e).__name__}: {e}")
+        return False
+
+
 def _alive(pid: int) -> bool:
     """Проверка живости процесса (best-effort).
 
-    Защита от нереалистичных PID: os.kill(pid, 0) с огромным/нулевым/отрицательным
-    PID на Windows может зависнуть или дать ложный результат. PID реальных
+    Защита от нереалистичных PID: с огромным/нулевым/отрицательным PID
+    запрос может зависнуть или дать ложный результат. PID реальных
     процессов на Windows/Linux практически никогда не выходят за 2^24.
     """
     if not isinstance(pid, int) or pid <= 0 or pid >= 2 ** 24:
         return False
+    if os.name == "nt":
+        return _alive_win(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -539,6 +642,8 @@ def _status_payload(progress: dict) -> dict:
         "kpi": (progress.get("recovery_telemetry") or {}).get("kpi"),
         "fingerprint": (progress.get("recovery_telemetry") or {})
             .get("fingerprint"),
+        "session_auth": progress.get("session_auth"),
+        "qa": progress.get("qa"),
     }
 
 
@@ -614,7 +719,9 @@ def _absorb_recovery_telemetry(progress: dict, combined: Optional[dict]) -> None
     kpi = combined.get("kpi")
     if kpi:
         acc = meta.setdefault("kpi", {})
-        for k in ("total_challenges", "total_recoveries"):
+        for k in ("total_challenges", "total_recoveries", "session_blocked",
+                  "session_exhausted", "puzzle_storms",
+                  "puzzle_attempts", "puzzle_solved"):
             v = kpi.get(k)
             if v is not None:
                 acc[k] = (acc.get(k, 0) or 0) + int(v)
@@ -623,6 +730,16 @@ def _absorb_recovery_telemetry(progress: dict, combined: Optional[dict]) -> None
         last_sr = kpi.get("success_rate")
         if last_sr is not None:
             acc["last_success_rate"] = last_sr
+        # Производные rate — «последний раунд» + кумулятивный solve-rate
+        # (тренд: solve-rate падает → детектор/драг-геометрия деградировали).
+        if kpi.get("puzzle_solve_rate") is not None:
+            acc["last_puzzle_solve_rate"] = kpi["puzzle_solve_rate"]
+        pa = int(acc.get("puzzle_attempts") or 0)
+        if pa:
+            acc["puzzle_solve_rate"] = round(
+                int(acc.get("puzzle_solved") or 0) / pa, 3)
+        if kpi.get("challenge_rate_per_100") is not None:
+            acc["last_challenge_rate_per_100"] = kpi["challenge_rate_per_100"]
     if combined.get("fingerprint"):
         meta["fingerprint"] = combined["fingerprint"]
     progress["recovery_telemetry"] = meta
@@ -639,6 +756,38 @@ def _absorb_recovery_telemetry(progress: dict, combined: Optional[dict]) -> None
     if rec.get("browser_tabs") is not None:
         meta["browser_tabs"] = rec.get("browser_tabs")
     progress["recovery_telemetry"] = meta
+
+
+def _absorb_session_auth(progress: dict, combined: Optional[dict]) -> None:
+    """Сводит состояние авторизации профиля по товарам прогона.
+
+    Неавторизованный Ozon отдаёт максимум ~96-100 отзывов (WALL_LIMITED).
+    Сводим session.auth из combined → progress["session_auth"], его читает
+    status.json: видно, объясняется ли потолок неавторизованной сессией.
+    Только наблюдаемость — на решение демона не влияет.
+    """
+    if not combined:
+        return
+    logged_in = anonymous = unknown = 0
+    for p in (combined.get("products") or []):
+        auth = (p.get("raw") or {}).get("session") or {}
+        state = (auth.get("auth") or {}).get("logged_in")
+        if state is True:
+            logged_in += 1
+        elif state is False:
+            anonymous += 1
+        else:
+            unknown += 1
+    total = logged_in + anonymous + unknown
+    if not total:
+        return
+    progress["session_auth"] = {
+        "checked": total,
+        "logged_in": logged_in,
+        "anonymous": anonymous,
+        "unknown": unknown,
+        "updated_at_utc": now_utc_iso(),
+    }
 
 
 def _challenge_cooldown_seconds(progress: dict) -> float:
@@ -958,6 +1107,9 @@ def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
         "max_age_s": max_age_s,
         "no_ocr": True,          # --ocr не передаётся демоном
         "skip_reviews": cfg.get("skip_reviews", False),
+        # Быстрый API-предсрез отзывов (ревизия 2.8): выключен по умолчанию,
+        # DOM остаётся источником истины. None → env OZON_REVIEWS_API.
+        "reviews_api": cfg.get("reviews_api"),
         "threads": 8,
         "no_preproc": False,
         "dedup_replies": True,   # без --no-dedup-replies
@@ -1003,9 +1155,23 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
         skip_pids = None
     else:
         pids = None
-        url = progress["url"]
-        skip_pids = (list(dict.fromkeys(progress.get("valid_pids", [])))
-                     or None)
+        # P0: URL лежит в состоянии кампании, поэтому мусор, попавший туда
+        # ДО 2.9, пережил бы рестарт демона. Чиним/отвергаем на загрузке.
+        try:
+            url = net.normalize_target_url(progress["url"])
+        except ValueError as e:
+            log.error("[key_daemon] URL кампании в state.json невалиден: "
+                      f"{e}. Перезадай --url или удали "
+                      f"data/campaigns/{progress.get('campaign', '?')}/state.json")
+            raise SystemExit(2)
+        # Пропускать ВСЕ уже известные пиды (valid + FAIL + permanently_failed),
+        # а не только valid: иначе мёртвые товары пересобираются в каждом раунде
+        # (пустая работа, капчи), а выдача "ходит по кругу" без прогресса.
+        _known = set(progress.get("discovered_pids", [])) \
+            | set(progress.get("valid_pids", [])) \
+            | set(progress.get("failed_pids", [])) \
+            | set(progress.get("permanently_failed_pids", []))
+        skip_pids = sorted(_known) or None
         # полный прогон собирает с запасом target + reserve_count (как в прежнем CLI)
         discovery = progress["target_count"] + int(cfg.get("reserve_count") or 0)
         limit = discovery
@@ -1030,13 +1196,19 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
     # при parallel=1 сбор шёл in-process в демоне и зависший CDP-вызов
     # не мог быть прерван оркестратором (не было отдельного воркера).
     from ozon_collector.parallel import collect_parallel
+    # ADR §14.7: после фулл-шторма прогретые воркер-профили не пересеиваем
+    # (иначе испорченная сессия main тиражируется на весь пул).
+    _storm_at = (progress.get("profile_cooldown") or {}).get(
+        "last_full_storm_at")
     combined = collect_parallel(
         url, limit=limit, gather_cfg=gather_cfg, parallel=parallel,
         query=None, max_recycles=2, join_timeout_s=43200.0,
         pids=pids or None, skip_pids=skip_pids, no_bootstrap=False,
+        bootstrap_post_storm_at=_storm_at,
         session_budget=session_budget, on_event=_on_event,
         max_worker_restarts=max_restarts, worker_log=worker_log,
-        stop_event=_STOP_EVENT, force_event=_FORCE_EXIT)
+        stop_event=_STOP_EVENT, force_event=_FORCE_EXIT,
+        canary_url=cfg.get("canary_url") or None)
 
     combined_file = CAMPAIGNS_DIR / camp / f"combined_{run_id}.json"
     combined_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1174,6 +1346,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  write_digest: bool = True,
                  compact: bool = False,
                  skip_reviews: bool = False,
+                 canary_url: Optional[str] = None,
+                 reviews_api: bool = False,
                  name_source: str = "explicit",
                  name_source_value: Optional[str] = None,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
@@ -1218,6 +1392,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         session_budget_wall_clock=session_budget_wall_clock,
         window_mode=window_mode,
         skip_reviews=skip_reviews,
+        canary_url=canary_url,
+        reviews_api=reviews_api,
         name_source=name_source,
         name_source_value=name_source_value)
 
@@ -1307,6 +1483,15 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         if window_mode is not None:
             rcfg["window_mode"] = window_mode
             progress["run_cfg"] = rcfg
+        # canary-url/reviews-api пишем только когда заданы: иначе run_cfg_hash
+        # существующей кампании изменился бы и на ровном месте пометил манифест
+        # как отредактированный вручную.
+        if canary_url:
+            rcfg["canary_url"] = canary_url
+            progress["run_cfg"] = rcfg
+        if reviews_api:
+            rcfg["reviews_api"] = True
+            progress["run_cfg"] = rcfg
 
         # run_cfg_hash: фиксируем fingerprint конфигурации — ручное изменение
         # manifest'а (напр. max_total_hours) помечается, а не молча применяется.
@@ -1344,8 +1529,26 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 progress["final_note"] = f"лимит времени {max_total_hours}ч исчерпан"
                 break
             if progress.get("no_progress_count", 0) >= max_no_progress_runs:
-                progress["final_reason"] = "no_progress"
-                progress["final_note"] = "лимит no-progress подряд исчерпан"
+                # Штормы тоже инкрементят no_progress (единый предохранитель от
+                # бесконечного кружения), но ДИАГНОЗ должен быть честным: если
+                # последние прогоны — ФУЛЛ-штормы (storm_streak>0), причина не
+                # «выдача перетёрлась», а блок Ozon. Иначе оператор читает
+                # final_reason=no_progress при challenge_control.total_storms=3
+                # и ищет проблему в выдаче, а не в анти-боте (живой случай
+                # zvukoizolyatsiya 2026-09-25 давал ровно эту путаницу).
+                # Частичные штормы (storm_streak==0) диагноз не меняют: там
+                # блок одного воркера, а не кампании (ADR §14.6).
+                cc_final = progress.get("challenge_control") or {}
+                if cc_final.get("storm_streak"):
+                    progress["final_reason"] = "challenge_storm"
+                    progress["final_note"] = (
+                        f"блок Ozon: {cc_final['storm_streak']} шторм(ов) подряд, "
+                        f"лимит no-progress ({max_no_progress_runs}) исчерпан")
+                else:
+                    progress["final_reason"] = "no_progress"
+                    progress["final_note"] = "лимит no-progress подряд исчерпан"
+                log.warning(f"no-progress лимит → {progress['final_reason']}: "
+                            f"{progress['final_note']}")
                 break
 
             # ---- cooldown (не пересекает max-total-hours: жёсткий дедлайн) ----
@@ -1451,6 +1654,26 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 # reachable только если _emergency_shutdown mocked/вернулся:
                 # не даём упасть в unbound exit_code / CRASH-ветку ниже.
                 raise
+            except AccessChallengeError as exc:
+                # Блок на СТРАНИЦЕ ВЫДАЧИ (main-сессия, search_page): воркеры
+                # ещё не спавнились, combined не пишется → classify_status видел
+                # только exit_code=1 и давал UNKNOWN_FAILURE, а демон молотил
+                # заблокированную сессию транзиентными ретраями по 4с (живой
+                # случай 2026-09-25, zvukoizolyatsiya: 4 прогона за 3 минуты,
+                # FAB-reload ×3 → new_tab → recycle → всё то же «нет соединения»).
+                # Помечаем как CHALLENGE_STORM: включается adaptive cooldown
+                # 1/5/15 мин + эскалация NEEDS_ATTENTION(challenge_storm).
+                sig = str(exc).split(": ", 1)[-1]
+                log.error(f"in-process сбор: анти-бот на выдаче ({sig}) → "
+                          f"CHALLENGE_STORM (cooldown вместо ретраев)")
+                combined = {
+                    "products": [], "found": 0,
+                    "aborted": {"reason": "challenge_storm",
+                                "where": "search_page", "signature": sig,
+                                "all_workers": True},
+                    "kpi": {"total_challenges": 1},
+                }
+                exit_code = 1
             except Exception as exc:
                 log.error(f"in-process сбор упал: {exc}")
                 # combined «пуст, но есть» + exit!=0 → UNKNOWN_FAILURE: прежнее
@@ -1463,6 +1686,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             _journal_stage(progress, run_id, "run_completed",
                            {"status": status, "exit_code": exit_code})
             _absorb_recovery_telemetry(progress, combined)
+            _absorb_session_auth(progress, combined)
 
             # FORCE (2-й Ctrl+C) в worker-фазе: _await_workers уже принудительно
             # завершил воркеров (зачистка их браузеров в родителе). Не уходим в
@@ -1559,15 +1783,32 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             progress["progress"] = prog
 
             stall = dict(progress.get("stall", {}))
-            if status == "NORMAL_DONE" and not new_disc and not new_valid:
+            if status in ("NORMAL_DONE", "EMPTY_SEARCH") \
+                    and not new_disc and not new_valid:
                 # выдача перетёрлась известными — стагнация discovery/valid
                 stall["full_runs_without_discovery"] = \
                     stall.get("full_runs_without_discovery", 0) + 1
                 if mode == "full":
                     stall["full_runs_without_valid"] = \
                         stall.get("full_runs_without_valid", 0) + 1
+            # Счётчики серий — только ПОДРЯД идущие сбои (ADR §14.5/§14.6).
+            # Раньше transient_failures и storm_streak были lifetime-счётчиками:
+            # 2 шторма вчера + 2 сегодня (или 2 UNKNOWN_FAILURE до обеда + 2
+            # после) давали NEEDS_ATTENTION ПОСЛЕ ЧАСОВ нормальной работы, т.е.
+            # 12-часовая кампания была обречена на смерть по календарю.
+            if status != "UNKNOWN_FAILURE" and progress.get("transient_failures"):
+                log.info(f"серия UNKNOWN_FAILURE прервана ({status}) → "
+                         f"transient_failures сброшен")
+                progress["transient_failures"] = 0
             if status == "CHALLENGE_STORM":
                 stall["challenge_runs"] = stall.get("challenge_runs", 0) + 1
+            elif status == "NORMAL_DONE" and (new_disc or new_valid):
+                cc = progress.get("challenge_control") or {}
+                if cc.get("storm_streak"):
+                    log.info(f"прогресс ({len(new_disc)}+{len(new_valid)}) → "
+                             f"storm_streak сброшен")
+                    cc["storm_streak"] = 0
+                    progress["challenge_control"] = cc
             if status == "CRASH":
                 stall["crash_runs"] = stall.get("crash_runs", 0) + 1
             progress["stall"] = stall
@@ -1586,7 +1827,11 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 # шторм (часть воркеров прогрессирует) — короткая пауза, БЕЗ
                 # эскалации, чтобы один воркер не сжигал cooldown кампании.
                 aborted = (combined or {}).get("aborted") or {}
-                all_stormed = bool(parallel == 1 or aborted.get("all_workers"))
+                block_kind = _storm_block_kind(aborted)
+                soft = block_kind == "soft"
+                # soft (SESSION_EXHAUSTED) НЕ эскалирует, даже если штормнули все
+                # воркеры: эскалация зарезервирована для hard-блокировок.
+                all_stormed, escalate = _storm_escalates(aborted, parallel)
                 stormed_workers = aborted.get("workers_stormed") or []
                 if not new_disc and not new_valid:
                     progress["no_progress_count"] = progress.get(
@@ -1597,56 +1842,84 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 # storm_streak растёт ТОЛЬКО после исчерпанного ФУЛЛ-шторма
                 # (SESSION_BLOCKED → combined.aborted). 1м → 5м → 15м → ...
                 signature = (progress.get("recovery_telemetry") or {}).get(
-                    "last_challenge_signature")
+                    "last_challenge_signature") or aborted.get("signature")
+                label = _storm_label(signature, aborted)
                 cc = progress.get("challenge_control") or {}
-                if all_stormed:
+                pause_s = CHALLENGE_PARTIAL_PAUSE_S
+                if escalate:
                     cc = _bump_challenge_control(progress, signature)
-                    cc["cooldown_until"] = (datetime.now(timezone.utc) +
-                                            timedelta(seconds=CHALLENGE_COOLDOWN_STEPS_S[-1])).isoformat(
-                                                timespec="seconds")
-                    # profile_cooldown (ADR §14.4): отдельно от storm — почему стоит
+                    pause_s = _challenge_cooldown_seconds(progress)
+                    # ОДНА adaptive-пауза на оба cooldown'а (ADR §14.4/§14.5).
+                    # Раньше cc/progress cooldown_until ставились по adaptive
+                    # значению, а pc["until"] — по ПОСЛЕДНЕМУ шагу (15м), и цикл
+                    # брал max(пауз) → лестница 1/5/15 не работала (всегда 15м
+                    # уже с первого шторма, NEEDS_ATTENTION через ~час молотья).
+                    until = (datetime.now(timezone.utc) +
+                              timedelta(seconds=pause_s)).isoformat(
+                                  timespec="seconds")
+                    cc["cooldown_until"] = until
                     if not _NO_COOLDOWN:
                         pc = progress.get("profile_cooldown") or {}
-                        pc["until"] = cc["cooldown_until"]
+                        pc["until"] = until
                         pc["reason"] = "repeated_challenge"
                         pc["challenge_count"] = cc.get("total_storms", 0)
                         pc["last_signature"] = signature
+                        pc["last_full_storm_at"] = time.time()
                         progress["profile_cooldown"] = pc
                 # Эскалация: при длинной серии штормов — NEEDS_ATTENTION
                 # (не молотить), иначе adaptive пауза с джиттером.
                 # KD_NO_COOLDOWN: не останавливаем кампанию, продолжаем обходить.
                 max_storm = len(CHALLENGE_COOLDOWN_STEPS_S)
-                if (not _NO_COOLDOWN and all_stormed
+                if (not _NO_COOLDOWN and escalate
                         and cc.get("storm_streak", 0) > max_storm):
                     progress["final_state"] = "NEEDS_ATTENTION"
                     progress["final_reason"] = "challenge_storm"
                     progress["final_note"] = (
                         f"persistent challenge ({cc['storm_streak']} штормов)")
+                    # last_error = причина для status.json: без него оператор
+                    # видит только «persistent challenge» и не знает, ЧТО вернула
+                    # Ozon (живой случай: FAB «Похоже, нет соединения» на
+                    # странице выдачи, а в status.json было пусто).
+                    progress["last_error"] = (
+                        f"persistent challenge: {label} "
+                        f"({cc['storm_streak']} штормов подряд, "
+                        f"всего {cc.get('total_storms', 0)})")
                     log.error(f"persistent challenge → NEEDS_ATTENTION "
-                        f"(storm_streak={cc['storm_streak']})")
+                        f"(storm_streak={cc['storm_streak']}, {label})")
                     _set_state(progress, "NEEDS_ATTENTION", "CHALLENGE_STORM",
                                run_id=run_id, storm_streak=cc["storm_streak"])
-                    notify(progress, "NEEDS_ATTENTION: persistent challenge")
+                    notify(progress, "NEEDS_ATTENTION: persistent challenge — "
+                           f"{label[:60]}")
                     save_json(progress_path, progress)
                     break
-                pause_s = (1 if _NO_COOLDOWN else (
-                    _challenge_cooldown_seconds(progress) if all_stormed
-                    else CHALLENGE_PARTIAL_PAUSE_S))
+                # pause_s уже посчитан выше (adaptive для ФУЛЛ-шторма,
+                # CHALLENGE_PARTIAL_PAUSE_S для частичного) — не пересчитываем,
+                # иначе второй вызов _challenge_cooldown_seconds дал бы другой
+                # джиттер и cooldown_until разошёлся бы с profile_cooldown.
+                if _NO_COOLDOWN:
+                    pause_s = 1
                 progress["cooldown_until"] = (
                     datetime.now(timezone.utc) +
                     timedelta(seconds=pause_s)).isoformat(timespec="seconds")
-                log.warning(f"challenge detected → adaptive pause {int(pause_s)}с "
-                    f"(storm_streak={cc['storm_streak']}) "
-                    f"{'ФУЛЛ' if all_stormed else 'ЧАСТИЧНЫЙ'}"
+                scope = ("soft:SESSION_EXHAUSTED" if soft else
+                         ("ФУЛЛ" if all_stormed else "частичный"))
+                log.warning(f"challenge detected → пауза {int(pause_s)}с "
+                    f"(kind={block_kind}, {scope}, "
+                    f"storm_streak={cc['storm_streak']})"
                     f"{' ' + str(stormed_workers) if stormed_workers else ''}, "
                     f"challenge_seq={progress['challenge_seq']}")
                 _set_state(progress, "COOLDOWN_CHALLENGE", "CHALLENGE_STORM",
                            run_id=run_id, pause=int(pause_s),
-                           storm_streak=cc["storm_streak"],
+                           storm_streak=cc['storm_streak'],
+                           block_kind=block_kind,
                            challenge_seq=progress['challenge_seq'])
+                progress["last_error"] = (
+                    f"challenge_storm ({scope}): "
+                    f"{label} | streak={cc['storm_streak']}, "
+                    f"всего={cc.get('total_storms', 0)}")
                 notify(progress, f"challenge: пауза {int(pause_s)}с "
-                       f"(storm #{cc['storm_streak']}, "
-                       f"{'ФУЛЛ' if all_stormed else 'частичный'})")
+                       f"(kind={block_kind}, {scope}) — "
+                       f"{label[:60]}")
 
             elif status == "CRASH":
                 progress["no_progress_count"] = progress.get(
@@ -1696,11 +1969,17 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     save_json(progress_path, progress)
                     break
 
-            elif status == "NORMAL_DONE":
+            elif status in ("NORMAL_DONE", "EMPTY_SEARCH"):
                 # Стагнация: прогон завершился, но не дал ни одного нового пида
                 # (ни новых discovery, ни новых valid). Неважно, был ли found>0 —
                 # выдача перетирается известными товарами, дальше греться некуда.
                 # Иначе при живой выдаче без роста демон крутился бы вечно.
+                if status == "EMPTY_SEARCH":
+                    # Пустая сетка ≠ перетёртая выдача: это проблема страницы
+                    # (не отрисовалась), а не отсутствие новых товаров.
+                    log.warning("прогон без товаров: сетка выдачи не "
+                                "отрисовалась (EMPTY_SEARCH) — считаю "
+                                "стагнацией, но это чинится проверкой URL/прокси")
                 if not new_disc and not new_valid:
                     progress["no_progress_count"] = progress.get(
                         "no_progress_count", 0) + 1
@@ -1767,7 +2046,7 @@ def _write_digest(progress: dict, data_dir: str,
                 or progress.get("campaign_final_pids") or [])
     if not pids:
         return
-    out = progress.get("out") or f"docs/{progress['campaign']}.md"
+    out = progress.get("out") or f"docs/digests/{progress['campaign']}.md"
     combined, _table = build_search_digest_combined(pids, data_dir)
     written = write_search_digest(combined, out)
     for path in written:
@@ -1839,7 +2118,8 @@ def finalize_campaign(progress: dict, progress_path: Path,
             total_fail += fails
             qa_batches.append({"batch": bi, "size": len(batch),
                                "fail": fails, "ok": qa.get("ok", 0),
-                               "warn": qa.get("warn", 0)})
+                               "warn": qa.get("warn", 0),
+                               "wall_limited": qa.get("wall_limited_count", 0)})
             log.info(f"финальный QA batch {bi}/{n}: FAIL={fails}")
             for pid in batch:
                 v = per_pid.get(pid, "OK")  # OK только при доказанных инвариантах
@@ -1888,7 +2168,9 @@ def finalize_campaign(progress: dict, progress_path: Path,
         progress["campaign_reserve_pids"] = reserve_clean[len(replacements):]
         progress["replacement_pids"] = replacement_pairs
         progress["qa"] = {"batches": qa_batches, "total_fail": total_fail,
-                          "checked_pids": len(pool)}
+                          "checked_pids": len(pool),
+                          "wall_limited": sum(b.get("wall_limited", 0)
+                                              for b in qa_batches)}
         n_clean = len(clean)
 
         # Цель — собрать target ЧИСТЫХ pid. Брак в snapshot заменяется чистыми
@@ -1917,7 +2199,9 @@ def finalize_campaign(progress: dict, progress_path: Path,
         _attention_parse_error()
         return
     progress["qa"] = {"batches": qa_batches, "total_fail": total_fail,
-                      "checked_pids": len(snapshot)}
+                      "checked_pids": len(snapshot),
+                      "wall_limited": sum(b.get("wall_limited", 0)
+                                          for b in qa_batches)}
     progress["campaign_accepted_pids"] = clean[:target]
 
     valid = len(clean)
@@ -1987,6 +2271,10 @@ def campaign_from_url(url: str) -> tuple[Optional[str], str, Optional[str]]:
     default = f"campaign_{datetime.now().strftime('%Y%m%d_%H%M')}"
     if not url:
         return default, "timestamp", None
+    try:
+        url = net.normalize_target_url(url)
+    except ValueError:
+        pass      # main() уже провалидировал; здесь защита при вызове из кода
     parsed = urlparse(url)
     # 1. text= (parse_qs уже декодирует percent-encoding и '+' — повторный
     #    unquote не нужен). Непустой после strip() и _slugify -> источник.
@@ -2025,7 +2313,7 @@ def parse_args(argv=None):
                          "(1 <= min_valid < --limit; для новых кампаний обязателен)")
     ap.add_argument("--out", default=None,
                     help="путь Markdown-дайджеста итога кампании "
-                         "(по умолчанию docs/{campaign}.md)")
+                         "(по умолчанию docs/digests/{campaign}.md)")
     ap.add_argument("--max-age", default="7d")
     ap.add_argument("--min-reviews", type=int, default=40)
     ap.add_argument("--parallel", type=int, default=1)
@@ -2089,6 +2377,19 @@ def parse_args(argv=None):
                          "фиксируется при создании кампании в манифесте "
                          "(run_cfg.skip_reviews); при resume взётся только из "
                          "манифеста, смена режима — через --reset.")
+    ap.add_argument("--canary-url", default=None, metavar="URL",
+                    help="цель canary-пробы после access-recovery. По умолчанию "
+                         "берётся URL текущей кампании (та же сущность, на "
+                         "которой упали). Переопределяется env OZON_CANARY_URL. "
+                         "Главная ozon.ru мягче карточки и может давать ложный "
+                         "ok — указывай /product/ или /category/.")
+    ap.add_argument("--reviews-api", action="store_true",
+                    help="быстрый предсрез отзывов через Ozon JSON API "
+                         "(ozon_fetch), в 10-100 раз быстрее DOM-скролла. "
+                         "DOM остаётся источником истины: API лишь дополняет "
+                         "список и не докручивает страницы, пока не докажет "
+                         "покрытие rating_count. Off по умолчанию; env "
+                         "OZON_REVIEWS_API=1 — тот же переключатель.")
     return ap.parse_args(argv)
 
 
@@ -2118,6 +2419,23 @@ def _emergency_shutdown(progress_path: Path, force: str = ""):
     _os._exit(1)
 
 
+def _validated_url(args, attr: str, flag: Optional[str] = None) -> str:
+    """Нормализовать URL аргумента, warn при починке, ValueError при мусоре.
+
+    Починка (markdown-обёртка, хвостовая пунктуация, пробелы) разрешена
+    молча-но-громко: оператор видит в логе, ЧТО реально открыли. Не-URL
+    (опечатка, 'javascript:', пусто) → ValueError → exit 2 до старта.
+    """
+    raw = getattr(args, attr, None)
+    if not raw:
+        return raw
+    fixed = net.normalize_target_url(raw)
+    if fixed != raw.strip():
+        log.warning(f"[key_daemon] URL {flag or '--url'} поправлен: "
+                 f"{raw.strip()[:90]!r} → {fixed[:90]!r}")
+    return fixed
+
+
 def main(argv=None):
     # Перекодировать stdout/stderr в UTF-8 ДО argparse: иначе help/usage
     # (с кириллицей и стрелками) падают с UnicodeEncodeError в cp1251-консоли
@@ -2130,11 +2448,30 @@ def main(argv=None):
     except Exception:
         pass
     args = parse_args(argv)
+    # P0 (ревизия 2.9): URL цели валидируется ДО прогона. Раньше markdown-ссылка
+    # вида [текст](url) доходила до Page.goto -> 'Cannot navigate to invalid URL',
+    # выдача 0 товаров и прогоны NORMAL_DONE с discovered=0 (тихая потеря
+    # времени и ложное 'успешно').
+    try:
+        args.url = _validated_url(args, "url")
+    except ValueError as e:
+        print(f"key_daemon: неверный --url: {e}", file=sys.stderr)
+        print("Подсказка: нужен чистый http(s)-адрес Ozon, например "
+              "https://www.ozon.ru/category/.../ "
+              "или https://www.ozon.ru/search/?text=...",
+              file=sys.stderr)
+        return 2
+    if args.canary_url:
+        try:
+            args.canary_url = _validated_url(args, "canary_url", "--canary-url")
+        except ValueError as e:
+            print(f"key_daemon: неверный --canary-url: {e}", file=sys.stderr)
+            return 2
     if args.campaign:
         campaign, name_source, name_source_value = args.campaign, "explicit", None
     else:
         campaign, name_source, name_source_value = campaign_from_url(args.url or "")
-    out = args.out or f"docs/{campaign}.md"
+    out = args.out or f"docs/digests/{campaign}.md"
     progress = run_campaign(
         campaign=campaign, url=args.url or "", target=args.limit,
         min_valid=args.min_valid, out=out, max_age=args.max_age,
@@ -2153,6 +2490,8 @@ def main(argv=None):
         write_digest=not args.no_digest,
         compact=args.compact,
         skip_reviews=args.no_reviews,
+        canary_url=args.canary_url,
+        reviews_api=args.reviews_api,
         name_source=name_source,
         name_source_value=name_source_value)
     print(json.dumps(summarize(progress), ensure_ascii=False, indent=2))

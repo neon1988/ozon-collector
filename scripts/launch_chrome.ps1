@@ -3,12 +3,14 @@
 # НЕ передавать --enable-automation (иначе navigator.webdriver === true → антибот).
 # Использование: powershell -ExecutionPolicy Bypass -File scripts/launch_chrome.ps1
 # Переменные: PORT (по умолч. 9222), PROFILE (по умолч. %LOCALAPPDATA%\opencode\ozon-profile),
-#             CHROME (по умолч. ищет ms-playwright chromium → системный Chrome).
+#             CHROME (по умолч. ищет ms-playwright chromium → системный Chrome),
+#             PROXY (ревизия 2.9: per-worker прокси; пусто → напрямую).
 # Скрипт запускает браузер и сразу завершается; браузер живёт сам по себе.
 param(
     [string]$Port = $env:PORT,
     [string]$Profile = $env:PROFILE,
-    [string]$Chrome = $env:CHROME
+    [string]$Chrome = $env:CHROME,
+    [string]$Proxy = $env:PROXY
 )
 
 if (-not $Port) { $Port = "9222" }
@@ -29,8 +31,14 @@ function Find-Chrome {
         (Join-Path $env:LOCALAPPDATA "ms-playwright\chromium-*\chrome-win64\chrome.exe"),
         (Join-Path $env:LOCALAPPDATA "ms-playwright\chromium-*\chrome-win\chrome.exe")
     )
+    # Свежая ревизия важнее старой: при нескольких установленных сборках
+    # берём максимальный числовой хвост каталога (chromium-1234), иначе
+    # Get-ChildItem отдаёт произвольную (часто старую) ревизию.
     foreach ($pat in $pwDirs) {
-        $hit = Get-ChildItem $pat -ErrorAction SilentlyContinue | Select-Object -First 1
+        $hit = Get-ChildItem $pat -ErrorAction SilentlyContinue |
+            Sort-Object { [int]([regex]::Match($_.Directory.Name, '\d+').Value) } `
+                      -Descending |
+            Select-Object -First 1
         if ($hit) { return $hit.FullName }
     }
     return $null
@@ -68,6 +76,13 @@ $chromeArgs = @(
     "--disable-infobars",
     "about:blank"
 )
+
+# Per-worker прокси (ревизия 2.9, ADR §18.7): пусто → напрямую, лишнего флага
+# не будет (пустые элементы фильтруем при сборке командной строки).
+# ВНИМАНИЕ: аргумент виден в CommandLine процесса (WMI/CIM) — не кладите
+# пароль прокси в общий доступ. Для socks5 с кредами нужен PAC/расширение:
+# Chrome игнорирует логин/пароль из URL для socks5 (предупреждает cdp.py).
+$proxyArg = if ($Proxy) { "--proxy-server=$Proxy" } else { $null }
 
 # Запуск через CreateProcess со STARTUPINFO.wShowWindow=SW_HIDE (0):
 # окно создаётся СКРЫТЫМ и физически не может активироваться/украсть фокус,
@@ -139,8 +154,25 @@ public class ChromeLaunch {
 }
 "@
 
+# --- Гейт: порт уже отвечает ДО запуска -----------------------------------
+# Чужой/старый Chromium на этом порту даёт ложный "OK": /json/version отвечает,
+# но это не наш браузер, а наш PID умирает (профиль уже открыт другим
+# экземпляром и Chromium уходит в него). Лучше явный отказ, чем тихий обман.
+$portBusy = $false
+try {
+    $null = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
+    $portBusy = $true
+} catch { }
+if ($portBusy) {
+    Write-Host "LAUNCHER-WARN: port $Port ALREADY responds before start (stale Chromium?)" -ForegroundColor Yellow
+    Write-Host "LAUNCHER-WARN: chrome=$Chrome profile=$Profile" -ForegroundColor Yellow
+    Write-Host "LAUNCHER-ERROR: aborted - otherwise a foreign process fakes success" -ForegroundColor Red
+    exit 1
+}
+
 # Полная командная строка: chrome.exe + аргументы (CreateProcessW, Unicode).
-$cmdLine = "`"$Chrome`" " + ($chromeArgs -join " ")
+$allArgs = @($chromeArgs) + @($proxyArg)
+$cmdLine = "`"$Chrome`" " + (($allArgs | Where-Object { $_ }) -join " ")
 $targetPid = [ChromeLaunch]::Launch($cmdLine)
 if ($targetPid -lt 0) {
     Write-Host "Не удалось запустить Chromium (CreateProcess, Win32Error=$(-$targetPid))" -ForegroundColor Red
@@ -217,6 +249,12 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowWindow = $tr
     $deadline = (Get-Date).AddMilliseconds($WaitMs)
     while ((Get-Date) -lt $deadline) {
         $win = Get-Process -Id $PidToWatch -ErrorAction SilentlyContinue
+        if (-not $win) {
+            # Процесса нет — окна уже не будет. Раньше мы здесь молча ждали весь
+            # таймаут (10s), из-за чего вывод лаунчера приходил позже, чем
+            # Python успевал прочитать лог: диагностика выглядела как "пусто".
+            return $false
+        }
         $h = if ($win) { [LaunchChromeMin]::FindMainWindow($PidToWatch) } else { [IntPtr]::Zero }
         if ($h -ne [IntPtr]::Zero) {
             $style = [LaunchChromeMin]::GetWindowLong($h, $GWL_EXSTYLE)
@@ -266,6 +304,9 @@ $minimized = Invoke-MinimizeNoActivate $targetPid 10000 $false
 $ready = $false
 for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 500
+    if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
+        break        # Chromium умер (например, профиль уже открыт) — ждать порт бессмысленно
+    }
     try {
         $ver = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
         $ready = $true
@@ -273,8 +314,26 @@ for ($i = 0; $i -lt 20; $i++) {
         break
     } catch { }
 }
+# Прокси маскируем (в выводе лаунчера не должно быть пароля).
+$proxyNote = if ($Proxy) {
+    ($Proxy -replace '://([^:@/]+):[^@/]+@', '://$1:***@')
+} else { "<прямое подключение>" }
+
+# Диагностика для коллектора: при неудаче _launch_browser печатает этот вывод.
+# Маркеры LAUNCHER-* — ASCII: кириллица в перенаправленном выводе PowerShell
+# едет через кодировку консоли и в логе нечитаема.
 if (-not $ready) {
-    Write-Host "ждём... проверьте http://127.0.0.1:$Port/json/version"
+    $alive = $null -ne (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)
+    if ($alive) {
+        Write-Host "LAUNCHER-ERROR: Chromium pid=$targetPid is ALIVE but http://127.0.0.1:$Port/json/version is silent" -ForegroundColor Red
+        Write-Host "LAUNCHER-ERROR: port $Port taken by another process? chrome=$Chrome profile=$Profile" -ForegroundColor Red
+    } else {
+        Write-Host "LAUNCHER-ERROR: Chromium pid=$targetPid EXITED, CDP never came up on port $Port" -ForegroundColor Red
+        Write-Host "LAUNCHER-ERROR: profile already open in another Chrome? profile=$Profile" -ForegroundColor Red
+        Write-Host "LAUNCHER-ERROR: need own profile per campaign (--user-data-dir) and a free port" -ForegroundColor Red
+    }
+    Write-Host "LAUNCHER-DIAG: chrome=$Chrome profile=$Profile port=$Port proxy=$proxyNote pid=$targetPid"
+    exit 1
 }
 
 # Контрольные проходы ПОСЛЕ полного старта: повторно применяем стиль
@@ -292,3 +351,5 @@ if ($minimized) {
 } else {
     Write-Warning "не удалось найти окно PID $targetPid для показа"
 }
+Write-Host "LAUNCHER-DIAG: chrome=$Chrome profile=$Profile port=$Port proxy=$proxyNote pid=$targetPid"
+exit 0

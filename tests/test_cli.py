@@ -52,3 +52,14 @@ def test_default_sorts_new_plus_negative():
 def test_gather_has_no_min_rating():
     args = cli.build_parser().parse_args(["gather", "--pid", "123"])
     assert not hasattr(args, "min_rating")
+
+
+def test_browser_flag_parses_firefox():
+    args = cli.build_parser().parse_args(["--browser", "firefox",
+                                          "gather", "--pid", "123"])
+    assert args.browser == "firefox"
+
+
+def test_browser_flag_default_none():
+    args = cli.build_parser().parse_args(["gather", "--pid", "123"])
+    assert args.browser is None

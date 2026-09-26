@@ -129,6 +129,44 @@ def test_browser_processes_filters_to_browser_only(monkeypatch):
     assert [i.pid for i in ids] == [1001]
 
 
+# ---- geckodriver: осиротевшие драйверы Firefox (2026-09-25) -------------------
+
+def _ff_argv(profile):
+    return ["firefox.exe", "-profile", profile]
+
+
+def test_geckodriver_processes_lists_all(monkeypatch):
+    fake = [(501, ["geckodriver.exe"], 400), (502, ["geckodriver.exe"], 401)]
+    monkeypatch.setattr(P, "_iter_named_processes",
+                        lambda name: iter(fake if name == "geckodriver" else []))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid=pid, start_key=f"s{pid}"))
+    assert [i.pid for i in P.geckodriver_processes()] == [501, 502]
+
+
+def test_orphaned_geckodriver_keeps_driver_with_our_firefox(monkeypatch):
+    """geckodriver с живым firefox-ребёнком на НАШЕМ профиле — не наш мусор."""
+    ff_profile = P.firefox_profile_path(P.worker_profile_token(1))
+    ff = [(601, _ff_argv(ff_profile), 500)]
+    drivers = [(500, ["geckodriver.exe"], 400), (700, ["geckodriver.exe"], 400)]
+    monkeypatch.setattr(P, "_iter_firefox_processes", lambda: iter(ff))
+    monkeypatch.setattr(P, "_iter_named_processes", lambda name: iter(drivers))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid=pid, start_key=f"s{pid}"))
+    assert [i.pid for i in P.orphaned_geckodriver_processes()] == [700]
+
+
+def test_orphaned_geckodriver_reaps_driver_without_our_firefox(monkeypatch):
+    """Драйвер без нашего firefox (окно убито/краш) — осиротевший, убираем."""
+    personal = [(601, ["firefox.exe"], 900)]  # личный Firefox, не наш профиль
+    drivers = [(500, ["geckodriver.exe"], 400)]
+    monkeypatch.setattr(P, "_iter_firefox_processes", lambda: iter(personal))
+    monkeypatch.setattr(P, "_iter_named_processes", lambda name: iter(drivers))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid=pid, start_key=f"s{pid}"))
+    assert [i.pid for i in P.orphaned_geckodriver_processes()] == [500]
+
+
 # ---- живой процесс: kill, identity, PID-reuse ------------------------------
 
 def test_identity_alive_and_kill_real_process():

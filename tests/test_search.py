@@ -210,7 +210,7 @@ def test_collect_search_min_rating_excludes(monkeypatch):
         return _ok_rating(cfg["pid"], ratings[cfg["pid"]])
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake)
-    c = collect_search(sess, "u", limit=5,
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5,
                        gather_cfg={"min_rating": 4.7})
     assert c["collected"] == 3
     assert c["excluded"] == 1
@@ -227,7 +227,7 @@ def test_collect_search_min_rating_disabled(monkeypatch):
     sess = _FakeSess([{"pid": "1", "url": "u1"}])
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_rating(cfg["pid"], 3.0))
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert c["collected"] == 1
     assert c["excluded"] == 0
     assert "min_rating" not in c
@@ -239,7 +239,7 @@ def test_collect_search_found_less_than_limit(monkeypatch):
     sess = _FakeSess(links)
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert c["found"] == 3
     assert c["collected"] == 3
     assert len(c["products"]) == 3
@@ -257,7 +257,7 @@ def test_collect_search_partial_failure(monkeypatch):
         return _ok_result(cfg["pid"])
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake)
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert c["collected"] == 2
     failed = [p for p in c["products"] if not p["ok"]]
     assert len(failed) == 1
@@ -271,7 +271,7 @@ def test_collect_search_one_session():
     from unittest import mock
     with mock.patch("ozon_collector.search.run_gather",
                     side_effect=lambda cfg, sess=None: _ok_result(cfg["pid"])):
-        collect_search(sess, "u", limit=5, gather_cfg={})
+        collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert sess.gotos == 3  # warmup (главная + категория) + одна докрутка (одна CDP-сессия)
 
 
@@ -281,7 +281,7 @@ def test_collect_search_progress_output(monkeypatch, capsys):
     sess = _FakeSess(links)
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
-    collect_search(sess, "u", limit=5, gather_cfg={})
+    collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     out = capsys.readouterr().out
     assert "найдено 3 товаров в выдаче, собираю 3" in out
     assert "товар 1/3: pid=1" in out
@@ -322,7 +322,7 @@ def test_collect_search_pids_uses_product_url(monkeypatch):
         return _ok_result(cfg["pid"])
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
-    collect_search(sess, "u", limit=5, gather_cfg={}, pids=["1234567"])
+    collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={}, pids=["1234567"])
     assert seen["url"] == "https://www.ozon.ru/product/1234567"
 
 
@@ -331,7 +331,7 @@ def test_collect_search_pids_respects_limit(monkeypatch):
     sess = _FakeSess([])
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
-    c = collect_search(sess, "u", limit=2, gather_cfg={},
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={},
                        pids=["1", "2", "3"])
     assert c["found"] == 3
     assert c["collected"] == 2
@@ -376,7 +376,7 @@ def test_collect_search_recycle_and_retry(monkeypatch):
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert len(recycled) == 1             # ровно один recycle
     assert recycled[0] == "search-1-r1"
     assert c["recovery"]["recycles"] == 1
@@ -385,6 +385,118 @@ def test_collect_search_recycle_and_retry(monkeypatch):
     assert len(ok) == 2
     assert ok[0]["recycle_attempts"] == 2
     assert ok[1]["recycle_attempts"] == 1
+
+
+def _browser_fail(pid, error="TargetClosedError: Page.goto: Target page, "
+                              "context or browser has been closed"):
+    """kind=browser: Playwright потерял цель (в т.ч. умер сам Chromium)."""
+    return {
+        "pid": pid, "ok": False, "error": f"Error: {error}",
+        "raw": None, "markdown": "", "cache": "miss", "ocr": "off",
+        "recyclable": True, "error_kind": "browser",
+        "error_probe_state": None, "error_signature": False,
+    }
+
+
+def _dead_cdp(monkeypatch):
+    """CDP воркера не отвечает (браузер убит/упал)."""
+    monkeypatch.setattr("ozon_collector.search.browser_alive",
+                        lambda url: False)
+    monkeypatch.setattr("ozon_collector.search.time.sleep",
+                        lambda *_a, **_k: None)
+
+
+def test_collect_search_browser_dead_no_recycle(monkeypatch):
+    """Браузер мёртв: recycle НЕ тратится (нечего пересоздавать).
+
+    Инцидент 2026-09-26: мёртвый CDP + recycle-бюджет = SESSION_EXHAUSTED на
+    каждом товаре (soft block из-за локальной поломки, Ozon ни при чём).
+    """
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    recycled = []
+    _dead_cdp(monkeypatch)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _browser_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: recycled.append(
+                            launch_id))
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1,
+                       gather_cfg={})
+    assert recycled == []                       # recycle не вызывался
+    assert c["recovery"]["recycles"] == 0       # и не посчитан
+    assert c["recovery"]["browser_dead"] == 1
+    p = c["products"][0]
+    assert p["ok"] is False
+    assert p["error_kind"] == "browser_dead"
+    assert p["failure_type"] == "infra_failure"  # НЕ session_failure
+    assert "нужен перезапуск браузера" in p["error"]
+
+
+def test_collect_search_browser_dead_not_a_block(monkeypatch):
+    """browser_dead — локальная поломка, НЕ блок: block_kind не выставляем."""
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    _dead_cdp(monkeypatch)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _browser_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2,
+                       gather_cfg={})
+    assert "block_kind" not in c["recovery"]
+    assert c["recovery"].get("session_exhausted", 0) == 0
+    assert c["recovery"].get("session_blocked", 0) == 0
+    # run НЕ прерван: оба товара отработали штатно (каждый со своим browser_dead)
+    assert c.get("aborted") is None
+    assert [p["error_kind"] for p in c["products"]] == ["browser_dead"] * 2
+    assert c["recovery"]["browser_dead"] == 2
+
+
+def test_collect_search_browser_dead_keeps_budget(monkeypatch):
+    """Мёртвый браузер НЕ жжёт recycle-бюджет (в отличие от живого)."""
+    _budget(monkeypatch, challenge=10, new_tab=10, browser_recycle=1)
+    links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
+    sess = _FakeSess(links)
+    _dead_cdp(monkeypatch)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _browser_fail(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: None)
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2,
+                       gather_cfg={})
+    # browser_recycle=1, 2 товара: живой браузер ушёл бы в SESSION_EXHAUSTED,
+    # мёртвый — не потратил бюджет вовсе (session_used, не лимиты).
+    assert c["recovery"]["session_budget"]["browser_recycle"] == 1
+    assert c["recovery"]["session_used"].get("browser_recycle", 0) == 0
+    assert c["recovery"].get("session_exhausted", 0) == 0
+    assert c.get("aborted") is None
+
+
+def test_collect_search_live_browser_still_recycles(monkeypatch):
+    """Регрессия: живой CDP + renderer_failure → recycle по-старому (R1/R2)."""
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    recycled = []
+    calls = {}
+
+    def fake_run_gather(cfg, sess=None):
+        if "retried" not in calls:
+            calls["retried"] = True
+            return _recyclable_fail(cfg["pid"])   # renderer_failure
+        return _ok_result(cfg["pid"])
+
+    monkeypatch.setattr("ozon_collector.search.browser_alive",
+                        lambda url: True)
+    monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
+    monkeypatch.setattr("ozon_collector.search._recycle_browser",
+                        lambda sess, manager, launch_id: recycled.append(
+                            launch_id))
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1,
+                       gather_cfg={})
+    assert recycled == ["search-1-r1"]
+    assert c["products"][0]["ok"] is True
+    assert "browser_dead" not in c["recovery"]
 
 
 def test_collect_search_no_recycle_for_non_recyclable(monkeypatch):
@@ -404,7 +516,7 @@ def test_collect_search_no_recycle_for_non_recyclable(monkeypatch):
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert recycled == []
     assert c["recovery"]["recycles"] == 0
     assert c["products"][0]["ok"] is False
@@ -425,7 +537,7 @@ def test_collect_search_recycle_until_success_or_limit(monkeypatch):
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
-    c = collect_search(sess, "u", limit=5, gather_cfg={},
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={},
                        max_recycles=2)
     assert len(recycled) == 3              # 2 recycle + 1 preventive (stability)
     assert c["recovery"]["recycles"] == 3
@@ -446,7 +558,7 @@ def test_collect_search_recycle_failure_marks_product(monkeypatch):
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert c["recovery"]["recycles"] == 0
     p = c["products"][0]
     assert p["ok"] is False
@@ -466,7 +578,7 @@ def test_collect_search_preventive_recycle(monkeypatch):
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
     monkeypatch.setattr("ozon_collector.search.RECYCLE_EVERY", 2)
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     preventive = [r for r in recycled if "preventive" in r]
     assert len(preventive) == 2                 # после 2-го и 4-го товара
     assert c["recovery"]["recycles"] == 2
@@ -492,7 +604,7 @@ def test_collect_search_challenge_storm_aborts(monkeypatch):
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert len(recycled) == 1               # 1 recycle (лестница инцидента)
     assert sess.new_pages == 1              # 1 new_tab (лестница инцидента)
     kinds = [p["error_kind"] for p in c["products"]]
@@ -510,12 +622,13 @@ def test_collect_search_pause_between_products(monkeypatch):
     import time
     links = [{"pid": f"{i}", "url": f"u{i}"} for i in range(1, 4)]
     sess = _FakeSess(links)
+    monkeypatch.setenv("OZON_ACTIVE_WARMUP", "0")
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
     sleeps = []
     monkeypatch.setattr("ozon_collector.search.time.sleep",
                         lambda s: sleeps.append(s))
-    collect_search(sess, "u", limit=3,
+    collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=3,
                    gather_cfg={"pause_s": 2.5})
     assert sleeps == [2.5, 2.5]   # 3 товара → 2 паузы
 
@@ -525,13 +638,36 @@ def test_collect_search_pause_zero_no_sleep(monkeypatch):
     import time
     links = [{"pid": f"{i}", "url": f"u{i}"} for i in range(1, 3)]
     sess = _FakeSess(links)
+    monkeypatch.setenv("OZON_ACTIVE_WARMUP", "0")
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
     sleeps = []
     monkeypatch.setattr("ozon_collector.search.time.sleep",
                         lambda s: sleeps.append(s))
-    collect_search(sess, "u", limit=2, gather_cfg={})
+    collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     assert sleeps == []
+
+
+def test_collect_search_warmup_challenges_telemetry(monkeypatch):
+    """Прогрев пишет warmup_challenges в recovery и НЕ тратит session_used."""
+    import ozon_collector.search as _S
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    monkeypatch.setenv("OZON_ACTIVE_WARMUP", "0")
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+
+    def _challenge(page, where, reload_on_fab=True):
+        if where == "warmup_home":
+            raise B.AccessChallengeError(f"challenge ({where}): title:captcha")
+        return None
+
+    monkeypatch.setattr(_S.C, "check_challenge", _challenge)
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1, gather_cfg={})
+    assert c["recovery"]["warmup_challenges"] == 1
+    assert c["recovery"]["warmup_entry"] == "home_category"
+    assert c["recovery"]["session_used"] == {"challenge": 0, "new_tab": 0,
+                                             "browser_recycle": 0}
 
 
 def test_collect_search_challenge_transient_ok_continues(monkeypatch):
@@ -550,7 +686,7 @@ def test_collect_search_challenge_transient_ok_continues(monkeypatch):
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id: None)
-    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     assert "aborted" not in c
     assert c["collected"] == 2
     assert c["recovery"].get("session_blocked") is None
@@ -570,7 +706,7 @@ def test_collect_search_challenge_ladder_not_a_loop(monkeypatch):
                         _challenge_fail(cfg["pid"]))
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id: None)
-    c = collect_search(sess, "u", limit=1, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1, gather_cfg={})
     # 1 + new_tab(1) + recycle(1) = 3 вызова; НЕ 4-й и НЕ бесконечный
     assert calls["n"] == 3
     assert c["products"][0]["error_kind"] == "session_blocked"
@@ -601,7 +737,7 @@ def test_collect_search_challenge_new_tab_recovers(monkeypatch):
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert recycled == []                    # recycle НЕ вызывался
     assert sess.new_pages == 1               # одна новая вкладка
     ok = [p for p in c["products"] if p["ok"]]
@@ -635,7 +771,7 @@ def test_collect_search_challenge_new_tab_fallback_recycle(monkeypatch):
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert sess.new_pages == 1
     assert len(recycled) == 1
     p = c["products"][0]
@@ -662,7 +798,7 @@ def test_collect_search_challenge_new_tab_max_then_recycle_limit(monkeypatch):
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
-    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     assert sess.new_pages == 1               # 1 new_tab (первый товар)
     assert len(recycled) == 1                # 1 recycle (первый товар)
     p0 = c["products"][0]
@@ -695,7 +831,7 @@ def test_collect_search_challenge_new_tab_failure_marks_product(monkeypatch):
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert recycled == []
     p = c["products"][0]
     assert p["ok"] is False
@@ -731,7 +867,7 @@ def test_session_budget_challenge_exhausted(monkeypatch):
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id: None)
-    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     # товар1: challenge(1) → new_tab → ok; товар2: challenge(2 > 1) → exhausted
     assert c["products"][0]["ok"] is True
     assert c["products"][1]["error_kind"] == "session_exhausted"
@@ -755,7 +891,7 @@ def test_session_budget_new_tab_exhausted(monkeypatch):
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id: None)
-    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     assert c["products"][0]["ok"] is True
     assert c["products"][1]["error_kind"] == "session_exhausted"
     assert c["recovery"]["session_used"]["new_tab"] == 2  # 1 + попытка на 2-м
@@ -784,12 +920,13 @@ def test_session_budget_wall_clock_param_override(monkeypatch):
                         lambda sess, manager, launch_id: None)
     override = {"challenge": 1, "new_tab": 10, "browser_recycle": 10,
                 "wall_clock_s": 0}
-    c = collect_search(sess, "u", limit=2, gather_cfg={},
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={},
                        session_budget=dict(override))
     assert c["recovery"]["session_budget"]["challenge"] == 1
     assert c["products"][0]["ok"] is True          # challenge(1) → new_tab → ok
     assert c["products"][1]["error_kind"] == "session_exhausted"  # 2-й challenge
     assert c["aborted"]["reason"] == "session_exhausted"
+    assert c["kpi"]["session_exhausted"] >= 1
 
 
 def test_kpi_and_fingerprint_in_combined(monkeypatch):
@@ -803,7 +940,7 @@ def test_kpi_and_fingerprint_in_combined(monkeypatch):
         return _ok_result(cfg["pid"])
 
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
-    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     kpi = c["kpi"]
     assert kpi["total_challenges"] == 0
     assert kpi["total_recoveries"] == 0
@@ -828,11 +965,30 @@ def test_kpi_challenge_recovery_counts(monkeypatch):
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id: None)
-    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     # 2 товара, оба с 1 challenge → new_tab recovery
     assert c["kpi"]["total_challenges"] == 2
     assert c["kpi"]["total_recoveries"] >= 2  # new_tab_attempts
     assert c["kpi"]["success_rate"] == 1.0
+    assert c["kpi"]["challenge_rate_per_100"] == 100.0
+    assert c["kpi"]["puzzle_attempts"] == 0
+    assert c["kpi"]["puzzle_solve_rate"] is None
+
+
+def test_kpi_puzzle_solve_rate(monkeypatch):
+    """KPI отдаёт solve-rate пазла: попытки/решения (ADR §14.7)."""
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+    monkeypatch.setattr("ozon_collector.puzzle.attempts", lambda: 5)
+    monkeypatch.setattr("ozon_collector.puzzle.failures", lambda: 2)
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1, gather_cfg={})
+    assert c["recovery"]["puzzle"] == {"attempts": 5, "failures": 2}
+    assert c["kpi"]["puzzle_attempts"] == 5
+    assert c["kpi"]["puzzle_solved"] == 3
+    assert c["kpi"]["puzzle_solve_rate"] == 0.6
+    assert c["kpi"]["challenge_rate_per_100"] == 0.0
 
 
 # ---- этап 7: recycle по browser stability (ADR §14.5) ------------------------
@@ -840,7 +996,8 @@ def test_kpi_challenge_recovery_counts(monkeypatch):
 def test_preventive_recycle_by_renderer_errors(monkeypatch):
     """Накопленные renderer-ошибки → preventive recycle (stability), НЕ по
     challenge. Challenge не вызывает stability-recycle."""
-    monkeypatch.setattr("ozon_collector.search.run_canary", lambda s: "ok")
+    monkeypatch.setattr("ozon_collector.search.run_canary",
+                        lambda s, url=None: "ok")
     links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
     sess = _FakeSess(links)
     recycled = []
@@ -853,7 +1010,7 @@ def test_preventive_recycle_by_renderer_errors(monkeypatch):
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
-    c = collect_search(sess, "u", limit=2, gather_cfg={},
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={},
                        max_recycles=1)
     # 2 товара × 1 recycle (max_recycles) + preventive (renderer_errors>=2)
     assert len(recycled) >= 3
@@ -869,7 +1026,7 @@ def test_preventive_recycle_by_renderer_errors(monkeypatch):
 def test_canary_ok_after_recycle_continues(monkeypatch):
     """Canary OK после recycle-recovery → прогон продолжается."""
     monkeypatch.setattr("ozon_collector.search.run_canary",
-                        lambda sess: "ok")
+                        lambda sess, url=None: "ok")
     links = [{"pid": "1", "url": "u1"}]
     sess = _FakeSess(links)
     recycled = []
@@ -885,7 +1042,7 @@ def test_canary_ok_after_recycle_continues(monkeypatch):
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
-    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     # товар: challenge→new_tab(challenge)→recycle→ok; canary OK → без aborted
     assert c["collected"] == 1
     assert "aborted" not in c
@@ -898,7 +1055,7 @@ def test_canary_challenge_blocks_session(monkeypatch):
     """Canary CHALLENGE после recycle-recovery → остаток SESSION_BLOCKED, но уже
     собранный товар НЕ штрафуется (raw/ok сохраняется, ADR §14.1)."""
     monkeypatch.setattr("ozon_collector.search.run_canary",
-                        lambda sess: "challenge")
+                        lambda sess, url=None: "challenge")
     links = [{"pid": str(i), "url": f"u{i}"} for i in range(1, 3)]
     sess = _FakeSess(links)
     recycled = []
@@ -914,7 +1071,7 @@ def test_canary_challenge_blocks_session(monkeypatch):
     monkeypatch.setattr("ozon_collector.search._recycle_browser",
                         lambda sess, manager, launch_id:
                         recycled.append(launch_id))
-    c = collect_search(sess, "u", limit=2, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
     # товар1 собран (ok=True) через recycle; canary CHALLENGE → abort остатка
     assert c["products"][0]["ok"] is True
     assert c["products"][0]["raw"] is not None
@@ -977,7 +1134,7 @@ def test_collect_search_links_recovery(monkeypatch):
     monkeypatch.setattr("ozon_collector.search._recycle_browser", fake_recycle)
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert calls["n"] == 2                        # первый провалился, второй — успех
     assert len(recycled) == 1
     assert recycled[0] == "search-links-r1"
@@ -999,7 +1156,7 @@ def test_collect_search_scrolls_until_stagnation(monkeypatch):
     sess = _GrowingSess(steps)
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
-    c = collect_search(sess, "u", limit=50, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=50, gather_cfg={})
     assert c["found"] == 32
     assert c["collected"] == 32
     assert len(c["products"]) == 32
@@ -1013,7 +1170,7 @@ def test_collect_search_found_full_selected_limit(monkeypatch):
     sess = _GrowingSess(steps)
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert c["found"] == 32      # найдено всё, что в выдаче
     assert c["limit"] == 5
     assert c["collected"] == 5   # собрано только 5
@@ -1027,7 +1184,7 @@ def test_collect_search_dedup_across_scrolls(monkeypatch):
     sess = _GrowingSess(steps)
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
-    c = collect_search(sess, "u", limit=50, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=50, gather_cfg={})
     assert c["found"] == 8
     pids = [p["pid"] for p in c["products"]]
     assert len(set(pids)) == len(pids)
@@ -1040,7 +1197,7 @@ def test_collect_search_stops_at_scan_limit(monkeypatch):
     sess = _GrowingSess(steps)
     monkeypatch.setattr("ozon_collector.search.run_gather",
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     assert c["found"] >= 50  # остановились на scan_limit, не дошли до стагнации
     assert sess.scrolls == 3
 
@@ -1118,7 +1275,7 @@ def test_collect_search_challenge_event_has_telemetry(monkeypatch):
     monkeypatch.setattr("ozon_collector.search.run_gather", fake_run_gather)
     # при первом new_tab сессия восстанавливается → второй вызов успешен
     sess._managed = 2
-    c = collect_search(sess, "u", limit=5, gather_cfg={})
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=5, gather_cfg={})
     ev = c["recovery"]["events"][0]
     assert ev["kind"] == "new_tab"
     assert ev["signature"]  # текст ошибки challenge
@@ -1270,3 +1427,50 @@ def test_collect_links_with_recovery_stop_blocks_retry(monkeypatch):
     else:
         raise AssertionError("ожидали CollectionInterrupted (graceful)")
     assert recycled == []            # повторная recovery НЕ запускалась
+
+
+# ---- ревизия 2.9 P0: невалидный URL не доходит до Page.goto -----------------
+
+def test_collect_search_rejects_junk_url():
+    """Мусорный URL = ValueError ДО warmup/goto, а не 'goto warn' + 0 товаров.
+
+    Реальный баг 2026-09-26: [текст](url) → Page.goto 'invalid URL' →
+    выдача 0 → run NORMAL_DONE discovered=0 (тихая потеря суток).
+    """
+    import pytest
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    with pytest.raises(ValueError):
+        collect_search(sess, "ozon категория шумы", limit=1, gather_cfg={})
+
+
+def test_collect_search_repairs_markdown_url(monkeypatch):
+    """Markdown-ссылка чинится, и canary получает ЧИСТЫЙ URL (rev 2.8 §10)."""
+    import ozon_collector.search as _S
+    got = {}
+    monkeypatch.setattr(_S, "_warmup_to_category",
+                        lambda s, u, recovery=None: got.setdefault("url", u))
+    monkeypatch.setattr(_S, "_collect_links_with_recovery",
+                        lambda s, m, u, lim, mr, rec: (got.update(links=u)
+                                                       or []))
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    c = collect_search(sess,
+                       "[кат](https://www.ozon.ru/category/j-10/?x=1)",
+                       limit=1, gather_cfg={})
+    assert got["url"] == "https://www.ozon.ru/category/j-10/?x=1"
+    assert got["links"] == "https://www.ozon.ru/category/j-10/?x=1"
+    assert c["search"]["url"] == "https://www.ozon.ru/category/j-10/?x=1"
+    assert c["recovery"]["canary_url"].startswith("https://www.ozon.ru/category/")
+
+
+def test_search_marks_grid_empty_flag(monkeypatch):
+    """Пустая сетка помечает recovery.search_grid_empty (демон → EMPTY_SEARCH)."""
+    import ozon_collector.search as _S
+    links = [{"pid": "1", "url": "https://www.ozon.ru/product/1/"}]
+    sess = _FakeSess(links)
+    monkeypatch.setenv("OZON_ACTIVE_WARMUP", "0")
+    monkeypatch.setattr(_S, "_feed_appeared", lambda s: False)
+    monkeypatch.setattr(_S.C, "detect_challenge", lambda p: None)
+    c = _S.collect_search(sess, "https://www.ozon.ru/category/z-1/",
+                          limit=1, gather_cfg={})
+    assert c["found"] == 0
+    assert c["recovery"]["search_grid_empty"] is True

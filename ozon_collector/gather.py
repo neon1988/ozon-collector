@@ -62,6 +62,12 @@ def assert_raw_structure(raw, pid) -> None:
     for m in C.CHALLENGE_TITLE_MARKERS:
         if m in low:
             raise B.AccessChallengeError(f"анти-бот (product.title): {m}")
+    # Слайдер-пазл: его h1 («Сопоставьте пазл, двигая ползунок») не входит в
+    # CHALLENGE_TITLE_MARKERS (это текст внутри страницы, а не <title>), но
+    # собран как название товара. Стоп-фразы — защита от капчи в product.title.
+    for m in ("сопоставьте пазл", "сопоставляйте пазл", "двигая ползунок"):
+        if m in low:
+            raise B.AccessChallengeError(f"анти-бот (product.title): {m}")
     if not isinstance(raw.get("reviews"), list):
         raise B.StructureError("reviews не является списком")
 
@@ -143,6 +149,7 @@ def run_gather(cfg: dict, sess=None) -> dict:
                 sorts=cfg.get("sorts"),
                 sess=sess,
                 skip_reviews=cfg.get("skip_reviews", False),
+                reviews_api=cfg.get("reviews_api"),
             )
             log.info(f"[gather] pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
             # Проверки объёма отзывов неприменимы в режиме без отзывов

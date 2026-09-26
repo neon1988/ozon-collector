@@ -114,6 +114,38 @@ def test_needs_restart_clean_no_challenge_not_restarted():
     assert PL._needs_restart(w, max_restarts=2) is False
 
 
+def test_needs_restart_browser_dead_restarts():
+    """Мёртвый браузер воркера: перезапускаем при exitcode 0 / без fatal_error.
+
+    Инцидент 2026-09-26: браузер воркера убили, воркер до конца прогона жёг
+    recycle-бюджет (нечего пересоздавать) и сыпал SESSION_EXHAUSTED на каждый
+    товар. Свежий браузер на респауне — единственное лечение.
+    """
+    w = _mk_worker(done=True, exitcode=0,
+                   payload={"fatal_error": None,
+                            "recovery_metrics": {"browser_dead": 5}},
+                   pending=[1, 3])
+    assert PL._needs_restart(w, max_restarts=2) is True
+
+
+def test_needs_restart_browser_dead_limit_exhausted():
+    """browser_dead тоже подчиняется max_restarts (защита от зомби-цикла)."""
+    w = _mk_worker(done=True, exitcode=0,
+                   payload={"fatal_error": None,
+                            "recovery_metrics": {"browser_dead": 5}},
+                   pending=[1, 3], restarts=2)
+    assert PL._needs_restart(w, max_restarts=2) is False
+
+
+def test_needs_restart_browser_dead_no_pending():
+    """browser_dead без незавершённой работы — перезапуск бессмыслен."""
+    w = _mk_worker(done=True, exitcode=0,
+                   payload={"fatal_error": None,
+                            "recovery_metrics": {"browser_dead": 5}},
+                   pending=[])
+    assert PL._needs_restart(w, max_restarts=2) is False
+
+
 # ---- _await_workers ---------------------------------------------------------
 
 def test_await_no_restart_when_limit_zero(monkeypatch):
@@ -141,7 +173,8 @@ def test_await_restarts_dead_worker(monkeypatch):
                       payload={"fatal_error": None}, pending=[])
     calls = []
     def fake_respawn(wctx, pending, items_by_index, gather_cfg,
-                     max_recycles, session_budget, on_event, worker_log=None):
+                     max_recycles, session_budget, on_event, worker_log=None,
+                     dynamic=False, canary_url=None):
         calls.append((wctx.worker_idx, sorted(pending)))
         return repl
     monkeypatch.setattr(PL, "_respawn", fake_respawn)
@@ -171,7 +204,8 @@ def test_await_restarts_puzzle_storm_worker(monkeypatch):
                       payload={"fatal_error": None}, pending=[])
     calls = []
     def fake_respawn(wctx, pending, items_by_index, gather_cfg,
-                     max_recycles, session_budget, on_event, worker_log=None):
+                     max_recycles, session_budget, on_event, worker_log=None,
+                     dynamic=False, canary_url=None):
         calls.append((wctx.worker_idx, sorted(pending)))
         return repl
     monkeypatch.setattr(PL, "_respawn", fake_respawn)
@@ -219,7 +253,8 @@ def test_await_restart_carries_collected_products(monkeypatch):
                       pending=[])
 
     def fake_respawn(wctx, pending, items_by_index, gather_cfg,
-                     max_recycles, session_budget, on_event, worker_log=None):
+                     max_recycles, session_budget, on_event, worker_log=None,
+                     dynamic=False, canary_url=None):
         return repl
     monkeypatch.setattr(PL, "_respawn", fake_respawn)
     deadline = time.monotonic() + 30
@@ -333,7 +368,8 @@ def test_await_stall_terminates_and_respawns(monkeypatch):
     calls = []
 
     def fake_respawn(wctx, pending, items_by_index, gather_cfg,
-                     max_recycles, session_budget, on_event, worker_log=None):
+                     max_recycles, session_budget, on_event, worker_log=None,
+                     dynamic=False, canary_url=None):
         calls.append((wctx.worker_idx, sorted(pending)))
         return repl
     monkeypatch.setattr(PL, "_respawn", fake_respawn)

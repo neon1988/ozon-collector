@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import threading
+from datetime import datetime
 
 import pytest
 
@@ -876,6 +877,25 @@ def test_classify_status_error_with_aborted_priority():
     assert k.classify_status(2, {"products": []}) == "UNKNOWN_FAILURE"
 
 
+# --- _storm_label: причина шторма для оператора ---
+
+def test_storm_label_prioritises_puzzle_then_signature():
+    # пазл-шторм важнее сигнатуры: сигнатуры у него нет вовсе, и без
+    # приоритета в last_error попадало «сигнатура неизвестна»
+    assert k._storm_label(None, {"puzzle_persistent": True,
+                                 "puzzle_failures": 3}) == \
+        "puzzle_storm: пазл не решён (3 неудач)"
+    assert k._storm_label(None, {"puzzle_persistent": True}) == \
+        "puzzle_storm: пазл не решён"
+    # обычный шторм: сигнатура страницы
+    assert k._storm_label("title:похоже, нет соединения", {}) == \
+        "title:похоже, нет соединения"
+    # ни пазла, ни сигнатуры — показываем воркеров, а не «неизвестно»
+    assert k._storm_label(None, {"workers_stormed": [1, 2]}) == \
+        "access_challenge (воркеры [1, 2])"
+    assert k._storm_label(None, {}) == "access_challenge (сигнатура неизвестна)"
+
+
 # --- normalize/extract edge ---
 
 def test_extract_discovered_pids_strips_url_wrap():
@@ -1172,6 +1192,30 @@ def test_finalize_target_reached_reserve_less_than_bad(tmp_path):
     k.finalize_campaign(prog, pa, qa_fn=qa)
     # pool = [1,2,3,10]; чистые = {3,10} = 2 < target 3 → ABANDONED (не COMPLETED_MIN)
     assert prog["final_state"] == "ABANDONED"
+
+
+def test_final_qa_keeps_wall_limited_metric(tmp_path):
+    """WALL_LIMITED не теряется: qa_raw уже считает его, демон обязан сохранить.
+
+    Регресс: parse_qa_stdout разбирал `WALL_LIMITED N`, но финальный QA
+    отбрасывал значение, и в progress/status.json не было видно, сколько
+    товаров упёрлось в анонимный потолок Ozon (~100 отзывов).
+    """
+    prog = _final_progress(3, 3, 2, reason="target_reached")
+    prog["campaign_final_pids"] = ["1", "2", "3"]
+    prog["campaign_reserve_pids"] = []
+    pa = tmp_path / "p.json"
+
+    def qa(batch):
+        # K4: products == размер батча, ok+warn+fail == products
+        return {"fail": 0, "ok": 0, "warn": len(batch),
+                "products": len(batch), "wall_limited_count": len(batch),
+                "per_pid": {p: "WARN" for p in batch}}
+
+    k.finalize_campaign(prog, pa, qa_fn=qa)
+    assert prog["qa"]["wall_limited"] == 3
+    assert prog["qa"]["batches"][0]["wall_limited"] == 3
+    assert k._status_payload(prog)["qa"]["wall_limited"] == 3
 
 
 def test_qa_clean_empty_list(tmp_path):
@@ -2332,6 +2376,60 @@ def _run_resume(data_dir, monkeypatch, **kw):
         qa_fn=qa, **kw)
 
 
+def test_integration_resume_heals_stale_failure_counters(tmp_path, monkeypatch):
+    """Resume после багованной эпохи: transient_failures=3 не убивает кампанию.
+
+    Живой случай zvukoizolyatsiya (2026-09-25): в манифесте осталось
+    transient_failures=3 (4× UNKNOWN_FAILURE из-за неверной классификации
+    блока) и пустой challenge_control. В старом коде ПЕРВЫЙ же новый сбой
+    давал tr=3 → терминал NEEDS_ATTENTION, т.е. кампания была мертва до
+    первого прогона. Новый код обязан самолечить счётчик первым же
+    не-UNKNOWN прогоном и честно остановиться по шторму.
+    """
+    def fac(argv):
+        return {"products": [], "found": 0,
+                "aborted": {"reason": "challenge_storm", "all_workers": True}}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    monkeypatch.setattr(k, "CHALLENGE_COOLDOWN_STEPS_S", [1, 2, 3])
+    monkeypatch.setattr(k, "CHALLENGE_JITTER_FRAC", 0.0)
+    data_dir = _seed_manifest(
+        tmp_path, monkeypatch, target_count=5, min_valid=1,
+        transient_failures=3,
+        challenge_control={"storm_streak": 0, "total_storms": 0,
+                           "last_storm_at": None, "cooldown_until": None,
+                           "last_signature": None},
+        profile_cooldown={"until": None, "reason": None, "challenge_count": 0,
+                          "last_signature": None, "last_full_storm_at": None},
+        recovery_telemetry={},
+        runs=[{"run_id": f"run_old_{i}", "mode": "full",
+               "status": "UNKNOWN_FAILURE"} for i in range(4)])
+    manifest = k.load_json(tmp_path / "campaigns" / "testcamp" / "progress.json")
+    manifest["run_cfg"]["max_no_progress_runs"] = 3
+    k.save_json(tmp_path / "campaigns" / "testcamp" / "progress.json", manifest)
+
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: fac(
+                            k.build_cli_args(progress, run_id, mode, targets)))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+    prog = k.run_campaign(
+        campaign="testcamp", url="u", target=5, min_valid=1,
+        out=str(data_dir / "campaign.md"), data_dir=str(data_dir),
+        max_total_hours=24.0, qa_fn=qa, max_no_progress_runs=3)
+    # stale transient_failures=3 обнулён первым же штормом (не-UNKNOWN прогон)
+    assert prog["transient_failures"] == 0
+    assert prog["challenge_control"]["total_storms"] == 3
+    assert prog["final_reason"] == "challenge_storm"
+    assert "нет соединения" not in (prog.get("last_error") or "")
+    daemon_log = (tmp_path / "logs" / "testcamp_daemon.log").read_text(
+        encoding="utf-8")
+    assert "серия UNKNOWN_FAILURE прервана" in daemon_log
+
+
 def test_integration_resume_uses_manifest_compact_flag(tmp_path, monkeypatch):
     """Флаг compact зафиксирован при fresh (True в манифесте); resume БЕЗ
     --compact НЕ переопределяет его (источник истины — манифест) и краткий
@@ -3141,6 +3239,11 @@ def test_absorb_kpi_accumulates():
     p = k.default_manifest("c", 10, 1, "url", "out.md")
     k._absorb_recovery_telemetry(p, {
         "kpi": {"total_challenges": 2, "total_recoveries": 3,
+                "session_blocked": 1, "session_exhausted": 2,
+                "puzzle_storms": 1,
+                "puzzle_attempts": 4, "puzzle_solved": 3,
+                "puzzle_solve_rate": 0.75,
+                "challenge_rate_per_100": 5.0,
                 "success_rate": 0.5},
         "fingerprint": {"webdriver": False, "tz": "Europe/Moscow"},
         "recovery": {"events": []},
@@ -3149,14 +3252,25 @@ def test_absorb_kpi_accumulates():
     assert tele["kpi"]["total_challenges"] == 2
     assert tele["kpi"]["total_recoveries"] == 3
     assert tele["kpi"]["last_success_rate"] == 0.5
+    assert tele["kpi"]["session_blocked"] == 1
+    assert tele["kpi"]["session_exhausted"] == 2
+    assert tele["kpi"]["puzzle_storms"] == 1
+    assert tele["kpi"]["puzzle_attempts"] == 4
+    assert tele["kpi"]["puzzle_solved"] == 3
+    assert tele["kpi"]["puzzle_solve_rate"] == 0.75
+    assert tele["kpi"]["last_challenge_rate_per_100"] == 5.0
     assert tele["fingerprint"]["webdriver"] is False
     # второй прогон — накопление
     k._absorb_recovery_telemetry(p, {
-        "kpi": {"total_challenges": 1, "total_recoveries": 1},
+        "kpi": {"total_challenges": 1, "total_recoveries": 1,
+                "puzzle_attempts": 4, "puzzle_solved": 1},
         "recovery": {"events": []},
     })
     assert tele["kpi"]["total_challenges"] == 3
     assert tele["kpi"]["total_recoveries"] == 4
+    assert tele["kpi"]["puzzle_attempts"] == 8
+    assert tele["kpi"]["puzzle_solved"] == 4
+    assert tele["kpi"]["puzzle_solve_rate"] == 0.5   # кумулятивный тренд
 
 
 def test_status_payload_includes_telemetry(tmp_path):
@@ -3246,6 +3360,209 @@ def test_integration_persistent_challenge_needs_attention(tmp_path, monkeypatch)
     assert prog["profile_cooldown"]["reason"] == "repeated_challenge"
 
 
+def test_integration_search_page_challenge_becomes_storm(tmp_path, monkeypatch):
+    """Блок на СТРАНИЦЕ ВЫДАЧИ → CHALLENGE_STORM + adaptive cooldown.
+
+    Живой случай (zvukoizolyatsiya, 2026-09-25): AccessChallengeError из
+    search_page попадал в общий except → UNKNOWN_FAILURE → транзиентные
+    ретраи по 4с молотили заблокированную сессию, storm_streak оставался 0.
+    Теперь это шторм: cooldown 1/5/15 мин, NEEDS_ATTENTION(challenge_storm).
+    """
+    from ozon_collector.browser import AccessChallengeError
+
+    def fac(argv):
+        raise AccessChallengeError(
+            "анти-бот (search_page): title:похоже, нет соединения")
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    monkeypatch.setattr(k, "CHALLENGE_COOLDOWN_STEPS_S", [1, 2, 3])
+    monkeypatch.setattr(k, "CHALLENGE_JITTER_FRAC", 0.0)
+    # Штормы подряд: adaptive-пауза должна расти 1→2→3с, и BOTH cooldown'а
+    # (progress.cooldown_until и profile_cooldown.until) совпадать. Баг был:
+    # pc["until"] ставился по последнему шагу (3с) → цикл брал max → лестница
+    # 1/5/15 мин не работала (всегда 15м с первого шторма).
+    snaps = []
+    _orig_set_state = k._set_state
+
+    def _spy(progress, state, event, **kw):
+        if state == "COOLDOWN_CHALLENGE":
+            snaps.append((progress.get("cooldown_until"),
+                          (progress.get("profile_cooldown") or {}).get("until")))
+        return _orig_set_state(progress, state, event, **kw)
+
+    monkeypatch.setattr(k, "_set_state", _spy)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=3, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=0,
+        reserve_count=0, max_total_hours=24.0,
+        max_no_progress_runs=100)
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog["final_reason"] == "challenge_storm"
+    assert prog["challenge_control"]["total_storms"] > 1
+    assert prog["profile_cooldown"]["reason"] == "repeated_challenge"
+    assert prog["profile_cooldown"]["last_full_storm_at"] > 0
+    assert "нет соединения" in (prog["profile_cooldown"]["last_signature"] or "")
+    assert prog["recovery_telemetry"]["kpi"]["total_challenges"] >= 1
+    # причина блока видна в status.json (last_error), а не только в логе
+    assert "нет соединения" in (prog.get("last_error") or "")
+    assert "штормов подряд" in (prog.get("last_error") or "")
+    # оба cooldown'а = одна adaptive-пауза, лестница растёт
+    assert len(snaps) >= 2
+    assert all(cu == pc for cu, pc in snaps), snaps
+    pauses = [datetime.fromisoformat(cu).timestamp() for cu, _ in snaps]
+    assert pauses == sorted(pauses) and len(set(pauses)) == len(pauses), pauses
+
+
+def test_transient_failures_reset_on_progress(tmp_path, monkeypatch):
+    """Серия UNKNOWN_FAILURE прерывается прогрессом (счётчик = подряд, не lifetime).
+
+    Баг: transient_failures никогда не сбрасывался → 4-е случайное
+    UNKNOWN_FAILURE за 12-часную кампанию (даже разнесённые по часам) убивало
+    её в NEEDS_ATTENTION. Шпион _absorb_recovery_telemetry видит значение
+    счётчика на входе каждого прогона.
+    """
+    calls = {"n": 0}
+
+    def fac(argv):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            return {"products": [{"pid": 1, "ok": True, "excluded": None}],
+                    "found": 1}
+        # UNKNOWN_FAILURE = in-proc сбор упал НЕ-AccessChallenge исключением
+        raise RuntimeError("boom")
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    seen = []
+    _orig_absorb = k._absorb_recovery_telemetry
+
+    def _spy(progress, combined):
+        seen.append(progress.get("transient_failures", 0))
+        return _orig_absorb(progress, combined)
+
+    monkeypatch.setattr(k, "_absorb_recovery_telemetry", _spy)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=5, min_valid=1, combined_factory=fac,
+        qa_fn=qa, n_pids=1, reserve_count=0, max_total_hours=24.0,
+        max_no_progress_runs=100)
+    # прогоны: crash, crash, ПРОГРЕСС, crash×4 (3 ретрая + терминал)
+    assert seen == [0, 1, 2, 0, 1, 2, 3], seen
+    assert prog["final_reason"] == "unknown_failure"
+    assert prog["transient_failures"] == 3
+    assert len(prog["runs"]) == 7
+
+
+def test_storm_streak_reset_on_progress(tmp_path, monkeypatch):
+    """storm_streak — счётчик ПОДРЯД идущих штормов: прогресс обнуляет его.
+
+    Баг: streak жил всю кампанию → 2 шторма до обеда + 2 после обеда давали
+    NEEDS_ATTENTION через часы нормальной работы.
+    """
+    calls = {"n": 0}
+
+    def fac(argv):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return {"products": [{"pid": 1, "ok": True, "excluded": None}],
+                    "found": 1}
+        return {"products": [], "found": 0,
+                "aborted": {"reason": "challenge_storm", "all_workers": True}}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    seen = []
+    _orig_absorb = k._absorb_recovery_telemetry
+
+    def _spy(progress, combined):
+        seen.append((progress.get("challenge_control") or {}).get("storm_streak", 0))
+        return _orig_absorb(progress, combined)
+
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    monkeypatch.setattr(k, "CHALLENGE_COOLDOWN_STEPS_S", [1, 2, 3])
+    monkeypatch.setattr(k, "CHALLENGE_JITTER_FRAC", 0.0)
+    monkeypatch.setattr(k, "_absorb_recovery_telemetry", _spy)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=5, min_valid=1, combined_factory=fac,
+        qa_fn=qa, n_pids=1, reserve_count=0, max_total_hours=24.0,
+        max_no_progress_runs=100)
+    # шторм → streak 1; прогресс → 0; затем 4 шторма подряд → NEEDS_ATTENTION
+    assert seen == [0, 1, 0, 1, 2, 3], seen
+    assert prog["final_reason"] == "challenge_storm"
+    assert prog["challenge_control"]["total_storms"] == 5
+    assert len(prog["runs"]) == 6
+
+
+def test_full_storm_default_limit_reports_challenge_storm(tmp_path, monkeypatch):
+    """Штормы с дефолтным лимитом no-progress → диагноз «блок», не «стагнация».
+
+    Баг: шторм инкрементит no_progress_count, поэтому при дефолте
+    max_no_progress_runs=3 демон останавливался с final_reason=no_progress
+    при challenge_control.total_storms=3 — оператор ищет проблему в выдаче,
+    а не в анти-боте.
+    """
+    def fac(argv):
+        return {"products": [], "found": 0,
+                "aborted": {"reason": "challenge_storm", "all_workers": True}}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    monkeypatch.setattr(k, "CHALLENGE_COOLDOWN_STEPS_S", [1, 2, 3])
+    monkeypatch.setattr(k, "CHALLENGE_JITTER_FRAC", 0.0)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=3, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=0,
+        reserve_count=0, max_total_hours=24.0)  # max_no_progress_runs=3 (дефолт)
+    assert prog["final_reason"] == "challenge_storm"
+    # final_note перезаписывает finalize (min_valid не достигнут), поэтому
+    # проверяем диагноз по логу демона, где он пишется в момент остановки
+    daemon_log = (tmp_path / "logs" / "testcamp_daemon.log").read_text(
+        encoding="utf-8")
+    assert "no-progress лимит → challenge_storm" in daemon_log
+    assert "блок Ozon: 3 шторм(ов) подряд" in daemon_log
+    assert prog["challenge_control"]["total_storms"] == 3
+    assert prog["challenge_control"]["storm_streak"] == 3
+
+
+def test_puzzle_storm_reports_diagnosis(tmp_path, monkeypatch):
+    """Пазл-шторм (puzzle_persistent) → last_error объясняет ПРИЧИНУ.
+
+    search.py кладёт recovery.challenge_storm.puzzle_persistent, parallel
+    прокидывает его в combined.aborted; раньше демон это игнорировал и писал
+    «сигнатура неизвестна» — оператор не мог отличить нерешаемый пазл от FAB.
+    """
+    def fac(argv):
+        return {"products": [], "found": 0,
+                "aborted": {"reason": "challenge_storm", "all_workers": True,
+                            "puzzle_persistent": True, "puzzle_failures": 3}}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setenv("KD_RANDOM_SEED", "0")
+    monkeypatch.setattr(k, "CHALLENGE_COOLDOWN_STEPS_S", [1, 2, 3])
+    monkeypatch.setattr(k, "CHALLENGE_JITTER_FRAC", 0.0)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=3, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=0,
+        reserve_count=0, max_total_hours=24.0)
+    assert prog["final_reason"] == "challenge_storm"
+    assert "puzzle_storm" in (prog.get("last_error") or "")
+    assert "3 неудач" in (prog.get("last_error") or "")
+    assert "сигнатура неизвестна" not in (prog.get("last_error") or "")
+
+
 def test_integration_partial_storm_no_escalation(tmp_path, monkeypatch):
     """ЧАСТИЧНЫЙ шторм (parallel=2, штормил ОДИН воркер, all_workers=False) →
     короткая пауза БЕЗ эскалации: storm_streak не растёт, profile_cooldown не
@@ -3274,6 +3591,8 @@ def test_integration_partial_storm_no_escalation(tmp_path, monkeypatch):
     assert prog["challenge_control"]["storm_streak"] == 0
     assert prog.get("profile_cooldown") is None or \
         not prog["profile_cooldown"].get("until")
+    assert prog.get("profile_cooldown") is None or \
+        not prog["profile_cooldown"].get("last_full_storm_at")
 
 
 def test_integration_full_storm_parallel_escalates(tmp_path, monkeypatch):
@@ -3300,6 +3619,7 @@ def test_integration_full_storm_parallel_escalates(tmp_path, monkeypatch):
     assert prog["final_reason"] == "challenge_storm"
     assert prog["challenge_control"]["storm_streak"] > 3
     assert prog["profile_cooldown"]["reason"] == "repeated_challenge"
+    assert prog["profile_cooldown"]["last_full_storm_at"] > 0
 
 
 # ---- Кооперативный стоп по Ctrl+C → INTERRUPTED ------------------------------
@@ -3623,7 +3943,7 @@ def test_main_auto_name_from_text(monkeypatch):
     k.main(["--url", "https://www.ozon.ru/search/?text=%D0%9C%D0%B0%D1%88%D0%B8%D0%BD%D0%BA%D0%B0",
             "--limit", "5", "--min-valid", "1"])
     assert captured["campaign"] == "mashinka"
-    assert captured["out"] == "docs/mashinka.md"
+    assert captured["out"] == "docs/digests/mashinka.md"
     assert captured["name_source"] == "url_text"
     assert captured["name_source_value"] == "Машинка"
 
@@ -3640,9 +3960,9 @@ def test_main_explicit_campaign_ignores_text(monkeypatch):
     monkeypatch.setattr(k, "run_campaign", fake_run)
     k.main(["--campaign", "prezervativy",
             "--url", "https://www.ozon.ru/search/?text=%D0%9C%D0%B0%D1%88%D0%B8%D0%BD%D0%BA%D0%B0",
-            "--limit", "5", "--min-valid", "1", "--out", "docs/p.md"])
+            "--limit", "5", "--min-valid", "1", "--out", "docs/digests/p.md"])
     assert captured["campaign"] == "prezervativy"
-    assert captured["out"] == "docs/p.md"
+    assert captured["out"] == "docs/digests/p.md"
     assert captured["name_source"] == "explicit"
 
 
@@ -3658,3 +3978,157 @@ def test_main_timestamp_fallback(monkeypatch):
     k.main(["--url", "https://ozon.ru/somepage", "--limit", "5", "--min-valid", "1"])
     assert re.fullmatch(r"campaign_\d{8}_\d{4}", captured["campaign"])
     assert captured["name_source"] == "timestamp"
+
+
+# ---------------------------------------------------------------------------
+# session_auth: видимость авторизации в status.json (потолок ~100 отзывов)
+# ---------------------------------------------------------------------------
+
+def _combined_with_auth(states):
+    """combined с товарами, у каждого raw.session.auth.logged_in = states[i]."""
+    return {"products": [
+        {"pid": str(i), "ok": True,
+         "raw": {"session": {"auth": {"logged_in": s,
+                                      "source": "cookie"}}}}
+        for i, s in enumerate(states)]}
+
+
+def test_absorb_session_auth_counts_states():
+    progress = {}
+    k._absorb_session_auth(progress, _combined_with_auth([True, False, True]))
+    sa = progress["session_auth"]
+    assert sa["checked"] == 3
+    assert sa["logged_in"] == 2
+    assert sa["anonymous"] == 1
+    assert sa["unknown"] == 0
+    assert sa["updated_at_utc"]
+
+
+def test_absorb_session_auth_unknown_when_marker_absent():
+    # Старые combined без session → не выдумываем авторизацию.
+    progress = {}
+    k._absorb_session_auth(progress, {"products": [{"pid": "1", "ok": True,
+                                                     "raw": {}}]})
+    assert progress["session_auth"]["logged_in"] == 0
+    assert progress["session_auth"]["anonymous"] == 0
+    assert progress["session_auth"]["unknown"] == 1
+
+
+def test_absorb_session_auth_noop_on_empty():
+    progress = {"session_auth": {"checked": 7, "logged_in": 3}}
+    k._absorb_session_auth(progress, None)
+    k._absorb_session_auth(progress, {"products": []})
+    # Пустой прогон не затирает уже накопленную картину.
+    assert progress["session_auth"]["checked"] == 7
+
+
+def test_status_payload_exposes_session_auth():
+    progress = {
+        "campaign": "c", "runtime_state": "RUNNING_FULL", "target_count": 5,
+        "started_at": datetime.now().isoformat(),
+        "run_cfg": {"max_total_hours": 1.0},
+        "session_auth": {"checked": 4, "logged_in": 0, "anonymous": 4,
+                         "unknown": 0, "updated_at_utc": "2026-09-25T10:00:00+00:00"},
+    }
+    payload = k._status_payload(progress)
+    assert payload["session_auth"]["anonymous"] == 4
+    assert payload["session_auth"]["logged_in"] == 0
+
+
+def test_status_payload_session_auth_absent_is_none():
+    payload = k._status_payload({
+        "campaign": "c", "runtime_state": "RUNNING_FULL", "target_count": 1,
+        "started_at": datetime.now().isoformat(),
+        "run_cfg": {"max_total_hours": 1.0},
+    })
+    assert payload["session_auth"] is None
+
+
+# ---- ревизия 2.9 P0: --url валидируется до прогона --------------------------
+
+class TestDaemonUrlGuard:
+    """Невалидный --url = exit 2 ДО старта браузера и демона.
+
+    Реальный баг 2026-09-26: [текст](url) дошёл до Page.goto
+    ('Cannot navigate to invalid URL'), выдача 0 товаров, прогоны
+    NORMAL_DONE с discovered=0 — демон работал вхолостую.
+
+    Политика: URL ЧИНИТСЯ, если это однозначно (markdown-обёртка, пробелы,
+    хвостовая пунктуация) + warning в лог; ОТВЕРГАЕТСЯ, если это мусор
+    (опечатка без схемы, javascript:, пусто) — exit 2 без прогона.
+    """
+
+    LIVE_BAD = ("[https://www.ozon.ru/category/zvukoizolyatsiya-33302/"
+                "?insulationinstallation=320869%2C320870]"
+                "(https://www.ozon.ru/category/fonari-11061/?type=47720)")
+
+    def test_markdown_url_repaired_before_run(self, monkeypatch):
+        got = {}
+        monkeypatch.setattr(k, "run_campaign", lambda **kw: got.update(kw) or {})
+        monkeypatch.setattr(k, "summarize", lambda p: {"ok": True})
+        assert k.main(["--url", self.LIVE_BAD, "--limit", "1"]) is None
+        assert got["url"] == ("https://www.ozon.ru/category/fonari-11061/"
+                              "?type=47720")
+
+    def test_markdown_url_names_campaign_from_repaired_url(self, monkeypatch):
+        got = {}
+        monkeypatch.setattr(k, "run_campaign", lambda **kw: got.update(kw) or {})
+        monkeypatch.setattr(k, "summarize", lambda p: {"ok": True})
+        k.main(["--url", "[заг](https://www.ozon.ru/category/g-7/)"])
+        assert got["name_source"] == "url_category"
+        assert got["campaign"] == "g"
+
+    def test_trailing_punctuation_repaired(self, monkeypatch):
+        got = {}
+        monkeypatch.setattr(k, "run_campaign", lambda **kw: got.update(kw) or {})
+        monkeypatch.setattr(k, "summarize", lambda p: {"ok": True})
+        k.main(["--url", "https://www.ozon.ru/category/h-8/?x=1. "])
+        assert got["url"] == "https://www.ozon.ru/category/h-8/?x=1"
+
+    def test_junk_url_exits_2_without_run(self, monkeypatch):
+        started = []
+        monkeypatch.setattr(k, "run_campaign",
+                            lambda **kw: started.append(kw) or {})
+        assert k.main(["--url", "ozon категория шумы"]) == 2
+        assert started == []
+
+    def test_bad_canary_url_exits_2(self, monkeypatch):
+        started = []
+        monkeypatch.setattr(k, "run_campaign",
+                            lambda **kw: started.append(kw) or {})
+        rc = k.main(["--url", "https://www.ozon.ru/category/i-9/",
+                     "--canary-url", "javascript:alert(1)"])
+        assert rc == 2
+        assert started == []
+
+    def test_bad_url_prints_hint(self, monkeypatch, capsys):
+        monkeypatch.setattr(k, "run_campaign", lambda **kw: {})
+        k.main(["--url", "просто текст"])
+        err = capsys.readouterr().err
+        assert "неверный --url" in err
+        assert "ozon.ru" in err
+
+
+# ---- ревизия 2.9: EMPTY_SEARCH не притворяется NORMAL_DONE -----------------
+
+class TestEmptySearchStatus:
+    """Прогон exit 0 с пустой сеткой = EMPTY_SEARCH, не «успех» (2.9)."""
+
+    def test_classify_empty_search(self):
+        c = {"found": 0, "collected": 0, "products": [],
+             "recovery": {"search_grid_empty": True}}
+        assert k.classify_status(0, c) == "EMPTY_SEARCH"
+
+    def test_classify_normal_done_unchanged(self):
+        c = {"found": 5, "collected": 3, "products": [{}] * 3,
+             "recovery": {}}
+        assert k.classify_status(0, c) == "NORMAL_DONE"
+
+    def test_classify_storm_beats_empty(self):
+        c = {"aborted": {"reason": "session_blocked"},
+             "recovery": {"search_grid_empty": True}}
+        assert k.classify_status(0, c) == "CHALLENGE_STORM"
+
+    def test_classify_no_recovery_key_is_normal(self):
+        assert k.classify_status(0, {"found": 0, "products": []}) == \
+            "NORMAL_DONE"

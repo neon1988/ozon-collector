@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from ozon_collector import browser as B
+from ozon_collector import collect as collect_mod
 from ozon_collector.collect import (
     collect_product,
     check_challenge,
@@ -23,7 +24,7 @@ class _Page:
         self._title = title
         self._body = body
 
-    def title(self):
+    def title(self, *a, **kw):
         return self._title
 
     def evaluate(self, js, *args, **kwargs):
@@ -36,11 +37,28 @@ class _BrokenEval:
     def __init__(self, title=""):
         self._title = title
 
-    def title(self):
+    def title(self, *a, **kw):
         return self._title
 
     def evaluate(self, *a, **kw):
         raise RuntimeError("Execution context was destroyed")
+
+
+class _ThinPage(_Page):
+    """Страница без маркеров капчи, но не отрисовавшаяся.
+
+    Реальный JS `_CHALLENGE_LOOKS_JS` возвращает булево «похоже на челлендж»
+    (нет h1, текста <300 символов), тогда как `detect_challenge` просит
+    innerText и получает пустую строку — то есть маркеров капчи нет.
+    """
+
+    def __init__(self, title="Ozon", body=""):
+        super().__init__(title=title, body=body)
+
+    def evaluate(self, js, *args, **kwargs):
+        if "location.href" in js:      # _CHALLENGE_LOOKS_JS → boolean
+            return True
+        return self._body
 
 
 def _product_page(product):
@@ -105,6 +123,39 @@ def test_check_challenge_marks_page_invalid():
 
 def test_check_challenge_passes_on_normal_page():
     check_challenge(_Page(title="Робот-пылесос Xiaomi X"), "product_page")
+
+
+def test_check_challenge_raises_on_unrendered_page(monkeypatch):
+    """Страница без маркеров капчи, но без h1/контента — тоже отказ.
+
+    Замер 2026-09-25: после холодного старта профиля Ozon отдал пустой
+    документ (widgets=0, h=805). Раньше такой случай проходил молча, и
+    collect писал пустой raw, тратя слот кампании.
+    """
+    monkeypatch.setattr(collect_mod, "CHALLENGE_RECHECKS", 0)
+    page = _ThinPage()
+    with pytest.raises(B.AccessChallengeError, match="не отрисована"):
+        check_challenge(page, "product_page")
+
+
+def test_check_challenge_unrendered_marks_page_invalid(monkeypatch):
+    """Неразрендеренная страница блокируется для evaluate (ADR §14.1)."""
+    monkeypatch.setattr(collect_mod, "CHALLENGE_RECHECKS", 0)
+    page = _ThinPage()
+    with pytest.raises(B.AccessChallengeError):
+        check_challenge(page, "product_page")
+    assert page.is_invalid is True
+
+
+def test_check_challenge_rechecks_then_raises_when_stays_thin(monkeypatch):
+    """Переспросы не помогли — отказ после них, а не пустая карточка."""
+    sleeps = []
+    monkeypatch.setattr(collect_mod, "CHALLENGE_RECHECKS", 3)
+    monkeypatch.setattr(collect_mod.time, "sleep", lambda s: sleeps.append(s))
+    page = _ThinPage()
+    with pytest.raises(B.AccessChallengeError, match="не отрисована"):
+        check_challenge(page, "product_page")
+    assert len(sleeps) == 3
 
 
 # ---- collect_product --------------------------------------------------------

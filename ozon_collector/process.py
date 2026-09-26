@@ -64,6 +64,17 @@ def profile_path(token: str) -> str:
     return os.path.join(profile_base_dir(), token)
 
 
+def firefox_profile_path(token: str) -> str:
+    """Полный путь Firefox-профиля по токену (отдельный от Chromium).
+
+    Firefox имеет свой формат профиля и не умеет жить в Chromium-профиле
+    того же токена — поэтому SUFFIX ".firefox":
+    ozon-profile.firefox / ozon-profile-worker-{k}.firefox. Куки Ozon.
+    сохраняются здесь и переживают перезапуск (первый вход — вручную).
+    """
+    return os.path.join(profile_base_dir(), f"{token}.firefox")
+
+
 def worker_profile_token(worker_id: int) -> str:
     """Токен профиля воркера: 'ozon-profile-worker-{k}' (часть ownership-контракта)."""
     return f"ozon-profile-worker-{int(worker_id)}"
@@ -107,9 +118,176 @@ def has_ozon_session(profile: str) -> bool:
     return bool(names and names & _OZON_SESSION_COOKIES)
 
 
+def _firefox_cookie_names(profile: str) -> set | None:
+    """Имена ozon-cookies Firefox-профиля (cookies.sqlite, та же схема)."""
+    p = os.path.join(profile, "cookies.sqlite")
+    if not os.path.exists(p):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=1)
+        try:
+            rows = con.execute(
+                "select name from moz_cookies where host like '%ozon%'"
+            ).fetchall()
+            return {r[0] for r in rows}
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def firefox_has_ozon_session(profile: str) -> bool:
+    """Есть ли Ozon-сессия в Firefox-профиле."""
+    names = _firefox_cookie_names(profile)
+    return bool(names and names & _OZON_SESSION_COOKIES)
+
+
+# Файлы сессии Firefox: cookies.sqlite — сами cookies, key4.db — ключ
+# расшифровки (master password/_pkcs11), logins.json — залогины. Без key4.db
+# скопированные cookies бесполезны: значение не расшифруется.
+_FIREFOX_SESSION_FILES = ("cookies.sqlite", "key4.db", "logins.json")
+
+# Политика сидинга воркер-профилей (ADR §14.7, 2026-09-25).
+#
+# Раньше куки main перезаписывали воркерские ПРИ КАЖДОМ вызове. После полного
+# challenge-шторма это тиражирует испорченную сессию main на весь пул воркеров
+# (каждый получает одни и те же куки → одинаковый блок). Поэтому:
+#   - холодный воркер (нет сессии) сеется ВСЕГДА (иначе «нет соединения»);
+#   - после фулл-шторма (post_storm_at) воркер со своей сессией НЕ пересеивается
+#     (status skipped:post_storm_hold) — держим то, что воркер донёс сам;
+#   - свежий сидинг (seeded_at < SEED_MIN_INTERVAL_S) не перезаписывается
+#     (skipped:seed_fresh) — копия раз в час вместо каждого раунда.
+SEED_META_NAME = "ozon_bootstrap.json"
+SEED_MIN_INTERVAL_S = 3600.0
+# Окно hold после фулл-шторма: столько прогретые воркеры сохраняют свою
+# сессию вместо пересева (main-куки в этот момент — испорченные).
+POST_STORM_HOLD_S = 3600.0
+
+
+def _read_seed_meta(profile: str) -> dict | None:
+    """Метаданные последнего сидинга профиля (None — не синили/битые)."""
+    p = os.path.join(profile, SEED_META_NAME)
+    try:
+        with open(p, encoding="utf-8") as f:
+            meta = json.load(f)
+        return meta if isinstance(meta, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_seed_meta(profile: str, meta: dict) -> None:
+    """Записать метаданные сидинга (best-effort: телеметрия, не блокер)."""
+    try:
+        with open(os.path.join(profile, SEED_META_NAME), "w",
+                  encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, sort_keys=True)
+    except OSError as e:
+        log.warning("[bootstrap] seed-meta не записан в %s: %s", profile, e)
+
+
+def _seed_skip_reason(meta: dict | None, *, had_session: bool, now_ts: float,
+                      post_storm_at: float | None,
+                      min_interval_s: float, hold_s: float) -> str | None:
+    """Причина пропустить пересев (None — сидинг разрешён)."""
+    if not had_session:
+        return None
+    if post_storm_at and now_ts - float(post_storm_at) < hold_s:
+        return "post_storm_hold"
+    seeded_at = float((meta or {}).get("seeded_at") or 0.0)
+    if min_interval_s > 0 and seeded_at > 0 \
+            and now_ts - seeded_at < min_interval_s:
+        return "seed_fresh"
+    return None
+
+
+def bootstrap_firefox_worker_profiles(worker_ids, main_profile: str | None = None,
+                                      main_alive_check=None,
+                                      worker_alive_check=None,
+                                      post_storm_at: float | None = None,
+                                      min_interval_s: float | None = None,
+                                      hold_s: float | None = None) -> dict:
+    """Сеять Ozon-сессию из main-Firefox-профиля в воркерские (2026-09-25).
+
+    Зачем: холодный профиль Ozon блокирует анти-ботом («Похоже, нет соединения»)
+    — ровно тот блок, что снимается копированием сессии (см.
+    bootstrap_worker_profiles для Chromium). Chromium-версия копирует
+    `Local State` + `Default/Network/Cookies`, но у Firefox-профиля другой
+    формат сессии, поэтому нужен отдельный путь.
+
+    Инварианты те же: main-браузер остановлен, работающий воркер не трогаем,
+    нет сессии в main → пропуск. Политика пересева — _seed_skip_reason
+    (ADR §14.7): холодный воркер сеется всегда, прогретый не трогается в
+    окне post_storm_hold / seed_fresh (метаданные — SEED_META_NAME).
+
+    Возвращает {worker_id: статус} для логов.
+    """
+    if min_interval_s is None:
+        min_interval_s = SEED_MIN_INTERVAL_S
+    if hold_s is None:
+        hold_s = POST_STORM_HOLD_S
+    if main_profile is None:
+        main_profile = firefox_profile_path(PROFILE_TOKEN)
+    if main_alive_check is None:
+        main_alive_check = lambda: bool(firefox_browser_processes(PROFILE_TOKEN))
+    if worker_alive_check is None:
+        def _w(k):
+            return bool(firefox_browser_processes(worker_profile_token(k)))
+        worker_alive_check = _w
+
+    status = {}
+    if main_alive_check():
+        for k in worker_ids:
+            status[int(k)] = "skipped:main_browser_running"
+        return status
+
+    src_cookies = os.path.join(main_profile, "cookies.sqlite")
+    if not os.path.exists(src_cookies):
+        for k in worker_ids:
+            status[int(k)] = "skipped:no_main_cookies"
+        return status
+
+    for k in worker_ids:
+        k = int(k)
+        wp = firefox_profile_path(worker_profile_token(k))
+        if worker_alive_check(k):
+            status[k] = "skipped:worker_browser_running"
+            continue
+        had_session = firefox_has_ozon_session(wp)
+        now_ts = time.time()
+        meta = _read_seed_meta(wp)
+        skip = _seed_skip_reason(meta, had_session=had_session, now_ts=now_ts,
+                                 post_storm_at=post_storm_at,
+                                 min_interval_s=min_interval_s, hold_s=hold_s)
+        if skip:
+            status[k] = f"skipped:{skip}"
+            continue
+        os.makedirs(wp, exist_ok=True)
+        copied = []
+        for name in _FIREFOX_SESSION_FILES:
+            s = os.path.join(main_profile, name)
+            if not os.path.exists(s):
+                continue
+            try:
+                shutil.copy2(s, os.path.join(wp, name))
+                copied.append(name)
+            except OSError as e:
+                log.warning("[bootstrap ff] worker-%d: %s не скопирован: %s",
+                            k, name, e)
+        _write_seed_meta(wp, {
+            "browser": "firefox", "seeded_at": now_ts, "source": main_profile,
+            "had_session": had_session, "files": copied,
+        })
+        status[k] = (f"refreshed ({', '.join(copied)})" if had_session
+                     else f"seeded ({', '.join(copied)})")
+    return status
+
+
 def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
                               main_alive_check=None, worker_alive_check=None,
-                              src_path=None) -> dict:
+                              src_path=None,
+                              post_storm_at: float | None = None,
+                              min_interval_s: float | None = None,
+                              hold_s: float | None = None) -> dict:
     """Сеять Ozon-сессию (cookies) из main-профиля в холодные воркер-профили.
 
     Решение §14 плана Фазы B: холодные профили Ozon блочит анти-бот
@@ -125,11 +303,17 @@ def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
     Инварианты:
     - копирование ТОЛЬКО при остановленном main-браузере (иначе файлы заняты);
     - работающий воркер-браузер пропускается;
-    - при отсутствии кук в main — пропуск (нечего сеять).
+    - при отсутствии кук в main — пропуск (нечего сеять);
+    - ADR §14.7: прогретый воркер не пересеивается в окне post_storm_hold /
+      seed_fresh (холодный — всегда, иначе блок «нет соединения»).
 
     Возвращает {worker_id: статус} для логов.
     """
     from .cdp import browser_alive as _ba
+    if min_interval_s is None:
+        min_interval_s = SEED_MIN_INTERVAL_S
+    if hold_s is None:
+        hold_s = POST_STORM_HOLD_S
     if main_profile is None:
         main_profile = profile_path(PROFILE_TOKEN)
     if main_alive_check is None:
@@ -162,6 +346,14 @@ def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
             status[k] = "skipped:worker_browser_running"
             continue
         had_session = has_ozon_session(wp)
+        now_ts = time.time()
+        meta = _read_seed_meta(wp)
+        skip = _seed_skip_reason(meta, had_session=had_session, now_ts=now_ts,
+                                 post_storm_at=post_storm_at,
+                                 min_interval_s=min_interval_s, hold_s=hold_s)
+        if skip:
+            status[k] = f"skipped:{skip}"
+            continue
         os.makedirs(os.path.join(wp, "Default", "Network"), exist_ok=True)
         copied = []
         for s, d in ((src_local, os.path.join(wp, "Local State")),
@@ -170,6 +362,10 @@ def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
             if os.path.exists(s):
                 shutil.copy2(s, d)
                 copied.append(os.path.basename(d))
+        _write_seed_meta(wp, {
+            "browser": "chrome", "seeded_at": now_ts, "source": str(src),
+            "had_session": had_session, "files": copied,
+        })
         status[k] = (f"refreshed ({', '.join(copied)})" if had_session
                      else f"seeded ({', '.join(copied)})")
     return status
@@ -590,6 +786,200 @@ def browser_processes(cdp_url: str = "http://127.0.0.1:9222",
         if ident is not None:
             out.append(ident)
     return out
+
+
+def _matches_firefox_profile(args: list[str], profile_path: str) -> bool:
+    """Firefox-процесс на нашем профиле: -profile <путь к профилю>.
+
+    Браузер поднимается как `firefox.exe -profile <user_data_dir>` (отдельные
+    аргументы, одинаково для geckodriver и ручного запуска). Сравнение
+    нормализованное (case + разделители), кавычки из токена снимаются —
+    буквальный аргумент может отличаться.
+    """
+    needle = os.path.normcase(os.path.normpath(profile_path))
+    for i, a in enumerate(args):
+        if a.strip('"') != "-profile" or i + 1 >= len(args):
+            continue
+        cand = os.path.normcase(os.path.normpath(args[i + 1].strip('"')))
+        if cand == needle:
+            return True
+    return False
+
+
+def _linux_iter_firefox_processes():
+    import glob
+
+    for path in glob.glob("/proc/[0-9]*/cmdline"):
+        pid = int(path.split("/")[2])
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        argv = [a.decode("utf-8", "replace")
+                for a in data.split(b"\0") if a]
+        if not argv:
+            continue
+        base = os.path.basename(argv[0]).lower()
+        if "firefox" not in base and "waterfox" not in base:
+            continue
+        ppid = _linux_ppid(pid)
+        yield pid, argv, ppid
+
+
+def _win_iter_firefox_processes():
+    cmd = [
+        "powershell", "-NoProfile", "-Command",
+        ("Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" | "
+         "Select-Object ProcessId,ParentProcessId,CommandLine | "
+         "ConvertTo-Json -Compress"),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception:
+        return
+    if out.returncode != 0 or not out.stdout.strip():
+        return
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        return
+    items = data if isinstance(data, list) else [data]
+    for it in items:
+        pid = it.get("ProcessId")
+        ppid = it.get("ParentProcessId")
+        cmdline = it.get("CommandLine")
+        if pid is None or not cmdline:
+            continue
+        yield int(pid), _tokenize_cmdline(cmdline), (
+            int(ppid) if ppid is not None else None)
+
+
+def _iter_firefox_processes():
+    if os.name == "nt":
+        yield from _win_iter_firefox_processes()
+    else:
+        yield from _linux_iter_firefox_processes()
+
+
+def _iter_named_processes(name: str):
+    """(pid, argv, ppid) всех процессов с именем name — кроссплатформенно.
+
+    Нужно для geckodriver: в его cmdline нет профиля, атрибуция только по имени
+    процесса + проверка потомков (orphaned_geckodriver_processes).
+    """
+    if os.name != "nt":
+        import glob
+
+        for path in glob.glob("/proc/[0-9]*/cmdline"):
+            pid = int(path.split("/")[2])
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            argv = [a.decode("utf-8", "replace")
+                    for a in data.split(b"\0") if a]
+            if argv and os.path.basename(argv[0]).lower().startswith(name):
+                yield pid, argv, _linux_ppid(pid)
+        return
+
+    cmd = [
+        "powershell", "-NoProfile", "-Command",
+        ("Get-CimInstance Win32_Process -Filter \"Name='%s.exe'\" | "
+         "Select-Object ProcessId,ParentProcessId,CommandLine | "
+         "ConvertTo-Json -Compress" % name),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception:
+        return
+    if out.returncode != 0 or not out.stdout.strip():
+        return
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        return
+    items = data if isinstance(data, list) else [data]
+    for it in items:
+        pid = it.get("ProcessId")
+        ppid = it.get("ParentProcessId")
+        cmdline = it.get("CommandLine")
+        if pid is None or not cmdline:
+            continue
+        yield int(pid), _tokenize_cmdline(cmdline), (
+            int(ppid) if ppid is not None else None)
+
+
+def firefox_browser_processes(profile_token: str) -> list[ProcessIdentity]:
+    """Идентичности Firefox-процессов на нашем профиле token.
+
+    У Firefox нет remote-debugging-port — ownership identity = (profile path):
+    процессы, запущенные Playwright с -profile нашего профиля. Identity всё
+    равно физическая (pid + start_key): kill идёт через _win_kill/_linux_kill
+    с защитой от PID-reuse, как и для Chromium.
+    """
+    profile = firefox_profile_path(profile_token)
+    out: list[ProcessIdentity] = []
+    for pid, argv, _ppid in _iter_firefox_processes():
+        if not _matches_firefox_profile(argv, profile):
+            continue
+        ident = process_identity(pid)
+        if ident is not None:
+            out.append(ident)
+    return out
+
+
+def geckodriver_processes() -> list[ProcessIdentity]:
+    """Все живые geckodriver-процессы (Selenium-драйверы Firefox).
+
+    geckodriver — РОДИТЕЛЬ нашего Firefox: он держит окно браузера. Если
+    воркер убит до driver.quit(), geckodriver остаётся жив и тянет за собой
+    окно (замер 2026-09-25: 14 geckodriver = 14 лишних окон после
+    прерванных прогонов). Убивать можно не всякий geckodriver — см.
+    orphaned_geckodriver_processes().
+    """
+    out: list[ProcessIdentity] = []
+    for pid, _argv, _ppid in _iter_named_processes("geckodriver"):
+        ident = process_identity(pid)
+        if ident is not None:
+            out.append(ident)
+    return out
+
+
+def orphaned_geckodriver_processes() -> list[ProcessIdentity]:
+    """geckodriver без живого Firefox-ребёнка на НАШЕМ профиле.
+
+    Атрибуция по профилю невозможна (в cmdline geckodriver профиля нет), поэтому
+   Ownership проверяется по потомкам: если у geckodriver нет firefox-процесса с
+    -profile ozon-profile*, он либо наш осиротевший, либо уже всё равно мёртвый
+    по смыслу (браузера нет). Живой geckodriver чужого/конкурентного запуска с
+    НАШИМ firefox-ребёнком не трогаем.
+    """
+    our_firefox_ppids = {
+        ppid for _pid, argv, ppid in _iter_firefox_processes()
+        if ppid is not None and _is_our_firefox_profile_argv(argv)
+    }
+    out: list[ProcessIdentity] = []
+    for pid, _argv, _ppid in _iter_named_processes("geckodriver"):
+        if pid in our_firefox_ppids:
+            continue
+        ident = process_identity(pid)
+        if ident is not None:
+            out.append(ident)
+    return out
+
+
+def _is_our_firefox_profile_argv(argv: list[str]) -> bool:
+    """Firefox запущен на одном из наших профилей (ozon-profile*.firefox)."""
+    base = profile_base_dir()
+    for i, a in enumerate(argv):
+        if a.strip('"') != "-profile" or i + 1 >= len(argv):
+            continue
+        cand = os.path.normcase(os.path.normpath(argv[i + 1].strip('"')))
+        if cand.startswith(os.path.normcase(os.path.normpath(base))):
+            return True
+    return False
 
 
 def _matches_profile_token(args, profile_token: str) -> bool:

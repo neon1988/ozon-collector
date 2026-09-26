@@ -13,7 +13,12 @@ WARN  — подозрительно, но не обязательно ошиб�
         текста у разных авторов, доля stars=0 > 5%,
         ориентир взят из rating_count (no_widget), данные старше недели.
 INFO  — метрики и видимость: coverage в WALL_LIMITED, пропуск гистограммы,
-        паттерн «оценка без текста» (будущий rating_only), неподтверждённый scope.
+        паттерн «оценка без текста» (будущий rating_only), неподтверждённый scope,
+        причина недобора у сессионного потолка Ozon: UNAUTH_WALL (профиль не
+        авторизован), AUTH_UNKNOWN (состояние не определено),
+        AUTH_NOT_MEASURED (raw без session.auth). Последние три — только при
+        WALL_LIMITED и не влияют на вердикт: срез неавторизованной сессии не
+        делает собранное браком.
 
 verdict = FAIL при любом FAIL; иначе WARN при любом WARN; иначе OK.
 collection_mode: FULL (official <= 100) | WALL_LIMITED (> 100) | UNKNOWN.
@@ -200,6 +205,25 @@ def qa_product(raw, pid):
     else:
         mode = "WALL_LIMITED"
 
+    # Состояние авторизации профиля: делает видимым потолок ~100 отзывов.
+    # Только INFO — вердикт не меняется, чтобы не пересобирать уже валидные
+    # pid; смысл кода в объяснении, а не в браковке.
+    # auth_state пустой = детект не выполнялся (raw до его появления) —
+    # это не то же самое, что «измерили и не определили».
+    auth = ((raw.get("session") or {}).get("auth") or {})
+    auth_logged_in = auth.get("logged_in")
+    if mode == "WALL_LIMITED":
+        if auth_logged_in is False:
+            add("UNAUTH_WALL", "INFO",
+                "недобор у сессионного среза: профиль не авторизован (нет куки _ozon_sat)")
+        elif not auth:
+            add("AUTH_NOT_MEASURED", "INFO",
+                "недобор при variant_count > 100; авторизация не измерялась "
+                "(raw без session.auth)")
+        elif auth_logged_in is None:
+            add("AUTH_UNKNOWN", "INFO",
+                "недобор при variant_count > 100; состояние авторизации не определено")
+
     scope_ok = None
     if source == "rating_count_fallback":
         if not skipped:
@@ -379,6 +403,8 @@ def qa_product(raw, pid):
         "per_sort_coverage": {s: per_sort.get(s, 0) for s in sorts_expected},
         "vm_reason": vm.get("reason"),
         "challenge_suspect": challenge,
+        "auth_logged_in": auth_logged_in,
+        "auth_source": auth.get("source"),
     }
     verdict = (
         "FAIL" if any(i["severity"] == "FAIL" for i in issues)

@@ -36,6 +36,50 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 @pytest.fixture(autouse=True)
+def _pin_browser_kind_chrome(monkeypatch):
+    """Стабильное окружение движка для тест-свиты.
+
+    Продакшн-дефолт OZON_BROWSER может меняться (сейчас = chrome), а CDP-тесты
+    (test_cdp_launch/test_browser/test_search/...) жёстко завязаны на chromium.
+    Firefox покрыт отдельно: test_cdp_firefox.py сам ставит OZON_BROWSER=firefox
+    (monkeypatch перекрывает), а test_default_chrome снимает env через delenv.
+    """
+    monkeypatch.setenv("OZON_BROWSER", "chrome")
+
+
+@pytest.fixture(autouse=True)
+def _redirect_launch_logs(tmp_path, monkeypatch):
+    """Логи автозапуска браузера — в tmp_path, а не в реальный %TEMP%.
+
+    cdp._launch_browser / browser._launch_script пишут в один фиксированный
+    файл на порт (ozon_launch_<port>.log). В тестах Popen почти всегда замотан,
+    но путь всё равно создаётся — без override тесты захламляют настоящий
+    %TEMP% (и на CI это грязно). Прод остаётся на %TEMP%.
+    """
+    logs = tmp_path / "launchlogs"
+    logs.mkdir(exist_ok=True)
+    monkeypatch.setenv("OZON_LAUNCH_LOG_DIR", str(logs))
+
+
+@pytest.fixture(autouse=True)
+def _assume_browser_alive(monkeypatch):
+    """По умолчанию CDP воркера считается ЖИВЫМ: тесты не зависят от портов.
+
+    search._cdp_dead() дёргает cdp.browser_alive() (реальный HTTP на
+    localhost), чтобы отличить «сбой вкладки» (лечится recycle) от «браузер
+    мёртв» (лечится перезапуском). Без этой фикстуры результат зависел бы от
+    того, слушает ли кто-нибудь 127.0.0.1:9222 — на машине разработчика с
+    живым демоном тесты про recycle проходили, на CI падали бы.
+
+    Тесты про browser_dead переопределяют точечно:
+        monkeypatch.setattr("ozon_collector.search.browser_alive",
+                            lambda url: False)
+    """
+    monkeypatch.setattr("ozon_collector.search.browser_alive",
+                        lambda url: True, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _redirect_log_dirs(tmp_path, monkeypatch):
     """Юнит-тесты не должны писать в боевой каталог logs/ проекта.
 

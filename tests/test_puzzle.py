@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from ozon_collector import puzzle
+from ozon_collector import puzzle_drag
 
 
 def test_is_puzzle_signatures():
@@ -15,34 +16,53 @@ def test_is_puzzle_signatures():
 def test_failures_counter_reset():
     puzzle.reset()
     assert puzzle.failures() == 0
+    assert puzzle.attempts() == 0
     puzzle._PUZZLE_FAILURES[0] = 3
+    puzzle._note_attempt()
     assert puzzle.failures() == 3
+    assert puzzle.attempts() == 1
     puzzle.reset()
     assert puzzle.failures() == 0
+    assert puzzle.attempts() == 0
 
 
-@pytest.mark.parametrize("y", [30, 140, 180])
-def test_find_notch_positive(y):
-    rng = np.random.default_rng(42)
-    bg = rng.integers(0, 256, (200, 300, 3), dtype=np.uint8)
-    patch = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
-    bg[y:y + 20, 25:25 + 20] = patch
-    piece = patch.copy()
-    assert puzzle._find_notch(bg, piece) == 25
+def test_solve_puzzle_no_bg_shot_fails_cleanly(monkeypatch):
+    """Нет живого кадра фона → честный провал, без UnboundLocalError.
+
+    Регресс: ветка звала classic-fallback (CDN template-match), тот делал
+    слепой драг и возвращал True; после этого код попадал в блок
+    `if not cands:` и строил f-string из bg_l/mask/yrow, которые в этой
+    ветке не присвоены → UnboundLocalError. Лунка рисуется оверлеем только
+    в живом кадре, поэтому без кадра решать нечем.
+    """
+    stages = []
+    info = {"bg": {"src": "http://x/bg.png", "r": [0, 0, 100, 100]},
+            "puzzle": {"src": "http://x/p.png", "r": [0, 0, 40, 40]}}
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    monkeypatch.setattr(puzzle, "_capture_info", lambda page: info)
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda page: False)
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda page: True)
+    monkeypatch.setattr(puzzle, "_bg_from_cdn", lambda info: None)
+    monkeypatch.setattr(puzzle, "_shot_bg_clean", lambda page, i: None)
+    monkeypatch.setattr(
+        puzzle, "_solve_diag",
+        lambda page, i, stage, **kw: stages.append(stage))
+    puzzle.reset()
+    ok = puzzle.solve_puzzle(_FakePage("puzzle"), attempts=1, timeout_s=0.0)
+    assert ok is False
+    assert "no_bg_shot" in stages          # дошли до нужной ветки
+    assert puzzle.failures() == 1
 
 
-def test_find_notch_no_match():
-    bg = np.random.default_rng(7).integers(0, 256, (60, 120, 3),
-                                           dtype=np.uint8)
-    piece = np.random.default_rng(9).integers(0, 256, (20, 20, 3),
-                                              dtype=np.uint8)
-    assert puzzle._find_notch(bg, piece) is not None
+def test_classic_template_match_path_is_gone():
+    """Template-match по CDN удалён: для текущего формата он мёртв.
 
-
-def test_find_notch_piece_larger_than_bg():
-    bg = np.zeros((20, 20, 3), dtype=np.uint8)
-    piece = np.zeros((40, 40, 3), dtype=np.uint8)
-    assert puzzle._find_notch(bg, piece) is None
+    Проверяем именно наличие символов — если кто-то вернёт classic-фолбэк,
+    тест упадёт до запуска anti-bot кода.
+    """
+    for name in ("_solve_classic", "_find_notch", "_notch_match",
+                 "_puzzle_piece_gone", "_log_slider", "_detect_slot"):
+        assert not hasattr(puzzle, name), f"мёртвый символ снова в модуле: {name}"
 
 
 class _FakeLocator:
@@ -64,12 +84,15 @@ class _FakeLocator:
 
 
 class _FakePage:
-    def __init__(self, sig):
+    def __init__(self, sig, href=None):
         self.sig = sig
+        self.href = href
         self.mouse = self
         self._down = False
 
     def evaluate(self, _js):
+        if "location.href" in str(_js) or "location?.href" in str(_js):
+            return self.href or ""
         return {"bg": None, "puzzle": None, "slider": None, "has": False}
 
     def locator(self, sel):
@@ -315,10 +338,13 @@ def test_drag_to_piece_mode_no_slider():
             return {"px": 50.0, "s": None, "ps": 10, "ss": None}
         return {"px": 90.0, "s": None, "ps": 10, "ss": None}
 
-    with patch.object(puzzle, "_find_slider", lambda p: None), \
-         patch.object(puzzle, "_read_sl_piece", side_effect=_read):
-        with patch.object(puzzle, "_still_challenge", lambda p: True):
-            res = puzzle._drag_to(page, target_vx=300.0, info=info, bx=200, score=1.0)
+    # _drag_to живёт в puzzle_drag: его глобальные имена (_find_slider,
+    # _read_sl_piece, _still_challenge) резолвятся в модуле-drag, поэтому
+    # патчим именно его, а не фасад puzzle.
+    with patch.object(puzzle_drag, "_find_slider", lambda p: None), \
+         patch.object(puzzle_drag, "_read_sl_piece", side_effect=_read), \
+         patch.object(puzzle_drag, "_still_challenge", lambda p: True):
+        res = puzzle._drag_to(page, target_vx=300.0, info=info, bx=200, score=1.0)
     kinds = [c[0] for c in calls]
     assert "down" in kinds and "up" in kinds
     assert any(k == "move" for k in kinds)
@@ -344,3 +370,102 @@ def test_detect_slot_diff_negative_for_shape_mismatch():
     cdn = np.full((200, 400), 128.0, dtype=np.float32)
     live = np.full((180, 380), 128.0, dtype=np.float32)
     assert puzzle._detect_slot_diff(live, cdn, mask, yrow=80) == []
+
+
+def test_captcha_done_true_when_url_has_marker():
+    page = _FakePage(sig="puzzle", href="https://ozon.ru/product/123/?&captchaDone=true")
+    assert puzzle._captcha_done(page) is True
+
+
+def test_captcha_done_false_without_marker():
+    page = _FakePage(sig="puzzle", href="https://ozon.ru/product/123/")
+    assert puzzle._captcha_done(page) is False
+
+
+def test_captcha_done_false_on_evaluate_error():
+    class _ErrPage(_FakePage):
+        def evaluate(self, _js):
+            raise RuntimeError("cdp gone")
+    assert puzzle._captcha_done(_ErrPage("puzzle")) is False
+
+
+def test_solve_puzzle_counts_attempts(monkeypatch):
+    """Каждая попытка solve_puzzle попадает в счётчик (ADR §14.7).
+
+    Инвариант для KPI: attempts == failures + solved.
+    """
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    monkeypatch.setattr(puzzle, "_capture_info", lambda page: None)
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda page: False)
+    puzzle.reset()
+    ok = puzzle.solve_puzzle(_FakePage("puzzle"), attempts=2, timeout_s=0.0)
+    assert ok is False
+    # пустой капча-стаб обрывает попытку сразу (не крутит attempts=2)
+    assert puzzle.attempts() == 1
+    assert puzzle.failures() == 1
+    puzzle.solve_puzzle(_FakePage("puzzle"), attempts=2, timeout_s=0.0)
+    assert puzzle.attempts() == 2
+    assert puzzle.failures() == 2
+
+
+def test_solve_puzzle_empty_capture_emits_on_event(monkeypatch):
+    """Капча есть, а пазл не пришёл (capture пустой, captchaDone нет):
+    on_event получает kind=empty — хантер пишет «заглушку пустой капчи»."""
+    evs = []
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    monkeypatch.setattr(puzzle, "_capture_info", lambda page: None)
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda page: False)
+    ok = puzzle.solve_puzzle(_FakePage("puzzle"), attempts=1,
+                             timeout_s=0.0, on_event=evs.append)
+    assert ok is False
+    assert evs and evs[0]["kind"] == "empty"
+    assert "seconds_s" in evs[0]
+
+
+def test_solve_puzzle_src_empty_quick_stub(monkeypatch):
+    """Пустая капча (src='') с живым челленджем: on_event kind=empty reason=
+    src_empty УЖЕ после ~3s (не 8s буфера) — ранний сигнал «заглушки»."""
+    evs = []
+    t = [1000.0]
+
+    def _mono():
+        t[0] += 1.0
+        return t[0]
+
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    monkeypatch.setattr(puzzle.time, "monotonic", _mono)
+    monkeypatch.setattr(puzzle, "_capture_info",
+                        lambda page: {"bg": {"src": ""}, "puzzle": {"src": ""}})
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda page: False)
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda page: True)
+    ok = puzzle.solve_puzzle(_FakePage("puzzle"), attempts=1,
+                             timeout_s=0.0, on_event=evs.append)
+    assert ok is False
+    assert evs and evs[0]["kind"] == "empty"
+    assert evs[0].get("reason") == "src_empty"
+
+
+def test_solve_puzzle_challenge_gone_stub(monkeypatch):
+    """Челлендж исчез, а страница — «нет соединения» (stub-маркер в title/теле):
+    on_event kind=empty reason=challenge_gone УЖЕ после ~3s, не 8s буфера."""
+    evs = []
+    t = [1000.0]
+
+    def _mono():
+        t[0] += 1.0
+        return t[0]
+
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    monkeypatch.setattr(puzzle.time, "monotonic", _mono)
+    monkeypatch.setattr(puzzle, "_capture_info", lambda page: None)
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda page: False)
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda page: False)
+    monkeypatch.setattr(
+        puzzle, "_stub_page",
+        lambda page: "нет соединения" in (page.sig or "").lower())
+    evs = []
+    ok = puzzle.solve_puzzle(_FakePage("Похоже, нет соединения"), attempts=1,
+                             timeout_s=0.0, on_event=evs.append)
+    assert ok is False
+    assert evs and evs[0]["kind"] == "empty"
+    assert evs[0].get("reason") == "challenge_gone"

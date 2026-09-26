@@ -30,7 +30,7 @@ class _FakeSess:
     def __init__(self, cdp_url="http://127.0.0.1:9222",
                  identity=None, page=None):
         self.cdp_url = cdp_url
-        self.browser_identity = identity
+        self.browser_pid = identity      # имя поля — как в cdp.Session
         self.page = page
 
 
@@ -40,6 +40,81 @@ def _identity(pid=1000, key="k"):
 
 def _rec(pid=1000, key="k"):
     return P.ProcessRecord("R1", _identity(pid, key))
+
+
+# ---- _launch_script / выбор браузера (OZON_CHROME_PATH) ---------------------
+
+def test_launch_script_injects_chrome_override(monkeypatch, tmp_path):
+    import subprocess
+
+    script = tmp_path / "launch_chrome.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    captured = {}
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["env"] = kw.get("env")
+        return mock.Mock()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(B, "_launch_script_path", lambda: script)
+    monkeypatch.setenv("OZON_CHROME_PATH", r"D:\browsers\cft\chrome.exe")
+    monkeypatch.delenv("CHROME", raising=False)
+
+    B._launch_script("http://127.0.0.1:9277", profile_path=r"C:\prof\ozon")
+
+    assert captured["env"]["PORT"] == "9277"
+    assert captured["env"]["PROFILE"] == r"C:\prof\ozon"
+    assert captured["env"]["CHROME"] == r"D:\browsers\cft\chrome.exe"
+
+
+def test_launch_script_no_override_keeps_env(monkeypatch, tmp_path):
+    import subprocess
+
+    script = tmp_path / "launch_chrome.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    captured = {}
+
+    def fake_popen(cmd, **kw):
+        captured["env"] = kw.get("env")
+        return mock.Mock()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(B, "_launch_script_path", lambda: script)
+    monkeypatch.delenv("OZON_CHROME_PATH", raising=False)
+    monkeypatch.delenv("CHROME", raising=False)
+
+    B._launch_script("http://127.0.0.1:9222")
+
+    assert "CHROME" not in captured["env"]
+
+
+def test_launch_script_keeps_predefined_chrome(monkeypatch, tmp_path):
+    import subprocess
+
+    script = tmp_path / "launch_chrome.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    captured = {}
+
+    def fake_popen(cmd, **kw):
+        captured["env"] = kw.get("env")
+        return mock.Mock()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(B, "_launch_script_path", lambda: script)
+    monkeypatch.delenv("OZON_CHROME_PATH", raising=False)
+    monkeypatch.setenv("CHROME", r"C:\my\chrome.exe")
+
+    B._launch_script("http://127.0.0.1:9222")
+
+    assert captured["env"]["CHROME"] == r"C:\my\chrome.exe"
+
+
+def test_chrome_override_parses_env(monkeypatch):
+    monkeypatch.delenv("OZON_CHROME_PATH", raising=False)
+    assert B._chrome_override() is None
+    monkeypatch.setenv("OZON_CHROME_PATH", r"D:\cft\chrome.exe")
+    assert B._chrome_override() == r"D:\cft\chrome.exe"
 
 
 # ---- has_renderer_signature -------------------------------------------------
@@ -313,10 +388,35 @@ def test_page_target_state_alive_with_page_target(monkeypatch):
 
 # ---- BrowserProbe: probe ----------------------------------------------------
 
-def test_probe_browser_dead_no_identity():
-    state, attempts = B.BrowserProbe().probe(_FakeSess(), signature=False)
-    assert state == B.ProbeState.BROWSER_DEAD
-    assert attempts == 0
+def test_probe_no_identity_falls_back_to_cdp(monkeypatch):
+    """Внешний браузер (не наш, identity=None) → владение не проверяем.
+
+    Регресс: раньше `ident is None` означал BROWSER_DEAD, поэтому любая
+    неопознанная PW-ошибка приводила к лишнему recycle здорового браузера.
+    Теперь судим по CDP HTTP — это и есть сигнал живости.
+    """
+    seen = []
+    monkeypatch.setattr(P, "identity_alive", lambda i: seen.append(i) or True)
+    monkeypatch.setattr(B.BrowserProbe, "cdp_http_ok", lambda self, url: True)
+    monkeypatch.setattr(B.BrowserProbe, "page_target_state",
+                        lambda self, s: "alive")
+    state, attempts = B.BrowserProbe().probe(_FakeSess(identity=None),
+                                             signature=False)
+    assert state == B.ProbeState.HEALTHY
+    assert seen == []          # identity_alive не вызывался вовсе
+
+
+def test_probe_never_reads_foreign_identity_attr():
+    """probe() обязан читать атрибут, который реально кладёт cdp.Session.
+
+    Раньше читался несуществующий `browser_identity` → ident всегда None →
+    BROWSER_DEAD на каждой неопознанной PW-ошибке (лишний recycle) и
+    бесполезная probe_state телеметрия.
+    """
+    import inspect
+    from ozon_collector import cdp
+    assert "browser_identity" not in inspect.getsource(B.BrowserProbe.probe)
+    assert "browser_identity" not in inspect.getsource(cdp.Session)
 
 
 def test_probe_browser_dead_identity_gone(monkeypatch):

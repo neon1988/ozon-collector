@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import unittest.mock as mock
 
 import pytest
 
@@ -365,3 +366,215 @@ class TestEnsureSingleWorkerTab:
             s.ensure_single_worker_tab()
         # старая рабочая вкладка НЕ уничтожена
         assert managed[0].closed is False
+
+
+class TestGeometryGuard:
+    """Read-only инвариант HWND↔CDP перед решением пазла (моки, без окна)."""
+
+    def _session(self, hwnd_rect, cdp_bounds, window_state=None):
+        import unittest.mock as mock
+        from ozon_collector import cdp as cdp_mod
+        s = cdp.Session.__new__(cdp.Session)
+        s.browser_pid = type("P", (), {"pid": 1234})()
+        fake_sess = type("FakeCDP", (), {
+            "send": staticmethod(
+                lambda m, *a, **kw: (
+                    {"windowId": 9} if m == "Browser.getWindowForTarget"
+                    else {"bounds": dict(cdp_bounds,
+                                         windowState=window_state),
+                          "windowState": window_state}))})()
+        ctx = type("Ctx", (), {})()
+        ctx.new_cdp_session = lambda *a: fake_sess
+        page = type("PPage", (), {"context": ctx})()
+        m = mock.patch.object(cdp_mod, "_physical_window_rect",
+                              return_value=hwnd_rect)
+        return s, page, m
+
+    def test_match_ok_window_state_ignored(self):
+        """Совпадение размеров = ok; windowState='minimized' не мешает."""
+        from ozon_collector import cdp
+        s, page, m = self._session(
+            [10, 20, 1440, 900],
+            {"left": 0, "top": 0, "width": 1440, "height": 900},
+            window_state="minimized")
+        with m:
+            ok, metrics = s._geometry_guard(page)
+        assert ok is True
+        assert metrics["cdp_window_state"] == "minimized"
+
+    def test_mismatch_detected(self):
+        """HWND шире CDP-модели на 160px → ok=False + оба прямоугольника."""
+        from ozon_collector import cdp
+        s, page, m = self._session(
+            [10, 20, 1600, 900],
+            {"left": 0, "top": 0, "width": 1440, "height": 900})
+        with m:
+            ok, metrics = s._geometry_guard(page)
+        assert ok is False
+        assert metrics["hwnd_rect"][2] == 1600
+        assert metrics["cdp_bounds"][2] == 1440
+
+    def test_no_pid_or_non_nt_noop(self):
+        """Без browser_pid проверки нет (внешний браузер)."""
+        from ozon_collector import cdp
+        s, page, m = self._session(
+            [10, 20, 1440, 900],
+            {"left": 0, "top": 0, "width": 1440, "height": 900})
+        s.browser_pid = None
+        with m:
+            ok, _ = s._geometry_guard(page)
+        assert ok is True
+
+    def test_cdp_unavailable_returns_true(self):
+        """CDP-модель недоступна (bounds=None) — по одному HWND не судим.
+
+        Моделируем ЯВНО: `send` отдаёт bounds=None. Раньше тест «проходил»
+        потому, что fake падал на dict(None) и исключение гасилось внутри
+        guard'а, — то есть проверял не то, что думал.
+        """
+        from ozon_collector import cdp
+        s, page, m = self._session([10, 20, 1440, 900], None)
+        with m:
+            ok, metrics = s._geometry_guard(page)
+        assert ok is True
+        assert "cdp_bounds_err" in metrics or metrics.get("cdp_bounds") is None
+
+    def test_guard_normalizes_and_rechecks_on_mismatch(self):
+        """Расхождение → normalize геометрии → повторная проверка = ok.
+
+        Патч `_physical_window_rect` живёт ВЕСЬ вызов (обычный `with`):
+        recheck происходит уже после возврата из `_normalize_window_geometry`,
+        поэтому «подменить и сразу снять» нельзя — вернётся старый прямоугольник.
+        """
+        from ozon_collector import cdp
+        s, page, _m = self._session(
+            [10, 20, 1600, 900],
+            {"left": 0, "top": 0, "width": 1440, "height": 900})
+
+        seen = []
+        normalized = []
+
+        def _rect(*_a, **_kw):
+            # первый замер — широкий HWND (рассинхрон), дальше — выровненный
+            seen.append(1)
+            return ([10, 20, 1600, 900] if len(seen) == 1
+                    else [10, 20, 1440, 900])
+
+        with mock.patch.object(cdp, "_physical_window_rect", side_effect=_rect):
+            s._normalize_window_geometry = lambda: normalized.append(1)
+            ok, metrics = s._geometry_guard(page)
+
+        assert ok is True
+        assert metrics.get("normalized") is True
+        assert normalized == [1], "normalize вызван ровно один раз"
+        assert len(seen) >= 2, "без повторного замера recheck не доказать"
+
+    def test_attach_on_page(self):
+        from ozon_collector import cdp
+        s, page, m = self._session([10, 20, 1440, 900],
+                                   {"left": 0, "top": 0, "width": 1440,
+                                    "height": 900})
+        s.page = page
+        s._attach_geom_guard()
+        assert getattr(page, "_geom_guard", None) == s._geometry_guard
+
+
+# ---- ревизия 2.9: Page Visibility/focus телеметрия fingerprint --------------
+
+class _FpPage:
+    """Страница, отдающая заранее заданный fingerprint-словарь."""
+
+    def __init__(self, fp):
+        self._fp = fp
+        self.evals = 0
+
+    def evaluate(self, script, *a, **kw):
+        self.evals += 1
+        if "innerWidth" in script:
+            return self._fp
+        return None
+
+
+def _fp_session(fp):
+    s = cdp.Session.__new__(cdp.Session)
+    s.page = _FpPage(fp)
+    s.keep_window = False
+    s._fingerprint_captured = False
+    s.fingerprint = None
+    return s
+
+
+def test_fingerprint_captures_page_visibility():
+    fp = {"hidden": True, "visibility": "hidden", "focused": False,
+          "webdriver": False, "ua": "UA", "vw": 1200}
+    s = _fp_session(fp)
+    s._capture_fingerprint_once()
+    assert s.fingerprint == fp
+    assert s.fingerprint["hidden"] is True
+    assert s.fingerprint["visibility"] == "hidden"
+    assert s.fingerprint["focused"] is False
+
+
+def test_fingerprint_visibility_js_fields_present():
+    """В evaluate-запросе должны быть поля видимости (иначе телеметрия пуста)."""
+    captured = {}
+
+    class _P:
+        def evaluate(self, script, *a, **kw):
+            captured["js"] = script
+            return {"hidden": False, "visibility": "visible",
+                    "webdriver": False}
+
+    s = cdp.Session.__new__(cdp.Session)
+    s.page = _P()
+    s.keep_window = True
+    s._fingerprint_captured = False
+    s.fingerprint = None
+    s._capture_fingerprint_once()
+    js = captured["js"]
+    for field in ("document.hidden", "visibilityState", "hasFocus()",
+                  "outerWidth", "outerHeight", "navigator.webdriver"):
+        assert field in js, field
+
+
+def test_fingerprint_captured_once():
+    s = _fp_session({"hidden": False, "visibility": "visible",
+                     "webdriver": False})
+    s._capture_fingerprint_once()
+    first = s.page.evals
+    s._capture_fingerprint_once()
+    assert s.page.evals == first
+
+
+def test_webdriver_true_logs_warning():
+    """webdriver === true = браузер запущен с чужими флагами → warning."""
+    import unittest.mock as mock
+    s = _fp_session({"hidden": False, "visibility": "visible",
+                     "webdriver": True})
+    with mock.patch.object(cdp.log, "warning") as warn:
+        s._capture_fingerprint_once()
+    assert warn.called
+    assert "webdriver" in warn.call_args[0][0]
+
+
+def test_hidden_window_logs_info():
+    import unittest.mock as mock
+    s = _fp_session({"hidden": True, "visibility": "hidden",
+                     "webdriver": False})
+    with mock.patch.object(cdp.log, "info") as info:
+        s._capture_fingerprint_once()
+    assert any("hidden" in c[0][0] for c in info.call_args_list)
+
+
+def test_visibility_telemetry_survives_broken_eval():
+    class _Bad:
+        def evaluate(self, script, *a, **kw):
+            raise RuntimeError("detached")
+
+    s = cdp.Session.__new__(cdp.Session)
+    s.page = _Bad()
+    s.keep_window = False
+    s._fingerprint_captured = False
+    s.fingerprint = None
+    s._capture_fingerprint_once()          # не бросает
+    assert s.fingerprint is None

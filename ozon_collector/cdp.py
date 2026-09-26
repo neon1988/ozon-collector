@@ -6,27 +6,62 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import NamedTuple
 from typing import Optional
 
 
 from playwright.sync_api import sync_playwright
 
+from . import browser as B
 from .browser import (BrowserWatchdog, is_renderer_failure,
-                      AccessChallengeError)
+                      AccessChallengeError, _chrome_override)
+from . import launchlog as _LL
 from . import log
+from . import ffsel
 from . import process as P
 
 
+# ---- Firefox-бэкенд (OZON_BROWSER=firefox) ---------------------------------
+
+# Минимум user-prefs для persistent-контекста Playwright Firefox.
+#
+# intl-префы — не маскировка, а выравнивание профиля. Замерено на Playwright
+# Firefox 153 (D:\Temp\opencode\ff_lang_probe.py): дефолтный контекст отдаёт
+# navigator.languages="en-US,en" на русском Ozon, тогда как chrome-путь идёт с
+# системными настройками (ru-RU, Europe/Moscow). Это нативное расхождение,
+# видимое Ozon без всякой автоматизации, поэтому выравниваем его prefs'ами.
+#
+# НЕ выставляем dom.webdriver.enabled=false: замерено (ff_webdriver_probe.py),
+# при выключенном префе Juggler всё равно оставляет navigator.webdriver === true
+# (свойство на Navigator.prototype, геттер). Преф не помогает, а JS-подмена
+# геттером вредна — Ozon детектит подмену (см. tests/test_cdp_launch.py).
+#
+# browser.tabs.unloadOnLowMemory=false — НЕ выгружать вкладки при нехватке
+# памяти. Гейт стоит в самом Firefox (TabUnloader, omni.ja: getBoolPref
+# ("browser.tabs.unloadOnLowMemory", true)). При 12 воркерах-FF память кончается,
+# Firefox выгружал рабочую вкладку, и Marionette падал с NoSuchWindowError
+# «Browsing context has been discarded» (живой прогон 2026-09-25).
+FIREFOX_WINDOW_CLASS = "MozillaWindowClass"
+FIREFOX_USER_PREFS = {
+    "toolkit.telemetry.enabled": False,
+    "browser.shell.checkDefaultBrowser": False,
+    "browser.tabs.unloadOnLowMemory": False,
+    "intl.accept_languages": "ru-RU, ru, en-US, en",
+    "intl.locale.requested": "ru-RU",
+}
 
 
 
-def _window_for_pid(pid: int, require_visible: bool = True):
+def _window_for_pid(pid: int, require_visible: bool = True,
+                    window_class: str | None = "Chrome_WidgetWin_1"):
     """Главное окно браузера процесса pid (user32 EnumWindows) или None.
 
     require_visible=True (по умолчанию) — первое ВИДИМОЕ окно (для минимизации);
-    require_visible=False — главное окно Chrome_WidgetWin_1 независимо от
-    видимости (для ПОКАЗА скрытого окна: фильтр по IsWindowVisible не годится,
-    т.к. скрытое с рождения SW_HIDE окно иначе найти нельзя и показать нечем).
+    require_visible=False — главное окно независимо от видимости (для ПОКАЗА
+    скрытого окна: фильтр по IsWindowVisible не годится, т.к. скрытое с
+    рождения SW_HIDE окно иначе найти нельзя и показать нечем).
+    window_class — имя класса окна; None = любой класс (для Firefox
+    MozillaWindowClass; Chromium по умолчанию Chrome_WidgetWin_1).
     """
     import ctypes
     from ctypes import wintypes
@@ -41,16 +76,98 @@ def _window_for_pid(pid: int, require_visible: bool = True):
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
         if wpid.value != pid:
             return True
-        cls = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(hwnd, cls, 64)
-        if cls.value != "Chrome_WidgetWin_1":
-            return True
+        if window_class is not None:
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, cls, 64)
+            if cls.value != window_class:
+                return True
         if require_visible and not user32.IsWindowVisible(hwnd):
             return True
         found.append(hwnd)
         return False  # первое подходящее окно — и достаточно
     user32.EnumWindows(EnumWindowsProc(_cb), 0)
     return found[0] if found else None
+
+
+def _chrome_pids_for_port(port: int):
+    """PID chrome-процессов с --remote-debugging-port=port (наш воркер)."""
+    if os.name != "nt":
+        return set()
+    out = subprocess.run(
+        ["wmic", "process", "where", "Name='chrome.exe'",
+         "get", "ProcessId,CommandLine", "/format:csv"],
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=10).stdout
+    pids = set()
+    for line in out.splitlines():
+        if f"--remote-debugging-port={port}" in line:
+            parts = line.strip().split(",")
+            if parts and parts[-1].strip().isdigit():
+                pids.add(int(parts[-1].strip()))
+    return pids
+
+
+def _physical_window_rect(pid: int):
+    """(left, top, width, height) OS-геометрии главного окна pid (Windows).
+
+    По GetWindowPlacement.wrRestore: корректный размер окна Chrome В СВЁРНУТОМ
+    состоянии (GetWindowRect при SW_MINIMIZE возвращает координаты свернутого
+    окна в таскбаре, а не восстановленный прямоугольник). Берём наибольший по
+    площади wrRestore среди Chrome_WidgetWin_* — главное окно Chrome может
+    быть Chrome_WidgetWin_1 либо Chrome_WidgetWin_0; мелкие окна (всплывашки)
+    игнорируются. Нужен для детекции рассинхрона «виртуальная геометрия CDP vs
+    реальная OS-геометрия», из-за которого композитор рисует контент смещённо.
+    """
+    if os.name != "nt" or pid is None:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        best = None
+        best_area = -1
+        WINDOWPLACEMENT_SIZE = 44  # sizeof(WINDOWPLACEMENT) Win64
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_uint),
+                ("flags", ctypes.c_uint),
+                ("showCmd", ctypes.c_uint),
+                ("ptMinPosition", wintypes.POINT),
+                ("ptMaxPosition", wintypes.POINT),
+                ("rcNormalPosition", wintypes.RECT),
+            ]
+
+        def _cb(hwnd, _lparam):
+            nonlocal best, best_area
+            wpid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value != pid:
+                return True
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, cls, 64)
+            if not cls.value.startswith("Chrome_WidgetWin_"):
+                return True
+            wp = WINDOWPLACEMENT()
+            wp.length = WINDOWPLACEMENT_SIZE
+            user32.GetWindowPlacement(hwnd, ctypes.byref(wp))
+            r = wp.rcNormalPosition
+            w = r.right - r.left
+            h = r.bottom - r.top
+            area = w * h
+            if area > best_area:
+                best = (r.left, r.top, w, h)
+                best_area = area
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        return best
+    except Exception as e:
+        log.debug(f"physical_window_rect: {type(e).__name__}: {e}")
+    return None
 
 
 def _js_label(js: str) -> str:
@@ -70,11 +187,21 @@ def _launch_script_path() -> Path:
             / _launch_script_name())
 
 
-def _launch_browser(cdp_url: str, profile_path: str | None = None):
+class LaunchRun(NamedTuple):
+    """Результат запуска лаунчера: путь лога + процесс (для fail-fast)."""
+
+    path: str
+    proc: subprocess.Popen
+
+
+def _launch_browser(cdp_url: str, profile_path: str | None = None,
+                    profile_token: str | None = None) -> LaunchRun:
     """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url).
 
     profile_path — полный путь --user-data-dir (для воркеров передаёт PROFILE
     env в launch_chrome.ps1/.sh; None = дефолтный профиль скрипта).
+    CHROME env (из OZON_CHROME_PATH или уже заданной CHROME) выбирает
+    исполняемый файл: системный Chrome либо автономный Chrome-for-Testing/Edge.
     """
     script = _launch_script_path()
     if not script.exists():
@@ -89,12 +216,70 @@ def _launch_browser(cdp_url: str, profile_path: str | None = None):
     env["PORT"] = str(P.cdp_port(cdp_url))
     if profile_path:
         env["PROFILE"] = profile_path
+    chrome = _chrome_override()
+    if chrome:
+        env["CHROME"] = chrome
+    # per-worker прокси (ревизия 2.9, net.py): 1 профиль = 1 IP. Дефолт — OFF
+    # (нет env → нет переменной PROXY в лаунчере → Chromium идёт напрямую).
+    from . import net
+    k = net.worker_index_from_profile_token(profile_token)
+    if k:
+        proxy = net.proxy_url_for_worker(k)
+        if proxy:
+            try:
+                net.chrome_proxy_arg(proxy)
+            except ValueError as e:
+                log.warning(f"[cdp] worker-{k}: некорректный прокси "
+                            f"({type(e).__name__}: {e}) — запуск без прокси")
+            else:
+                env["PROXY"] = proxy
+                log.info(f"[cdp] worker-{k}: прокси {net.mask_proxy(proxy)}"
+                         + (" [ creds в URL: Chrome применит]" if net.
+                            has_credentials(proxy) and not
+                            proxy.lower().startswith("socks5") else
+                            " [ creds в socks5-URL Chrome игнорирует — нужен "
+                            "PAC]" if net.has_credentials(proxy) else ""))
     cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
            if os.name == "nt" else [str(script)])
-    subprocess.Popen(cmd, env=env,
-                     stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL)
+    # Вывод лаунчера НЕ выбрасываем (ревизия 2.9): при пустом/битом
+    # launch_chrome.ps1 коллектор раньше получал только «CDP-браузер не
+    # поднялся за 30с» и неделю гадал про DISPLAY, хотя Chromium даже не
+    # запускался. Пишем в temp-файл, читаем хвост при неудаче.
+    path = _LL.launcher_log_path(P.cdp_port(cdp_url))
+    try:
+        with open(path, "wb") as fh:      # truncate: лог всегда от THIS запуска
+            proc = subprocess.Popen(cmd, env=env,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=fh, stderr=subprocess.STDOUT)
+    except OSError as e:
+        raise RuntimeError(f"не удалось запустить {_launch_script_name()}: "
+                           f"{type(e).__name__}: {e}") from e
+    return LaunchRun(path, proc)
+
+
+def _launcher_log_tail(path, limit: int = 12) -> str:
+    """Хвост вывода лаунчера (общий хелпер — см. launchlog.py)."""
+    return _LL.read_log_tail(getattr(path, "path", path), limit)
+
+
+def _launcher_tail_after_grace(path, grace_s: float = 3.0,
+                               limit: int = 12) -> str:
+    """Хвост лога, но пустоту подтверждаем только после паузы.
+
+    Лаунчер — отдельный процесс: он мог ещё писать, когда мы уже сдались
+    (наблюдалось: 0 байт при живом лаунчере, который дописал 293 байта через
+    секунду). Без паузы «пусто» врёт и уводит диагностику не туда.
+    """
+    tail = _launcher_log_tail(path, limit)
+    if tail and "не вывел ничего" not in tail:
+        return tail
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        tail = _launcher_log_tail(path, limit)
+        if tail and "не вывел ничего" not in tail:
+            return tail
+    return tail
 
 
 def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
@@ -113,19 +298,43 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
     profile_path = None
     if profile_token:
         profile_path = P.profile_path(profile_token)
-    _launch_browser(cdp_url, profile_path=profile_path)
+    run = _launch_browser(cdp_url, profile_path=profile_path,
+                          profile_token=profile_token)
+    logf = run.path
     deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
-        if browser_alive(cdp_url):
-            return True
-        time.sleep(0.5)
-    raise RuntimeError(
-        f"CDP-браузер не поднялся за {wait_s:.0f}с на {cdp_url}\n"
-        f"Проверьте DISPLAY и Chromium, либо запустите вручную: "
-        f"powershell -ExecutionPolicy Bypass -File scripts/launch_chrome.ps1"
-        if os.name == "nt" else
-        f"sh scripts/launch_chrome.sh"
-    )
+    try:
+        while time.monotonic() < deadline:
+            if browser_alive(cdp_url):
+                return True
+            if run.proc.poll() is not None:
+                # Лаунчер завершился: он уже знает, поднялся браузер или нет
+                # (exit 1 + LAUNCHER-ERROR). Ждать остаток wait_s бессмысленно —
+                # раньше неудачный старт стоил полные 30с на попытку.
+                break
+            time.sleep(0.5)
+        # Подсказка — платформенная (DISPLAY значим только для X-сервера),
+        # плюс фактический вывод лаунчера: иначе «не поднялся за 30с» без
+        # причины (ревизия 2.9: так и не увидели обнулённый launch_chrome.ps1).
+        if os.name == "nt":
+            hint = (r"проверьте Chromium и профиль (частая причина: профиль "
+                    r"уже открыт другим Chrome, либо порт занят старым), либо "
+                    r"запустите вручную: powershell -ExecutionPolicy Bypass "
+                    r"-File scripts\launch_chrome.ps1")
+        else:
+            hint = ("проверьте DISPLAY/Xvfb и Chromium, либо запустите вручную: "
+                    "sh scripts/launch_chrome.sh")
+        code = run.proc.poll()
+        exit_note = ("лаунчер ещё работает" if code is None
+                     else f"код возврата лаунчера={code}")
+        raise RuntimeError(
+            f"CDP-браузер не поднялся за {wait_s:.0f}с на {cdp_url} "
+            f"({exit_note}); {hint}"
+            + f"\nвывод {_launch_script_name()} ({logf}):"
+            + _launcher_tail_after_grace(logf))
+    finally:
+        # лог не удаляем намеренно: после неудачи это улика, путь известен
+        # (_LL.launcher_log_path) и печатается в тексте ошибки выше
+        pass
 
 
 class Session:
@@ -144,6 +353,10 @@ class Session:
                  keep_window: Optional[bool] = None):
         self.cdp_url = cdp_url
         self.profile_token = profile_token
+        # kind: движок браузера (OZON_BROWSER, дефолт = chrome). 'chrome' —
+        # CDP-подключение к живому Chromium; 'firefox' — stock Firefox +
+        # geckodriver/Selenium, persistent-профиль (CDP нет).
+        self.kind = B.browser_kind()
         self.auto_launch = (auto_launch if auto_launch is not None
                             else os.environ.get("OZON_AUTO_LAUNCH", "1") != "0")
         # keep_window: None → env OZON_KEEP_WINDOW (1 = окно видимо/наверху),
@@ -152,7 +365,10 @@ class Session:
                             else os.environ.get("OZON_KEEP_WINDOW") == "1")
         self.browser_owner = "external"   # external | collector (ADR §14.1)
         self.browser_pid = None
-        self.browser_profile = P.profile_path(profile_token)
+        self.browser_profile = (
+            P.firefox_profile_path(profile_token)
+            if self.kind == "firefox"
+            else P.profile_path(profile_token))
         self._playwright = None
         self._browser = None
         self.page = None
@@ -163,6 +379,9 @@ class Session:
         self._connect()
 
     def _connect(self):
+        if self.kind == "firefox":
+            self._connect_firefox()
+            return
         was_alive = browser_alive(self.cdp_url)
         if self.auto_launch and not was_alive:
             launch_and_wait(self.cdp_url, profile_token=self.profile_token)
@@ -201,6 +420,7 @@ class Session:
         else:
             self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
         self._managed_pages = [self.page]
+        self._attach_geom_guard()
         if self.keep_window:
             # Окно коллектора видимо и на всех: не сворачиваем (env/CLI
             # --window-mode visible). SWP/ShowWindow снаружи бесполезны,
@@ -209,43 +429,287 @@ class Session:
         else:
             self._minimize_window()
 
+    def _connect_firefox(self):
+        """Firefox-бэкенд: stock Firefox через geckodriver (Selenium/Marionette).
+
+        ВНИМАНИЕ, статус 2026-09-25: Ozon отдаёт заглушку «нет соединения» на
+        первом же goto ЛЮБОЙ сессии geckodriver/Marionette — тёплый профиль,
+        пустой профиль, без prefs, с включённым OCSP: все варианты заблокированы
+        за 6-8с. Chromium CDP при этом проходит, в том числе с
+        navigator.webdriver === true (то есть сам флаг — не причина; см.
+        browser_kind с полной таблицей замеров). Причина — marionette-сессия
+        как таковая; отдельный её tell не локализован, лечится сменой транспорта.
+
+        Транспорт: НЕ Playwright, а Selenium + шим ffsel.FirefoxPage,
+        повторяющий нужный поднабор page-API (evaluate/locator/mouse/screenshot).
+        Ветка остаётся для отладки профилей и офлайн-разбора, боевой сбор —
+        на OZON_BROWSER=chrome (дефолт).
+
+        Профиль всегда наш → browser_owner='collector' (перезапуск разрешён).
+        OZON_FF_PRIVATE=1 — без профиля (аналог инкогнито, временный профиль).
+        OZON_FIREFOX_PATH — путь к firefox.exe; по умолчанию системный. Сюда
+        НЕЛЬЗЯ указывать patched-сборку ms-playwright/firefox-*.
+        """
+        private = os.environ.get("OZON_FF_PRIVATE", "0") == "1"
+        if not private:
+            # Профиль не должен быть занят чужим firefox (после crash-инстанса).
+            # Процессы на нашем профиле = наши по ownership-контракту — гасим.
+            stale = P.firefox_browser_processes(self.profile_token)
+            if stale:
+                log.warning(f"[cdp] firefox: профиль занят {len(stale)} процессами "
+                            f"— останавливаю перед запуском")
+                P.kill_records([P.ProcessRecord("prelaunch", ident)
+                                for ident in stale], wait_s=3.0)
+        binary = os.environ.get("OZON_FIREFOX_PATH") or None
+        driver, page, adapter = ffsel.connect(
+            profile_path=None if private else self.browser_profile,
+            prefs=FIREFOX_USER_PREFS,
+            binary=binary)
+        self._playwright = None
+        self._driver = driver
+        self._browser = adapter
+        self.browser_owner = "collector"
+        try:
+            procs = P.firefox_browser_processes(self.profile_token)
+            self.browser_pid = procs[0] if procs else None
+        except Exception:
+            self.browser_pid = None
+        self.page = page
+        self._managed_pages = [self.page]
+        self._attach_geom_guard()
+        log.info(f"[cdp] firefox connected via selenium: profile="
+                 f"{'private' if private else self.browser_profile}, "
+                 f"pid={getattr(self.browser_pid, 'pid', None)}, "
+                 f"binary={binary or 'system'}")
+        if self.keep_window:
+            self._keep_window_visible()
+        elif getattr(self, "kind", "chrome") == "firefox":
+            # Свёрнутое окно Firefox не рендерит lazy-блоки: IntersectionObserver
+            # не срабатывает, webListReviews не монтируется — 0 отзывов через
+            # cli.py при 12 в том же профиле с видимым окном (замер 2026-09-25,
+            # D:\Temp\opencode\ff_vmode_probe.py). Поэтому окно разворачиваем
+            # без активации (WS_EX_NOACTIVATE + TOPMOST) — фокус не крадём.
+            log.info("[cdp] firefox: окно разворачиваю без фокуса — свёрнутое "
+                     "окно не монтирует lazy-блоки отзывов и теряет вкладку "
+                     "при выгрузке по памяти")
+            self._restore_window_native(pids=self._firefox_pids(),
+                                        window_class=FIREFOX_WINDOW_CLASS)
+        else:
+            self._minimize_window()
+
     def _minimize_window(self):
         """Сворачивает окно Chromium, чтобы не перекрывало работу пользователя.
 
         При запуске и подключении CDP Chromium разворачивает окно поверх всех
-        и крадёт фокус. Двойная защита:
-        1) CDP Browser.setWindowBounds (windowState=minimized) — сворачивание
-           через сам браузер;
-        2) user32: WS_EX_NOACTIVATE + SW_MINIMIZE на главное окно процесса —
-           окно не получает фокус при разворачивании (важно при live-сборе,
-           чтобы печать в другом приложении не прерывалась).
+        и крадёт фокус. Сворачивание только user32:
+        WS_EX_NOACTIVATE + SW_MINIMIZE на главное окно — окно уходит свёрнутым
+        и не получает фокус при разворачивании (важно при live-сборе, чтобы
+        печать в другом приложении не прерывалась).
         Игнорируем ошибки: сбой минимизации некритичен.
+
+        ВАЖНО (fixсдвига рендера): НЕ использовать CDP Browser.setWindowBounds
+        с windowState=minimized. Он «замораживает» внутреннюю модель окна
+        Chromium на стартовом размере (1440x900): при последующем
+        восстановлении/максимизации пользователем физическое окно растёт
+        (например до 1920x1032), а viewport (innerWidth/innerHeight) остаётся
+        от свёрнутого состояния → контент рисуется в левом верхнем углу.
+        user32-сворачивание движет окно Windows, но CDP-модель остаётся
+        normal/синхронна, поэтому максимизация корректно пересчитывает viewport.
         """
+        # fix рассинхрона OS-window vs Chromium-модель: если физическое окно
+        # другого размера, чем внутренняя модель Chromium (1440x900),
+        # композитор рисует контент со смещением от оси мыши → синхронизируем
+        # геометрию ДО сворачивания. Только для collector-браузеров:
+        # external (чужой Chrome пользователя) не трогаем — его окно личное.
+        if getattr(self, "browser_owner", None) == "collector":
+            self._normalize_window_geometry()
+        if getattr(self, "kind", "chrome") == "firefox":
+            # Firefox не сворачиваем НИКОГДА: свёрнутое окно не рендерит
+            # lazy-блоки (0 отзывов) и теряет вкладку при выгрузке по памяти
+            # («Browsing context has been discarded», живой прогон 12 воркеров
+            # 2026-09-25). Разворачиваем без фокуса — см. _apply_window_policy.
+            log.info("firefox: игнорирую minimize — разворачиваю без фокуса")
+            self._restore_window_native(pids=self._firefox_pids(),
+                                        window_class=FIREFOX_WINDOW_CLASS)
+        else:
+            self._minimize_window_native(P.cdp_port(self.cdp_url))
+
+    def _apply_window_policy(self, why: str = ""):
+        """Единая политика окна браузера коллектора (connect/new_page/recycle).
+
+        keep_window=1 (OZON_KEEP_WINDOW) → развернуть и показать.
+        Firefox (always) → развернуть БЕЗ фокуса: свёрнутое окно не рендерит
+        lazy-блоки (IntersectionObserver молчит) и попадает под выгрузку
+        вкладок Firefox при нехватке памяти — живой прогон 2026-09-25 с 12
+        воркерами отваливался на «Browsing context has been discarded» (worker
+        падал на ПЕРВОМ товаре, когда new_page сворачивал окно).
+        Chromium → свернуть, чтобы не перекрывал работу пользователя.
+        """
+        if getattr(self, "keep_window", False):
+            self._keep_window_visible()
+        elif getattr(self, "kind", "chrome") == "firefox":
+            log.debug("firefox: окно разворачиваю без фокуса%s", why)
+            self._restore_window_native(pids=self._firefox_pids(),
+                                        window_class=FIREFOX_WINDOW_CLASS)
+        else:
+            self._minimize_window()
+
+    def _firefox_pids(self) -> list:
+        """PIDs нашего Firefox (все процессы на профиле, для native-окна).
+
+        Playwright поднимает ДВА firefox.exe на одном -profile (launcher +
+        main browser); главное окно MozillaWindowClass висит на одном из них —
+        перебираем все, иначе не найдём окно для minimize/restore.
+        """
+        try:
+            return [i.pid for i in
+                    P.firefox_browser_processes(self.profile_token)]
+        except Exception:
+            return []
+
+    def _normalize_window_geometry(self, width: int = 1440,
+                                   height: int = 900,
+                                   timeout: float = 2.0) -> bool:
+        """Синхронизирует физическое OS-окно воркера с моделью Chromium.
+
+        Бывает рассинхрон: Chromium свёрнут, а его внутренняя модель окна
+        (Browser.getWindowForTarget) не совпадает с реальной OS-геометрией
+        (GetWindowRect). Тогда композитор рисует viewport по «виртуальным»
+        координатам, а OS показывает окно в других пикселях → визуально весь
+        контент «съехал» относительно кликов (клики по DOM попадают в место,
+        а картинка на экране — выше/левее). Лекарство: принудительно выставить
+        browser bounds (= установка геометрии Chromium), подтвердить, что
+        физическое окно стало правильного размера, — после этого отрисовка
+        совпадает с осью мыши. Возвращает True если синхронизация нужна и
+        выполнена (окно было рассинхронизировано).
+        """
+        if os.name != "nt":
+            return False
+        if getattr(self, "kind", "chrome") == "firefox":
+            # Firefox: нет CDP Browser.setWindowBounds — чинить нечем, нечего
+            # и проверять (рассинхрон — chromium-специфика композитора).
+            return False
+        pid = getattr(getattr(self, "browser_pid", None), "pid", None)
+        phys = _physical_window_rect(pid)
+        if phys is None:
+            # окно не нашли (ещё не создано / не Windows) — нечего чинить
+            return False
+        if abs(phys[2] - width) < 2 and abs(phys[3] - height) < 2:
+            # физический размер совпадает с ожидаемым — рассинхрона нет
+            return False
+        log.info(f"window geometry desync: physical={phys}, want {width}x{height}"
+                 f" — fixing via CDP setWindowBounds")
+        ok = False
         try:
             sess = self._browser.new_browser_cdp_session()
             targets = sess.send("Target.getTargets")
-            tid = None
             for t in targets.get("targetInfos", []):
-                if t.get("type") == "page":
-                    tid = t["targetId"]
-                    break
-            if tid is not None:
-                res = sess.send("Browser.getWindowForTarget", {"targetId": tid})
+                if t.get("type") != "page":
+                    continue
+                res = sess.send("Browser.getWindowForTarget",
+                                {"targetId": t["targetId"]})
                 sess.send("Browser.setWindowBounds", {
                     "windowId": res["windowId"],
-                    "bounds": {"windowState": "minimized"},
+                    "bounds": {"left": 0, "top": 0,
+                               "width": width, "height": height,
+                               "windowState": "normal"},
                 })
+                break
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                cur = _physical_window_rect(pid)
+                if cur and abs(cur[2] - width) < 2 and abs(cur[3] - height) < 2:
+                    ok = True
+                    break
+                time.sleep(0.05)
         except Exception as e:
-            log.debug(f"minimize_window cdp: {type(e).__name__}: {e}")
-        self._minimize_window_native(P.cdp_port(self.cdp_url))
+            log.debug(f"normalize_window_geometry: {type(e).__name__}: {e}")
+        if ok:
+            log.info("window geometry sync: OK")
+        else:
+            log.info("window geometry sync: failed, physical="
+                     f"{_physical_window_rect(pid)}")
+        return ok
+
+    def _assert_geometry_ok(self, page, tolerance: float = 3.0):
+        """Read-only инвариант «физическое OS-окно == CDP-модель» (для solve).
+
+        Сравнивает ЧИСЛОВУЮ геометрию: GetWindowRect(hwnd) vs CDP
+        Browser.getWindowBounds. Поле windowState в сравнении НЕ участвует
+        (2026-09-22 live: CDP говорит minimized при физически восстановленном
+        окне — это ожидаемый компромисс от восстановления через Win32 в обход
+        CDP, а не рассинхрон; иначе guard ловил бы ложное срабатывание каждый
+        прогон).
+
+        Только чтение — ничего не двигает и не ресайзит. Возвращает
+        (ok: bool, metrics: dict). Не-Windows / unknown pid / нет окна → True
+        (нечего проверять, solve не блокируем).
+        """
+        if os.name != "nt":
+            return True, {}
+        pid = getattr(getattr(self, "browser_pid", None), "pid", None)
+        if pid is None:
+            return True, {}
+        phys = _physical_window_rect(pid)
+        if phys is None:
+            # окно не нашли — ничего не сравниваем (external браузеры тоже тут)
+            return True, {}
+        l, t, w, h = int(phys[0]), int(phys[1]), int(phys[2]), int(phys[3])
+        metrics = {"hwnd_rect": [l, t, w, h]}
+        if getattr(self, "kind", "chrome") == "firefox":
+            # нет CDP-модели окна (Firefox) — сравнивать не с чем
+            metrics["browser_kind"] = "firefox"
+            return True, metrics
+        cw = ch = None
+        try:
+            sess = page.context.new_cdp_session(page)
+            res = sess.send("Browser.getWindowForTarget")
+            bnd = sess.send("Browser.getWindowBounds", {"windowId": res["windowId"]})
+            b = bnd.get("bounds") or {}
+            cw, ch = b.get("width"), b.get("height")
+            metrics["cdp_bounds"] = [b.get("left"), b.get("top"), cw, ch]
+            metrics["cdp_window_state"] = b.get("windowState")
+        except Exception as e:
+            log.debug(f"_assert_geometry_ok: cdp bounds err "
+                      f"{type(e).__name__}: {e}")
+            metrics["cdp_bounds_err"] = f"{type(e).__name__}"
+        if cw is None or ch is None:
+            # CDP-модель недоступна — по одному HWND не судиим о рассинхроне
+            return True, metrics
+        ok = (abs(w - int(cw)) <= tolerance and abs(h - int(ch)) <= tolerance)
+        log.debug(f"geometry check hwnd={[l, t, w, h]} "
+                  f"cdp={metrics.get('cdp_bounds')} ok={ok}")
+        return ok, metrics
+
+    def _geometry_guard(self, page, tolerance: float = 3.0):
+        """Инвариант перед решением пазла: validate → normalize if fail →
+        revalidate. Возвращает (ok, metrics). Разделяет ЧТЕНИЕ (всегда
+        читает-редактирует только при расхождении) и ДЕЙСТВИЕ подъёма
+        геометрии — не пере-устанавливает геометрию на каждый пазл.
+        """
+        ok, m = self._assert_geometry_ok(page, tolerance=tolerance)
+        if ok:
+            m["normalized"] = False
+            return True, m
+        log.warning(f"geometry desync перед solve: metrics={m} — "
+                    f"пытаюсь синхронизировать")
+        try:
+            self._normalize_window_geometry()
+        except Exception as e:
+            log.debug(f"_geometry_guard: normalize err "
+                      f"{type(e).__name__}: {e}")
+        ok2, m2 = self._assert_geometry_ok(page, tolerance=tolerance)
+        m2.update({"normalized": True, "after_each": m2.get("hwnd_rect")})
+        return ok2, m2
 
     @staticmethod
-    def _minimize_window_native(port: int):
-        """user32: свёртывание + запрет активации окна CDP-Chromium (Windows).
+    def _minimize_window_native(port: int | None = None, pids=None,
+                                window_class: str = "Chrome_WidgetWin_1"):
+        """user32: свёртывание + запрет активации окна браузера (Windows).
 
-        Находит главное окно процесса chrome с remote-debugging-port=port
-        (наш воркер), ставит WS_EX_NOACTIVATE и сворачивает (SW_MINIMIZE).
-        Окна обычного Chrome пользователя не трогаются. Не-Windows — no-op.
+        Chromium: pids вычисляются по port (chrome с --remote-debugging-port,
+        наш воркер). Firefox: pids передаются явно (нет порта), класс окна
+        MozillaWindowClass. Не-Windows — no-op.
         """
         if os.name != "nt":
             return
@@ -258,23 +722,12 @@ class Session:
             WS_EX_NOACTIVATE = 0x08000000
             SW_MINIMIZE = 6
 
-            # ищем PID процесса chrome с remote-debugging-port через wmic
-            import subprocess
-            out = subprocess.run(
-                ["wmic", "process", "where",
-                 "Name='chrome.exe'",
-                 "get", "ProcessId,CommandLine",
-                 "/format:csv"],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=10).stdout
-            pids = set()
-            for line in out.splitlines():
-                if f"--remote-debugging-port={port}" in line:
-                    parts = line.strip().split(",")
-                    if parts and parts[-1].strip().isdigit():
-                        pids.add(int(parts[-1].strip()))
+            if pids is None:
+                if port is None:
+                    return
+                pids = _chrome_pids_for_port(port)
             for pid in pids:
-                hwnd = _window_for_pid(pid)
+                hwnd = _window_for_pid(pid, window_class=window_class)
                 if hwnd:
                     style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
                     user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
@@ -285,13 +738,16 @@ class Session:
             log.debug(f"minimize_window native: {type(e).__name__}: {e}")
 
     def _keep_window_visible(self):
-        """OZON_KEEP_WINDOW=1: развернуть окно Chromium и показать его.
+        """OZON_KEEP_WINDOW=1: развернуть окно браузера и показать его.
 
-        `_minimize_window` вызывается на каждом __init__/reconnect — окно вечно
-        «пропадает», т.к. Chrome сам задаёт позицию (SWP снаружи бесполезен).
-        Здесь через CDP Browser.setWindowBounds просим normal + ставим
-        координаты в границы экрана, чтобы окно было видимым и наверху.
+        Chromium: через CDP Browser.setWindowBounds просим normal + ставим
+        координаты в границы экрана (Chrome сам задаёт позицию, SWP снаружи
+        бесполезен). Firefox: CDP bounds нет — только native SW_RESTORE+TOPMOST.
         """
+        if getattr(self, "kind", "chrome") == "firefox":
+            self._restore_window_native(pids=self._firefox_pids(),
+                                        window_class=FIREFOX_WINDOW_CLASS)
+            return
         try:
             sess = self._browser.new_browser_cdp_session()
             targets = sess.send("Target.getTargets")
@@ -315,11 +771,13 @@ class Session:
         self._restore_window_native(P.cdp_port(self.cdp_url))
 
     @staticmethod
-    def _restore_window_native(port: int):
-        """user32: SW_RESTORE + TOPMOST окна Chromium (Windows), без активации.
+    def _restore_window_native(port: int | None = None, pids=None,
+                               window_class: str = "Chrome_WidgetWin_1"):
+        """user32: SW_RESTORE + TOPMOST окна браузера (Windows), без активации.
 
         Дублирует путь launch_chrome.ps1, но применим к уже работающему окну
-        (после reconnect/перезапуска коллектором). NOACTIVATE + SW_RESTORE,
+        (после reconnect/перезапуска коллектором). Chromium: pids из порта;
+        Firefox: pids явные + класс MozillaWindowClass. NOACTIVATE + SW_RESTORE,
         фокус не крадём.
         """
         if os.name != "nt":
@@ -337,26 +795,17 @@ class Session:
             SWP_NOSIZE = 0x0001
             SWP_NOACTIVATE = 0x0010
 
-            import subprocess
-            out = subprocess.run(
-                ["wmic", "process", "where",
-                 "Name='chrome.exe'",
-                 "get", "ProcessId,CommandLine",
-                 "list", "brief"],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=15)
-            pids = set()
-            for raw in out.stdout.splitlines():
-                if "remote-debugging-port" in raw:
-                    parts = raw.strip().split(",")
-                    if parts and parts[-1].strip().isdigit():
-                        pids.add(int(parts[-1].strip()))
+            if pids is None:
+                if port is None:
+                    return
+                pids = _chrome_pids_for_port(port)
             for pid in pids:
                 # require_visible=False: главное окно браузера находим даже В
                 # СКРЫТОМ состоянии (SW_HIDE при старте) — иначе его нельзя
                 # найти и показать (замкнутый круг). SW_RESTORE +
                 # SWP_SHOWWINDOW гарантированно показывают невидимое окно.
-                hwnd = _window_for_pid(pid, require_visible=False)
+                hwnd = _window_for_pid(pid, require_visible=False,
+                                       window_class=window_class)
                 if hwnd:
                     style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
                     user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
@@ -369,6 +818,19 @@ class Session:
         except Exception as e:
             log.debug(f"restore_window native: {type(e).__name__}: {e}")
 
+    @staticmethod
+    def _firefox_context_lost(e: Exception) -> bool:
+        """Firefox потерял вкладку: её выгрузили (дискард) или закрыли.
+
+        Marionette отдаёт NoSuchWindowException «Browsing context has been
+        discarded» (см. Firefox: driver.sys.mjs assert.open). Лечится свежей
+        вкладкой — сгоревшая вкладка не восстанавливается сама.
+        """
+        msg = str(e).lower()
+        return ("browsing context has been discarded" in msg
+                or type(e).__name__ in ("NoSuchWindowException",
+                                        "NoSuchWindowError"))
+
     def goto(self, url: str, wait_ms: int = 7000):
         """Перейти на страницу, дождаться domcontentloaded + паузу."""
         self._guard_check()
@@ -376,19 +838,27 @@ class Session:
         try:
             self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
-            if is_renderer_failure(e):
+            if (getattr(self, "kind", "chrome") == "firefox"
+                    and self._firefox_context_lost(e)):
+                log.warning(f"[cdp] firefox: вкладка потеряна при goto "
+                            f"({type(e).__name__}) — новая вкладка + повтор")
+                self.new_page(close_current=True)
+                self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            elif is_renderer_failure(e):
                 log.warning(f"goto renderer_failure: {url} → {type(e).__name__}: {e}")
                 raise
-            msg = str(e)
-            # Навигационные сбои (таймаут, DNS, ERR_*) означают, что страница
-            # НЕ загрузилась: продолжать разбор по старой/ошибочной странице
-            # нельзя — пробрасываем, иначе соберём чужой/пустой контент.
-            name = type(e).__name__
-            if name == "TimeoutError" or "net::ERR_" in msg \
-                    or "Timeout" in msg:
-                log.warning(f"goto nav failure: {url} → {name}: {e}")
-                raise
-            log.warning(f"[cdp] goto warn: {url} → {type(e).__name__}: {e}")
+            else:
+                msg = str(e)
+                # Навигационные сбои (таймаут, DNS, ERR_*) означают, что
+                # страница НЕ загрузилась: продолжать разбор по старой/
+                # ошибочной странице нельзя — пробрасываем, иначе соберём
+                # чужой/пустой контент.
+                name = type(e).__name__
+                if name == "TimeoutError" or "net::ERR_" in msg \
+                        or "Timeout" in msg:
+                    log.warning(f"goto nav failure: {url} → {name}: {e}")
+                    raise
+                log.warning(f"[cdp] goto warn: {url} → {type(e).__name__}: {e}")
         self.page.wait_for_timeout(wait_ms)
         self._capture_fingerprint_once()
         log.debug(f"goto done: {url}")
@@ -420,12 +890,42 @@ class Session:
                 " sw: window.screen.width,"
                 " sh: window.screen.height,"
                 " colorDepth: window.screen.colorDepth,"
-                " })"
+                " hidden: document.hidden,"
+                " visibility: document.visibilityState,"
+                " focused: document.hasFocus(),"
+                " ow: window.outerWidth,"
+                " oh: window.outerHeight,"
+                "})"
             )
             if isinstance(fp, dict):
                 self.fingerprint = fp
+                self._log_visibility_telemetry(fp)
         except Exception:
             pass
+
+    def _log_visibility_telemetry(self, fp: dict):
+        """Отметить Page Visibility/focus-след окна (ревизия 2.9, L1/L10).
+
+        У minimized-окна `document.hidden === true`, у окна на неактивном
+        виртуальном рабочем столе Windows — тоже. Это измеримый признак
+        «человека за столом нет»; сам по себе он не блокирует, но позволяет
+        A/B-сравнить режимы окна по `challenges` вместо догадок. Ничего не
+        подделывается — только логируется.
+        """
+        hidden = fp.get("hidden")
+        vis = fp.get("visibility") or "?"
+        if hidden:
+            log.info(f"[cdp] page visibility: hidden=True (state={vis}, "
+                     f"keep_window={self.keep_window}) — окно свёрнуто или "
+                     f"на неактивном виртуальном столе; A/B против "
+                     f"--window-mode visible см. §10")
+        else:
+            log.debug(f"[cdp] page visibility: visible (state={vis})")
+        if fp.get("webdriver") is True:
+            log.warning(f"[cdp] navigator.webdriver === true — браузер запущен "
+                        f"с чужими флагами (см. §5: --enable-automation не "
+                        f"передаём, init-script подмены нет)")
+
 
     def scroll(self, by: int = 600):
         self._guard_check()
@@ -455,6 +955,7 @@ class Session:
         if getattr(self, "_managed_pages", None) is None:
             self._managed_pages = [old] if old is not None else []
         self._managed_pages.append(new)
+        self._attach_geom_guard()
         if close_current and old is not None:
             try:
                 old.close()
@@ -467,10 +968,7 @@ class Session:
                     self._managed_pages.remove(old)
             except Exception:
                 pass
-        if getattr(self, "keep_window", False):
-            self._keep_window_visible()
-        else:
-            self._minimize_window()
+        self._apply_window_policy(" (new_page)")
         log.debug(f"new_page: {self.cdp_url}")
         return new
 
@@ -489,7 +987,8 @@ class Session:
         """
         if self._watchdog is None:
             self._watchdog = BrowserWatchdog(self.cdp_url,
-                                             profile_token=self.profile_token)
+                                             profile_token=self.profile_token,
+                                             kind=self.kind)
             self._watchdog.start()
             log.debug(f"watchdog started: {self.cdp_url}")
 
@@ -499,6 +998,22 @@ class Session:
             self._watchdog.stop()
             log.debug("watchdog stopped")
             self._watchdog = None
+
+    def _attach_geom_guard(self):
+        """Привязать read-only геометрический guard к текущей странице.
+
+        page-атрибут (не глобальное состояние, не меняет сигнатуры вызовов):
+        puzzle.solve_puzzle берёт `getattr(page, "_geom_guard", None)` и
+        вызывает его перед решением. Guard живёт в Session — ему нужны
+        browser_pid/новый browser (Win32 GetWindowRect + CDP bounds).
+        External-браузеры тоже получают guard, но его проверка для
+        не-Windows/без-окна возвращает True (no-op) — личную геометрию
+        пользователя не трогаем.
+        """
+        try:
+            self.page._geom_guard = self._geometry_guard
+        except Exception:
+            pass
 
     def _guard_check(self):
         """Fail-fast перед операцией: мёртвый браузер → BrowserRecoveryError.
@@ -572,13 +1087,29 @@ class Session:
         log.info("reconnect: done")
 
     def close(self):
-        """Закрыть лишние вкладки и завершить сессию Playwright.
+        """Закрыть лишние вкладки и завершить сессию браузера.
 
-        Браузер НЕ гасится — остаётся жив для следующей команды.
+        Браузер НЕ гасится — остаётся жив для следующей команды (chrome).
         Все вкладки кроме pages[0] закрываются; pages[0] уводится на about:blank.
         """
         self.watchdog_stop()
         log.debug("Session.close()")
+        if getattr(self, "kind", "chrome") == "firefox":
+            # Firefox/Selenium: владение драйвером → quit() закрывает и окно.
+            # Куки/сессия остаются в профиле и переживают перезапуск.
+            log.info("[cdp] close: firefox driver quit (окно закрыто, сессия "
+                     "сохранена в профиле)")
+            try:
+                if self._browser is not None:
+                    self._browser.quit()
+            except Exception:
+                pass
+            self._playwright = None
+            self._driver = None
+            self._browser = None
+            if getattr(self, "_managed_pages", None) is not None:
+                self._managed_pages = []
+            return
         try:
             ctx = (self._browser.contexts[0]
                    if self._browser and self._browser.contexts else None)

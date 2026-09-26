@@ -255,7 +255,68 @@ class _FakePage:
         pass
 
     def evaluate(self, js, *args, **kwargs):
+        if "location.href" in js:
+            # _CHALLENGE_LOOKS_JS: страница с отзывами отрисована →
+            # «не похоже на челлендж» (иначе check_challenge ждёт переспросы).
+            return False
         return self.reviews_data
+
+
+class TestCanonicalProductUrl:
+    """Короткий /product/{pid} не гидратирует отзывы — нужен canonical со slug."""
+
+    class _Page:
+        def __init__(self, canon):
+            self.canon = canon
+            self.visited = []
+            self.url = "https://www.ozon.ru/product/1590289080"
+
+        def evaluate(self, js, *args, **kwargs):
+            assert "canonical" in js
+            return self.canon
+
+        def goto(self, url, **kwargs):
+            self.visited.append(url)
+            self.url = url
+
+    def test_short_url_goes_to_canonical(self):
+        page = self._Page("https://www.ozon.ru/product/porolon-1590289080/")
+        out = collect_mod._canonical_product_url(
+            page, "https://www.ozon.ru/product/1590289080")
+        assert out.endswith("/product/porolon-1590289080/")
+        assert page.visited == [out]
+
+    def test_slug_url_left_untouched(self):
+        url = "https://www.ozon.ru/product/porolon-1590289080/?tab=reviews"
+        page = self._Page("https://www.ozon.ru/product/other-1/")
+        assert collect_mod._canonical_product_url(page, url) == url
+        assert page.visited == []
+
+    def test_missing_canonical_keeps_url(self):
+        url = "https://www.ozon.ru/product/1590289080"
+        page = self._Page(None)
+        assert collect_mod._canonical_product_url(page, url) == url
+        assert page.visited == []
+
+    def test_evaluate_error_keeps_url(self):
+        url = "https://www.ozon.ru/product/1590289080"
+
+        class _Boom(self._Page):
+            def evaluate(self, js, *args, **kwargs):
+                raise RuntimeError("detached")
+
+        page = _Boom(None)
+        assert collect_mod._canonical_product_url(page, url) == url
+        assert page.visited == []
+
+    def test_goto_error_keeps_original_url(self):
+        class _Fail(self._Page):
+            def goto(self, url, **kwargs):
+                raise RuntimeError("net error")
+
+        page = _Fail("https://www.ozon.ru/product/porolon-1590289080/")
+        url = "https://www.ozon.ru/product/1590289080"
+        assert collect_mod._canonical_product_url(page, url) == url
 
 
 def _patch_variant_collect(monkeypatch, used=True, reason="click_ok"):
@@ -1022,6 +1083,28 @@ def test_scroll_jitter_effective_seed_self_set():
     assert collect_mod.effective_scroll_jitter_seed() == s1
 
 
+def test_fab_reload_delay_jitter():
+    """Пауза FAB-reload джиттерится ±15% и детерминирована seed'ом (ADR §14.7).
+
+    Три фиксированных 2.5с подряд — регулярный retry-сигнал; jitter ломает
+    ритм, seed сохраняет воспроизводимость.
+    """
+    collect_mod.set_scroll_jitter_seed(4242)
+    a = [collect_mod.fab_reload_delay_s() for _ in range(20)]
+    collect_mod.set_scroll_jitter_seed(4242)
+    b = [collect_mod.fab_reload_delay_s() for _ in range(20)]
+    assert a == b
+    assert len(set(a)) > 1                      # джиттер реально варьирует
+    for v in a:
+        assert 2.125 <= v <= 2.875              # 2500 мс ±15%
+
+
+def test_fab_reload_delay_jitter_zero():
+    """jitter=0 → ровно базовая пауза (escape hatch для отладки)."""
+    collect_mod.set_scroll_jitter_seed(1)
+    assert collect_mod.fab_reload_delay_s(jitter=0.0) == 2.5
+
+
 # ---- Phase A: телеметрия сходимости ----------------------------------------
 
 def test_scroll_to_converge_telemetry():
@@ -1277,6 +1360,66 @@ def test_apply_api_comments_skips_uuidless():
     reviews = [{"comments": [{"text": "DOM"}]}]
     n = collect_mod._apply_api_comments(reviews, {"rv1": [{"text": "X"}]})
     assert n == 0
+
+
+# ---- _expand_comments_snapshot: Firefox-ветка без перехвата сети ----------------
+
+
+class _PageNoCapture:
+    """Страница без перехвата сети (Firefox/Selenium)."""
+
+    network_capture = False
+
+    def __init__(self):
+        self.listeners = []
+        self.remove_calls = []
+
+    def on(self, event, cb):
+        self.listeners.append((event, cb))
+
+    def remove_listener(self, event, cb):
+        self.remove_calls.append(event)
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+def test_comments_snapshot_no_capture_skips_listener(monkeypatch):
+    """Firefox: перехват не регистрируется, комментарии берутся из DOM."""
+    page = _PageNoCapture()
+    calls = []
+    monkeypatch.setattr(collect_mod, "_expand_review_comments",
+                        lambda p, max_passes=4: calls.append(max_passes) or 7)
+    monkeypatch.setattr(collect_mod, "_touch_watchdog", lambda: None)
+    n_clicks, by_review = collect_mod._expand_comments_snapshot(page)
+    assert n_clicks == 7
+    assert by_review == {}
+    assert page.listeners == [], "перехват сети не должен регистрироваться"
+    assert calls == [4]
+
+
+def test_comments_snapshot_with_capture_registers_listener(monkeypatch):
+    """Chrome-путь не сломали: слушатель response регистрируется и снимается."""
+    class _Page(_PageNoCapture):
+        network_capture = True
+
+        class _Resp:
+            url = ""
+            request = type("R", (), {"post_data": None})()
+            body = staticmethod(lambda: b"")
+
+        def evaluate(self, js, *a, **kw):
+            return 0
+
+    page = _Page()
+    monkeypatch.setattr(collect_mod, "_expand_review_comments",
+                        lambda p, max_passes=4: 0)
+    monkeypatch.setattr(collect_mod, "_touch_watchdog", lambda: None)
+    n_clicks, by_review = collect_mod._expand_comments_snapshot(page)
+    assert n_clicks == 0
+    assert by_review == {}
+    assert [e for e, _ in page.listeners] == ["response"]
+    assert page.remove_calls == ["response"]
 
 
 def test_parse_comment_api_brutally_long_text():

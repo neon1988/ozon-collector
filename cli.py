@@ -9,8 +9,8 @@
 Примеры:
   python3 cli.py collect --pid 3627230434 --variant 'Цвет:белый' --category headphones
   python3 cli.py ocr    --raw data/3627230434_raw.json
-  python3 cli.py report --raw data/3627230434_raw.json --out docs/headphones_xiaomi_redmi_buds8.md
-  python3 cli.py gather --pid 3627230434 --variant 'Цвет:белый' --out docs/xiaomi.md
+  python3 cli.py report --raw data/3627230434_raw.json --out docs/digests/headphones_xiaomi_redmi_buds8.md
+  python3 cli.py gather --pid 3627230434 --variant 'Цвет:белый' --out docs/digests/xiaomi.md
 """
 from __future__ import annotations
 
@@ -23,16 +23,33 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ozon_collector import collect as C
+from ozon_collector import browser as B
 from ozon_collector import ocr as O
 from ozon_collector import report as R
 from ozon_collector import cache as K
 from ozon_collector import log
+from ozon_collector import net
 from ozon_collector.gather import run_gather
 
 # Сортировки отзывов по умолчанию: сначала «новые и полезные» (published_at_desc),
 # затем «сначала низкие оценки» (score_asc) — негативные отзывы попадают в сбор,
 # дедуп по uuid убирает дубли между проходами.
 DEFAULT_SORTS = "published_at_desc,score_asc"
+
+
+def _add_reviews_api_arg(parser) -> None:
+    """Флаг --reviews-api для collect/gather (общий текст в двух местах).
+
+    Модуль ozon_fetch даёт те же отзывы за 0,1 с вместо минут скролла, но на
+    анонимной сессии сервер отдаёт только 4 (замер 2026-09-25) — поэтому флаг
+    выключен по умолчанию, а DOM остаётся источником истины.
+    """
+    parser.add_argument(
+        "--reviews-api", action="store_true",
+        help="быстрый предсрез отзывов через Ozon JSON API (ozon_fetch). "
+             "DOM остаётся источником истины: API дополняет список и не "
+             "докручивает страницы, пока не докажет покрытие rating_count. "
+             "Off по умолчанию; env OZON_REVIEWS_API=1 — тот же переключатель.")
 
 
 def _parse_sorts(value):
@@ -80,8 +97,25 @@ def _apply_scroll_jitter_seed(args):
     return effective
 
 
-def cmd_collect(args):
+def _target_url(args):
+    """Целевой URL с валидацией (ревизия 2.9, P0).
+
+    Принимает markdown-обёртку [текст](url) и лишнюю пунктуацию, но
+    отвергает не-URL с понятной ошибкой: иначе Page.goto молча уходит в
+    'Cannot navigate to invalid URL' и команда завершается «пустым успехом».
+    """
     url = args.url or f"https://www.ozon.ru/product/{args.pid}"
+    try:
+        fixed = net.normalize_target_url(url)
+    except ValueError as e:
+        raise SystemExit(f"cli: неверный --url: {e}")
+    if fixed != url.strip():
+        log.warning(f"[cli] --url поправлен: {url.strip()[:90]!r} → {fixed[:90]!r}")
+    return fixed
+
+
+def cmd_collect(args):
+    url = _target_url(args)
     _apply_scroll_jitter_seed(args)
     log.info(f"[cli] collect: url={url} variant={args.variant!r} "
              f"sorts={args.sorts!r} max_pages={args.max_pages} "
@@ -97,6 +131,7 @@ def cmd_collect(args):
         save_dom=not args.no_dom,
         apply_variant_mode=not args.no_variant_mode,
         sorts=_parse_sorts(args.sorts),
+        reviews_api=args.reviews_api or None,
     )
     log.info(f"[cli] DONE. reviews={raw['reviews_collected']}, "
              f"out=data/{C.pid_from_url(url)}_raw.json")
@@ -129,7 +164,7 @@ def cmd_report(args):
 
 
 def cmd_gather(args):
-    url = args.url or f"https://www.ozon.ru/product/{args.pid}"
+    url = _target_url(args)
     pid = C.pid_from_url(url)
     _apply_scroll_jitter_seed(args)
     try:
@@ -155,6 +190,7 @@ def cmd_gather(args):
         "no_preproc": args.no_preproc,
         "gallery_dir": args.gallery_dir,
         "overwrite": args.overwrite,
+        "reviews_api": args.reviews_api or None,
     }
     log.info(f"[cli] gather: pid={pid} variant={args.variant!r} "
              f"sorts={cfg['sorts']!r} max_age_s={max_age_s} "
@@ -181,6 +217,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log", default=None,
                    help="путь файла лога прогона (по умолч. logs/ozon_collector.log; "
                         "ротация при каждом запуске: предыдущий — logs/ozon_collector.log.1)")
+    p.add_argument("--browser", default=None,
+                   help="движок браузера: chrome|firefox (приоритет над env "
+                        "OZON_BROWSER; по умолч. — env, иначе chrome). "
+                        "Chrome: живой Chromium + CDP (scripts/launch_chrome.ps1), "
+                        "единственный рабочий транспорт — Ozon блокирует "
+                        "geckodriver/Marionette. Firefox оставлен для отладки "
+                        "профилей. Опечатка → ValueError на старте")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pc = sub.add_parser("collect", help="сбор карточки + отзывов варианта (CDP)")
@@ -204,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--scroll-jitter-seed", type=int, default=None,
                     help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
                          "по умолчанию случайный)")
+    _add_reviews_api_arg(pc)
     pc.set_defaults(fn=cmd_collect)
 
     po = sub.add_parser("ocr", help="OCR галереи в raw.json")
@@ -257,6 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--scroll-jitter-seed", type=int, default=None,
                     help="детерминированный seed jitter-пауз скролла (для воспроизводимых прогонов; "
                          "по умолчанию случайный)")
+    _add_reviews_api_arg(pg)
     pg.set_defaults(fn=cmd_gather)
 
     return p
@@ -277,6 +322,11 @@ def main():
     args = p.parse_args()
     if args.log:
         os.environ["OZON_COLLECTOR_LOG"] = args.log
+    # --browser имеет приоритет над env OZON_BROWSER; валидируем сразу
+    # (ValueError на опечатку), а не в момент подключения к браузеру.
+    if getattr(args, "browser", None):
+        os.environ["OZON_BROWSER"] = args.browser
+        B.browser_kind()
     log.setup()
     args.fn(args)
 

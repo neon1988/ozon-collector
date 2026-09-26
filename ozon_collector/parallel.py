@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import random
 import socket
 import sys
 import threading
@@ -22,10 +23,12 @@ from collections import deque
 from datetime import datetime, timezone
 
 from . import SCHEMA_VERSION, VERSION
+from . import browser as B
 from . import cache as K
 from . import cdp
 from . import collect as C
 from . import log
+from . import net
 from . import process as P
 from . import search as S
 from .browser import BrowserProcessManager
@@ -48,6 +51,21 @@ WORKER_STALL_S = 300           # 5 мин без heartbeat = зависание 
 # gather_cfg["batch_size"] для эмпирического тюнинга.
 DEFAULT_BATCH_SIZE = 5
 
+# Старт воркеров не синхронный: N браузеров, открывших первые страницы в один
+# миллисекунд, — сам по себе паттерн (п.6 ревью 2026-09-25). Разброс
+# фиксированный (детерминированный seed), 0 — полностью отключить (тесты).
+WORKER_START_STAGGER_S = 0.7
+_stagger_rng = random.Random(0x0A11CE)
+
+
+def _start_stagger_s(seed_key: int, base: float | None = None) -> float:
+    """Пауза перед стартом воркера: uniform(0.5·base .. 1.5·base) секунд."""
+    base = WORKER_START_STAGGER_S if base is None else float(base)
+    if base <= 0:
+        return 0.0
+    _stagger_rng.seed(0x0A11CE + int(seed_key))
+    return _stagger_rng.uniform(0.5 * base, 1.5 * base)
+
 
 # ---- Спеки и сериализуемые структуры ---------------------------------------
 
@@ -58,14 +76,30 @@ def worker_spec(k: int) -> dict:
     из process.worker_profile_* (тестируются отдельно).
     """
     k = int(k)
-    return {
+    browse = B.resolve_browser_for_parallel()
+    spec = {
         "worker_id": k,
-        "port": 9222 + k,
-        "cdp_url": f"http://127.0.0.1:{9222 + k}",
+        "kind": browse,
         "profile_token": P.worker_profile_token(k),
         "profile_path": P.worker_profile_path(k),
         "log_path": _worker_log_path(k),
     }
+    # Прокси воркера (ревизия 2.9, net.py): 1 профиль = 1 IP. Дефолт OFF.
+    # В спек идёт ТОЛЬКО маскированный вид (host:port), без креденшелов.
+    _proxy = net.proxy_url_for_worker(k)
+    if _proxy:
+        spec["proxy"] = net.mask_proxy(_proxy)
+    if browse == "firefox":
+        # stock Firefox + geckodriver/Selenium на своём persistent-профиле:
+        # CDP-порт/окна не нужны вообще (см. cdp.Session._connect_firefox).
+        # Живость оркестратор оценивает по процессу воркера + heartbeat,
+        # а не по CDP.
+        spec["port"] = None
+        spec["cdp_url"] = None
+    else:
+        spec["port"] = 9222 + k
+        spec["cdp_url"] = f"http://127.0.0.1:{9222 + k}"
+    return spec
 
 
 def _worker_log_path(k: int) -> str:
@@ -113,6 +147,51 @@ def preflight_check(specs: list[dict]) -> list[str]:
     if len(set(all_paths)) != len(all_paths):
         errs.append("profile_path воркеров не попарно различны")
 
+    for s in specs:
+        w = s["worker_id"]
+        if s.get("kind") == "firefox":
+            # Firefox-воркер: НЕТ CDP-контракта (порт/cdp_url пусты, см.
+            # worker_spec). Живость оцениваем по firefox-процессам на нашем
+            # профиле (geckodriver/Selenium) + heartbeat. Осиротевший
+            # firefox от мёртвого родителя убираем по профилю — иначе
+            # следующий прогон навсегда упирается в preflight. Ownership-контракт
+            # для firefox = профиль: всё, что на нашем profile_token, наше
+            # (тот же контракт, что в cdp.Session._connect_firefox).
+            orphans = P.firefox_browser_processes(s["profile_token"])
+            if orphans:
+                try:
+                    P.kill_records([P.ProcessRecord(f"worker{w}-orphan", ident)
+                                    for ident in orphans], wait_s=3.0)
+                    log.warning(f"[parallel] worker{w}: убран осиротевший "
+                                f"Firefox ({len(orphans)} процесс(ов), "
+                                f"родитель мёртв)")
+                except Exception as e:
+                    errs.append(f"worker{w}: не удалось убрать осиротевший "
+                                f"Firefox: {type(e).__name__}: {e}")
+            pp = s["profile_path"]
+            if not os.path.isdir(pp):
+                try:
+                    os.makedirs(pp, exist_ok=True)
+                except OSError as e:
+                    errs.append(f"worker{w}: не удалось создать профиль "
+                                f"{pp}: {e}")
+            continue
+
+    if any(s.get("kind") == "firefox" for s in specs):
+        # Осиротевшие geckodriver: родитель нашего Firefox, держит окно даже
+        # после гибели воркера (замер 2026-09-25 — 14 лишних окон). Убираем
+        # только те, у которых нет живого firefox-ребёнка на нашем профиле.
+        stale_drivers = P.orphaned_geckodriver_processes()
+        if stale_drivers:
+            try:
+                P.kill_records([P.ProcessRecord("gecko-orphan", ident)
+                                for ident in stale_drivers], wait_s=3.0)
+                log.warning(f"[parallel] убрано осиротевших geckodriver: "
+                            f"{len(stale_drivers)}")
+            except Exception as e:
+                errs.append(f"не удалось убрать осиротевшие geckodriver: "
+                            f"{type(e).__name__}: {e}")
+
     # Автоочистка осиротевших браузеров воркеров: после аварийной гибели
     # родителя (kill/Ctrl+C/таймаут) воркер не выполняет finally и его
     # Chromium остаётся висеть. Идентифицируем по мёртвому родителю (PPID
@@ -120,6 +199,8 @@ def preflight_check(specs: list[dict]) -> list[str]:
     # preflight. Живой воркер (реально идущий прогон) не трогаем.
     for s in specs:
         w = s["worker_id"]
+        if s.get("kind") == "firefox":
+            continue
         orphans = P.orphaned_worker_browser_processes(
             s["cdp_url"], s["profile_token"])
         if not orphans:
@@ -147,6 +228,8 @@ def preflight_check(specs: list[dict]) -> list[str]:
 
     for s in specs:
         w = s["worker_id"]
+        if s.get("kind") == "firefox":
+            continue
         if not _port_free(s["port"]):
             errs.append(f"worker{w}: порт {s['port']} уже занят")
         if P.browser_processes(s["cdp_url"],
@@ -585,6 +668,8 @@ def worker_main(spec: dict, task: dict, conn, p2w_conn):
         gather_cfg = dict(task.get("gather_cfg") or {})
         max_recycles = int(task.get("max_recycles", 2))
         recovery = payload["recovery_metrics"]
+        recovery["canary_url"] = S.resolve_canary_url(
+            task.get("canary_url"))[0]
         tb = task.get("session_budget")
         if tb:
             recovery["session_budget"] = tb
@@ -809,15 +894,33 @@ def _storm_summary(wctxs, payloads, parallel: int) -> dict | None:
     что Ozon душит аккаунт/IP целиком → полный cooldown).
     """
     storms = []
+    storm_rms = []
     for w, pl in zip(wctxs, payloads):
         rm = pl.get("recovery_metrics") or {}
         if rm.get("challenge_storm"):
+            storm_rms.append(rm)
             storms.append({"worker": w.worker_idx,
                            **rm["challenge_storm"]})
     if not storms:
         return None
+    # soft/hard (ревизия 2.9): SESSION_EXHAUSTED = сессия устала от серии
+    # проверок (soft, короткая пауза), SESSION_BLOCKED/ip_blocked = жёсткая
+    # блокировка (hard, полный cooldown). Если воркеры разного типа — шторм
+    # считаем hard (жалко ошибаться в сторону «мягко»).
+    #
+    # ВАЖНО (ревизия 2.9): block_kind/block_kind_reason берём ТОЛЬКО из
+    # штормивших воркеров. recovery.block_kind ставится любому воркеру, у
+    # которого прогон упёрся в терминальный session-блок, даже без
+    # challenge_storm; раньше такой «чистый» воркер с block_kind=hard
+    # переводил в hard soft-шторм соседа. Тихий воркер не влияет на эскалацию.
+    kinds = {str(rm.get("block_kind") or "hard") for rm in storm_rms}
+    block_kind = "soft" if kinds == {"soft"} else "hard"
     return {
         "reason": "challenge_storm",
+        "block_kind": block_kind,
+        "block_reasons": sorted({str(rm["block_kind_reason"])
+                                 for rm in storm_rms
+                                 if rm.get("block_kind_reason")}),
         "workers_stormed": [s["worker"] for s in storms],
         "all_workers": len(storms) == parallel,
         **storms[0],
@@ -854,10 +957,11 @@ def _needs_restart(wctx: WorkerContext, max_restarts: int,
 
     Перезапускаем при реальном сбое (процесс умер без done, либо done
     с fatal_error/ненулевым exitcode) И когда осталась незавершённая работа.
-    Дополнительно перезапускаем при challenge_storm (нерешённый пазл): воркер
-    завершился формально "чисто", но без доведения своего шарда — открываем
-    новое окно и пробуем дальше (ADR §14.6: частичный шторм ≠ бан всей
-    кампании; лимит max_restarts ограничивает зомби-цикл).
+    Дополнительно перезапускаем при challenge_storm (нерешённый пазл) и при
+    browser_dead (браузер воркера мёртв): в обоих случаях воркер завершился
+    формально "чисто", но не довёл своё — открываем новое окно и пробуем дальше
+    (ADR §14.6: частичный шторм ≠ бан всей кампании; лимит max_restarts
+    ограничивает зомби-цикл).
     Истечение времени (deadline_halted) и успешное/ожидаемое завершение не
     перезапускаем.
 
@@ -896,14 +1000,42 @@ def _needs_restart(wctx: WorkerContext, max_restarts: int,
     rm = pl.get("recovery_metrics") or {}
     if rm.get("challenge_storm"):
         return True
+    # Браузер воркера МЁРТВ (kill/crash): search.py помечает товар
+    # browser_dead и НЕ тратит recycle (пересоздавать нечего), поэтому
+    # воркер выходит "чисто" (exitcode 0, без fatal_error) и без этой
+    # проверки до конца прогона жёг бы бюджет на каждом товаре, сыпя
+    # SESSION_EXHAUSTED. Свежий браузер на респауне — единственное лечение.
+    if rm.get("browser_dead"):
+        return True
     return False
+
+
+def _worker_task(items, gather_cfg: dict, max_recycles: int,
+                 session_budget: dict | None, worker_log: str | None,
+                 canary_url: str | None = None) -> dict:
+    """Task для spawn-воркера (spawn-picklable, без сокетов).
+
+    Единая точка сборки: обычный спавн и респавн после падения должны передавать
+    ОДИНАКОВЫЙ набор (иначе замена воркера незаметно теряет, например, canary_url
+    и начинает проверять главную вместо сущности кампании).
+    """
+    return {
+        "items": list(items or []),
+        "gather_cfg": gather_cfg,
+        "max_recycles": max_recycles,
+        "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
+        "session_budget": dict(session_budget) if session_budget else None,
+        "worker_log": worker_log,
+        "canary_url": canary_url,
+    }
 
 
 def _respawn(wctx: WorkerContext, pending: list[int],
              items_by_index: dict, gather_cfg: dict,
              max_recycles: int, session_budget: dict | None,
              on_event=None, worker_log: str | None = None,
-             dynamic: bool = False) -> WorkerContext:
+             dynamic: bool = False,
+             canary_url: str | None = None) -> WorkerContext:
     """Поднять воркера-замену на том же worker_id с недоделанными индексами.
 
     Сначала чистим зависший Chromium воркера (fresh браузер), ждём
@@ -929,14 +1061,14 @@ def _respawn(wctx: WorkerContext, pending: list[int],
         items2 = [(_idx, pid, url)
                   for _idx, (pid, url) in items_by_index.items()
                   if _idx in pend_set]
-    task2 = {
-        "items": items2,
-        "gather_cfg": gather_cfg,
-        "max_recycles": max_recycles,
-        "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
-        "session_budget": dict(session_budget) if session_budget else None,
-        "worker_log": worker_log,
-    }
+    task2 = _worker_task(items2, gather_cfg, max_recycles, session_budget,
+                         worker_log, canary_url=canary_url)
+    # Рестарт после общего сбоя не должен бить синхронно с остальными рестартами.
+    _stagger = _start_stagger_s(int(spec.get("worker_id") or 1) + 1000)
+    if _stagger > 0:
+        log.info(f"[parallel] stagger рестарта worker-{spec.get('worker_id')}: "
+                 f"{_stagger:.2f}с")
+        time.sleep(_stagger)
     new = _spawn_ctx(spec, task2, on_event=on_event)
     new.restarts = wctx.restarts + 1
     new.shard_indexes = list(pending)
@@ -1008,7 +1140,8 @@ def _await_workers(wctxs: list, deadline: float,
                    stop_event=None, force_event=None,
                    shared_items=None, completed_indexes=None,
                    owner=None, pid_by_idx=None, url_by_idx=None,
-                   batch_size: int = DEFAULT_BATCH_SIZE) -> list:
+                   batch_size: int = DEFAULT_BATCH_SIZE,
+                   canary_url: str | None = None) -> list:
     """Дождаться завершения воркеров, перезапуская аварийно упавших.
 
     Динамическая пакетная раздача: когда переданы shared_items/completed_indexes/
@@ -1230,11 +1363,12 @@ def _await_workers(wctxs: list, deadline: float,
                 new = _respawn(
                     wctx, pending, items_by_index, gather_cfg,
                     max_recycles, session_budget, on_event, worker_log,
-                    dynamic=dynamic)
+                    dynamic=dynamic, canary_url=canary_url)
             else:
                 new = _respawn(
                     wctx, pending, items_by_index, gather_cfg,
-                    max_recycles, session_budget, on_event, worker_log)
+                    max_recycles, session_budget, on_event, worker_log,
+                    canary_url=canary_url)
             # Перенести уже собранные товары упавшего воркера в замену: иначе
             # merge широко пометит их как "terminated/failed" (потеря данных).
             old_pl = wctx.payload or {}
@@ -1254,11 +1388,26 @@ def _await_workers(wctxs: list, deadline: float,
 
 
 def _stop_main_browser():
-    """Полный останов main-Chromium (порт 9222, ozon-profile) ДО воркеров.
+    """Полный останов main-браузера (main-профиль) ДО воркеров.
 
-    Session.close гасит только CDP-клиент; лишний main-процесс ест RAM при
-    параллельном сборе — останавливаем через manager по главному токену.
+    chrome: manager по CDP-порту 9222 — Session.close гасит только CDP-клиент,
+    лишний main-процесс ест RAM при параллельном сборе.
+    firefox: driver.quit() в Session.close асинхронен, поэтому дожимаем
+    процессы по токену профиля. Иначе bootstrap воркеров увидит живой main и
+    пропустит сев сессии → cold worker-профиль → блок «Похоже, нет соединения».
     """
+    if B.browser_kind() == "firefox":
+        records = [P.ProcessRecord("main-stop-ff", ident)
+                   for ident in P.firefox_browser_processes(P.PROFILE_TOKEN)]
+        if not records:
+            return
+        try:
+            killed = P.kill_records(records, wait_s=5.0)
+            log.info(f"main Firefox stopped ({len(killed)} процесс(ов))")
+        except Exception as e:
+            log.warning(f"stop main Firefox: {type(e).__name__}: {e}")
+        return
+
     cdp_url = "http://127.0.0.1:9222"
     records = [P.ProcessRecord("main-stop", ident)
                for ident in P.browser_processes(cdp_url)]
@@ -1278,12 +1427,14 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      pids: list | None = None,
                      skip_pids: list | None = None,
                      no_bootstrap: bool = False,
+                     bootstrap_post_storm_at: float | None = None,
                      session_budget: dict | None = None,
                      on_event=None,
                      max_worker_restarts: int = 0,
                      worker_log: str | None = None,
                      stop_event=None,
-                     force_event=None) -> dict:
+                     force_event=None,
+                     canary_url: str | None = None) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
 
     pids — явный список артикулов вместо докрутки выдачи: main-сессия не
@@ -1291,20 +1442,28 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
 
     bootstrap: сев Ozon-сессии в воркеры выполняется ЗДЕСЬ (после остановки
     main-браузера), а не в cli — иначе main жив и профили не обновляются.
+    bootstrap_post_storm_at — epoch последнего ФУЛЛ-шторма: в окне после него
+    прогретые воркер-профили не пересеиваются (ADR §14.7, иначе испорченная
+    сессия main тиражируется на весь пул).
 
     Возвращает combined-объект схемы 2.0 (аддитивно parallel{workers[],shards[]}).
     Ошибка preflight → RuntimeError (воркеры не запускаются).
 
     stop_event/force_event (от демона, threading.Event): остановка Ctrl+C.
       stop_event  во время докрутки ссылок → CollectionInterrupted(forced=False):
-                  возвращаем частичный combined (discovered_pids из найденных
+                  возвращаем partial combined (discovered_pids из найденных
                   ссылок, collected=0, воркеры НЕ запускаем) — демон сохранит
                   discovery и завершится INTERRUPTED.
       force_event во время докрутки → пробрасываем CollectionInterrupted(forced=True)
                   наверх: воркеры ещё не спавнились, экстренный выход выполняет
                   демон. force_event во время worker-фазы обрабатывает
                   _await_workers (terminate всех воркеров).
+
+    canary_url — цель canary-пробы в воркерах после access-recovery. По умолчанию
+      URL этой кампании (та же сущность, на которой упало), см.
+      search.resolve_canary_url; переопределяется OZON_CANARY_URL.
     """
+    B.resolve_browser_for_parallel()  # дефолт движка для воркеров (firefox; переопределяется env/флагом)
     parallel = int(parallel)
     if pids:
         links = S._links_from_pids(pids)
@@ -1360,7 +1519,11 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
              f"собираю {total} через {parallel} воркер(ов)")
 
     if not no_bootstrap:
-        bs = P.bootstrap_worker_profiles(range(1, parallel + 1))
+        kind = B.browser_kind()
+        fn = (P.bootstrap_firefox_worker_profiles if kind == "firefox"
+              else P.bootstrap_worker_profiles)
+        bs = fn(range(1, parallel + 1),
+                post_storm_at=bootstrap_post_storm_at)
         for k, st in bs.items():
             log.info(f"[parallel] bootstrap worker-{k}: {st}")
 
@@ -1370,24 +1533,28 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     if errs:
         raise RuntimeError("preflight FAILED:\n" + "\n".join(errs))
 
+    # Canary-цель решается ОДИН раз в оркестраторе и уезжает в воркеры в task:
+    # иначе каждый воркер решает сам и может взять разные цели (главная/категория).
+    canary_target, canary_kind = S.resolve_canary_url(canary_url, campaign=url)
+    log.info(f"[canary] цель: {canary_kind} ({canary_target})")
+
     wctxs = []
     _wm = gather_cfg.get("window_mode")
     for k, spec in enumerate(specs, 1):
         # window_mode: visible/hidden для воркер-браузеров (spec видит Session)
         spec["window_mode"] = _wm
-        task = {
-            # Динамическая пакетная раздача: полный список НЕ раздаётся
-            # статическим шардом; фактическая выдача пачек идёт через
-            # parent→worker pipe в _await_workers. items здесь — только для
-            # журнала/совместимости инициализации WorkerContext.
-            "items": [],
-            "gather_cfg": gather_cfg,
-            "max_recycles": max_recycles,
-            "scroll_jitter_seed": gather_cfg.get("scroll_jitter_seed"),
-            "session_budget": dict(session_budget) if session_budget else None,
-            "worker_log": worker_log,
-        }
+        # Динамическая пакетная раздача: полный список НЕ раздаётся
+        # статическим шардом; фактическая выдача пачек идёт через
+        # parent→worker pipe в _await_workers. items здесь — только для
+        # журнала/совместимости инициализации WorkerContext.
+        task = _worker_task([], gather_cfg, max_recycles, session_budget,
+                            worker_log, canary_url=canary_target)
         wctxs.append(_spawn_ctx(spec, task, on_event=on_event))
+        if k < len(specs):
+            _stagger = _start_stagger_s(k)
+            log.info(f"[parallel] stagger старта worker-{k + 1}: "
+                     f"{_stagger:.2f}с")
+            time.sleep(_stagger)
 
     # Динамическая пакетная раздача: источники истины у оркестратора.
     shared_items = deque(items)
@@ -1408,7 +1575,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         force_event=force_event,
         shared_items=shared_items, completed_indexes=completed_indexes,
         owner=owner, pid_by_idx=pid_by_idx, url_by_idx=url_by_idx,
-        batch_size=batch_size)
+        batch_size=batch_size, canary_url=canary_target)
 
     # После завершения динамической раздачи пересобираем shards из актуального
     # owner (полные кортежи (idx,pid,url)) — совместимый формат для
@@ -1461,6 +1628,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     mr = gather_cfg.get("min_rating")
     if mr is not None:
         combined["min_rating"] = mr
+    combined["kpi"] = _kpi_summary(payloads, len(products))
     storm = _storm_summary(wctxs, payloads, parallel)
     if storm:
         combined["aborted"] = storm
@@ -1485,8 +1653,72 @@ def _merge_carried(pl: dict, wctx: WorkerContext) -> dict:
     return pl
 
 
+def _kpi_int(v) -> int:
+    """Метрика → int (None/bool/строка/мусор не роняют агрегат)."""
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _kpi_summary(payloads: list[dict], attempted: int) -> dict:
+    """Агрегат health-телеметрии пула в combined.kpi (ADR §14.7).
+
+    Суммирует по воркерам recovery_metrics: challenges, recoveries (recycle +
+    new_tab), session_blocked/exhausted, puzzle storms/attempts/solved, canary_fails
+    и ip_blocks; считает производные puzzle_solve_rate и challenge_rate_per_100
+    (challenge на 100 товаров).
+    """
+    ch = rec = blocked = exhausted = storms = p_att = p_fail = 0
+    canary_fails = ip_blocks = 0
+    for pl in payloads:
+        rm = (pl or {}).get("recovery_metrics")
+        if not isinstance(rm, dict):
+            continue
+        astats = rm.get("access_stats")
+        if isinstance(astats, dict):
+            ch += _kpi_int(astats.get("challenges"))
+        rec += _kpi_int(rm.get("recycles")) + _kpi_int(rm.get("new_tab_attempts"))
+        blocked += _kpi_int(rm.get("session_blocked"))
+        exhausted += _kpi_int(rm.get("session_exhausted"))
+        canary_fails += _kpi_int(rm.get("canary_fails"))
+        ip_blocks += _kpi_int(rm.get("ip_blocks"))
+        if rm.get("challenge_storm"):
+            storms += 1
+        pz = rm.get("puzzle")
+        if isinstance(pz, dict):
+            p_att += _kpi_int(pz.get("attempts"))
+            p_fail += _kpi_int(pz.get("failures"))
+    p_solved = max(0, p_att - p_fail)
+    return {
+        "total_challenges": ch,
+        "total_recoveries": rec,
+        "session_blocked": blocked,
+        "session_exhausted": exhausted,
+        "canary_fails": canary_fails,
+        "ip_blocks": ip_blocks,
+        "puzzle_storms": storms,
+        "puzzle_attempts": p_att,
+        "puzzle_solved": p_solved,
+        "puzzle_solve_rate": (round(p_solved / p_att, 3) if p_att else None),
+        "challenge_rate_per_100": (round(ch / attempted * 100, 2)
+                                   if attempted else None),
+    }
+
+
+def _worker_challenges(pl: dict) -> int:
+    """Access-challenges конкретного воркера (для A/B параллелизма)."""
+    rm = (pl or {}).get("recovery_metrics")
+    astats = rm.get("access_stats") if isinstance(rm, dict) else None
+    return _kpi_int(astats.get("challenges")) if isinstance(astats, dict) else 0
+
+
 def _worker_summary(wctx: WorkerContext, pl: dict) -> dict:
     spec = wctx.spec
+    processed = len(pl.get("processed_indexes", []))
+    failed = len(pl.get("failed_indexes", []))
+    challenges = _worker_challenges(pl)
+    attempted = processed + failed
     return {
         "worker_idx": wctx.worker_idx,
         "pid": wctx.pid,
@@ -1495,11 +1727,21 @@ def _worker_summary(wctx: WorkerContext, pl: dict) -> dict:
         "exitcode": pl.get("exitcode"),
         "started": pl.get("started"),
         "finished": pl.get("finished"),
-        "processed": len(pl.get("processed_indexes", [])),
-        "failed": len(pl.get("failed_indexes", [])),
+        "processed": processed,
+        "failed": failed,
+        # Телеметрия для A/B параллелизма: сколько access-challenges досталось
+        # этому воркеру и как часто (на 100 товаров). Раньше challenges были
+        # только суммой по пулу — нельзя было понять, вредит ли параллелизм
+        # именно этому IP/профилю.
+        "challenges": challenges,
+        "challenge_rate_per_100": (round(challenges / attempted * 100, 2)
+                                   if attempted else None),
         "fatal_error": pl.get("fatal_error"),
         "rss_bytes": pl.get("rss_bytes"),
         "browser_stopped": pl.get("browser_stopped"),
+        # Прокси воркера (маскированный, ревизия 2.9): нужно, чтобы A/B
+        # «свой IP на воркер» читался прямо из combined.parallel.workers.
+        "proxy": spec.get("proxy"),
         "recovery": pl.get("recovery_metrics"),
         "num_batches": pl.get("num_batches"),
         "scheduler": getattr(wctx, "scheduler_metrics", None),

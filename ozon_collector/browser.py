@@ -1,7 +1,7 @@
 """Браузерный слой: probe здоровья, классификация ошибок, restart/stop Chromium.
 
 Зависит только от process.py (identity, kill) и от duck-typed Session
-(атрибуты cdp_url, browser_identity, page). Сама Session живёт в cdp.py.
+(атрибуты cdp_url, browser_pid, page). Сама Session живёт в cdp.py.
 Recovery-автомата (R1/R2, retry) — в search.py; здесь строительные блоки.
 
 Классификация (policy):
@@ -25,8 +25,10 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlparse
 
+from . import launchlog as _LL
 from . import log
 from . import process as P
 
@@ -88,11 +90,112 @@ def _launch_script_path() -> Path:
             / _launch_script_name())
 
 
-def _launch_script(cdp_url: str, profile_path: str | None = None):
+def _chrome_override() -> str | None:
+    """Путь к автономному Chromium для launch-скриптов, либо None.
+
+    OZON_CHROME_PATH → CHROME в scripts/launch_chrome.ps1/.sh. Допустим путь
+    к chrome.exe ИЛИ к каталогу с chrome.exe (Chrome-for-Testing, Edge — любой
+    Chromium-ский браузер). Даёт независимость от системного Chrome и его
+    апдейтов (Google Update): автономный Chrome никогда не обновляется сам.
+    """
+    return os.environ.get("OZON_CHROME_PATH") or None
+
+
+BROWSER_KINDS = ("chrome", "firefox")
+DEFAULT_BROWSER_KIND = "chrome"
+
+
+def browser_kind() -> str:
+    r"""Движок браузера: 'chrome' (CDP) | 'firefox' (geckodriver/Selenium).
+
+    Дефолт = chrome с 2026-09-25. Причина смены: Ozon отдаёт заглушку «похоже,
+    нет соединения» на ПЕРВОМ же goto ЛЮБОЙ сессии geckodriver/Marionette, то
+    есть блокируется сам транспорт автоматизации Firefox, а не отдельные его
+    признаки. Firefox-бэкенд для боевого сбора непригоден; ветка остаётся для
+    отладки профилей. Рабочий транспорт — Chromium через scripts/launch_chrome
+    (--remote-debugging-port; --enable-automation не обязателен, см. Session
+    в cdp.py).
+
+    Живые замеры 2026-09-25 (один IP, ozon.ru, по одному запросу, gobot 1.0):
+
+      Firefox 156 + geckodriver, профиль ozon-profile       → заглушка 8с
+      Firefox 156 + geckodriver, ПУСТОЙ профиль .v2         → заглушка 8с
+      Firefox 156 + geckodriver, пустой профиль, без prefs  → заглушка 7с
+      Firefox 156 + geckodriver, пустой профиль, OCSP/CRLite→ заглушка 6.6с
+        (во всех четырёх navigator.webdriver === true)
+      Chromium, launch_chrome.ps1, свежий user-data-dir     → ✅ 19.7с
+        (navigator.webdriver === false)
+      Chromium + --enable-automation (webdriver=true)       → ✅ 13.6с
+      Firefox инкогнито вручную (контроль оператора)         → ✅ открывается
+
+    Что замеры ДОКАЗЫВАЮТ:
+      - webdriver-флаг НЕ является причиной: Chromium с webdriver=true
+        проходит, Firefox с webdriver=true нет;
+      - исключены как причины: профиль (тёплый/пустой), user prefs, locale
+        (ru-RU в обоих), геометрия окна/экрана, headless/свёрнуто, блокировка
+        ресурсов, человеческие тайминги, OCSP/CRL/CRLite;
+      - не IP, не репутация IP, не cookie: тот же IP в инкогнито вручную
+        открывается;
+      - не локализуемо глубже текущими инструментами: Firefox без marionette
+        не скриптуется, поэтому разделить «marionette-уровневый tell» и
+        «правило automation+UA Firefox» нечем. Лечится сменой транспорта.
+
+    Значение вне {chrome, firefox} — ValueError: лучше явно упасть на опечатке
+    конфига, чем молча работать на другом движке.
+    """
+    kind = os.environ.get("OZON_BROWSER", DEFAULT_BROWSER_KIND).strip().lower()
+    if kind not in BROWSER_KINDS:
+        raise ValueError(
+            f"OZON_BROWSER: ожидается {'|'.join(BROWSER_KINDS)}, получено {kind!r}")
+    return kind
+
+
+def env_browser_override() -> str | None:
+    """Явно заданный OZON_BROWSER (None = дефолт, пользователь не выбирал).
+
+    Нужно, чтобы отличать «chrome, потому что это дефолт» от осознанного
+    «OZON_BROWSER=firefox». Для совместимых с движком решений (см.
+    resolve_browser_for_parallel) дефолт можно мягко заменять, явный — не трогать.
+    """
+    return os.environ.get("OZON_BROWSER") or None
+
+
+def resolve_browser_for_parallel() -> str:
+    """Движок для parallel/daemon-режима.
+
+    До 2026-09-24 firefox в parallel блокировался: owner-контракт воркеров
+    жил на CDP-портах Chromium (browser_alive через /json/version, restart,
+    окна). Firefox не даёт CDP-сетевого конца вообще — поэтому фолбекали на
+    chrome. С 2026-09-24 firefox-воркеры в parallel работают БЕЗ CDP: каждый
+    воркер = отдельный процесс со своим stock Firefox + geckodriver/Selenium
+    (см. cdp.Session._connect_firefox), живость оркестратор оценивает по
+    процессу воркера + heartbeat (не по CDP), окна не двигает (нативная
+    геометрия).
+
+    С 2026-09-25 дефолт = chrome: Ozon отдаёт заглушку ЛЮБОЙ сессии
+    geckodriver/Marionette, при этом Chromium CDP с тем же webdriver=true
+    проходит (см. browser_kind). Firefox-ветка остаётся для отладки, но
+    боевой parallel/daemon должен идти на chrome.
+    """
+    return browser_kind()
+
+
+
+class LaunchRun(NamedTuple):
+    """Результат запуска лаунчера: путь лога + процесс (для fail-fast)."""
+
+    path: str
+    proc: subprocess.Popen
+
+
+def _launch_script(cdp_url: str, profile_path: str | None = None) -> LaunchRun:
     """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url).
 
     profile_path — полный путь --user-data-dir (для воркеров передаёт PROFILE
     env в launch_chrome.ps1/.sh; None = дефолтный профиль скрипта).
+    CHROME env (из OZON_CHROME_PATH или уже заданной CHROME) выбирает
+    исполняемый файл браузера: системный Chrome по умолчанию, либо автономный
+    Chrome-for-Testing/Edge (см. scripts/setup_bundled_chrome.py).
     """
     script = _launch_script_path()
     if not script.exists():
@@ -106,12 +209,28 @@ def _launch_script(cdp_url: str, profile_path: str | None = None):
     env["PORT"] = str(P.cdp_port(cdp_url))
     if profile_path:
         env["PROFILE"] = profile_path
+    chrome = _chrome_override()
+    if chrome:
+        env["CHROME"] = chrome
     cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
            if os.name == "nt" else [str(script)])
-    subprocess.Popen(cmd, env=env,
-                     stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL)
+    # Вывод лаунчера пишем в temp-файл, а не в DEVNULL: если Chromium не
+    # поднялся, ProcessManager.launch печатает этот вывод в лог (ревизия 2.9).
+    logf = _LL.launcher_log_path(P.cdp_port(cdp_url))
+    try:
+        with open(logf, "wb") as fh:     # truncate: лог всегда от THIS запуска
+            proc = subprocess.Popen(cmd, env=env,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=fh, stderr=subprocess.STDOUT)
+    except OSError as e:
+        raise RuntimeError(f"не удалось запустить {_launch_script_name()}: "
+                           f"{type(e).__name__}: {e}") from e
+    return LaunchRun(logf, proc)
+
+
+def _launch_log_tail(path: str | None, limit: int = 12) -> str:
+    """Хвост вывода лаунчера (диагностика «CDP не поднялся»)."""
+    return _LL.read_log_tail(path, limit)
 
 
 # ---- классификация ---------------------------------------------------------
@@ -247,9 +366,15 @@ class BrowserProbe:
         return "alive"
 
     def probe(self, sess, signature: bool) -> tuple[str, int]:
-        """Health probe. Возвращает (ProbeState, http_attempts)."""
-        ident = getattr(sess, "browser_identity", None)
-        if ident is None or not P.identity_alive(ident):
+        """Health probe. Возвращает (ProbeState, http_attempts).
+
+        Идентичность процесса берём из `sess.browser_pid` (так называется
+        поле cdp.Session, где лежит P.ProcessIdentity). `None` = браузер
+        запущен не нами (внешний/чужой) → владение не проверяем, судим
+        только по CDP HTTP: это и есть сигнал живости.
+        """
+        ident = getattr(sess, "browser_pid", None)
+        if ident is not None and not P.identity_alive(ident):
             return ProbeState.BROWSER_DEAD, 0
         attempts = 0
         cdp_ok = False
@@ -283,7 +408,7 @@ def _classify_hang(sess, signature: bool) -> Classification:
     if page is None:
         return Classification("unknown", signature=signature)
     try:
-        page.evaluate("1+1", timeout=8000)
+        page.evaluate("1+1")
     except Exception:
         return Classification("renderer_failure", probe_state="renderer_hang",
                               signature=signature)
@@ -293,7 +418,7 @@ def _classify_hang(sess, signature: bool) -> Classification:
 def classify_error(exc, sess=None) -> Classification:
     """Классифицирует исключение сбора товара -> Classification.
 
-    sess — сессия с cdp_url/browser_identity/page; None -> «не знаем» (unknown).
+    sess — сессия с cdp_url/browser_pid/page; None -> «не знаем» (unknown).
     error_kind — источник для policy; probe_state/probe_attempts — телеметрия.
     """
     signature = has_renderer_signature(str(exc))
@@ -351,9 +476,12 @@ class BrowserWatchdog:
 
     def __init__(self, cdp_url: str, poll_interval: float = 2.0,
                  grace_s: float = 4.0, probe: BrowserProbe | None = None,
-                 profile_token: str = P.PROFILE_TOKEN):
+                 profile_token: str = P.PROFILE_TOKEN,
+                 kind: str | None = None):
         self.cdp_url = cdp_url
         self.profile_token = profile_token
+        # None = движок из env (browser_kind); явный kind имеет приоритет.
+        self.kind = kind or browser_kind()
         self.poll_interval = poll_interval
         self.grace_s = grace_s
         self.probe = probe or BrowserProbe(http_timeout=1.0)
@@ -427,7 +555,12 @@ class BrowserWatchdog:
         CDP молчит → проверяем OS-уровень: процесса на profile+port нет —
         браузер реально мёртв (False); процесс ещё жив — транзиент (True),
         флаг «мёртв» не ставится (это BROWSER_UNHEALTHY, не смерть).
+
+        Firefox (kind='firefox'): CDP HTTP не существует — живость = есть ли
+        firefox-процесс на нашем профиле (geckodriver/Selenium).
         """
+        if self.kind == "firefox":
+            return bool(P.firefox_browser_processes(self.profile_token))
         if self.probe.cdp_http_ok(self.cdp_url):
             return True
         return bool(P.browser_processes(self.cdp_url,
@@ -492,7 +625,12 @@ class BrowserProcessManager:
         matching>1 -> BrowserOwnershipError.
         """
         wait_s = wait_s or self.launch_wait_s
-        _launch_script(self.cdp_url, profile_path=self.profile_path)
+        run = _launch_script(self.cdp_url, profile_path=self.profile_path)
+        return self._await_launch(launch_id, wait_s, run)
+
+    def _await_launch(self, launch_id: str, wait_s: float,
+                      run: "LaunchRun | None") -> "ProcessRecord | None":
+        logf = getattr(run, "path", run)
         record = None
         deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline:
@@ -508,6 +646,8 @@ class BrowserProcessManager:
             if record is not None and self._cdp_ready():
                 record.set_lifecycle(P.Lifecycle.CDP_READY)
                 return record
+            if run is not None and run.proc.poll() is not None:
+                break       # лаунчер завершился: он уже знает результат
             time.sleep(self.capture_interval)
         if record is None:
             matches = self._matching()
@@ -520,6 +660,16 @@ class BrowserProcessManager:
                 record.set_lifecycle(P.Lifecycle.ALIVE)
         if record is not None:
             record.partial = record.lifecycle != P.Lifecycle.CDP_READY
+        if record is None or record.partial:
+            code = run.proc.poll() if run is not None else None
+            exit_note = ("лаунчер ещё работает" if code is None
+                         else f"код возврата лаунчера={code}")
+            log.warning(
+                f"[browser] CDP не готов после {wait_s:.0f}с на {self.cdp_url} "
+                f"(process={'нет' if record is None else record.lifecycle}; "
+                f"{exit_note})"
+                + f"\nвывод {_launch_script_name()} ({logf}):"
+                + _launch_log_tail(logf))
         return record
 
     def _cdp_ready(self) -> bool:

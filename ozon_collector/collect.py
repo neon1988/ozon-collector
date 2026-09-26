@@ -11,9 +11,18 @@
    reviews_variant_mode {used, clicked, variant_present, variant_count, active,
                          total_count, reason, reviews_matched_variant,
                          reviews_dropped_by_client_filter},
-   pages, review_pages, artifacts {dom_snapshot}, source
+   pages, review_pages, artifacts {dom_snapshot}, source,
+   session {auth {logged_in, source, cookie_present}}
    (при sorts: у каждого отзыва review_sort — сортировка первого появления,
     review_sorts — список всех сортировок, где отзыв встретился)
+
+session.auth объясняет недобор у сессионного потолка Ozon: logged_in —
+авторизован ли профиль (_ozon_sat в куках = True, source="cookie"), None если
+определить не удалось (source="dom"/"ambiguous"/"unknown"). Потолок зависит от
+сессии и товара, а не от метода сбора: измерено 97 отзывов на сортировку
+(2026-08-29) против 4 (2026-09-25, анонимная сессия) на одном и том же товаре
+(pid 210502516, 257 707 отзывов). У товаров, собранных до появления детектора,
+поля нет.
 """
 from __future__ import annotations
 
@@ -32,6 +41,7 @@ from . import VERSION, SCHEMA_VERSION, DEFAULT_CDP_URL
 from . import browser as B
 from . import cache as K
 from . import log
+from . import ozon_fetch
 from . import puzzle as _puzzle
 from .constants import CHALLENGE_TITLE_MARKERS
 from .cdp import Session
@@ -190,6 +200,20 @@ def scroll_pause_ms(base: int = SCROLL_PAUSE_MS,
     low = int(base * (1 - jitter))
     high = int(base * (1 + jitter))
     return _scroll_rng.randint(low, high)
+
+
+def fab_reload_delay_s(base_ms: int | None = None,
+                       jitter: float | None = None) -> float:
+    """Пауза FAB-reload с джиттером ±jitter% (тот же seeded-RNG, что скролл).
+
+    Три фиксированные паузы 2.5с подряд — регулярный сигнал retry, который
+    ловится и без фингерпринтинга. Seed сохранён: тесты/replay детерминированы.
+    """
+    if base_ms is None:
+        base_ms = FAB_RELOAD_DELAY_MS
+    if jitter is None:
+        jitter = FAB_RELOAD_JITTER
+    return scroll_pause_ms(base=base_ms, jitter=jitter) / 1000.0
 
 # ---------------------------------------------------------------------------
 # Сортировки отзывов (URL-параметр sort=)
@@ -919,7 +943,7 @@ def detect_challenge(page) -> str | None:
     сигнатуры, чтобы не ронять реальные карточки без отзывов.
     """
     try:
-        title = (page.title() or "").strip().lower()
+        title = (page.title(timeout=8000) or "").strip().lower()
     except Exception:
         title = ""
     for m in CHALLENGE_TITLE_MARKERS:
@@ -927,7 +951,8 @@ def detect_challenge(page) -> str | None:
             return f"title:{m}"
     try:
         body = (page.evaluate(
-            "() => (document.body ? document.body.innerText : '')") or "")
+            "() => (document.body ? document.body.innerText : '')",
+            timeout=8000) or "")
         body = body.lower()
     except Exception:
         return None
@@ -939,6 +964,43 @@ def detect_challenge(page) -> str | None:
 
 FAB_RELOAD_ATTEMPTS = 3
 FAB_RELOAD_DELAY_MS = 2500
+FAB_RELOAD_JITTER = 0.15       # ±15% к паузе reload (антибот-ритм retry)
+
+# Капча v10 приходит ПОЗЖЕ основной страницы: сначала «каркас» (пустые
+# img#image/img#puzzle, captcha_v10.js заполняет src через 0.3–2s), а то и
+# вообще с редиректом ?__rr=1 после первичной загрузки. Однократная проверка
+# «сразу после goto» пазл не видит → собирается мусор (капча как товар).
+# Поэтому, если страница выглядит «подозрительно» (нет контента товара, URL с
+# __rr/antibot/слайдер) — переспрашиваем пазл несколько раз с паузой.
+CHALLENGE_RECHECKS = 4
+CHALLENGE_RECHECK_DELAY_S = 1.5
+
+_CHALLENGE_LOOKS_JS = (
+    "() => {"
+    " const u = location.href || '';"
+    " if (/__rr|abt_att|captcha|antibot/i.test(u)) return true;"
+    " const h1 = document.querySelector('h1');"
+    " const h1t = h1 ? (h1.innerText || '').trim() : '';"
+    " if (h1t && h1t.length >= 5) return false;"
+    " const body = document.body ? (document.body.innerText || '') : '';"
+    " if (body.length >= 300) return false;"
+    " return true;"
+    "}"
+)
+
+
+def _looks_like_challenge(page) -> bool:
+    """Есть ли основание ждать появление капчи (переспросить позже).
+
+    TRUE — страница пока «тонкая»: нет заголовка товара, мало текста, или
+    URL уже содержит признаки челленджа. На такой странице пазл может
+    прийти с задержкой — зовём переспросы. FALSE — это нормальная карточка
+    (есть h1 и контент): повторный опрос не нужен, лишних пауз нет.
+    """
+    try:
+        return bool(page.evaluate(_CHALLENGE_LOOKS_JS))
+    except Exception:
+        return False
 
 
 def _reload_fn(page):
@@ -953,6 +1015,33 @@ def _reload_fn(page):
     return True
 
 
+def _challenge_sig(page) -> str | None:
+    """Сигнатура челленджа: detect_challenge (текст/mаркеры) или каркас капчи.
+
+    Каркас пазла (is_captcha_shell) — сам по себе признак челленджа: Ozon
+    только начал инжект пазла (src ещё пустые), но страница УЖЕ анти-бот.
+    FAB-заглушка детектится detect_challenge по маркерам.
+    """
+    sig = detect_challenge(page)
+    if sig:
+        return sig
+    if _puzzle.is_captcha_shell(page):
+        return "shell:captcha_v10"
+    return None
+
+
+def _ensure_no_challenge(page, where: str) -> None:
+    """Жёстко: страница ДОЛЖНА быть без челленджа (для post-extract).
+
+    Никаких решений/релоадов: если на странице есть пазл/заглушка/каркас —
+    данные карточки невалидны (название/цена могли быть извлечены с капчи),
+    сбор нельзя продолжать. Бросаем AccessChallengeError → recyclable.
+    """
+    sig = _challenge_sig(page)
+    if sig:
+        raise B.AccessChallengeError(f"анти-бот после сбора ({where}): {sig}")
+
+
 def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
     """Поднять AccessChallengeError, если страница — анти-бот-заглушка.
 
@@ -960,8 +1049,24 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
     простым обновлением страницы (подтверждено вручную: reload открывает Ozon).
     Делаем до FAB_RELOAD_ATTEMPTS перезагрузок с паузой; если FAB остаётся —
     бросаем AccessChallengeError.
+
+    Капча v10 появляется с задержкой (каркас → инжект src через 0.3–2s, или
+    редирект ?__rr=1 после загрузки). Если сразу челленджа нет, но страница
+    выглядит «тонкой» (нет контента товара) — переспрашиваем до
+    CHALLENGE_RECHECKS раз с паузой: пазл должен быть виден к моменту сбора,
+    а не собран как товар. Нормальные карточки (есть h1/контент) дополнительных
+    пауз не получают.
+
+    Если после переспросов страница всё ещё «тонкая», но маркеров капчи нет —
+    это неразрендеренная/заблокированная страница: AccessChallengeError, а не
+    пустая карточка (иначе кампания собирает мусор и тратит слот).
     """
-    sig = detect_challenge(page)
+    sig = _challenge_sig(page)
+    for _ in range(CHALLENGE_RECHECKS) if (not sig and _looks_like_challenge(page)) else range(0):
+        time.sleep(CHALLENGE_RECHECK_DELAY_S)
+        sig = _challenge_sig(page)
+        if sig:
+            break
     if sig and (_puzzle.is_puzzle(sig) or _puzzle.looks_like_puzzle(page)):
         # Слайдер-пазл (НЕ FAB-заглушка): сначала пытаемся РЕШИТЬ, а не
         # перезагружать вслепую. Успех → пазл снят, никакого AccessChallenge
@@ -973,12 +1078,12 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
             return
         log.warning(f"[collect] пазл не решён за {_puzzle.failures()} "
                     f"попыток ({where}) → FAB-reload fallback")
-        sig = detect_challenge(page)
+        sig = _challenge_sig(page)
     for _ in range(FAB_RELOAD_ATTEMPTS) if (sig and reload_on_fab) else range(0):
         log.warning(f"[collect] FAB-заглушка ({sig}) → reload для разблокировки")
         _reload_fn(page)
-        time.sleep(FAB_RELOAD_DELAY_MS / 1000.0)
-        sig = detect_challenge(page)
+        time.sleep(fab_reload_delay_s())
+        sig = _challenge_sig(page)
         if not sig:
             break
     if sig:
@@ -989,6 +1094,18 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
         except Exception:
             pass
         raise B.AccessChallengeError(f"анти-бот ({where}): {sig}")
+    if _looks_like_challenge(page):
+        # Маркеров капчи нет, но страница так и не отрисовалась: нет h1 и
+        # почти нет текста даже после CHALLENGE_RECHECKS переспросов. Считать
+        # с неё нечего — извлечение вернёт пустую карточку, а пустой raw
+        # засоряет кампанию и жжёт слот (замер 2026-09-25: widgets=0, h=805).
+        # Классифицируем как челлендж: бюджет тратится на сессию, а не на
+        # мусорные товары.
+        try:
+            page.is_invalid = True
+        except Exception:
+            pass
+        raise B.AccessChallengeError(f"страница не отрисована ({where}): нет h1/контента")
 
 
 _AGE_GATE_PROBE_JS = (
@@ -1063,6 +1180,75 @@ def _pass_age_gate(page) -> bool:
             raise
         log.warning(f"[collect] age-gate warn: {e}")
         return False
+
+
+_AUTH_COOKIE_NAME = "_ozon_sat"
+_AUTH_DOM_JS = r"""() => {
+    const q = (sel) => !!document.querySelector(sel);
+    const hasAccount = q('a[href*="/my/"]') || q('[data-widget*="webHeaderUser"]')
+        || /Мой Ozon|Выйти/i.test((document.body && document.body.innerText) || '');
+    const hasLogin = q('a[href*="/auth/"]') || q('[data-widget*="webLogin"]')
+        || /(^|\n)\s*Войти\s*(\n|$)/.test((document.body && document.body.innerText) || '');
+    return {hasLogin: hasLogin, hasAccount: hasAccount};
+}"""
+
+
+def _page_cookies(page) -> Optional[list]:
+    """Куки текущей страницы: Playwright page.context.cookies() или
+    Selenium get_cookies(). None = куки недоступны (не «пусто»)."""
+    for getter in (lambda: page.context.cookies(), lambda: page.get_cookies()):
+        try:
+            return list(getter())
+        except Exception:
+            continue
+    return None
+
+
+def detect_auth_state(page) -> dict:
+    r"""Состояние авторизации профиля: {logged_in, source, cookie_present}.
+
+    Зачем: у неавторизованного профиля Ozon режет выдачу отзывов, и величина
+    среза зависит от сессии и товара — на pid 210502516 (257 707 отзывов)
+    2026-08-29 отдавали 97 отзывов на сортировку, а 2026-09-25 анонимная
+    сессия отдаёт 4 (DOM и JSON API одинаково). Пока это не помечено в raw,
+    недобор неотличим от сбоя скролла — и QA не может это объяснить.
+    Источник 1 — кука _ozon_sat (HttpOnly, из JS не видна → читаем куки
+    браузера). Источник 2 — DOM: аноним показывает «Войти» (/auth/),
+    авторизованный — «Мой Ozon» (/my/). Ничего не сработало →
+    logged_in=None, source="unknown".
+
+    Никогда не бросает: детект не должен ронять сбор.
+    """
+    out = {"logged_in": None, "source": "unknown", "cookie_present": None}
+    cookies = _page_cookies(page)
+    if cookies is not None:
+        names = {str(c.get("name") or "") for c in cookies if isinstance(c, dict)}
+        out["cookie_present"] = _AUTH_COOKIE_NAME in names
+    dom = None
+    try:
+        dom = page.evaluate(_AUTH_DOM_JS)
+    except Exception as e:
+        log.debug(f"[collect] auth dom probe warn: {type(e).__name__}")
+    if isinstance(dom, dict):
+        has_login = bool(dom.get("hasLogin"))
+        has_account = bool(dom.get("hasAccount"))
+        if out["cookie_present"] is not None:
+            out["logged_in"] = out["cookie_present"]
+            out["source"] = "cookie"
+        elif has_account and not has_login:
+            out["logged_in"] = True
+            out["source"] = "dom"
+        elif has_login and not has_account:
+            out["logged_in"] = False
+            out["source"] = "dom"
+        elif has_account and has_login:
+            out["source"] = "ambiguous"
+    elif out["cookie_present"] is not None:
+        out["logged_in"] = out["cookie_present"]
+        out["source"] = "cookie"
+    log.info(f"[collect] auth: logged_in={out['logged_in']} "
+             f"source={out['source']} cookie_present={out['cookie_present']}")
+    return out
 
 
 def collect_product(page, product_url: str, category: str | None = None) -> dict:
@@ -1281,6 +1467,8 @@ def _scroll_to_converge(page, target_min: int = 40, max_iters: int = 90,
         except Exception as e:
             if B.is_renderer_failure(e):
                 raise
+            log.warning(f"[collect] converge: скролл не удался: "
+                        f"{type(e).__name__}: {e}")
             break
         tel["scroll_count"] += 1
         pause = scroll_pause_ms()
@@ -1493,12 +1681,16 @@ def _parse_comment_api(body: bytes) -> tuple[list | None, str]:
 
 
 def _expand_comments_snapshot(page, max_passes: int = 4) -> tuple[int, dict]:
-    """Раскрывает комментарии с перехватом API rpGetCommentsByReviewUuid.
+    """Раскрывает комментарии к отзывам, при возможности — через API.
 
-    Делает то же, что _expand_review_comments, но параллельно ловит ответы
-    API и привязывает их к отзыву по reviewUuid из post_data запроса
-    (response-listener, см. _parse_comment_api). Слушатель снимается в
-    try/finally; после кликов — короткая пауза, чтобы догнать хвост API.
+    Основной путь (Chrome/Playwright): параллельно ловим ответы API
+    rpGetCommentsByReviewUuid и привязываем их к отзыву по reviewUuid из
+    post_data запроса (listener, см. _parse_comment_api). API-комментарии
+    полнее DOM, поэтому заменяют их; остальные отзывы остаются с DOM.
+
+    Firefox/Selenium: перехват сети недоступен (у page есть
+    network_capture=False), поэтому сразу идём DOM-путём — он проверен живым
+    прогоном: 15 trusted-кликов дали 15 узлов [data-comment-uuid].
 
     Возвращает (n_clicks, by_review): by_review — {review_uuid: [comments]}
     (пустой, если платформа не отвечала API). Отзывы с неоднозначной
@@ -1508,7 +1700,17 @@ def _expand_comments_snapshot(page, max_passes: int = 4) -> tuple[int, dict]:
     n_resp = 0
     total_comments = 0
 
+    if not getattr(page, "network_capture", True):
+        log.debug("[comments-api] page без перехвата сети, DOM-комментарии")
+        n_clicks = _expand_review_comments(page, max_passes=max_passes)
+        try:
+            _touch_watchdog()
+        except Exception:
+            pass
+        return n_clicks, by_review
+
     def _on_response(resp):
+
         nonlocal n_resp, total_comments
         if _COMMENTS_API_URL_FRAGMENT not in (resp.url or ""):
             return
@@ -1784,6 +1986,8 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
             except Exception as e:
                 if B.is_renderer_failure(e):
                     raise
+                log.warning(f"[variant_mode] скролл не удался: "
+                            f"{type(e).__name__}: {e}")
                 break
             page.wait_for_timeout(scroll_pause_ms())
             try:
@@ -1878,6 +2082,30 @@ def _count_review_cards(page):
         return None
 
 
+_PAGE_GEOM_JS = """
+() => ({
+  ready: document.readyState,
+  y: Math.round(window.scrollY),
+  h: document.documentElement.scrollHeight,
+  ih: window.innerHeight,
+  body: document.body ? document.body.innerText.length : 0,
+  widgets: document.querySelectorAll('div[data-widget]').length,
+  scripts: document.scripts.length,
+})
+"""
+
+
+def _page_geom(page) -> dict:
+    """Геометрия/состояние страницы — для диагностики пустого прокручивания."""
+    try:
+        g = page.evaluate(_PAGE_GEOM_JS)
+        return g if isinstance(g, dict) else {}
+    except Exception as e:
+        if B.is_renderer_failure(e):
+            raise
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def _collect_reviews_pass(
     page, page_url: str, sort: str | None, target_variant: dict,
     max_pages: int = 12, min_reviews: int = 40, apply_variant_mode: bool = True,
@@ -1926,6 +2154,12 @@ def _collect_reviews_pass(
         _pass_age_gate(page)
         if apply_variant_mode:
             vm = _activate_variant_mode(page)
+            n_cards = _count_review_cards(page)
+            msg = (f"[variant_mode] p{p} sort={sort}: {vm} cards={n_cards}")
+            if n_cards:
+                log.debug(msg)
+            else:
+                log.info(msg + f" geom={_page_geom(page)}")
             if variant_mode is None or vm.get("used"):
                 variant_mode = vm
             if vm.get("used") and vm.get("variant_count") == 0:
@@ -2123,6 +2357,36 @@ def _finalize_variant_mode(variant_mode: dict | None, reviews: list,
     return base
 
 
+def _canonical_product_url(page, url: str) -> str:
+    """Вернуть канонический URL карточки (со slug), если он есть.
+
+    Короткий адрес `/product/{pid}` открывает недогидратированную оболочку:
+    на живой проверке (2026-09-25, Firefox) `webListReviews` отсутствовал, тело
+    страницы — 1863 символа, скролл давал 0 карточек, тогда как тот же товар
+    по полному slug-URL отдавал 12 отзывов. Ozon публикует канонический адрес
+    в `<link rel="canonical">`, поэтому берём его и один раз переходим.
+    Ничего не делаем, если slug уже есть или каноника не читается."""
+    if re.search(r"/product/[^/]*\d+[^/]*/", url or ""):
+        return url
+    try:
+        canon = page.evaluate(
+            "() => { const l = document.querySelector("
+            "'link[rel=\"canonical\"]'); return l ? l.href : null; }",
+        )
+    except Exception:
+        return url
+    if not canon or canon == url:
+        return url
+    try:
+        log.info(f"[collect] canonical URL: {canon}")
+        page.goto(canon, timeout=60000)
+    except Exception as e:
+        log.warning(f"[collect] переход по canonical не удался: "
+                    f"{type(e).__name__}: {e}")
+        return url
+    return canon
+
+
 def collect_reviews(
     page, reviews_url: str, target_variant: dict, max_pages: int = 12,
     min_reviews: int = 40, apply_variant_mode: bool = True,
@@ -2238,6 +2502,100 @@ def pid_from_url(url: str) -> str:
     return (m.group(1) or m.group(2)) if m else "unknown"
 
 
+REVIEWS_API_ENV = "OZON_REVIEWS_API"
+_TRUE = ("1", "true", "yes", "on")
+
+
+def reviews_api_enabled(flag: bool | None = None) -> bool:
+    """Включён ли быстрый API-предсрез отзывов.
+
+    По умолчанию ВЫКЛЮЧЕН (ревизия 2.8): модуль доказан только как способ снять
+    те же 4 отзыва, что и DOM, за 0,1 с. Включение — явное (флаг/CLI/env), чтобы
+    смена поведения боевого сбора не случилась сама.
+    """
+    if flag is not None:
+        return bool(flag)
+    return (os.environ.get(REVIEWS_API_ENV) or "").strip().lower() in _TRUE
+
+
+def _reviews_api_prepass(page, pid: str | None, target_variant: dict,
+                         rating_count, sorts, enabled: bool) -> dict:
+    """Быстрый предсрез отзывов через API. Всегда safe: на любой проблеме → {}.
+
+    complete=True только когда API вернул не меньше доверенного rating_count и
+    не нужен вариант/мульти-сорт (тогда DOM-страницы можно не докручивать).
+    """
+    tel = {"enabled": bool(enabled), "used": False, "reason": "",
+           "fetched": 0, "pages": 0, "complete": False, "reviews": []}
+    if not enabled:
+        tel["reason"] = "disabled"
+        return tel
+    if not pid or str(pid) in ("", "unknown"):
+        tel["reason"] = "no_pid"
+        return tel
+    allowed, why = ozon_fetch.api_plan(target_variant,
+                                       need_dom_extras=bool(sorts))
+    if not allowed:
+        tel["reason"] = why
+        return tel
+    t0 = time.monotonic()
+    try:
+        got = ozon_fetch.fetch_slice(page, str(pid), max_pages=1)
+    except Exception as e:
+        # Предсрез — ускорение, а не источник данных: любая ошибка тихо
+        # оставляет DOM-сбор как единственный путь.
+        tel["reason"] = f"error:{type(e).__name__}"
+        tel["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+        log.warning(f"[reviews-api] предсрез не удался: {type(e).__name__}: {e}")
+        return tel
+    tel.update(used=bool(got.get("fetched")), fetched=got.get("fetched", 0),
+               pages=got.get("pages", 0), reviews=got.get("reviews") or [])
+    tel["complete"] = bool(sorts is None and ozon_fetch.api_slice_complete(
+        tel["fetched"], rating_count))
+    tel["reason"] = ("complete" if tel["complete"]
+                     else (got.get("error") or "partial"))
+    tel["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+    log.info(f"[reviews-api] предсрез: {tel['fetched']} отзывов за "
+             f"{tel['elapsed_ms']}мс (rating_count={rating_count}, "
+             f"complete={tel['complete']}, reason={tel['reason']})")
+    return tel
+
+
+def _collect_reviews_stage(sess, rurl, target_variant, rating_count, pid,
+                           max_pages, min_reviews, apply_variant_mode, sorts,
+                           telemetry, no_count_hint, reviews_api):
+    """Сбор отзывов товара (+ опциональный API-предсрез) для collect().
+
+    Вынесено из collect(), чтобы не растить его CCN: логика «быстрый предсрез →
+    ограничение глубины DOM-докрутки → merge» — отдельный этап со своим
+    результатом (reviews, total_pages, page_log, variant_mode, raw_api_ctx).
+    """
+    api_ctx = _reviews_api_prepass(
+        sess.page, pid, target_variant, rating_count, sorts,
+        enabled=reviews_api_enabled(reviews_api))
+    # Покрытие доказано счётчиком из карточки → глубокий DOM-скролл не нужен.
+    # Мульти-сорт и вариант-фильтр сюда не попадают (см. ozon_fetch.api_plan).
+    eff_max_pages = 1 if api_ctx.get("complete") else max_pages
+    if api_ctx.get("complete"):
+        log.info(f"[reviews-api] покрытие доказано "
+                 f"({api_ctx['fetched']} ≥ rating_count) — "
+                 f"DOM докручиваю только 1 страницу")
+    reviews, total_pages, page_log, variant_mode = collect_reviews(
+        sess.page, rurl, target_variant, max_pages=eff_max_pages,
+        min_reviews=min_reviews, apply_variant_mode=apply_variant_mode,
+        sorts=sorts, telemetry=telemetry, no_count_hint=no_count_hint,
+    )
+    reviews, api_stats = ozon_fetch.merge_reviews_api(
+        reviews, api_ctx.get("reviews") or [])
+    if not api_ctx.get("used"):
+        return reviews, total_pages, page_log, variant_mode, {
+            "enabled": api_ctx.get("enabled", False), "used": False,
+            "reason": api_ctx.get("reason", "disabled")}
+    api_stats.update({k: v for k, v in api_ctx.items() if k != "reviews"})
+    api_stats["dom_short_circuit"] = bool(api_ctx.get("complete"))
+    return reviews, total_pages, page_log, variant_mode, api_stats
+
+
 def collect(
     product_url: str,
     reviews_url: str | None = None,
@@ -2253,6 +2611,7 @@ def collect(
     sess=None,
     overwrite: bool = False,
     skip_reviews: bool = False,
+    reviews_api: bool | None = None,
 ) -> dict:
     """Полный сбор: карточка + отзывы варианта.
 
@@ -2268,6 +2627,10 @@ def collect(
     проверки объёма отзывов неприменимы; нулевым отзывы не подтверждаются.
     sess — внешняя CDP-сессия (для переиспользования в search/gather):
     если передана, используется и НЕ закрывается; иначе создаётся своя.
+    reviews_api — быстрый предсрез отзывов через ozon_fetch (None → env
+    OZON_REVIEWS_API, по умолчанию выключено). DOM остаётся источником
+    истины: API лишь дополняет список, а не докручивает страницы, пока не
+    докажет покрытие rating_count (см. _reviews_api_prepass).
     Возвращает dict."""
     target_variant = parse_variant(variant)
     sess_owned = sess is None
@@ -2275,10 +2638,17 @@ def collect(
         sess = Session(cdp_url)
     dom_html = None
     telemetry: dict = {}
+    # Телеметрия API-предсреза: пишется в raw всегда (и когда выключен/пропущен),
+    # иначе по отчёту нельзя отличить «API не пробовали» от «API не помог».
+    raw_api_ctx: dict = {"enabled": reviews_api_enabled(reviews_api),
+                         "used": False, "reason": "not_attempted"}
+    auth_state = {"logged_in": None, "source": "unknown", "cookie_present": None}
     try:
         sess.goto(product_url)
         check_challenge(sess.page, "product_page")
         _pass_age_gate(sess.page)
+        auth_state = detect_auth_state(sess.page)
+        product_url = _canonical_product_url(sess.page, product_url)
         requested_pid = pid_from_url(product_url)
         actual_pid = pid_from_url(sess.page.url)
         if (requested_pid and actual_pid and requested_pid != "unknown"
@@ -2288,6 +2658,11 @@ def collect(
                 f"but browser shows PID {actual_pid}"
             )
         product = collect_product(sess.page, product_url, category=category)
+        # Капча могла вылезти ПОСЛЕ первоначальной проверки (задержка инжекта
+        # пазла / редирект ?__rr=1): если страница теперь заглушка или пазл,
+        # данные карточки невалидны (название/цена из капчи). Собирать дальше
+        # (отзывы, raw.json) нельзя — бросаем AccessChallengeError → recyclable.
+        _ensure_no_challenge(sess.page, "product_post_extract")
         chars = product.get("characteristics") or {}
         if "Артикул" in chars and str(chars["Артикул"]) != str(requested_pid):
             log.warning(f"[collect] warning: артикул в характеристиках "
@@ -2301,6 +2676,8 @@ def collect(
                 log.warning(f"[collect] dom snapshot warn: {e}")
                 dom_html = None
         rurl = reviews_url or product_url + "?tab=reviews"
+        if reviews_url:
+            rurl = _canonical_product_url(sess.page, reviews_url) + "?tab=reviews"
         rc = product.get("rating_count")
         no_count_hint = not (isinstance(rc, int) and rc > 0)
         if skip_reviews:
@@ -2310,6 +2687,8 @@ def collect(
             reviews, total_pages, page_log = [], 1, []
             variant_mode = {"used": False, "reason": "reviews_skipped",
                             "variant_count": None}
+            raw_api_ctx = {"enabled": raw_api_ctx.get("enabled", False),
+                           "used": False, "reason": "reviews_skipped"}
         elif isinstance(rc, int) and rc <= 0:
             # У товара 0 отзывов целиком (кейс 4551551032: нет тумблера
             # варианта и пустой раздел) — прокручивать нечего, сортировки
@@ -2319,13 +2698,14 @@ def collect(
             reviews, total_pages, page_log = [], 1, []
             variant_mode = {"used": False, "reason": "no_reviews_product",
                             "variant_count": 0}
+            raw_api_ctx = {"enabled": raw_api_ctx.get("enabled", False),
+                           "used": False, "reason": "no_reviews_product"}
         else:
-            reviews, total_pages, page_log, variant_mode = collect_reviews(
-                sess.page, rurl, target_variant, max_pages=max_pages,
-                min_reviews=min_reviews, apply_variant_mode=apply_variant_mode,
-                sorts=sorts, telemetry=telemetry,
-                no_count_hint=no_count_hint,
-            )
+            (reviews, total_pages, page_log, variant_mode,
+             raw_api_ctx) = _collect_reviews_stage(
+                sess, rurl, target_variant, rc, requested_pid, max_pages,
+                min_reviews, apply_variant_mode, sorts, telemetry,
+                no_count_hint, reviews_api)
     finally:
         if sess_owned:
             sess.close()
@@ -2345,6 +2725,8 @@ def collect(
         "reviews_expected": None,
         "reviews_sorts": sorts,
         "reviews_variant_mode": variant_mode,
+        "reviews_api": raw_api_ctx,
+        "session": {"auth": auth_state},
         "pages": total_pages,
         "review_pages": page_log,
         "source": "cdp",

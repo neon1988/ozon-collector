@@ -33,6 +33,9 @@ class FakePage:
     def evaluate(self, js, *a, **k):
         if js == C._CARDS_COUNT_JS:
             return self.cards
+        if "location.href" in js:
+            # _CHALLENGE_LOOKS_JS: страница отрисована, челленджа нет.
+            return False
         if "step-up" in js:
             v = self.ups[min(self.j, len(self.ups) - 1)]
             self.j += 1

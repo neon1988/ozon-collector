@@ -20,7 +20,57 @@
 > Если браузер закрыт, `collect`/`gather`/`search`
 > запускают его автоматически; отключить: `OZON_AUTO_LAUNCH=0`.
 >
-> Полная архитектура обхода антибота — `docs/anti_bot_architecture.md`.
+> Полная архитектура обхода антибота — `docs/architecture/anti_bot_architecture.md`.
+
+## Ревизия 2.9 — что нужно знать оператору
+
+**URL кампании проверяется на входе.** Markdown-ссылка, «умные» кавычки и
+хвостовая пунктуация чинятся автоматически (в лог падает warning «URL поправлен»);
+не-URL (`опечатка`, `javascript:...`, пусто) → ошибка с кодом 2 **до** запуска
+браузера. Раньше такой URL доходил до `Page.goto` и давал «нулевые» прогоны со
+статусом `NORMAL_DONE`.
+
+**`EMPTY_SEARCH`** — новый статус прогона: браузер жив, сетка выдачи не
+отрисовалась, товаров 0. Считается стагнацией (оператору видно в логе и
+`status.json`), а не успехом.
+
+Переменные окружения ревизии 2.9:
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `OZON_ACTIVE_WARMUP` | `1` | Активный прогрев (scroll + mousemove). `0` — только навигации и паузы |
+| `OZON_PROXY_URL` | — | Прокси для worker'ов (в логах маскируется). **Выключено по умолчанию, включать после A/B** |
+| `OZON_PROXY_URLS` | — | Список прокси через запятую: worker-1 берёт первый, worker-2 второй и т.д. |
+| `OZON_KEEP_WINDOW` | `0` | Показать окно браузера после запуска (на сервере без дисплея используйте Xvfb + `DISPLAY`) |
+| `OZON_CANARY_URL` | — | Переопределить canary-цель (приоритет: `--canary-url` → env → URL кампании → главная) |
+
+Диагностика:
+
+- `fingerprint` в логах теперь содержит `hidden` / `visibility` / `focused` —
+  по ним видно, в каком состоянии вкладка (данные только, принудительного
+  foreground нет).
+- `recovery` в прогонах: `warmup_activity`, `warmup_challenges`,
+  `search_grid_empty`, `canary`, `block_kind` (`soft`/`hard`).
+
+Все новые механизмы покрыты тестами, но **влияние на блокировки не измерено
+живым A/B** — см. таблицу «Проверка гипотез ревизии 2.9» в
+`docs/architecture/anti_bot_architecture.md`.
+
+- **Диагностика автозапуска браузера.** Каждый запуск лаунчера пишет лог в
+  `%TEMP%\ozon_launch_<порт>.log` (перезаписывается при каждом старте, после
+  неудачи остаётся как улика). Если демон пишет «CDP-браузер не поднялся», в
+  сообщении уже есть: путь к логу, код возврата лаунчера и его вывод. Маркеры
+  лаунчера — ASCII и читаются без искажений:
+
+  | Маркер | Значит |
+  |---|---|
+  | `LAUNCHER-ERROR: port N ALREADY responds` | порт держал старый Chromium — освободите порт |
+  | `LAUNCHER-ERROR: Chromium pid=N EXITED` | процесс умер сразу; чаще всего профиль уже открыт другим Chrome |
+  | `LAUNCHER-DIAG: chrome=… profile=… port=… proxy=…` | что именно запускалось (пароль прокси маскирован) |
+
+  Проверка вручную: `powershell -ExecutionPolicy Bypass -File scripts\launch_chrome.ps1`
+  (код возврата 0 — успех, 1 — отказ с причиной). Путь к логу можно переопределить
+  через `OZON_LAUNCH_LOG_DIR` (используется тестами).
 
 ## Установка
 
@@ -46,13 +96,93 @@ OCR v1.7.0 (опционально):
   `ocr` в `data/tessdata_best/` (без apt); при недоступности сети — системный
   tessdata.
 
+## Автономный браузер (Chrome-for-Testing / Edge)
+
+Коллектор работает на любом Chromium-браузере, а не только на системном Chrome.
+Если системный Chrome обновляется сам / недоступен / не хочется зависеть от
+Google Update — поставь закреплённый Chrome-for-Testing (не обновляется сам,
+версия меняется только явным перезапуском скрипта):
+
+```powershell
+python scripts/setup_bundled_chrome.py     # скачивает chrome.exe и печатает export
+$env:OZON_CHROME_PATH = "<путь из вывода>"
+```
+
+Так же годится любой Chromium-путь (каталог или exe) — Chrome-for-Testing, Edge:
+
+```powershell
+$env:OZON_CHROME_PATH = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+```
+
+`OZON_CHROME_PATH` пробрасывается в launch-скрипты как `CHROME`, автономный
+браузер использует тот же anti-automation паттерн (без `--enable-automation`).
+Без переменной — по умолчанию системный Chrome. **Движок по умолчанию в сборке —
+Chromium** (`chrome`, см. `OZON_BROWSER`; явно задать другой: `--browser
+firefox` или `OZON_BROWSER=firefox`).
+
+## Firefox (отладочная ветка, НЕ для боевого сбора)
+
+Firefox — **stock Firefox через Selenium + geckodriver (Marionette)**, не
+Playwright: Playwright патчит Firefox (канал Juggler) и Ozon это видит.
+`geckodriver` должен быть в PATH, каталог профиля создаётся **заранее** —
+geckodriver не создаёт его сам (`Failed to set preferences`).
+
+> ⚠️ **Firefox заблокирован целиком (замеры 2026-09-25).** Ozon отдаёт заглушку
+> «Похоже, нет соединения» на первом же `goto` **любой** marionette-сессии:
+> тёплый профиль, пустой профиль, без user prefs, с включёнными
+> OCSP/CRLite/CRL — заглушка 6.6–8с. Chromium CDP на том же IP проходит
+> (19.7с; 13.6с даже с `--enable-automation`, `webdriver=true`).
+>
+> Что замеры **доказали**: webdriver-флаг причиной **не является**; исключены
+> профиль, prefs, locale, геометрия окна, ресурс-блокировка, тайминги,
+> OCSP/CRL, IP и его репутация, cookies (инкогнито вручную на том же IP
+> открывается). Отделить tell уровня marionette-протокола от правила
+> «automation + UA Firefox» текущими инструментами нельзя: Firefox без
+> marionette не скриптуется. Поэтому `firefox` — только для отладки профилей,
+> боевой `gather`/`search`/`key_daemon` идёт на `chrome`.
+
+```powershell
+$env:OZON_BROWSER = "firefox"                # вариант 1: env
+python cli.py --browser firefox gather ...   # вариант 2: флаг
+```
+
+Что осталось рабочим в firefox-ветке (для отладки):
+
+- Профиль — persistent `{token}.firefox` (`OZON_PROFILE_BASE`), куки живут
+  между запусками, как и в Chrome.
+- Окно **не сворачивается**: свёрнутое окно Firefox не рендерит lazy-блоки
+  (IntersectionObserver не срабатывает) — список отзывов остаётся пустым. Окно
+  разворачивается без активации фокуса (`WS_EX_NOACTIVATE`), чтобы не мешать
+  работе за компьютером. `OZON_KEEP_WINDOW=1` — развернуть и показать явно.
+- Перехват сети не используется: комментарии берутся из DOM. Селекторы
+  Playwright-псевдокласс (`:visible`) разворачиваются в XPath, `has_text`
+  локатора поддержан.
+- Навигация не ждёт `load`: geckodriver возвращает управление на
+  DOMContentLoaded (`pageLoadStrategy=eager`), иначе страницы отзывов Ozon висят
+  до таймаута и отдают недогидрированную оболочку.
+- Короткий адрес `/product/{pid}` без slug не подгружает блок отзывов — перед
+  сбором collect берёт `<link rel="canonical">` и переходит на полный URL.
+- Параллельный сбор для firefox разрешён: каждый воркер = отдельный процесс со
+  своим Firefox+geckodriver и профилем, живость — по процессу + heartbeat
+  (без CDP).
+- Окна Firefox управляются нативно (PID + класс `MozillaWindowClass`), рестарт
+  броузерной подсистемы = kill процессов профиля + reconnect.
+
+Опечатка в `OZON_BROWSER` (не `chrome`/`firefox`) — `ValueError` на старте.
+
+Замечания по сборкам:
+- Предпочитай Chrome-for-Testing (stable, `setup_bundled_chrome.py`) или Edge.
+  Playwright-сборка chromium (`%LOCALAPPDATA%\ms-playwright\chromium-*\chrome-win*\chrome.exe`) через `launch_chrome` работает нестабильно — браузер может стартовать и сразу умереть; лучше не использовать.
+- `storage.googleapis.com/.../last-known-good-versions-with-downloads.json` иногда
+  отдаёт 404 — скрипт автоматически пробует зеркало `googlechromelabs.github.io`.
+
 ## Быстрый старт
 
 Браузер запускается автоматически при первом обращении (если закрыт), затем
 весь пайплайн одним вызовом:
 
 ```bash
-python3 cli.py gather --pid 550332874 --sorts published_at_desc,score_desc,score_asc --out docs/report.md
+python3 cli.py gather --pid 550332874 --sorts published_at_desc,score_desc,score_asc --out docs/digests/report.md
 ```
 
 Ручной запуск браузера (не обязателен, полезен при отладке):
@@ -74,14 +204,14 @@ powershell -ExecutionPolicy Bypass -File scripts/launch_chrome.ps1
 python3 cli.py collect --pid 550332874 --sorts published_at_desc,score_asc
 
 # 2) Полный пайплайн с OCR галереи → отчёт в файл
-python3 cli.py gather --pid 550332874 --out docs/report.md
+python3 cli.py gather --pid 550332874 --out docs/digests/report.md
 
 # 3) Отчёт из уже собранного raw.json (офлайн, без браузера)
-python3 cli.py report --raw data/550332874_raw.json --out docs/report.md
+python3 cli.py report --raw data/550332874_raw.json --out docs/digests/report.md
 ```
 
 ID товара = цифры из URL (`ozon.ru/product/550332874`) либо `--url <полный URL>`.
-Результат: `data/{pid}_raw.json` + `docs/report.md`.
+Результат: `data/{pid}_raw.json` + `docs/digests/report.md`.
 
 ## Пайплайн
 
@@ -106,7 +236,7 @@ python3 cli.py ocr --raw data/3627230434_raw.json --threads 8      # ворке�
 python3 cli.py ocr --raw data/3627230434_raw.json --no-preproc     # без cv2 (gray/upscale/CLAHE)
 
 # 4) Markdown-отчёт (без --out — в stdout)
-python3 cli.py report --raw data/3627230434_raw.json --out docs/headphones_xiaomi_redmi_buds8.md
+python3 cli.py report --raw data/3627230434_raw.json --out docs/digests/headphones_xiaomi_redmi_buds8.md
 ```
 
 Пользовательский shortcut — вся цепочка одним вызовом:
@@ -116,7 +246,7 @@ python3 cli.py report --raw data/3627230434_raw.json --out docs/headphones_xiaom
 python3 cli.py gather --pid 3627230434 --variant 'Цвет товара: черный'
 
 # сохранение в файл
-python3 cli.py gather --pid 3627230434 --variant 'Цвет товара: черный' --out docs/xiaomi.md
+python3 cli.py gather --pid 3627230434 --variant 'Цвет товара: черный' --out docs/digests/xiaomi.md
 
 # быстрый прогон без OCR (без tesseract)
 python3 cli.py gather --pid 3627230434 --no-ocr
@@ -144,6 +274,19 @@ reviews_dropped_by_client_filter); в отчёте выводится строк
 > `variant_count` больше собранного и разница не объясняется ограничением
 > «доступно только после регистрации» — сбор был неполный, пересобирать).
 > Собранные отзывы — это данные именно выбранного варианта, а не всего товара.
+
+**Сессионный срез отзывов и авторизация.** Неавторизованный профиль Ozon режет
+выдачу, и величина среза зависит от сессии и товара, а не от способа сбора: на
+одном и том же pid `210502516` (257 707 отзывов) 2026-08-29 отдавали 97 отзывов
+на сортировку, а 2026-09-25 анонимная сессия отдаёт 4 — одинаково через DOM и
+через JSON API. Такой недобор помечается в QA как `WALL_LIMITED`, а причина пишется
+в `raw.session.auth`: `logged_in: true|false|null`,
+`source: cookie|dom|ambiguous|unknown`. Куки `_ozon_sat` считаются авторитетными,
+DOM («Войти» / «Мой Ozon») — фолбэком. У данных, собранных до появления детектора,
+поля нет — QA тогда пишет `AUTH_NOT_MEASURED`. Коды `UNAUTH_WALL` /
+`AUTH_UNKNOWN` / `AUTH_NOT_MEASURED` имеют уровень INFO и **не меняют вердикт**:
+собранное — значит валидно, а не «пересобрать заново». Сводка по кампании —
+`status.json` → `session_auth`.
 
 `--category` сохраняется в `product.category` и выводится в отчёте.
 `--no-dom` отключает DOM-снимок. `--out` задаёт путь raw.json (по умолчанию
@@ -173,8 +316,13 @@ python3 cli.py gather --pid 3627230434 --sorts published_at_desc,score_desc,scor
 ## Справка по командам и опциям
 
 ```
-ozon-collector {collect,ocr,report,gather,search} [опции]
+ozon-collector {collect,ocr,report,gather} [опции]
 ```
+
+Поисковый сбор (`search`) — **не CLI-подкоманда**: это модуль
+`ozon_collector/search.py`, который вызывается демоном in-process
+(`scripts/key_daemon.py::_inproc_collect` → `parallel.collect_parallel`).
+Отдельный поисковый CLI в сборке нет.
 
 ### `collect` — сбор карточки + отзывов варианта (CDP)
 
@@ -226,10 +374,21 @@ ozon-collector {collect,ocr,report,gather,search} [опции]
 | `--no-dedup-replies` | не скрывать повторяющиеся ответы продавца (см. ниже) | дедуп включён |
 | `--overwrite` | перезаписывать существующий `data/{pid}_raw.json`; иначе новый прогон → `data/{pid}_raw.<ts>.<i>.json` | выкл |
 
-### `search` — дайджест выдачи Ozon для LLM (v1.11.0)
+### `search` — поисковый сбор выдачи для кампаний (v1.11.0, модуль, не CLI)
 
-Собирает до `--limit` товаров из выдачи поиска Ozon через тот же пайплайн
-`gather` и выдаёт один markdown-digest для Gemini (выбор лучшего товара).
+Собирает до `limit` товаров из выдачи поиска/категории Ozon через пайплайн
+`gather` и складывает combined-json + markdown-дайджест. Живой код входа —
+`ozon_collector/search.py` (`collect_search`) и
+`ozon_collector/parallel.py` (`collect_parallel`, воркеры); вызывает их демон
+(`scripts/key_daemon.py`, режимы full/rescan), а не CLI. Аргументы — из
+манифеста кампании: `run_cfg` демона → `gather_cfg` (см. `key_daemon.py:1013`).
+
+Запуск поиска вручную — только через демон (он ведёт учёт, QA и cooldown):
+
+```bash
+python scripts/key_daemon.py --url "https://www.ozon.ru/category/..." \
+    --limit 300 --min-valid 200
+```
 
 **Докрутка выдачи:** Ozon рендерит в DOM лишь первые карточки, остальные
 подгружаются при прокрутке (`infiniteVirtualPaginator`). `search` прокручивает
@@ -240,48 +399,26 @@ ozon-collector {collect,ocr,report,gather,search} [опции]
 (= «Найдено товаров в выдаче» в digest) — все найденные уникальные товары,
 собирается при этом `min(found, limit)`.
 
-```bash
-# по запросу (список первых N товаров выдачи)
-python3 cli.py search --query "палатка 4 местная" --limit 5 --out docs/digest.md
+Эквивалентные параметры задаются флагами демона (кампания = поисковый прогон):
+`--url` (выдача/категория), `--limit` (сколько товаров собрать),
+`--min-reviews`, `--max-age` (TTL кеша raw), `--parallel` (1..2; выше —
+`OZON_PARALLEL_MAX`), `--out` (markdown-дайджест кампании). Полный список —
+`python scripts/key_daemon.py --help`.
 
-# по URL выдачи (страница /search/ или /category/)
-python3 cli.py search --url "https://www.ozon.ru/category/palatki-4-mestnye-9889/" --limit 3
-```
-
-| Опция | Назначение | По умолчанию |
-|-------|-----------|--------------|
-| `--query TEXT` | поисковый запрос (альтернатива `--url`) | — |
-| `--url URL` | URL выдачи Ozon | — |
-| `--limit N` | сколько товаров собрать | 5 |
-| `--reviews-per-product N` | отзывов на товар в digest (`0` = все) | 100 |
-| `--min-reviews N` | минимум отзывов на странице (как в `collect`) | 40 |
-| `--max-pages N` | лимит страниц пагинации отзывов | 12 |
-| `--out PATH` | путь markdown-digest | stdout |
-| `--out-raw PATH` | путь combined raw (все товары) | `data/search_combined.json` |
-| `--max-age AGE` | TTL сырого кеша товаров | `1d` |
-| `--no-dedup-replies` | не скрывать повторяющиеся ответы продавца (см. ниже) | дедуп включён |
-| `--parallel N` | кол-во воркер-процессов (1..2; выше — env `OZON_PARALLEL_MAX`), каждый со своим Chromium (Фаза B) | 1 |
-| `--allow-parallel-ocr` | разрешить OCR в параллельном сборе (потоки OCR на воркера уменьшаются) | выкл |
-| `--worker-timeout S` | макс. время ожидания воркеров, сек (5..3600) | 3600 |
-| `--overwrite` | перезаписывать существующий `data/{pid}_raw.json`; иначе новый прогон → `data/{pid}_raw.<ts>.<i>.json` | выкл |
-
-Переиспользуются все опции `gather` (`--variant`, `--category`, `--threads`,
-`--no-preproc`, `--no-dom`, `--no-ocr`, `--no-variant-mode`, `--sorts`,
-`--no-dedup-replies`).
-
-`search` открывает **одну CDP-сессию** на весь прогон. В `--out-raw` пишется
-combined-файл: `{schema_version, collector_version, collected_at_utc, search
-{url, query}, found, limit, collected, recovery, products[{pid, ok, error,
-error_kind, recycle_attempts, raw, markdown, cache, ocr}]}`. `found` —
-уникальные товары, найденные на странице выдачи; `collected` — сколько удалось
-собрать до `limit`.
+Поисковый прогон открывает **одну CDP-сессию** на весь прогон. Combined-файл
+(`combined_{run_id}.json` в каталоге кампании) пишется всегда и содержит:
+`{schema_version, collector_version, collected_at_utc, search {url, query},
+found, limit, collected, recovery, products[{pid, ok, error, error_kind,
+recycle_attempts, raw, markdown, cache, ocr}]}`. `found` — уникальные товары,
+найденные на выдаче; `collected` — сколько удалось собрать до `limit`. Это
+контракт, который читает демон (не текст лога).
 
 ### Recovery после краша браузера (v1.12.0)
 
-Длительный `search` может упереться в OOM-краш renderer'а Chromium (типовой
-сценарий: `net::ERR_ABORTED: The frame was detached from the DOM`). Коллектор
-классифицирует ошибку сбора (независимый health probe по OS-identity процесса
-+ CDP HTTP `/json/version` + состоянию target'а) и:
+Длительный поисковый прогон (кампания) может упереться в OOM-краш renderer'а
+Chromium (типовой сценарий: `net::ERR_ABORTED: The frame was detached from the
+DOM`). Коллектор классифицирует ошибку сбора (независимый health probe по
+OS-identity процесса + CDP HTTP `/json/version` + состоянию target'а) и:
 
 - **recyclable** (`browser` / `renderer_failure`) → **R1**: браузер
   перезапускается (`BrowserProcessManager`: kill старых процессов с сверкой
@@ -297,6 +434,36 @@ error_kind, recycle_attempts, raw, markdown, cache, ocr}]}`. `found` —
 `recycle_attempts`; в combined — `recovery{recycles, events[{pid, attempt,
 kind}]}`. В консоли видно `[search] товар N/M: renderer_failure → recycle
 браузера (попытка 1/2)`.
+
+### Canary по классу сущности + API-предсрез отзывов (ревизия 2.8)
+
+**Canary.** После recycle «по доступу» сессия проверяется не всегда на главной:
+цель выбирается по классу сущности — `--canary-url` → env `OZON_CANARY_URL` →
+URL кампании → `https://www.ozon.ru/`. Главная мягче карточки по лимитам, и
+`CANARY_OK` на ней не доказывал доступ к `/product/`, из-за чего бюджет сессии
+уходил вхолостую. Класс цели и результат пишутся в
+`recovery.canary={url, kind, result}` и в агрегаты `kpi.canary_fails` /
+`kpi.ip_blocks`; воркерам цель уходит в `task["canary_url"]`, чтобы замена
+упавшего воркера не проверяла другую сущность. Флаг демона: `--canary-url URL`.
+
+**Отзывы через Ozon API.** По умолчанию выключено. Включается `--reviews-api`
+(у `collect`/`gather` и у демона) или `OZON_REVIEWS_API=1`; результат
+фиксируется в `run_cfg.reviews_api` манифеста. Поведение:
+
+- DOM — источник истины: API добавляет только те отзывы, которых в DOM нет
+  (сверка по `uuid`, при конфликте выигрывает DOM);
+- пагинация — только по серверному `nextPage` (синтетический `layout_page_index`
+  без токенов сервер игнорирует);
+- DOM-докрутка сокращается до одной страницы, только если API вернул не меньше
+  доверенного `rating_count` товара;
+- вариант-фильтр и мульти-сорт этот путь отключают;
+- любая ошибка API не ломает сбор — предсрез просто выключается на этот товар.
+
+Диагностика без разбора логов: `raw["reviews_api"]` в combined/манифесте —
+`{enabled, used, reason, fetched, pages, complete, api_added, api_dupes,
+dom_short_circuit}`. Подробности и замеры (почему это opt-in) — в
+[`docs/architecture/anti_bot_architecture.md`](docs/architecture/anti_bot_architecture.md)
+§7, §9, §10, §12, §16.
 
 ### Прогресс-логи
 
@@ -342,8 +509,8 @@ kind}]}`. В консоли видно `[search] товар N/M: renderer_failur
 Запуск (лог и так пишется по умолчанию; `--log` — если нужен отдельный файл):
 
 ```bash
-python cli.py search --query "палатка 4 местная" --limit 5
-python cli.py --log logs/run1.log search --query "палатка 4 местная" --limit 5
+python scripts/key_daemon.py --url "https://www.ozon.ru/category/..." --limit 5
+python cli.py --log logs/run1.log gather --pid 550332874
 ```
 
 ### Кеш сырых данных (`--max-age`, v1.11.0)
@@ -415,18 +582,27 @@ python scripts/key_daemon.py --url "https://www.ozon.ru/search/?text=палат�
 `text=` в query → сегмент категории (`/category/<slug>-<id>/`, числовой ID
 отбрасывается) → `campaign_<дата_время>`. Имя — детерминированный транслит
 (макс. 50 символов, `len<=50`, без завершающего `_`); `--out` по умолчанию
-`docs/{имя}.md`.
+`docs/digests/{имя}.md`.
 
 Явные флаги работают строго как раньше (автоименование НЕ вызывается):
 
 ```bash
 python scripts/key_daemon.py --campaign prezervativy \
-    --url "<URL>" --limit 300 --out docs/prezervativy.md ...
+    --url "<URL>" --limit 300 --out docs/digests/prezervativy.md ...
 ```
 
 > ⚠️ **`text=` используется ТОЛЬКО для имени кампании, никогда для фильтра
 > названий `--match-title`** (поисковый запрос ≠ название товара; инцидент
 > podarok_five из PROJECT_NOTES.md).
+
+Если прогон упал на финальной фазе (главный профиль занят, CDP не поднялся, Ctrl+C после сбора), сырьё уже лежит в `data/*_raw*.json`, а дайджеста нет — повторный сбор ради файла не нужен, отрендерить его из кеша без сети и браузера:
+
+```
+python scripts/digest_from_cache.py <campaign>   # напр. fonari_dlya_velosipedov
+python scripts/digest_from_cache.py <campaign> --dry-run   # только показать pid и путь
+```
+
+Берёт PID из `data/campaigns/<campaign>/progress.json` (`valid_pids`) и пишет `progress["out"]`. Манифест не меняет, в сеть не ходит.
 
 ## Данные
 
@@ -438,9 +614,9 @@ data/
   ├── ocr_cache/                      # кэш OCR: {md5}_{lang}_{psm}_{preproc}_{tessdata}_schema{N}.json
   └── search_combined.json            # combined raw всех товаров (search --out-raw)
 docs/
-  ├── headphones_xiaomi_redmi_buds8.md  # готовый отчёт
-  ├── schema.md                         # схема raw.json
-  └── archive/                          # старые отчёты (эталонные примеры markdown)
+  ├── architecture/                       # архитектурные документы (ADRs, схема)
+  ├── digests/{slug}.md                   # готовые дайджесты кампаний (по умолчанию)
+  └── qa/                                 # QA-отчёты (json + md: qa_latest.*)
 ```
 
 ## Тесты
