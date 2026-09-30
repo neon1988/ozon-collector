@@ -158,6 +158,112 @@ def test_check_challenge_rechecks_then_raises_when_stays_thin(monkeypatch):
     assert len(sleeps) == 3
 
 
+# ---- поздняя заглушка после пазла -------------------------------------------
+
+
+class _LateStubPage(_Page):
+    """Пазл снят, страница тонкая, заглушка вылезает позже.
+
+    Реализует наблюдение с экрана 2026-09-30: кусок встал в лунку, пазл
+    исчез, страница осталась тонкой (нет h1/текста), и только спустя
+    `delay` опросов проявилась заглушка «нет соединения». До этого маркеров
+    в title/body нет, поэтому сигнатура пустая.
+    """
+
+    def __init__(self, delay=3, title="Похоже, нет соединения"):
+        super().__init__(title="Ozon", body="")
+        self._delay = delay
+        self._n = 0
+        self._stub_title = title
+        self.reloads = 0
+
+    def evaluate(self, js, *a, **kw):
+        if "location.href" in js:      # _CHALLENGE_LOOKS_JS → boolean
+            return True                # страница ТОНКАЯ (контента нет)
+        return self._body
+
+    def _maybe_stub(self):
+        self._n += 1
+        if self._n > self._delay:
+            self._title = self._stub_title
+            self._body = "Похоже, нет соединения. Проверьте VPN."
+
+    def title(self, *a, **kw):
+        self._maybe_stub()
+        return self._title
+
+    def reload(self, *a, **kw):
+        self.reloads += 1
+        self._n = -10 ** 6      # после reload страница чистая
+        self._title = "Ozon"
+        self._body = ""
+
+
+# Оригинальная сигнатура — до monkeypatch, иначе патчем сами себя.
+_REAL_SIG = collect_mod._challenge_sig
+
+
+def test_await_challenge_sig_waits_for_late_stub(monkeypatch):
+    """Заглушка, вылезшая поздно, ДОЛЖНА находиться ожиданием.
+
+    Регресс 2026-09-30: разовый _challenge_sig после solve_puzzle давал None,
+    ветка FAB-reload была зацеплена за `if sig` → range(0) → страница висела
+    с заглушкой и не перезагружалась (наблюдение с экрана пользователя).
+    """
+    monkeypatch.setattr(collect_mod.time, "sleep", lambda s: None)
+    page = _LateStubPage(delay=3)
+    t = [0.0]
+    monkeypatch.setattr(collect_mod.time, "monotonic",
+                        lambda: (t.__setitem__(0, t[0] + 1.0), t[0])[1])
+    sig = collect_mod._await_challenge_sig(page, 12.0)
+    assert sig, "поздняя заглушка обязана быть обнаружена"
+
+
+class _ProductishPage(_Page):
+    """Нормальная карточка: h1 есть, текста много, маркеров капчи нет."""
+
+    def __init__(self):
+        super().__init__(title="Робот-пылесос Xiaomi X - купить на OZON",
+                         body="x" * 400)
+
+    def evaluate(self, js, *a, **kw):
+        if "location.href" in js:      # _CHALLENGE_LOOKS_JS
+            return False               # страница НЕ тонкая
+        return self._body
+
+
+def test_await_challenge_sig_skips_wait_when_page_has_content(monkeypatch):
+    """Есть h1 и текст — успех, polling не тратит паузу."""
+    sleeps = []
+    monkeypatch.setattr(collect_mod.time, "sleep", lambda s: sleeps.append(s))
+    page = _ProductishPage()
+    assert collect_mod._await_challenge_sig(page, 12.0) is None
+    assert sleeps == []
+
+
+def test_check_challenge_reloads_after_solve_when_late_stub(monkeypatch):
+    """Полный путь: пазл «решён» → поздно вылезла заглушка → reload.
+
+    Раньше check_challenge после успешного solve_puzzle делал `return`, не
+    проверяя страницу, а FAB-reload не срабатывал из-за пустой сигнатуры.
+    """
+    monkeypatch.setattr(collect_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(collect_mod, "FAB_RELOAD_ATTEMPTS", 1)
+    monkeypatch.setattr(collect_mod, "fab_reload_delay_s", lambda: 0.0)
+    t = [0.0]
+    monkeypatch.setattr(collect_mod.time, "monotonic",
+                        lambda: (t.__setitem__(0, t[0] + 1.0), t[0])[1])
+    monkeypatch.setattr(collect_mod, "_challenge_sig", _REAL_SIG)
+    monkeypatch.setattr(collect_mod._puzzle, "solve_puzzle", lambda page: True)
+    monkeypatch.setattr(collect_mod._puzzle, "is_puzzle", lambda s: True)
+    monkeypatch.setattr(collect_mod._puzzle, "looks_like_puzzle",
+                        lambda page: True)
+    page = _LateStubPage(delay=2)
+    with pytest.raises(B.AccessChallengeError):
+        check_challenge(page, "product_page")
+    assert page.reloads >= 1, "после поздней заглушки страница обязана перезагрузиться"
+
+
 # ---- collect_product --------------------------------------------------------
 
 def test_collect_product_challenge_title_raises():

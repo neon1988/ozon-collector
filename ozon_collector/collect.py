@@ -1042,6 +1042,33 @@ def _ensure_no_challenge(page, where: str) -> None:
         raise B.AccessChallengeError(f"анти-бот после сбора ({where}): {sig}")
 
 
+# Заглушка «Похоже, нет соединения» вылезает НЕ сразу: по наблюдению с экрана
+# 2026-09-30 через ~30s после неверного дропа (кусок встал в лунку, пазл
+# исчез, и только потом показалась заглушка). Разовый _challenge_sig сразу
+# после solve_puzzle возвращает None — маркеры в title/body ещё не отрисованы,
+# #captcha уже нет. Из-за этого ветка FAB-reload была зацеплена за `if sig`
+# и не срабатывала: range(0), страница просто висела.
+CHALLENGE_SETTLE_S = 12.0
+CHALLENGE_SETTLE_STEP_S = 1.0
+
+
+def _await_challenge_sig(page, seconds: float = CHALLENGE_SETTLE_S):
+    """Дождаться ПОЗДНЕЙ заглушки, если страница выглядит заблокированной.
+
+    Возвращает сигнатуру или None. Если страница отдала контент (есть h1 и
+    текст) — возвращает None сразу, не тратя паузу: успех не нужно
+    подтверждать polling'ом. Ожидание платится только когда страница тонкая.
+    """
+    if not _looks_like_challenge(page):
+        return None
+    t0 = time.monotonic()
+    sig = _challenge_sig(page)
+    while not sig and time.monotonic() - t0 < seconds:
+        time.sleep(CHALLENGE_SETTLE_STEP_S)
+        sig = _challenge_sig(page)
+    return sig
+
+
 def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
     """Поднять AccessChallengeError, если страница — анти-бот-заглушка.
 
@@ -1074,11 +1101,20 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
         # случаи, когда сигнатура — общий 'antibot captcha', но на странице
         # реально есть фон+кусочек пазла.
         if _puzzle.solve_puzzle(page):
-            log.warning(f"[collect] пазл решён ({where})")
-            return
-        log.warning(f"[collect] пазл не решён за {_puzzle.failures()} "
-                    f"попыток ({where}) → FAB-reload fallback")
-        sig = _challenge_sig(page)
+            # Пазл снят — но это ещё не доказательство, что доступ выдан.
+            # Заглушка может вылезти ПОЗЖЕ (~30s, наблюдение 2026-09-30), и
+            # раньше мы возвращались наружу сразу, не проверив страницу.
+            late = _await_challenge_sig(page)
+            if not late:
+                log.warning(f"[collect] пазл решён ({where})")
+                return
+            sig = late
+            log.warning(f"[collect] после решения пазла вылезла заглушка "
+                        f"({late}, {where}) → reload")
+        else:
+            log.warning(f"[collect] пазл не решён за {_puzzle.failures()} "
+                        f"попыток ({where}) → ждём заглушку, FAB-reload")
+            sig = _await_challenge_sig(page) or _challenge_sig(page)
     for _ in range(FAB_RELOAD_ATTEMPTS) if (sig and reload_on_fab) else range(0):
         log.warning(f"[collect] FAB-заглушка ({sig}) → reload для разблокировки")
         _reload_fn(page)
