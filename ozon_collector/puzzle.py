@@ -656,13 +656,19 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 if verdict in ("done", "unblocked"):
                     _attempt("solve", ok=True, via=verdict, bx=x)
                     return "solved"
-                # Не снят. Подмена заглушкой (челлендж исчез, но страница —
-                # «нет соединения»/FAB) или кусок пропал с живым челленджем:
-                # кандидаты устарели, свип прекращаем.
+                # Не снят. Челлендж исчез, но контента нет: это либо подмена
+                # заглушкой, либо капча успела перерисоваться. Различаем
+                # ТОЛЬКО фактом смены капчи: раньше любой such случай рвал
+                # свип как reroll, не проверив src, и мы выбрасывали оставшиеся
+                # кандидаты. Живой замер 2026-10-01 (live8): 3 дропа из 11 были
+                # именно такими (still=False, verdict=no) — свип рвался, хотя
+                # капча могла остаться той же и следующие выстрелы были годны.
                 if not still:
-                    if on_event is not None:
-                        on_event({"kind": "reroll", "ctx": "confirm_failed"})
-                    return "reroll"
+                    if _captcha_src_changed(page, info):
+                        if on_event is not None:
+                            on_event({"kind": "reroll", "ctx": "confirm_failed"})
+                        return "reroll"
+                    return "reject"
                 if okc:
                     # кусок пропал из DOM, но челлендж жив (реролл после
                     # дропа) — кандидаты устарели, прекращаем весь свип.
