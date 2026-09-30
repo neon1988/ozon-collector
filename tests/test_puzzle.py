@@ -469,3 +469,72 @@ def test_solve_puzzle_challenge_gone_stub(monkeypatch):
     assert ok is False
     assert evs and evs[0]["kind"] == "empty"
     assert evs[0].get("reason") == "challenge_gone"
+
+
+# ── Вердикт снятия капты: URL-маркер ИЛИ снятие челленджа (2026-09-30) ──
+#
+# Регресс живой находки 2026-09-29: текущее поколение капчи (v10, кусочек
+# без трека) после верного дропа снимает челлендж из DOM и перезапрашивает
+# выдачу НА МЕСТЕ — навигации с captchaDone=true не происходит. Старый
+# вердикт ждал только URL, поэтому 64 дропа, попавшие в лунку (|err|≤1px),
+# были засчитаны провалом (успех 3), а кандидат ещё и 24с ждал мёртвый маркер.
+
+
+def test_classify_accepts_url_marker():
+    assert puzzle._classify(True, False, False) == "done"
+    assert puzzle._classify(True, True, True) == "done"
+
+
+def test_classify_accepts_challenge_gone_without_url_marker():
+    """Челлендж снят, URL чист, страница не заглушка — это успех (unblocked)."""
+    assert puzzle._classify(False, True, False) == "unblocked"
+
+
+def test_classify_rejects_live_challenge_and_stub():
+    assert puzzle._classify(False, False, False) == "no"   # челлендж жив
+    assert puzzle._classify(False, True, True) == "no"     # подмена заглушкой
+
+
+def test_puzzle_verdict_resolves_module_globals(monkeypatch):
+    """_verdict читает ГЛОБАЛЫ puzzle — патч тестов обязан влиять на бой."""
+    page = _FakePage("puzzle")
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda p: False)
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda p: True)
+    monkeypatch.setattr(puzzle, "_stub_page", lambda p: False)
+    assert puzzle._verdict(page) == "no"
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda p: False)
+    assert puzzle._verdict(page) == "unblocked"
+
+
+def test_await_verdict_polls_until_challenge_gone(monkeypatch):
+    """Вердикт появляется не мгновенно: поллинг дожидается снятия."""
+    seq = [True, True, False]      # два поллинга ещё живой, третий — снят
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda p: False)
+    monkeypatch.setattr(puzzle, "_stub_page", lambda p: False)
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda p: seq.pop(0))
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    assert puzzle._await_verdict(_FakePage("puzzle"), 5.0) == "unblocked"
+    assert seq == []
+
+
+def test_await_verdict_gives_up_on_stub(monkeypatch):
+    """Заглушка вместо разблокировки — успехом не считается, ждём до дедлайна."""
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda p: False)
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda p: False)
+    monkeypatch.setattr(puzzle, "_stub_page", lambda p: True)
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    t = [0.0]
+    monkeypatch.setattr(puzzle.time, "monotonic",
+                        lambda: (t.__setitem__(0, t[0] + 1.0), t[0])[1])
+    assert puzzle._await_verdict(_FakePage("puzzle"), 5.0) == "no"
+
+
+def test_drag_verdict_accepts_unblocked(monkeypatch):
+    """Тот же вердикт в puzzle_drag: дроп без URL-маркера — успех."""
+    page = _FakePage("puzzle")
+    monkeypatch.setattr(puzzle_drag, "_captcha_done", lambda p: False)
+    monkeypatch.setattr(puzzle_drag, "_still_challenge", lambda p: False)
+    monkeypatch.setattr(puzzle_drag, "_stub_page", lambda p: False)
+    assert puzzle_drag._verdict(page) == "unblocked"
+    monkeypatch.setattr(puzzle_drag, "_stub_page", lambda p: True)
+    assert puzzle_drag._verdict(page) == "no"

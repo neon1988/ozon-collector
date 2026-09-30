@@ -21,7 +21,8 @@ from typing import Optional
 
 from ozon_collector import log
 
-from .puzzle_dom import _captcha_done, _find_slider, _still_challenge
+from .puzzle_dom import (_await_solved, _captcha_done, _classify,  # noqa: F401
+                          _find_slider, _still_challenge, _stub_page)
 from .puzzle_input import (_human_click, _human_drag, _human_move,
                            _human_path)
 from .puzzle_state import _attempt
@@ -33,6 +34,27 @@ from .puzzle_state import _attempt
 CALIB_MAX = 40.0   # потолок = прежнее поведение для дальних целей
 CALIB_MIN = 6.0    # меньше 6px k не измерить: getBoundingClientRect даёт ~1px
 CALIB_GUARD = 2.0  # не подходить к цели ближе, чем на 2px
+
+# Пауза после отпускания куска до вердикта «снято/не снято». Приёмка приходит
+# быстро (перезапрос выдачи на месте), 2.5s хватает; дальше решает вызывающий
+# (solve_puzzle ждёт ещё _SOLVED_GRACE_S). Прежний _confirm_solved ждал
+# 6x1s ТОЛЬКО URL-маркер captchaDone=true, которого текущее поколение капчи
+# не ставит, — верные дропы возвращали okc=False и жегли время.
+DROP_VERDICT_S = 2.5
+
+
+def _verdict(page) -> str:
+    """Вердикт снятия капты: 'done' | 'unblocked' | 'no'.
+
+    Признаки резолвятся через глобалы ЭТОГО модуля, чтобы юнит-тесты
+    подменяли puzzle_drag._captcha_done / puzzle_drag._still_challenge.
+    """
+    return _classify(_captcha_done(page), not _still_challenge(page),
+                     _stub_page(page))
+
+
+def _await_verdict(page, seconds: float = DROP_VERDICT_S) -> str:
+    return _await_solved(page, seconds, probe=lambda: _verdict(page))
 
 
 def _calib_step(dist: float) -> float:
@@ -185,27 +207,24 @@ def _drag_to(page, target_vx: float, info, bx, score,
     move_noise = random.uniform(-2.5, 2.5)
 
     def _confirm_solved():
-        # Пазл мог решиться, но страница медленно перерисовывается: выдача
+        # Пазл мог решиться, но страница медленно перестраивается: выдача
         # открывается после снятия челленджа, и DOM ещё секунды показывает
-        # остатки пазла. Успех = ТОЛЬКО переход url на captchaDone=true
-        # (исчезновение челленджа из DOM бывает подменой FAB/VPN-блоком).
+        # остатки пазла. Успех = ЛЮБОЙ из двух признаков: переход url на
+        # captchaDone=true (старое поколение) ИЛИ снятие челленджа из DOM на
+        # живой странице (текущее поколение v10 — перезапрос выдачи на месте).
         for _p in range(6):
             if deadline and time.monotonic() > deadline:
                 return False
             time.sleep(1.0)
-            if _captcha_done(page):
+            if _verdict(page) != "no":
                 return True
-        return _captcha_done(page)
+        return _verdict(page) != "no"
 
     def _drop_and_confirm(cur0: float) -> bool:
-        # Кнопка ещё зажата на куске, доведённом к цели. Snap-sweep-фаза
-        # убрана (hunter20 — 0/3, драги переваливали дедлайн): только
-        # мгновенная проверка, затем отпуск и подтверждение _still_challenge.
-        if not _still_challenge(page):
-            page.mouse.up()
-            return True
+        # Кнопка ещё зажата на куске, доведённом к цели. Отпускаем и сразу
+        # спрашиваем вердикт у обоих признаков снятия.
         page.mouse.up()
-        return _confirm_solved()
+        return _await_verdict(page) != "no"
 
     last = {}
     for _try in range(3):
@@ -223,8 +242,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
             if r0 is None:
                 _attempt("drag", note="no_piece", bx=bx, score=score,
                          target_vx=round(target_vx, 1))
-                return _confirm_solved() if _still_challenge(page) is False \
-                    else False
+                return _await_verdict(page) != "no"
         # подвод мыши к точке хвата (визуально-естественно) затем нажим
         _human_click(page, gx + rng_x, gy, hold=random.uniform(0.06, 0.16))
         time.sleep(random.uniform(0.05, 0.12))

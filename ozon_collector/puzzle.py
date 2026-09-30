@@ -52,8 +52,10 @@ from .puzzle_detect import (  # noqa: F401
 )
 from .puzzle_dom import (  # noqa: F401
     _await_done,
+    _await_solved,
     _captcha_done,
     _capture_info,
+    _classify,
     _confirm_solved,
     _find_slider,
     _grace_resolve,
@@ -96,6 +98,13 @@ _DIAG_DIR = os.environ.get(
 # Fail-стадии пишутся всегда (это и есть диагностика проблем).
 _DIAG_ENABLED = os.environ.get("OZON_PUZZLE_DIAG", "0") == "1"
 _FAIL_DIAG_STAGES = {"no_slot", "all_cands_failed", "exception", "no_bg_shot"}
+
+# Сколько ждём снятия капты после отпускания куска, прежде чем считать дроп
+# отвергнутым. Приёмка приходит быстро (перезапрос выдачи на месте), поэтому
+# 5s хватает с запасом; прежний код ждал до 24s (_confirm_solved 6s +
+# _grace_resolve 18s) ради URL-маркера, которого текущее поколение капчи не
+# ставит, — время сжигалось впустую на каждом отвергнутом кандидате.
+_SOLVED_GRACE_S = 5.0
 
 
 """Живой метод решения (валидирован на живых капчах, новое поколение пазлов):
@@ -220,6 +229,22 @@ def _bg_from_cdn(info):
         return {"bg_l": bg_l, "bg_r": b_r, "pz_r": p_r}
     except Exception:
         return None
+
+
+def _verdict(page) -> str:
+    """Вердикт снятия капты: 'done' | 'unblocked' | 'no'.
+
+    Признаки резолвятся через ГЛОБАЛЫ ЭТОГО МОДУЛЯ (не через puzzle_dom),
+    чтобы юнит-тесты подменяли puzzle._captcha_done / puzzle._still_challenge
+    / puzzle._stub_page и влияли на боевое поведение solve_puzzle.
+    """
+    return _classify(_captcha_done(page), not _still_challenge(page),
+                     _stub_page(page))
+
+
+def _await_verdict(page, seconds: float = 5.0) -> str:
+    """Поллить вердикт снятия (см. _verdict)."""
+    return _await_solved(page, seconds, probe=lambda: _verdict(page))
 
 
 def _captcha_src_changed(page, info) -> bool:
@@ -475,38 +500,34 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 if _expired():
                     _attempt("solve", ok=False, reason="timeout")
                     return "timeout"
+                # Вердикт снятия — по ЛЮБОМУ из двух признаков. Прежний ждал
+                # только captchaDone=true в URL, чего текущее поколение капчи
+                # (v10, кусочек без трека) не делает НИКОГДА: после верного
+                # дропа челлендж снимается из DOM, выдача перезапрашивается
+                # на месте. Живой лог 2026-09-29: 64 дропа легли в лунку
+                # (|err|≤1px), успехом засчитаны 3 — 61 верное попадание
+                # выброшено, плюс 24s мёртвого ожидания URL на кандидата.
+                verdict = _await_verdict(page, _SOLVED_GRACE_S)
                 _attempt("cand", bx=x, score=score0, okc=bool(okc),
-                         still=still, target_vx=round(target_vx, 1))
-                log.debug(f"solve drag okc={okc} still_challenge={still}")
-                if okc and not still:
-                    # Челлендж пропал из DOM, но успехом это СТАНОВИТСЯ только
-                    # при переходе url на captchaDone=true (подмена FAB/VPN-блоком
-                    # тоже «убирает» челлендж). Подтверждаем по URL.
-                    if _confirm_solved(page):
-                        _attempt("solve", ok=True)
-                        return "solved"
-                    # челлендж пропал, но url без captchaDone — не успех,
-                    # кандидаты устарели, прекращаем свип.
+                         still=still, verdict=verdict,
+                         target_vx=round(target_vx, 1))
+                log.debug(f"solve drag okc={okc} still_challenge={still} "
+                          f"verdict={verdict}")
+                if verdict in ("done", "unblocked"):
+                    _attempt("solve", ok=True, via=verdict, bx=x)
+                    return "solved"
+                # Не снят. Подмена заглушкой (челлендж исчез, но страница —
+                # «нет соединения»/FAB) или кусок пропал с живым челленджем:
+                # кандидаты устарели, свип прекращаем.
+                if not still:
                     if on_event is not None:
                         on_event({"kind": "reroll", "ctx": "confirm_failed"})
                     return "reroll"
-                if okc and still:
+                if okc:
                     # кусок пропал из DOM, но челлендж жив (реролл после
                     # дропа) — кандидаты устарели, прекращаем весь свип.
                     if on_event is not None:
                         on_event({"kind": "reroll", "ctx": "piece_drop"})
-                    return "reroll"
-                if not okc and not still:
-                    # live: точный дроп иногда снимает капчу, но _confirm_solved
-                    # внутри _drag_to не успевает поймать URL (медленный
-                    # редирект) → okc=False. Челлендж уже исчез. По данным
-                    # 2026-09-22 только 2/106 таких случаев — реальные успехи,
-                    # остальное подмена/реролл. Быстрый 2s-поллинг, не 24s.
-                    if _await_done(page, 2.0):
-                        _attempt("solve", ok=True)
-                        return "solved"
-                    if on_event is not None:
-                        on_event({"kind": "reroll", "ctx": "drag_ok_url_miss"})
                     return "reroll"
                 # точный/грубый дроп не снял капчу. Если капча за это время
                 # сменилась (реролл новым фоном/куском) — кандидаты устарели,

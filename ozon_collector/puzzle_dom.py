@@ -95,6 +95,47 @@ def _captcha_done(page) -> bool:
     return "captchaDone=true" in href
 
 
+def _classify(url_done: bool, challenge_gone: bool, stub: bool) -> str:
+    """Чистый вердикт снятия капчи из трёх признаков (без DOM).
+
+    'done'      — URL несёт captchaDone=true (окончательный маркер старого
+                  поколения капчи со слайдером).
+    'unblocked' — челлендж исчез из DOM, страница не заглушка. Это приёмка
+                  приёмка текущего поколения (v10, кусочек без трека): после
+                  верного дропа капча снимает челлендж и перезапрашивает
+                  выдачу НА МЕСТЕ, без навигации, поэтому captchaDone=true в
+                  URL не появляется НИКОГДА.
+    'no'        — челлендж жив либо страница подменена заглушкой.
+    """
+    if url_done:
+        return "done"
+    if not challenge_gone or stub:
+        return "no"
+    return "unblocked"
+
+
+def _solved_state(page) -> str:
+    """Вердикт снятия одним вызовом (резолвит признаки в этом модуле)."""
+    return _classify(_captcha_done(page), not _still_challenge(page),
+                     _stub_page(page))
+
+
+def _await_solved(page, seconds: float = 5.0, step: float = 0.4,
+                  probe=None) -> str:
+    """Поллить вердикт снятия до 'done'/'unblocked' или до дедлайна.
+
+    probe — необязательный callable вместо _solved_state: вызывающий модуль
+    подставляет свою резолюцию признаков (см. _verdict в puzzle.py и
+    puzzle_drag.py), чтобы юнит-тесты патчили свои глобалы.
+    """
+    t0 = time.monotonic()
+    while True:
+        st = probe() if probe is not None else _solved_state(page)
+        if st != "no" or time.monotonic() - t0 >= seconds:
+            return st
+        time.sleep(step)
+
+
 def _stub_page(page) -> bool:
     """Страница — заглушка «нет соединения»/«попробуйте ещё раз» (FAB/VPN):
     маркеры в title/теле, а анти-бот оболочки в DOM уже НЕТ. Если челлендж
