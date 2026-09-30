@@ -486,13 +486,22 @@ def test_classify_accepts_url_marker():
 
 
 def test_classify_accepts_challenge_gone_without_url_marker():
-    """Челлендж снят, URL чист, страница не заглушка — это успех (unblocked)."""
-    assert puzzle._classify(False, True, False) == "unblocked"
+    """Челлендж снят, URL чист, страница не заглушка, контент есть — успех."""
+    assert puzzle._classify(False, True, False, True) == "unblocked"
 
 
 def test_classify_rejects_live_challenge_and_stub():
-    assert puzzle._classify(False, False, False) == "no"   # челлендж жив
-    assert puzzle._classify(False, True, True) == "no"     # подмена заглушкой
+    assert puzzle._classify(False, False, False, True) == "no"   # челлендж жив
+    assert puzzle._classify(False, True, True, True) == "no"     # подмена заглушкой
+
+
+def test_classify_rejects_challenge_gone_but_no_content():
+    """РЕГРЕСС 2026-09-30 (наблюдение с экрана): после верного дропа Ozon
+    успевает снять пазл и тут же показать заглушку «Похоже, нет соединения».
+    Челлендж исчез, заглушку _stub_page ещё не поймал (её текст мог ещё
+    рендериться) — успехом засчитывать НЕЛЬЗЯ. Без проверки контента такие
+    случаи давали ложный solved: хантер показывал 100% при реальном ~15%."""
+    assert puzzle._classify(False, True, False, False) == "no"
 
 
 def test_puzzle_verdict_resolves_module_globals(monkeypatch):
@@ -501,9 +510,13 @@ def test_puzzle_verdict_resolves_module_globals(monkeypatch):
     monkeypatch.setattr(puzzle, "_captcha_done", lambda p: False)
     monkeypatch.setattr(puzzle, "_still_challenge", lambda p: True)
     monkeypatch.setattr(puzzle, "_stub_page", lambda p: False)
+    monkeypatch.setattr(puzzle, "_page_has_content", lambda p: True)
     assert puzzle._verdict(page) == "no"
     monkeypatch.setattr(puzzle, "_still_challenge", lambda p: False)
     assert puzzle._verdict(page) == "unblocked"
+    # контента нет (страница-заглушка) — успех отменяется
+    monkeypatch.setattr(puzzle, "_page_has_content", lambda p: False)
+    assert puzzle._verdict(page) == "no"
 
 
 def test_await_verdict_polls_until_challenge_gone(monkeypatch):
@@ -511,6 +524,7 @@ def test_await_verdict_polls_until_challenge_gone(monkeypatch):
     seq = [True, True, False]      # два поллинга ещё живой, третий — снят
     monkeypatch.setattr(puzzle, "_captcha_done", lambda p: False)
     monkeypatch.setattr(puzzle, "_stub_page", lambda p: False)
+    monkeypatch.setattr(puzzle, "_page_has_content", lambda p: True)
     monkeypatch.setattr(puzzle, "_still_challenge", lambda p: seq.pop(0))
     monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
     assert puzzle._await_verdict(_FakePage("puzzle"), 5.0) == "unblocked"
@@ -522,6 +536,7 @@ def test_await_verdict_gives_up_on_stub(monkeypatch):
     monkeypatch.setattr(puzzle, "_captcha_done", lambda p: False)
     monkeypatch.setattr(puzzle, "_still_challenge", lambda p: False)
     monkeypatch.setattr(puzzle, "_stub_page", lambda p: True)
+    monkeypatch.setattr(puzzle, "_page_has_content", lambda p: False)
     monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
     t = [0.0]
     monkeypatch.setattr(puzzle.time, "monotonic",
@@ -535,6 +550,15 @@ def test_drag_verdict_accepts_unblocked(monkeypatch):
     monkeypatch.setattr(puzzle_drag, "_captcha_done", lambda p: False)
     monkeypatch.setattr(puzzle_drag, "_still_challenge", lambda p: False)
     monkeypatch.setattr(puzzle_drag, "_stub_page", lambda p: False)
+    monkeypatch.setattr(puzzle_drag, "_page_has_content", lambda p: True)
     assert puzzle_drag._verdict(page) == "unblocked"
     monkeypatch.setattr(puzzle_drag, "_stub_page", lambda p: True)
     assert puzzle_drag._verdict(page) == "no"
+    monkeypatch.setattr(puzzle_drag, "_stub_page", lambda p: False)
+    monkeypatch.setattr(puzzle_drag, "_page_has_content", lambda p: False)
+    assert puzzle_drag._verdict(page) == "no"
+
+
+def test_page_has_content_rejects_empty_href():
+    """_FakePage отдаёт '' на запрос location.href — контента нет."""
+    assert puzzle._page_has_content(_FakePage("puzzle")) is False

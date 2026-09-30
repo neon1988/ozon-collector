@@ -95,29 +95,68 @@ def _captcha_done(page) -> bool:
     return "captchaDone=true" in href
 
 
-def _classify(url_done: bool, challenge_gone: bool, stub: bool) -> str:
-    """Чистый вердикт снятия капчи из трёх признаков (без DOM).
+def _classify(url_done: bool, challenge_gone: bool, stub: bool,
+              has_content: bool = True) -> str:
+    """Чистый вердикт снятия капты из четырёх признаков (без DOM).
 
     'done'      — URL несёт captchaDone=true (окончательный маркер старого
                   поколения капчи со слайдером).
-    'unblocked' — челлендж исчез из DOM, страница не заглушка. Это приёмка
-                  приёмка текущего поколения (v10, кусочек без трека): после
-                  верного дропа капча снимает челлендж и перезапрашивает
-                  выдачу НА МЕСТЕ, без навигации, поэтому captchaDone=true в
-                  URL не появляется НИКОГДА.
-    'no'        — челлендж жив либо страница подменена заглушкой.
+    'unblocked' — челлендж исчез, страница не заглушка И отдала реальный
+                  контент. Это приёмка текущего поколения (v10, кусочек без
+                  трека): после верного дропа капча снимает челлендж и
+                  перезапрашивает выдачу НА МЕСТЕ, без навигации, поэтому
+                  captchaDone=true в URL не появляется НИКОГДА.
+    'no'        — челлендж жив, страница подменена заглушкой, либо контента
+                  на странице нет.
+
+    has_content — обязательное условие для 'unblocked' (наблюдение 2026-09-30
+    с живого прогона): исчезновение челленджа само по себе бывает подменой —
+    после верного дропа Ozon успевает снять пазл и тут же показать заглушку
+    «Похоже, нет соединения». Без проверки контента такой случай засчитывался
+    как solved (ложный успех: хантер показывал 100% при реальном ~15%).
     """
     if url_done:
         return "done"
-    if not challenge_gone or stub:
+    if not challenge_gone or stub or not has_content:
         return "no"
     return "unblocked"
+
+
+# Страница «отдала контент» = есть заголовок h1 и непустой текст. Тот же
+# признак, что collect._CHALLENGE_LOOKS_JS, но с обратной логикой и своим
+# резолвом: puzzle_dom не должен зависеть от collect (collect импортирует
+# puzzle — круговая ссылка).
+_PAGE_HAS_CONTENT_JS = (
+    "() => {"
+    " const u = location.href || '';"
+    " if (/__rr|abt_att|captcha|antibot/i.test(u)) return false;"
+    " const h1 = document.querySelector('h1');"
+    " const h1t = h1 ? (h1.innerText || '').trim() : '';"
+    " if (h1t.length >= 5) return true;"
+    " const body = document.body ? (document.body.innerText || '') : '';"
+    " return body.length >= 300;"
+    "}"
+)
+
+
+def _page_has_content(page) -> bool:
+    """Есть ли на странице реальный контент (не заглушка, не пустой каркас).
+
+    Обратная к collect._looks_like_challenge: там True = «страница тонкая,
+    имеет смысл переспросить капчу», здесь True = «контент есть, доступ
+    выдан». Ошибка evaluate трактуется как «контента нет» — осторожная
+    сторона: лучше недосчитать успех, чем засчитать заглушку.
+    """
+    try:
+        return bool(page.evaluate(_PAGE_HAS_CONTENT_JS))
+    except Exception:
+        return False
 
 
 def _solved_state(page) -> str:
     """Вердикт снятия одним вызовом (резолвит признаки в этом модуле)."""
     return _classify(_captcha_done(page), not _still_challenge(page),
-                     _stub_page(page))
+                     _stub_page(page), _page_has_content(page))
 
 
 def _await_solved(page, seconds: float = 5.0, step: float = 0.4,

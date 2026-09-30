@@ -22,7 +22,8 @@ from typing import Optional
 from ozon_collector import log
 
 from .puzzle_dom import (_await_solved, _captcha_done, _classify,  # noqa: F401
-                          _find_slider, _still_challenge, _stub_page)
+                          _find_slider, _page_has_content, _still_challenge,
+                          _stub_page)
 from .puzzle_input import (_human_click, _human_drag, _human_move,
                            _human_path)
 from .puzzle_state import _attempt
@@ -50,7 +51,7 @@ def _verdict(page) -> str:
     подменяли puzzle_drag._captcha_done / puzzle_drag._still_challenge.
     """
     return _classify(_captcha_done(page), not _still_challenge(page),
-                     _stub_page(page))
+                     _stub_page(page), _page_has_content(page))
 
 
 def _await_verdict(page, seconds: float = DROP_VERDICT_S) -> str:
@@ -210,15 +211,11 @@ def _drag_to(page, target_vx: float, info, bx, score,
         # Пазл мог решиться, но страница медленно перестраивается: выдача
         # открывается после снятия челленджа, и DOM ещё секунды показывает
         # остатки пазла. Успех = ЛЮБОЙ из двух признаков: переход url на
-        # captchaDone=true (старое поколение) ИЛИ снятие челленджа из DOM на
-        # живой странице (текущее поколение v10 — перезапрос выдачи на месте).
-        for _p in range(6):
-            if deadline and time.monotonic() > deadline:
-                return False
-            time.sleep(1.0)
-            if _verdict(page) != "no":
-                return True
-        return _verdict(page) != "no"
+        # captchaDone=true (старое поколение) ИЛИ снятие челленджа при реальном
+        # контенте на странице (текущее поколение v10 — перезапрос выдачи на
+        # месте). Прежние 6x1s ждали только URL-маркер и почти всегда истекали
+        # впустую: заменены на _await_verdict с тем же вердиктом.
+        return _await_verdict(page) != "no"
 
     def _drop_and_confirm(cur0: float) -> bool:
         # Кнопка ещё зажата на куске, доведённом к цели. Отпускаем и сразу

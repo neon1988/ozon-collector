@@ -26,6 +26,7 @@ challenge, а нерешаемый пазл (перезапуск/cooldown-ло�
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -61,6 +62,7 @@ from .puzzle_dom import (  # noqa: F401
     _grace_resolve,
     _still_challenge,
     _stub_page,
+    _page_has_content,
     is_captcha_shell,
     is_puzzle,
     looks_like_puzzle,
@@ -231,15 +233,40 @@ def _bg_from_cdn(info):
         return None
 
 
+def _page_state(page) -> dict:
+    """Снимок состояния страницы после дропа — для последующего разбора.
+
+    Нужен, чтобы отличить «пазл не решён» от «подменён заглушкой» и от
+    «страница ещё грузится» уже ПОСЛЕ факта, а не по памяти. Один
+    page.evaluate, тихий при любой ошибке. Пишется в журнал попыток
+    (puzzle._attempt, kind=cand): даёт размеченный датасет «куда поставили →
+    чем кончилось» для последующей правки детектора.
+    """
+    try:
+        d = page.evaluate("""() => ({
+            href: (location.href || '').slice(0, 160),
+            title: (document.title || '').slice(0, 80),
+            h1: (() => { const e = document.querySelector('h1');
+                         return e ? (e.innerText || '').trim().slice(0, 60) : ''; })(),
+            blen: (document.body ? (document.body.innerText || '').length : 0),
+        })""")
+        if isinstance(d, dict):
+            return {("st_" + k): v for k, v in d.items()}
+    except Exception:
+        pass
+    return {}
+
+
 def _verdict(page) -> str:
     """Вердикт снятия капты: 'done' | 'unblocked' | 'no'.
 
     Признаки резолвятся через ГЛОБАЛЫ ЭТОГО МОДУЛЯ (не через puzzle_dom),
     чтобы юнит-тесты подменяли puzzle._captcha_done / puzzle._still_challenge
-    / puzzle._stub_page и влияли на боевое поведение solve_puzzle.
+    / puzzle._stub_page / puzzle._page_has_content и влияли на боевое
+    поведение solve_puzzle.
     """
     return _classify(_captcha_done(page), not _still_challenge(page),
-                     _stub_page(page))
+                     _stub_page(page), _page_has_content(page))
 
 
 def _await_verdict(page, seconds: float = 5.0) -> str:
@@ -510,7 +537,8 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 verdict = _await_verdict(page, _SOLVED_GRACE_S)
                 _attempt("cand", bx=x, score=score0, okc=bool(okc),
                          still=still, verdict=verdict,
-                         target_vx=round(target_vx, 1))
+                         target_vx=round(target_vx, 1),
+                         **_page_state(page))
                 log.debug(f"solve drag okc={okc} still_challenge={still} "
                           f"verdict={verdict}")
                 if verdict in ("done", "unblocked"):
@@ -574,10 +602,16 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                         detail=f"{type(exc).__name__}: {exc}")
             _PUZZLE_FAILURES[0] += 1
             return False
+        # Сюда падаем только если ПОСЛЕДНИЙ цикл закончился на `continue`:
+        # без этого хвоста solve_puzzle возвращал None (falsy без ошибки), и
+        # счётчик failures не рос — ломался инвариант KPI attempts ==
+        # failures + solved. Прежний `_grace_resolve(page, 18.0)` здесь ждал
+        # URL-маркер, которого текущее поколение капчи не ставит: 18s
+        # пустоты на каждый проваленный инцидент (наблюдение с экрана
+        # 2026-09-30: «пазл стоит, 20-30s ничего, потом перезагрузка»).
+        # Вердикт снятия теперь полностью живёт в _drag_bx (_await_verdict).
         if _captcha_done(page):
-            return True
-        if _grace_resolve(page, 18.0):
-            _attempt("solve", ok=True, note="late_snap")
+            _attempt("solve", ok=True, note="late_url")
             return True
         _PUZZLE_FAILURES[0] += 1
         return False
