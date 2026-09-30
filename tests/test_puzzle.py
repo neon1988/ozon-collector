@@ -612,33 +612,48 @@ def test_last_move_reports_zero_when_piece_stuck():
 
 
 def test_shot_order_top_first_with_micro_shifts():
-    """Топ-кандидат + микросдвиги ±3 идут первыми, дальше остальные."""
+    """Топ-кандидат с микросдвигами ±3 — весь порядок выстрелов.
+
+    Остальные кластеры НЕ перебираются: каждый дроп с неверной целью вызывает
+    перезагрузку пазла, а после нескольких промахов сессия сгорает в
+    заглушку (наблюдение пользователя с экрана 2026-10-01).
+    """
     cands = [(300, 9.0), (250, 5.0), (200, 4.0), (150, 3.0)]
     shots = [x for x, _ in puzzle._shot_order(cands)]
-    assert shots[:3] == [300, 297, 303]
-    assert shots[3] == 250
-    assert 200 in shots and 150 in shots
+    assert shots == [300, 297, 303]
+    assert 250 not in shots and 200 not in shots
 
 
 def test_shot_order_dedups_and_respects_cap():
-    """Дубли схлопываются, список ограничен SHOTS_MAX."""
-    cands = [(300, 9.0), (297, 8.0), (250, 5.0), (200, 4.0),
-             (150, 3.0), (100, 2.0), (50, 1.0), (20, 0.5), (10, 0.2)]
+    cands = [(300, 9.0), (297, 8.0), (250, 5.0), (200, 4.0), (150, 3.0)]
     shots = [x for x, _ in puzzle._shot_order(cands)]
     assert len(shots) == len(set(shots)), "дублей быть не должно"
     assert len(shots) <= puzzle.SHOTS_MAX
-    assert shots[0] == 300
 
 
-def test_shot_order_empty_cands():
-    assert puzzle._shot_order([]) == []
+def test_shot_order_stays_within_drop_budget():
+    """Бюджет сессии должен РЕАЛЬНО ограничивать число дропов.
+
+    Без него циклы дали бы SHOTS_MAX*PUZZLE_MAX_ATTEMPTS дропов на один пазл,
+    и сессия сгорала бы в заглушку (наблюдение пользователя 2026-10-01).
+    """
+    cands = [(300, 9.0), (250, 5.0)]
+    per_cycle = len(puzzle._shot_order(cands))
+    uncapped = per_cycle * puzzle.PUZZLE_MAX_ATTEMPTS
+    assert puzzle.DROP_BUDGET < uncapped, "бюджет обязан быть меньше полного"
+    assert puzzle.DROP_BUDGET >= 1
 
 
 def test_shot_order_keeps_scores_for_logging():
     cands = [(300, 9.0), (250, 5.0)]
     shots = puzzle._shot_order(cands)
     assert shots[0][1] == 9.0
-    assert shots[-1][1] == 5.0
+    # все выстрелы несут score топ-кандидата: они его микросдвиги
+    assert all(s == 9.0 for _, s in shots)
+
+
+def test_shot_order_empty_cands():
+    assert puzzle._shot_order([]) == []
 
 
 def test_solve_puzzle_aborts_when_session_already_blocked(monkeypatch):
