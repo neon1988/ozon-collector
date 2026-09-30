@@ -562,3 +562,59 @@ def test_drag_verdict_accepts_unblocked(monkeypatch):
 def test_page_has_content_rejects_empty_href():
     """_FakePage отдаёт '' на запрос location.href — контента нет."""
     assert puzzle._page_has_content(_FakePage("puzzle")) is False
+
+
+# ---- порядок выстрелов (2026-10-01) -----------------------------------------
+
+
+def test_shot_order_top_first_with_micro_shifts():
+    """Топ-кандидат + микросдвиги ±3 идут первыми, дальше остальные."""
+    cands = [(300, 9.0), (250, 5.0), (200, 4.0), (150, 3.0)]
+    shots = [x for x, _ in puzzle._shot_order(cands)]
+    assert shots[:3] == [300, 297, 303]
+    assert shots[3] == 250
+    assert 200 in shots and 150 in shots
+
+
+def test_shot_order_dedups_and_respects_cap():
+    """Дубли схлопываются, список ограничен SHOTS_MAX."""
+    cands = [(300, 9.0), (297, 8.0), (250, 5.0), (200, 4.0),
+             (150, 3.0), (100, 2.0), (50, 1.0), (20, 0.5), (10, 0.2)]
+    shots = [x for x, _ in puzzle._shot_order(cands)]
+    assert len(shots) == len(set(shots)), "дублей быть не должно"
+    assert len(shots) <= puzzle.SHOTS_MAX
+    assert shots[0] == 300
+
+
+def test_shot_order_empty_cands():
+    assert puzzle._shot_order([]) == []
+
+
+def test_shot_order_keeps_scores_for_logging():
+    cands = [(300, 9.0), (250, 5.0)]
+    shots = puzzle._shot_order(cands)
+    assert shots[0][1] == 9.0
+    assert shots[-1][1] == 5.0
+
+
+def test_solve_puzzle_aborts_when_session_already_blocked(monkeypatch):
+    """Заглушка в DOM при живом пазле — сессия сожжена, дропов быть не должно.
+
+    Живой замер 2026-10-01: 6 из 8 дропов несли st_h1='Похоже, нет соединения'
+    при живом пазле. Драгами это не лечится, только тратит попытки.
+    """
+    evs = []
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    monkeypatch.setattr(puzzle, "_stub_page", lambda p: True)
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda p: True)
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda p: False)
+    info = {"bg": {"src": "http://x/b.png", "r": [0, 0, 512, 384]},
+            "puzzle": {"src": "http://x/p.png", "r": [0, 0, 141, 128]}}
+    monkeypatch.setattr(puzzle, "_capture_info", lambda page: info)
+    puzzle.reset()
+    ok = puzzle.solve_puzzle(_FakePage("puzzle"), attempts=3,
+                             timeout_s=0.0, on_event=evs.append)
+    assert ok is False
+    assert evs and evs[0]["kind"] == "blocked"
+    # ни одного дропа: бюджет попыток не израсходован впустую
+    assert puzzle.failures() == 1

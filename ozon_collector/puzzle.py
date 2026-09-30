@@ -112,6 +112,12 @@ _FAIL_DIAG_STAGES = {"no_slot", "all_cands_failed", "exception", "no_bg_shot"}
 # случае мы всё равно уходим на новый цикл).
 _SOLVED_GRACE_S = 12.0
 
+# Максимум выстрелов (дропов) на один цикл. Измеренная точность top-1 ~25%,
+# при 7 выстрелах кумулятивно ~87%; каждый отвергнутый стоит ~12s вердикта,
+# поэтому дальше 7 идти бессмысленно по времени — остальное добирают новые
+# циклы с свежим захватом кадра.
+SHOTS_MAX = 7
+
 
 """Живой метод решения (валидирован на живых капчах, новое поколение пазлов):
 
@@ -261,6 +267,48 @@ def _page_state(page) -> dict:
     return {}
 
 
+def _shot_order(cands) -> list:
+    """Порядок выстрелов по списку кандидатов (чистая функция).
+
+    Топ-кандидат идёт первым со своими микросдвигами ±3 (дискретизация
+    детектора даёт ошибку ~±1-4px, валидация 2026-09-22: cands[0] решает
+    в 36/59 эпизодов, ±3 — ещё в 21/59). Остальные кластеры — по одному
+    чистому выстрелу, в порядке убывания score.
+
+    Ограничение SHOTS_MAX нужно, чтобы один тяжёлый пазл не висел: каждый
+    отвергнутый выстрел стоит времени на drag + вердикт (12s), и при
+    PUZZLE_MAX_ATTEMPTS=3 циклах полный перебор размножается.
+    """
+    out = []
+    seen = set()
+
+    def _push(x):
+        x = int(round(x))
+        if x < 1 or x in seen:
+            return
+        seen.add(x)
+        out.append(x)
+
+    if not cands:
+        return []
+    top, top_sc = cands[0]
+    for off in (0, -3, 3):
+        _push(top + off)
+    for x, sc in cands[1:]:
+        if len(out) >= SHOTS_MAX:
+            break
+        _push(x)
+    return [(x, top_sc if i < 3 else _score_of(cands, x, top_sc))
+            for i, x in enumerate(out[:SHOTS_MAX])]
+
+
+def _score_of(cands, x, default) -> float:
+    for cx, cs in cands:
+        if cx == x:
+            return cs
+    return default
+
+
 def _verdict(page) -> str:
     """Вердикт снятия капты: 'done' | 'unblocked' | 'no'.
 
@@ -405,6 +453,23 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
         try:
             psrc = (info["puzzle"] or {}).get("src")
             if not psrc:
+                _PUZZLE_FAILURES[0] += 1
+                return False
+            # Сессия уже сожжена: заглушка «Похоже, нет соединения» стоит в DOM
+            # ОДНОВРЕМЕННО с пазлом (живой замер 2026-10-01: 6 из 8 дропов
+            # дали st_h1='Похоже, нет соединения', st_blen=95 при живом пазле).
+            # Драгами это не лечится — Ozon отвергнет любой кусок, а мы ещё и
+            # сожжём попытки. Честно отказываем сразу, чтобы вызывающий ушёл в
+            # reload/переработку сессии, а не в длинный бесполезный свип.
+            if _stub_page(page):
+                log.warning("solve: сессия уже заблокирована (заглушка в DOM "
+                            "при живом пазле) → без дропов")
+                if on_event is not None:
+                    on_event({"kind": "blocked", "ctx": "stub_with_puzzle",
+                              "seconds_s": round(time.monotonic() - _t0, 1)})
+                _solve_diag(page, info, "session_blocked",
+                            detail="stub present while puzzle alive")
+                _attempt("solve", ok=False, reason="session_blocked")
                 _PUZZLE_FAILURES[0] += 1
                 return False
             cdn = _bg_from_cdn(info)
@@ -570,36 +635,35 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                     return "reroll"
                 return "reject"
 
-            # ЛИВ-вапидация 2026-09-22 (59 успешных эпизодов): решающий bx
-            # == cands[0] в 36 эп., cands[0]±3px в 21 эп., кандидаты r1/r2 в
-            # 5 эп., ноль — дальше. Свип по ВСЕМ кандидатам давал 4+bx → 0%
-            # успехов: капча рероллится после каждого неудачного дропа,
-            # устаревшие кандидаты бесполезны. Итого: только cands[0] и
-            # микросдвиги ±3 (компенсация дискретизации детектора ~±1-4px),
-            # затем рестарт цикла (свежий захват новой капчи).
-            bx0, score0 = cands[0]
-            for off in (0, -3, 3):
-                r = _drag_bx(bx0 + off, score0)
+            # ПОРЯДОК ВЫСТРЕЛОВ (2026-10-01, живой замер 8 дропов).
+            #
+            # Прежний порядок держался на валидации 2026-09-22: «капча
+            # рероллится после каждого неудачного дропа, устаревшие кандидаты
+            # бесполезны, свип 4+bx даёт 0%». НА ЖИВОЙ КАПЧЕ ЭТО НЕ ТАК:
+            # из 8 дропов 6 оставили капчу НА МЕСТЕ (still=True) — кандидаты
+            # после провала остаются валидными, просто угадывать надо дальше
+            # по списку. Измеренная точность top-1 ~25% (2 верных из 8), при
+            # 7 выстрелах на цикл кумулятивно 1-0.75^7 = 87%.
+            #
+            # Порядок: сначала топ-кандидат с микросдвигами ±3 (валидировано
+            # 2026-09-22: решающий bx = cands[0] в 36/59 эпизодах, ±3 — ещё
+            # в 21/59), затем остальные кластеры по одному выстрелу. Свип
+            # прерывается только на 'solved'/'reroll'/'timeout' — 'reject'
+            # означает «капча та же», значит следующий кандидат ещё в силе.
+            shots = _shot_order(cands)
+            r = "skip"
+            for bx, sc in shots:
+                r = _drag_bx(bx, sc)
                 if r == "solved":
                     return True
                 if r == "timeout":
                     return False
                 if r == "reroll":
                     break
-            if r == "reject" and len(cands) > 1:
-                # точная цель + микросдвиги кандидата-1 не сняли капчу,
-                # капча не сменилась: один шанс ближайшему следующему кластеру
-                # (по данным r1/r2 решают в 5/59 эпизодов); потом рестарт.
-                r2 = _drag_bx(cands[1][0], cands[1][1])
-                if r2 == "solved":
-                    return True
-                if r2 == "timeout":
-                    return False
             _solve_diag(page, info, "all_cands_failed",
-                        detail=f"cands={cands}")
-            _attempt("solve", ok=False, cands=[c[0] for c in cands])
-            # Пазл часто МЕНЯЕТСЯ после неудачного дропа (новый фон/слайдер):
-            # устаревшие кандидаты бесполезны — выходим на повторный захват.
+                        detail=f"cands={cands} shots={shots}")
+            _attempt("solve", ok=False, cands=[c[0] for c in cands],
+                     shots=[b for b, _ in shots])
             continue
         except Exception as exc:
             _solve_diag(page, info, "exception",
