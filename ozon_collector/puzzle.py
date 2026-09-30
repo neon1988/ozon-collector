@@ -114,6 +114,11 @@ _FAIL_DIAG_STAGES = {"no_slot", "all_cands_failed", "exception", "no_bg_shot"}
 # случае мы всё равно уходим на новый цикл).
 _SOLVED_GRACE_S = 12.0
 
+# Максимум ожидания, когда дроп ОТВЕРГНУТ (челлендж жив и не исчезает).
+# Короткий намеренно: ждать тут нечего, а каждый выстрел идёт в общий бюджет
+# solve. Полный _SOLVED_GRACE_S платится только когда челлендж исчез.
+_REJECT_FAST_S = 1.5
+
 # Максимум выстрелов (дропов) на один цикл. Измеренная точность top-1 ~25%,
 # при 7 выстрелах кумулятивно ~87%; каждый отвергнутый стоит ~12s вердикта,
 # поэтому дальше 7 идти бессмысленно по времени — остальное добирают новые
@@ -329,9 +334,31 @@ def _verdict(page) -> str:
                      _stub_page(page), _page_has_content(page))
 
 
-def _await_verdict(page, seconds: float = 5.0) -> str:
-    """Поллить вердикт снятия (см. _verdict)."""
-    return _await_solved(page, seconds, probe=lambda: _verdict(page))
+def _await_verdict(page, seconds: float = _SOLVED_GRACE_S,
+                   reject_after: float = _REJECT_FAST_S) -> str:
+    """Поллить вердикт снятия, различая «отвергнуто» и «ждём рендер».
+
+    Полный grace нужен только когда челлендж ИСЧЕЗ: дроп мог быть верным, и мы
+    ждём, пока страница отдаст контент (наблюдение: заглушка вылезает через
+    ~30s, контент тоже медленно). Если челлендж ЖИВ — дроп уже отвергнут, и
+    ждать бессмысленно: выходим после reject_after.
+
+    Без этого разделения каждый отвергнутый выстрел стоил полные 12s, семь
+    выстрелов = 84s, и solve упирался в таймаут хантера (90s): live7 дал два
+    провала по 96-97s с reason=timeout вместо нормального отказа по кандидатам.
+    """
+    t0 = time.monotonic()
+    while True:
+        st = _verdict(page)
+        if st != "no":
+            return st
+        alive = _still_challenge(page)
+        if alive:
+            if time.monotonic() - t0 >= reject_after:
+                return "no"
+        elif time.monotonic() - t0 >= seconds:
+            return "no"
+        time.sleep(0.4)
 
 
 def _captcha_src_changed(page, info) -> bool:

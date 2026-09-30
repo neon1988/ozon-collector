@@ -70,8 +70,24 @@ def _verdict(page) -> str:
                      _stub_page(page), _page_has_content(page))
 
 
-def _await_verdict(page, seconds: float = DROP_VERDICT_S) -> str:
-    return _await_solved(page, seconds, probe=lambda: _verdict(page))
+def _await_verdict(page, seconds: float = DROP_VERDICT_S,
+                   reject_after: float = 1.2) -> str:
+    """Вердикт после отпускания: полный grace только если челлендж исчез.
+
+    Если челлендж жив — дроп отвергнут, хватит reject_after (иначе каждый
+    выстрел стоит полные секунды и свип не укладывается в таймаут solve).
+    """
+    t0 = time.monotonic()
+    while True:
+        st = _verdict(page)
+        if st != "no":
+            return st
+        if _still_challenge(page):
+            if time.monotonic() - t0 >= reject_after:
+                return "no"
+        elif time.monotonic() - t0 >= seconds:
+            return "no"
+        time.sleep(0.3)
 
 
 def _calib_step(dist: float) -> float:
