@@ -556,6 +556,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                          va=[x for x, _ in va_cands],
                          edges=[x for x, _ in edge_cands],
                          cands=[x for x, _ in cands],
+                         silL=silL, silR=silR, sil_use=sil_use,
                          shot_reason=_shot_bg_reason())
                 if edge_cands or diff_cands:
                     _solve_diag(page, info, "slot_diff",

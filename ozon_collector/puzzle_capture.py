@@ -267,13 +267,24 @@ def _shot_piece_margin(page, info) -> Optional[int]:
 def _shot_piece_margin_rect(page, rect) -> Optional[int]:
     """Съёмка кусочка по явному rect [x,y,w,h] (независимо от info)."""
     from PIL import Image
+    # Прячем кусок по ТОМУ ЖЕ признаку, по которому его находит остальной код
+    # (_read_sl_piece, _capture_info): id === 'puzzle' ИЛИ className ~ /puzzle/.
+    # Раньше здесь матчился только className, и если живой кусок опознаётся по
+    # id, hide() не прятал НИЧЕГО: diff был нулевой, mx<8, функция молча
+    # возвращала None, а solve_puzzle откатывался на silL из CDN-альфы —
+    # заведомо ненадёжную маржу. Именно это давало промах детектора: успехи
+    # шли при марже 22, провалы при 12-15 (живой замер 2026-10-01).
     hide = """() => { let n=0;
         document.querySelectorAll('img').forEach(el=>{
-          if (/puzzle/.test(el.className||'')) { el.__v=el.style.visibility;
-            el.style.visibility='hidden'; n++; } });
+          const c = String(el.className||'');
+          if (el.id === 'puzzle' || /puzzle/.test(c)) {
+            el.__v = el.style.visibility;
+            el.style.visibility = 'hidden'; n++; } });
         return n; }"""
     show = """() => { document.querySelectorAll('img').forEach(el=>{
-        if (/puzzle/.test(el.className||'')) el.style.visibility = el.__v||''; }); }"""
+          const c = String(el.className||'');
+          if (el.id === 'puzzle' || /puzzle/.test(c))
+            el.style.visibility = el.__v||''; }); }"""
     do_shot = lambda: np.asarray(Image.open(io.BytesIO(page.screenshot(
         clip={"x": rect[0], "y": rect[1], "width": rect[2], "height": rect[3]},
         timeout=5000, animations="disabled"))).convert("L")).astype(float)
