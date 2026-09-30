@@ -62,6 +62,7 @@ from .puzzle_dom import (  # noqa: F401
     _grace_resolve,
     _still_challenge,
     _stub_page,
+    STUB_MARKERS,
     _page_has_content,
     is_captcha_shell,
     is_puzzle,
@@ -72,6 +73,7 @@ from .puzzle_input import (_human_click, _human_drag, _human_move,  # noqa: F401
 
 from .puzzle_drag import (  # noqa: F401  (реэкспорт: puzzle.X работает)
     _drag_to,
+    _last_move,
     _piece_grip_offset,
     _read_sl_piece,
     _wait_piece,
@@ -117,6 +119,12 @@ _SOLVED_GRACE_S = 12.0
 # поэтому дальше 7 идти бессмысленно по времени — остальное добирают новые
 # циклы с свежим захватом кадра.
 SHOTS_MAX = 7
+
+# Аварийный выключатель guard'а «сессия сожжена» (OZON_PUZZLE_NO_BLOCK_GUARD=1).
+# Нужен, когда guard подозрителен: пазл на экране, а кусок не двигается —
+# проще снять проверку и смотреть, чем гадать по логу. Симптом, который он
+# снимает, случился 2026-10-01 из-за слишком широких маркеров _stub_page.
+_NO_BLOCK_GUARD = os.environ.get("OZON_PUZZLE_NO_BLOCK_GUARD", "0") == "1"
 
 
 """Живой метод решения (валидирован на живых капчах, новое поколение пазлов):
@@ -461,7 +469,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
             # Драгами это не лечится — Ozon отвергнет любой кусок, а мы ещё и
             # сожжём попытки. Честно отказываем сразу, чтобы вызывающий ушёл в
             # reload/переработку сессии, а не в длинный бесполезный свип.
-            if _stub_page(page):
+            if _stub_page(page) and not _NO_BLOCK_GUARD:
                 log.warning("solve: сессия уже заблокирована (заглушка в DOM "
                             "при живом пазле) → без дропов")
                 if on_event is not None:
@@ -596,6 +604,14 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 if _expired():
                     _attempt("solve", ok=False, reason="timeout")
                     return "timeout"
+                # Двигался ли кусок вообще — отдельный вопрос от «попала ли
+                # лунка». no_move означает поломку захвата (мышь не зацепила),
+                # а не промах детектора: различать обязательно, иначе обе
+                # причины выглядят одинаково и в логе, и на экране.
+                _moved = _last_move()
+                if _expired():
+                    _attempt("solve", ok=False, reason="timeout")
+                    return "timeout"
                 # Вердикт снятия — по ЛЮБОМУ из двух признаков. Прежний ждал
                 # только captchaDone=true в URL, чего текущее поколение капчи
                 # (v10, кусочек без трека) не делает НИКОГДА: после верного
@@ -605,7 +621,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 # выброшено, плюс 24s мёртвого ожидания URL на кандидата.
                 verdict = _await_verdict(page, _SOLVED_GRACE_S)
                 _attempt("cand", bx=x, score=score0, okc=bool(okc),
-                         still=still, verdict=verdict,
+                         still=still, verdict=verdict, moved_px=_moved,
                          target_vx=round(target_vx, 1),
                          **_page_state(page))
                 log.debug(f"solve drag okc={okc} still_challenge={still} "

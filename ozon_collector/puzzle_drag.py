@@ -43,6 +43,22 @@ CALIB_GUARD = 2.0  # не подходить к цели ближе, чем на
 # не ставит, — верные дропы возвращали okc=False и жегли время.
 DROP_VERDICT_S = 2.5
 
+# Последний замер фактического сдвига цели за drag, в px (None = не сдвинулась).
+# Решатель читает его через _last_move(), чтобы отличать «мышь не зацепила
+# кусок» (поломка) от «кусок доехал, но лунка не та» (промах детектора).
+# Наблюдение пользователя 2026-10-01: пазл стоит и не двигается — по логу
+# без этого поля нельзя понять, движок ли это или захват.
+_LAST_MOVE: list = [None]
+
+
+def _last_move():
+    """Фактический сдвиг цели в последнем drag, px (None — не сдвинулась)."""
+    return _LAST_MOVE[0]
+
+
+def _reset_last_move():
+    _LAST_MOVE[0] = None
+
 
 def _verdict(page) -> str:
     """Вердикт снятия капты: 'done' | 'unblocked' | 'no'.
@@ -164,6 +180,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
     анти-бот палит равномерные линейные move (телепорт + идеальная прямая).
     """
     ACC = 0.9
+    _LAST_MOVE[0] = None
     if deadline and time.monotonic() > deadline:
         return False
     try:
@@ -263,13 +280,33 @@ def _drag_to(page, target_vx: float, info, bx, score,
             # доводку замкнутому контуру, который меряет реальный px каждый шаг.
             log.debug(f"drag calib skipped dist="
                       f"{abs(target_vx - (r0.get('px') or 0)):.1f} k=1.0")
-        log.debug(f"drag r1={r1} calib={calib} "
-                  f"dpx={(r1.get('px') - r0.get('px')) if r1 else None} k={k}")
+        # ЖИВОСТЬ ДРАГА. Если после mousedown + калибровочного зонда кусок/ручка
+        # не сдвинулись (|dpx| <= 1px) — мышь не зацепила цель, и никакая
+        # доводка это не спасёт. Это НЕ метрика, а поломка, поэтому она видна
+        # в логе голосом WARNING и отдельной записью no_move с фактическим
+        # сдвигом: иначе «пазл стоит, ничего не происходит» неотличимо от
+        # «мышь едет, но лунка не та» (наблюдение пользователя 2026-10-01).
+        _moved = None
+        if r1 and r1.get("px") is not None and r0.get("px") is not None:
+            _moved = round(r1["px"] - r0["px"], 2)
+        _LAST_MOVE[0] = _moved
+        log.debug(f"drag r1={r1} calib={calib} moved_px={_moved} k={k}")
         if k is None or not (0.4 <= k <= 3.0):
             page.mouse.up()
             time.sleep(random.uniform(0.3, 0.5))
+            _no_move = _moved is None or abs(_moved) <= 1.0
+            if _no_move:
+                log.warning(f"drag: КУСОК НЕ ДВИНУЛСЯ (moved_px={_moved}, "
+                            f"calib={calib:.1f}, grip={grip_mode} @"
+                            f"({gx:.0f},{gy:.0f}) bx={bx}) — мышь не зацепила "
+                            f"цель, доводка невозможна")
+                _attempt("drag", note="no_move", bx=bx, score=score,
+                         target_vx=round(target_vx, 1), calib=round(calib, 1),
+                         moved_px=_moved, gx=round(gx, 1), gy=round(gy, 1),
+                         grip=grip_mode)
             _attempt("drag", note="grip_fail", bx=bx, score=score,
-                     target_vx=round(target_vx, 1), k=k, grip=grip_mode)
+                     target_vx=round(target_vx, 1), k=k, grip=grip_mode,
+                     moved_px=_moved, no_move=_no_move)
             rng_x = random.uniform(-9, 9)
             if grip_mode == "piece":
                 # При повторном хвате НЕ рандом: читаем живую непрозрачную точку

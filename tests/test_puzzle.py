@@ -564,6 +564,50 @@ def test_page_has_content_rejects_empty_href():
     assert puzzle._page_has_content(_FakePage("puzzle")) is False
 
 
+class _TextPage:
+    """Страница с заданными title и текстом body — для _stub_page."""
+
+    def __init__(self, title="", body=""):
+        self._title = title
+        self._body = body
+
+    def evaluate(self, js, *a, **kw):
+        return f"{self._title}||{self._body}"
+
+
+def test_stub_page_ignores_words_that_live_captcha_uses():
+    """РЕГРЕСС 2026-10-01: guard «сессия сожжена» отказывался двигать кусок.
+
+    На живой капче Ozon в инструкции есть «Попробуйте сопоставить», а в
+    разметке — «antibot». Старые маркеры _stub_page ловили это как заглушку,
+    solve_puzzle возвращал False за 0.0s, и пазл стоял неподвижно: live6 —
+    8 пазлов, 0 дропов, все reason=session_blocked.
+    """
+    page = _TextPage("Ozon", "Попробуйте сопоставить части картинки. antibot")
+    assert puzzle._stub_page(page) is False
+
+
+def test_stub_page_still_catches_real_stub():
+    page = _TextPage("Ozon", "Похоже, нет соединения. Проверьте VPN.")
+    assert puzzle._stub_page(page) is True
+
+
+def test_stub_markers_are_distinctive():
+    """В маркерах не должно быть слов, встречающихся на живой капче."""
+    joined = " ".join(puzzle.STUB_MARKERS)
+    for bad in ("попробуйте", "challenge", "antibot"):
+        assert bad not in joined, f"маркер {bad!r} даёт ложные срабатывания"
+
+
+def test_last_move_reports_zero_when_piece_stuck():
+    """«Ползунок не двигается» должно быть видно как измеренный факт."""
+    puzzle_drag._reset_last_move()
+    assert puzzle_drag._last_move() is None
+    puzzle_drag._LAST_MOVE[0] = 0.0
+    assert puzzle_drag._last_move() == 0.0
+    puzzle_drag._reset_last_move()
+
+
 # ---- порядок выстрелов (2026-10-01) -----------------------------------------
 
 
