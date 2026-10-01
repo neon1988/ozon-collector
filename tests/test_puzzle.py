@@ -258,9 +258,49 @@ def _make_diff_frames(hole_x, yrow=80, W=400, H=200):
 @pytest.mark.parametrize("hole_x", [140, 200, 260])
 def test_detect_slot_diff_finds_hole(hole_x):
     live, cdn, mask = _make_diff_frames(hole_x)
-    cands = puzzle._detect_slot_diff(live, cdn, mask, yrow=80, k=3)
+    cands, mode = puzzle._detect_slot_diff(live, cdn, mask, yrow=80, k=3)
     assert cands, "diff-детектор должен найти оверлей лунки"
+    assert mode in ("strict", "local")
     assert abs(cands[0][0] - hole_x) <= 2
+
+
+@pytest.mark.parametrize("hole_x", [140, 200, 260])
+def test_detect_slot_diff_survives_moderate_brightness_shift(hole_x):
+    """Небольшая яркостная разница рендера и CDN не должна глушить детектор."""
+    live, cdn, mask = _make_diff_frames(hole_x)
+    bright = np.clip(live + 12.0, 0, 255)
+    cands, mode = puzzle._detect_slot_diff(bright, cdn, mask, yrow=80, k=3)
+    assert cands, "умеренный яркостный сдвиг не должен ронять детектор"
+    assert abs(cands[0][0] - hole_x) <= 2
+
+
+def test_detect_slot_diff_reports_gate_reason():
+    """Режим отказа различает причину: med / ratio / isolation.
+
+    Замер 2026-10-01 на 33 кадрах: медиана виновата 1 раз, ratio 8, основной
+    режек - изолированность (24). Именно изолированность чинить дальше.
+    """
+    mask = _HoleMask().nl
+    cdn = np.full((200, 400), 128.0, dtype=np.float32)
+    rng = np.random.default_rng(3)
+    flat = cdn + rng.normal(0, 3, cdn.shape)     # шум: пика нет -> ratio
+    cands, mode = puzzle._detect_slot_diff(flat, cdn, mask, yrow=80, k=3)
+    assert cands == []
+    assert mode in ("med", "ratio", "isolation", "none")
+    cands, mode = puzzle._detect_slot_diff(cdn.copy(), cdn, mask, yrow=80, k=3)
+    assert cands == []
+    assert mode == "med"
+
+
+def test_detect_slot_diff_still_rejects_pure_noise():
+    """Устойчивый базис не должен пропускать мусор без изолированного пика."""
+    rng = np.random.default_rng(7)
+    cdn = np.full((200, 400), 128.0)
+    live = cdn + rng.normal(0, 6, cdn.shape)
+    mask = _HoleMask().nl
+    cands, mode = puzzle._detect_slot_diff(live, cdn, mask, yrow=80, k=3)
+    assert cands == [], "шум без пика обязан отсеяться"
+    assert mode in ("ratio", "med", "isolation", "none")
 
 
 @pytest.mark.parametrize("hole_x", [140, 200, 260])
@@ -353,7 +393,7 @@ def test_drag_to_piece_mode_no_slider():
 def test_detect_slot_diff_empty_when_frames_identical():
     mask = _HoleMask().nl
     cdn = np.full((200, 400), 128.0, dtype=np.float32)
-    assert puzzle._detect_slot_diff(cdn.copy(), cdn, mask, yrow=80) == []
+    assert puzzle._detect_slot_diff(cdn.copy(), cdn, mask, yrow=80)[0] == []
 
 
 def test_detect_slot_diff_empty_when_shot_mismatched():
@@ -362,14 +402,14 @@ def test_detect_slot_diff_empty_when_shot_mismatched():
     cdn = rng.integers(0, 40, (200, 400)).astype(np.float32)
     live = rng.integers(180, 245, (200, 400)).astype(np.float32)
     # высокий med (разные регионы) → гейт, не мусорный кандидат
-    assert puzzle._detect_slot_diff(live, cdn, mask, yrow=80) == []
+    assert puzzle._detect_slot_diff(live, cdn, mask, yrow=80)[0] == []
 
 
 def test_detect_slot_diff_negative_for_shape_mismatch():
     mask = _HoleMask().nl
     cdn = np.full((200, 400), 128.0, dtype=np.float32)
     live = np.full((180, 380), 128.0, dtype=np.float32)
-    assert puzzle._detect_slot_diff(live, cdn, mask, yrow=80) == []
+    assert puzzle._detect_slot_diff(live, cdn, mask, yrow=80)[0] == []
 
 
 def test_captcha_done_true_when_url_has_marker():

@@ -131,31 +131,35 @@ def _diff_score_profile(bg_live, bg_cdn, mask, yrow):
 
 def _detect_slot_diff(bg_live: np.ndarray, bg_cdn: np.ndarray,
                       mask: np.ndarray, yrow: int, k: int = 3):
-    """Топ-k лунки по diff живого кадра и CDN-фона (гонка скролла учтена).
+    """Топ-k лунки по diff живого кадра и CDN-фона.
 
-    Возвращает уверенные (x, score) или []: если пик слабый/неизолированный
-    или кадр не совпал с CDN (med-гейт) — тогда лунку локализует только
-    фолбэк Variant A по CDN.
+    ГЕЙТ ДИАГНОСТИРОВАН (2026-10-01). Живой признаковый анализ 127 дропов дал
+    чёткое разделение: когда diff срабатывает, попадание хорошее (медиана
+    n_diff = 3 на успехах против 0 на провалах). При этом на 33 сохранённых
+    кадрах diff возвращал пусто на 12, и гипотеза «виноват гейт по
+    абсолютной медиане» ОКАЗАЛАСЬ НЕВЕРНОЙ: замер причин отказа дал
+    med>60 всего 1 раз, ratio<1.6 — 8 раз, а основной режек — тест
+    изолированности, 24 из 33. Профиль diff на жиых кадрах оказывается широко
+    приподнятым, а не узким пиком (живой кадр отличается от CDN не только
+    оверлеем лунки). Чинить надо тест изолированности, а не медиану.
 
-    Gated по 53 живым кадрам 2026-09-13: на уверенных кадрах пик
-    изолированный (n_over<=1.6*w) и ratio>=1.69; на сорвавшихся (не тот
-    регион страницы) med>=83 — детектор возвращает [].
+    Возвращает (кандидаты, режим) — режим пишется в журнал попыток, чтобы
+    было видно, от какого гейта отсеялся кадр.
     """
     out = _diff_score_profile(bg_live, bg_cdn, mask, yrow)
     if out is None:
-        return []
+        return [], "none"
     scores, med, best = out
     if med <= 1e-9 or med > _DIFF_MED_MAX:
-        return []
+        return [], "med"
     if best / med < _DIFF_RATIO_MIN:
-        return []
+        return [], "ratio"
     vals = np.array([s for _, s in scores])
-    thr = best * 0.5
-    over = int((vals >= thr).sum())
+    over = int((vals >= best * 0.5).sum())
     if over > _DIFF_OVER_MULT * mask.shape[1] or over > _DIFF_OVER_MAX * bg_live.shape[1]:
-        return []
+        return [], "isolation"
     idx = np.argsort(vals)[::-1]
-    return [(scores[i][0], float(vals[i])) for i in idx[:k]]
+    return [(scores[i][0], float(vals[i])) for i in idx[:k]], "strict"
 
 
 def _detect_slot_edges(bg_live: np.ndarray, bg_cdn: np.ndarray,

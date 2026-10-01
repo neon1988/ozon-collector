@@ -7,6 +7,7 @@ _firefox_page — обход только для диагностических 
 Перенесено из puzzle.py без изменения кода (механический сплит).
 """
 
+import re
 import time
 from typing import Optional
 
@@ -203,6 +204,139 @@ def _stub_page(page) -> bool:
     except Exception:
         return False
     return any(m in doc for m in STUB_MARKERS)
+
+
+# Перехват координаты лунки из JS капчи.
+#
+# Скилл ozon-puzzle-slot-fallback документирует: slot_x НЕ приходит из сети и
+# НЕ лежит в DOM, он передаётся АРГУМЕНТОМ в вызовы инициализации капты
+# (runCaptcha/_runCaptcha/initCaptcha). Живой дамп 131847 видел cx=112 в этих
+# аргументах, и драг 48px снял капчу.
+#
+# Зачем при живом фоне и точной геометрии драга: CV-детекторы по
+# фотографическому фону принципиально ненадёжны (79 кадров: 27 всегда успех,
+# 40 всегда провал; переупорядочивание кандидатов не помогает - 20% против
+# 17%). Здесь координата берётся из самого кода капчи, а не угадывается.
+#
+# Ставится ДО любых дропов и живёт на странице: после каждого неверного дропа
+# капча перерисовывается и инициализация вызывается заново, так что запас
+# обновляется сам. Аргументы DOM-узлов читаем через getBoundingClientRect.
+_SLOT_SPY_JS = r"""
+() => {
+  const S = {hits: [], installed: true};
+  const rect = a => { try { const r = a.getBoundingClientRect();
+      return [Math.round(r.x), Math.round(r.y),
+              Math.round(r.width), Math.round(r.height)]; } catch (e) { return null; } };
+  const NAMES = ['runCaptcha', '_runCaptcha', 'initCaptcha', 'initSlide',
+                 'init', 'renderCaptcha', 'showCaptcha', 'drawCaptcha',
+                 'setSlide', 'slide', 'initPuzzle', 'onCaptcha'];
+  for (const n of NAMES) {
+    const f = window[n];
+    if (typeof f !== 'function') continue;
+    const wrapped = function () {
+      try {
+        const args = [];
+        for (let i = 0; i < arguments.length && i < 12; i++) {
+          const a = arguments[i];
+          if (a && typeof a.getBoundingClientRect === 'function')
+            args.push({t: 'el', v: rect(a)});
+          else if (a && typeof a === 'object' && !Array.isArray(a)) {
+            const o = {};
+            for (const k in a) {
+              const v = a[k];
+              o[k] = (typeof v === 'number') ? v
+                   : (v && typeof v.getBoundingClientRect === 'function'
+                      ? {el: rect(v)} : typeof v);
+            }
+            args.push({t: 'obj', v: o});
+          } else args.push({t: 'prim', v: a});
+        }
+        S.hits.push({fn: n, args: args, at: Date.now()});
+        if (S.hits.length > 24) S.hits.shift();
+      } catch (e) { /* не мешаем капче */ }
+      return f.apply(this, arguments);
+    };
+    try { window[n] = wrapped; } catch (e) { /* readonly */ }
+  }
+  window.__slotSpy = S;
+  return S.installed;
+}
+"""
+
+_SLOT_READ_JS = r"""
+() => {
+  const S = window.__slotSpy;
+  if (!S || !S.hits || !S.hits.length) return null;
+  const out = [];
+  for (const h of S.hits) {
+    for (const a of (h.args || [])) {
+      if (a.t === 'prim' && typeof a.v === 'number') {
+        out.push({fn: h.fn, kind: 'num', v: a.v});
+      } else if (a.t === 'el' && Array.isArray(a.v)) {
+        out.push({fn: h.fn, kind: 'el', v: a.v});
+      } else if (a.t === 'obj' && a.v) {
+        for (const k in a.v) {
+          const v = a.v[k];
+          if (typeof v === 'number') {
+            out.push({fn: h.fn, kind: 'field', k: k, v: v});
+          } else if (v && typeof v === 'object' && v.el) {
+            out.push({fn: h.fn, kind: 'fieldEl', k: k, v: v.el});
+          }
+        }
+      }
+    }
+  }
+  return {hits: S.hits.length, vals: out};
+}
+"""
+
+
+def _slot_spy_install(page) -> bool:
+    """Повесить перехватчик координат лунки (до первого дропа)."""
+    try:
+        return bool(page.evaluate(_SLOT_SPY_JS))
+    except Exception:
+        return False
+
+
+def _slot_from_js(page) -> Optional[dict]:
+    """Координата лунки, перехваченная в аргументах вызовов капты.
+
+    Возвращает {'x': float, 'y': float, 'src': str} — координаты в экранных
+    px, если удалось; иначе None. Молча: это улучшение поверх детекторов, а не
+    замена им.
+    """
+    try:
+        d = page.evaluate(_SLOT_READ_JS)
+    except Exception:
+        return None
+    if not d or not d.get("vals"):
+        return None
+    vals = d["vals"]
+    best = None
+    # 1) явное числовое поле с координатой слота
+    for v in vals:
+        if v["kind"] == "field" and re.fullmatch(
+                r"(x|sx|slotX|slot_x|left|leftX|cx|centerX|offsetX|targetX)", v["k"]):
+            best = (float(v["v"]), v["fn"] + "." + v["k"])
+            break
+    # 2) единственное «круглое» число в разумном диапазоне ширины фона
+    if best is None:
+        nums = [float(v["v"]) for v in vals
+                if v["kind"] == "num" and 20 <= float(v["v"]) <= 520]
+        if len(nums) == 1:
+            best = (nums[0], "num")
+    # 3) DOM-узел, который уже не кусок и не фон (например сам оверлей лунки)
+    if best is None:
+        els = [v for v in vals if v["kind"] in ("el", "fieldEl")]
+        for v in els:
+            x, y, w, h = v["v"]
+            if 20 <= w <= 260 and 20 <= h <= 200 and x > 1:
+                best = (float(x), v["fn"] + "@el")
+                break
+    if best is None:
+        return None
+    return {"x": best[0], "src": best[1], "hits": d.get("hits")}
 
 
 def _await_done(page, seconds: float, step: float = 0.5) -> bool:

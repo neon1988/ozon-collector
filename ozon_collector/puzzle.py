@@ -64,6 +64,8 @@ from .puzzle_dom import (  # noqa: F401
     _stub_page,
     STUB_MARKERS,
     _page_has_content,
+    _slot_from_js,
+    _slot_spy_install,
     is_captcha_shell,
     is_puzzle,
     looks_like_puzzle,
@@ -137,6 +139,11 @@ DROP_BUDGET = 4
 # проще снять проверку и смотреть, чем гадать по логу. Симптом, который он
 # снимает, случился 2026-10-01 из-за слишком широких маркеров _stub_page.
 _NO_BLOCK_GUARD = os.environ.get("OZON_PUZZLE_NO_BLOCK_GUARD", "0") == "1"
+
+# Ставился ли перехватчик координат лунки на текущей странице (список как
+# изменяемый синглтон, чтобы reset между шардами не ломал spy на живой
+# странице).
+_SPY_OK: list = [False]
 
 
 """Живой метод решения (валидирован на живых капчах, новое поколение пазлов):
@@ -311,6 +318,32 @@ def _shot_order(cands) -> list:
         seen.add(x)
         out.append((x, top_sc))
     return out[:SHOTS_MAX]
+
+
+def _js_slot_target(page, b_r) -> Optional[dict]:
+    """Цель из перехваченных вызовов капты, если координата уже известна.
+
+    Приоритетнее детекторов: координата берётся из кода капчи, а не
+    угадывается по фотографическому фону (CV здесь принципиально ненадёжен:
+    79 живых кадров дали 27 всегда успех / 40 всегда провал, переупорядочивание
+    кандидатов не помогло). Требует, чтобы координата была МАСШТАБИРОВАНА в
+    css-пиксели фона: проверяем, что результат попадает в ширину бокса
+    фона, иначе отбрасываем (иначе получим координату в натуральном
+    разрешении CDN-картинки).
+    """
+    d = _slot_from_js(page)
+    if not d:
+        return None
+    x = d.get("x")
+    if x is None or b_r is None or len(b_r) != 4:
+        return None
+    try:
+        x = float(x)
+    except Exception:
+        return None
+    if not (1.0 <= x <= float(b_r[2]) - 2.0):
+        return None
+    return {"bx": int(round(x)), "src": d.get("src"), "hits": d.get("hits")}
 
 
 def _verdict(page) -> str:
@@ -501,6 +534,15 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
             cdn = _bg_from_cdn(info)
             shot = None
             grip = None
+            # Перехват координаты из кода капчи. Ставим сразу, до дропов: после
+            # каждого неверного дропа капча перерисовывается и инициализация
+            # вызывается заново, так что запас обновляется сам. Дальше каждый
+            # цикл сначала спрашивает _js_slot_target и, если координата есть,
+            # стреляет по ней, а не по догадкам детекторов.
+            if not _SPY_OK[0]:
+                _SPY_OK[0] = _slot_spy_install(page)
+                if _SPY_OK[0]:
+                    log.debug("solve: slot-spy установлен")
             if cdn is not None:
                 # Кандидаты: diff(живой кадр, CDN) ПЕРВИЧНЫ — лунка рисуется
                 # CSS-оверлеем только в живом кадре (новый формат), на плоских
@@ -513,9 +555,10 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                                  float(bg_l.max()), float(bg_l.min()))
                 shot = _shot_bg_clean(page, info)
                 diff_cands = []
+                diff_mode = "none"
                 if shot is not None and shot["bg_l"].shape == bg_l.shape:
-                    diff_cands = _detect_slot_diff(shot["bg_l"], bg_l,
-                                                   mask, yrow, k=3)
+                    diff_cands, diff_mode = _detect_slot_diff(
+                        shot["bg_l"], bg_l, mask, yrow, k=3)
                 edge_cands = []
                 if shot is not None and shot["bg_l"].shape == bg_l.shape:
                     edge_cands = _detect_slot_edges(shot["bg_l"], bg_l,
@@ -548,6 +591,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                          edges=[x for x, _ in edge_cands],
                          cands=[x for x, _ in cands],
                          silL=silL, silR=silR, sil_use=sil_use,
+                         diff_mode=diff_mode,
                          shot_reason=_shot_bg_reason())
                 if edge_cands or diff_cands:
                     _solve_diag(page, info, "slot_diff",
@@ -693,6 +737,14 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
             # DROP_BUDGET: исчерпали - стоп и сигнал перезагрузки, а не жжение.
             shots = _shot_order(cands)
             r = "skip"
+            js_hit = _js_slot_target(page, b_r)
+            if js_hit:
+                # Точная цель из кода капты — она важнее любой догадки.
+                log.debug(f"solve: цель из JS {js_hit['src']} bx={js_hit['bx']} "
+                          f"(hits={js_hit.get('hits')})")
+                _attempt("det", js_bx=js_hit["bx"], js_src=js_hit["src"],
+                         cands=[c[0] for c in cands])
+                shots = [(js_hit["bx"], float("inf"))]
             for bx, sc in shots:
                 r = _drag_bx(bx, sc)
                 if r == "solved":
