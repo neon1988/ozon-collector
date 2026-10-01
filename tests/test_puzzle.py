@@ -289,7 +289,7 @@ def test_detect_slot_shape_uses_whole_band_not_guess_yrow():
     import os
     here = os.path.dirname(os.path.abspath(__file__))
     corpus = os.path.join(os.path.dirname(here), ".tmp", "corpus")
-    hits = tot = 0
+    hits = hits_wrong_row = tot = 0
     for jp in sorted(glob.glob(os.path.join(corpus, "*.json"))):
         with open(jp, encoding="utf-8") as f:
             rec = json.load(f)
@@ -303,14 +303,21 @@ def test_detect_slot_shape_uses_whole_band_not_guess_yrow():
         except Exception:
             continue
         tot += 1
-        for y in (0, rec.get("yrow") or 0):
-            c = puzzle._detect_slot_shape(bg, mask, y, k=1)
-            if c and abs(c[0][0] - int(bx)) <= 6:
-                hits += 1
-                break
+        yrow = rec.get("yrow") or max(0, bg.shape[0] - mask.shape[0] - 2)
+        c = puzzle._detect_slot_shape(bg, mask, yrow, k=1)
+        if c and abs(c[0][0] - int(bx)) <= 6:
+            hits += 1
+        # контроль: с неверной строкой должно быть заметно хуже - именно на
+        # этом эффекте (87% против 27%) нашла правка вызова в solve_puzzle
+        c0 = puzzle._detect_slot_shape(bg, mask, 0, k=1)
+        if c0 and abs(c0[0][0] - int(bx)) <= 6:
+            hits_wrong_row += 1
     if tot == 0:
         pytest.skip("корпус не собран")
     assert hits / tot >= 0.8, f"shape-детектор дал {hits}/{tot}, ждали >=80%"
+    assert hits > hits_wrong_row, (
+        f"yrow должен влиять: с верной строкой {hits}/{tot}, "
+        f"с нулевой {hits_wrong_row}/{tot}")
 
 
 def test_shape_cands_take_precedence_in_solve_cands():
