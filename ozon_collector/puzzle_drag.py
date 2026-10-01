@@ -15,6 +15,7 @@ _drag_to — один «заход»: снять актуальную позиц
 _calib_step/_k_from_probe покрыты юнит-тестами (tests/test_puzzle_drag.py).
 """
 
+import os
 import random
 import time
 from typing import Optional
@@ -42,6 +43,10 @@ CALIB_GUARD = 2.0  # не подходить к цели ближе, чем на
 # 6x1s ТОЛЬКО URL-маркер captchaDone=true, которого текущее поколение капчи
 # не ставит, — верные дропы возвращали okc=False и жегли время.
 DROP_VERDICT_S = 2.5
+
+# Простой непрерывный драг вместо возвратно-точного FSM (см.
+# _simple_drag_once). Флагом, чтобы A/B на живых прогонах.
+_SIMPLE_DRAG = os.environ.get("OZON_PUZZLE_SIMPLE_DRAG", "0") == "1"
 
 # Последний замер фактического сдвига цели за drag, в px (None = не сдвинулась).
 # Решатель читает его через _last_move(), чтобы отличать «мышь не зацепила
@@ -256,6 +261,47 @@ def _drag_to(page, target_vx: float, info, bx, score,
         page.mouse.up()
         return _await_verdict(page) != "no"
 
+    def _simple_drag_once() -> bool:
+        """ОДИН непрерывный человеческий драг: без зонда и без до-крутки.
+
+        Гипотеза (наблюдение пользователя с экрана 2026-10-01): «если
+        начинаешь двигать ползунок, но потом его бросаешь, происходит
+        перезагрузка пазла». Текущий _drag_to делает ровно то, о чём говорит
+        наблюдение: mousedown, затем калибровочный зонд ВПЕРЁД на 6-40px,
+        потом возврат к цели, потом до 18 итераций микрокоррекции с паузами,
+        и только затем отпуск. Для живой капчи это выглядит как «начал тянуть
+        и бросил» - и она перезагружается.
+
+        Здесь: одно mousedown, один _human_drag до цели, короткая пауза,
+        mouse.up. Позиция куска заранее известна (r0.px), к цели едем
+        напрямую, поэтому калибровать k не нужно.
+        """
+        r = _read_sl_piece(page)
+        if not r or r.get("px") is None:
+            r = _wait_piece(page, deadline=deadline, tries=3)
+        if not r or r.get("px") is None:
+            _attempt("drag", note="simple_no_piece", bx=bx, score=score,
+                     target_vx=round(target_vx, 1))
+            return _await_verdict(page) != "no"
+        px0 = r["px"]
+        _LAST_MOVE[0] = None
+        _human_click(page, gx + rng_x, gy, hold=random.uniform(0.08, 0.18))
+        time.sleep(random.uniform(0.05, 0.12))
+        dest = max(track[0] + 1, min(max_hx, gx + (target_vx - px0)))
+        _shape = _human_drag(page, gx + rng_x, gy, dest, gy, bound=max_hx)
+        time.sleep(random.uniform(0.2, 0.45))
+        r2 = _read_sl_piece(page)
+        if r2 and r2.get("px") is not None:
+            _LAST_MOVE[0] = round(r2["px"] - px0, 2)
+        err = round((r2.get("px") if r2 and r2.get("px") is not None
+                     else px0) - target_vx, 2)
+        _attempt("drag", note="simple_end", bx=bx, score=score,
+                 target_vx=round(target_vx, 1), err=err, shape=_shape,
+                 moved_px=_LAST_MOVE[0], grip=grip_mode, k=1.0)
+        log.debug(f"drag simple px0={px0} dest={dest:.1f} err={err} "
+                  f"moved={_LAST_MOVE[0]}")
+        return _drop_and_confirm(dest)
+
     last = {}
     for _try in range(3):
         if deadline and time.monotonic() > deadline:
@@ -273,6 +319,17 @@ def _drag_to(page, target_vx: float, info, bx, score,
                 _attempt("drag", note="no_piece", bx=bx, score=score,
                          target_vx=round(target_vx, 1))
                 return _await_verdict(page) != "no"
+        if _SIMPLE_DRAG:
+            # Один непрерывный драг: гипотеза, что возвратно-точный FSM
+            # (зонд вперёд + до 18 микрокоррекций) Ozon читает как
+            # «начал тянуть и бросил» и перезагружает пазл (наблюдение
+            # пользователя 2026-10-01). Включается флагом, чтобы можно было
+            # A/B сравнить на живых прогонах.
+            _solved = _simple_drag_once()
+            if _solved:
+                return True
+            page.mouse.up()
+            return False
         # подвод мыши к точке хвата (визуально-естественно) затем нажим
         _human_click(page, gx + rng_x, gy, hold=random.uniform(0.06, 0.16))
         time.sleep(random.uniform(0.05, 0.12))
