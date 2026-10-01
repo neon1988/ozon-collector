@@ -103,6 +103,12 @@ _DIFF_MED_MAX = 60.0     # медиана score-окон: выше = кадр н
 _DIFF_OVER_MULT = 1.6    # изолированность: ширина пика <= 1.6 * ширины кусочка
 _DIFF_OVER_MAX = 0.6     # и <= 60% ширины кадра
 
+# Явный приоритет кандидата по форме над колоночными: их score измеряется в
+# другой шкале (сумма энергии контура против доли пика), поэтому сортировка
+# по величине бессмысленна. Замер 2026-10-01: shape 87% top-1, колоночные
+# 20-27%.
+_SHAPE_SCORE_BIAS = 1e6
+
 
 def _diff_score_profile(bg_live, bg_cdn, mask, yrow):
     """Скоринг-профиль |live - cdn| по полосе yrow..yrow+h (маск-взвеш.).
@@ -235,7 +241,104 @@ def _detect_slot_edges(bg_live: np.ndarray, bg_cdn: np.ndarray,
         if 1 <= x < bg_live.shape[1] - w - 1:
             out.append((x, sc))
     return out
-def _solve_cands(mask, edge_cands, diff_cands, va_cands, silL):
+def _erode_mask(mask: np.ndarray) -> np.ndarray:
+    """Эрозия силуэта на 1px (внутренность формы)."""
+    binm = mask.astype(np.uint8)
+    if binm.max() > 1:
+        binm = (binm > 127).astype(np.uint8)
+    inner = binm.copy()
+    inner[:, 1:] &= binm[:, :-1]
+    inner[1:, :] &= binm[:-1, :]
+    inner[1:, 1:] &= binm[:-1, :-1]
+    return inner > 0
+
+
+def _mask_edges(mask: np.ndarray) -> np.ndarray:
+    """Границы силуэта куска (пиксели на его контуре).
+
+    Маска может прийти bool или 0..255 - приводим к 0/1 один раз.
+    """
+    binm = mask.astype(np.uint8)
+    if binm.max() > 1:
+        binm = (binm > 127).astype(np.uint8)
+    inner = binm.copy()
+    inner[:, 1:] &= binm[:, :-1]
+    inner[1:, :] &= binm[:-1, :]
+    inner[1:, 1:] &= binm[:-1, :-1]
+    return (binm.astype(np.int16) - inner.astype(np.int16)) > 0
+
+
+def _detect_slot_shape(bg: np.ndarray, mask: np.ndarray, yrow: int,
+                       k: int = 3):
+    """Локализация лунки ПО ФОРМЕ: силуэт куска против карты границ фона.
+
+    ОСНОВНОЙ ДЕТЕКТОР (2026-10-01). Замена колоночным edges/va, и вот почему.
+
+    Разбор DOM живой капты (discover-фаза) показал: оверлея лунки нет, canvas
+    нет, background-image нет - лунка ЗАПЕЧЕНА в CDN-PNG. Отсюда два
+    измеренных факта:
+      - diff(live, cdn) в месте слота даёт ноль: обе картинки содержат лунку,
+        поэтому ранг истинного слота в профиле diff был медиана 198.5 из ~512
+        и ни разу не попадал в топ-10;
+      - след лунки в картинке ЕСТЬ, но слабый: окно слота контрастнее
+        случайного всего в 1.05-1.13 раза, тогда как границы фотографии в
+        ~10 раз контрастнее. Поэтому колоночные детекторы выбирают
+        фотографию, а не лунку, и давали 20-27% попаданий.
+
+    Силуэт куска повторяет форму отверстия, поэтому корреляция по форме
+    отсекает фоновые рёбра независимо от их силы. Замер на 15 размеченных
+    кадрах: top-1 13/15 = 87%, медиана ранга 0 (против 198.5 у колоночных).
+
+    ВАЖНО про координату: возвращаемые x лежат в той же системе, что и
+    итоговый bx цели, поэтому к ним НЕ применяется вычитание маржи
+    (silL/silR) - это делают только детекторы, работающие с левой гранью.
+
+    Возвращает [(x, score), ...] или [].
+    """
+    if bg is None or mask is None or mask.ndim != 2 or bg.ndim != 2:
+        return []
+    h, w = bg.shape
+    mh, mw = mask.shape
+    if mh < 8 or mw < 8 or mh > h or mw > w:
+        return []
+    y0 = int(max(0, min(h - mh, yrow)))
+    edge = _mask_edges(mask)
+    if not edge.any():
+        return []
+    # карта границ: первый порядок ловит полосы по краям, второй - сам край
+    gx = np.abs(np.gradient(bg, axis=1))
+    gxx = np.abs(np.gradient(gx, axis=1))
+    em = gx + 1.5 * gxx
+    band = em[y0:y0 + mh]
+    n_valid = w - mw + 1
+    if n_valid <= 0:
+        return []
+    cols = edge.sum(axis=0).astype(float)
+    csum = cols.sum()
+    if csum <= 0:
+        return []
+    cols = cols / cols.max() if cols.max() > 0 else cols
+    # Сознательно НЕ вычитаем энергию внутри силуэта: проба с вычитанием
+    # не дала выигрыша на 15 боевых кадрах (13/15 = 87% и с ним, и без него),
+    # а на синтетике с «фотографией» из прямой грани разница была случайной.
+    # По формуле ничего не усложняем, пока замер не покажет обратного.
+    prof = np.zeros(n_valid)
+    for i in range(n_valid):
+        seg = band[:, i:i + mw]
+        prof[i] = float((seg * cols[None, :]).sum() / csum)
+    idx = np.argsort(prof)[::-1]
+    out = []
+    for i in idx:
+        if int(i) < 1:
+            continue
+        out.append((int(i), float(prof[i])))
+        if len(out) >= k:
+            break
+    return out
+
+
+def _solve_cands(mask, edge_cands, diff_cands, va_cands, silL,
+                 shape_cands=None):
     """Построить финальный порядок кандидатов лунки.
 
     Логика (вынесена из solve_puzzle для переиспользования в калибровке):
@@ -250,7 +353,13 @@ def _solve_cands(mask, edge_cands, diff_cands, va_cands, silL):
                   if x - silL >= 1]
     seen = {x for x, _ in edge_fixed}
     seen.update(x for x, _ in diff_cands)
-    cands = edge_fixed + diff_cands + \
+    # Кандидаты по форме идут ПЕРВЫМИ и в своей системе координат (без
+    # вычитания маржи): замер 2026-10-01 дал им 87% top-1 против 20-27% у
+    # колоночных детекторов. Шкала их score не сравнима с чужой (сумма
+    # энергии по контуру против доли пика), поэтому они получают явный
+    # приоритет, а не «надежду на сортировку».
+    shape_first = [(x, sc + _SHAPE_SCORE_BIAS) for x, sc in (shape_cands or [])]
+    cands = shape_first + edge_fixed + diff_cands + \
         [c for c in va_cands if c[0] not in seen]
     cands = cands + [(x, sc * 0.6) for x, sc in edge_cands if x >= 1]
 
@@ -274,6 +383,11 @@ def _solve_cands(mask, edge_cands, diff_cands, va_cands, silL):
     cands_dedup = _dedup1(cands)
 
     try:
+        # Консенсус edges∩diff (валидирован 2026-09-23) НЕ применяется, если
+        # первым уже стоит кандидат по форме: измерённая точность shape выше
+        # (87% против 20-27%), и промоуция консенсуса его бы вытеснила.
+        if shape_first and cands_dedup:
+            return cands_dedup
         exs = {x for x, _ in edge_cands}
         dxs = {x for x, _ in diff_cands}
         best_c = None

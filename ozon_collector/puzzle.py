@@ -43,6 +43,7 @@ from .puzzle_capture import (  # noqa: F401  (реэкспорт: puzzle.X ра�
 from .puzzle_detect import (  # noqa: F401
     _detect_slot_diff,
     _detect_slot_edges,
+    _detect_slot_shape,
     _detect_slot_topk,
     _diff_score_profile,
     _grip_point,
@@ -564,6 +565,11 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                     edge_cands = _detect_slot_edges(shot["bg_l"], bg_l,
                                                     mask, yrow, k=3)
                 va_cands = _detect_slot_topk(bg_l, mask, yrow, k=3)
+                # ОСНОВНОЙ ДЕТЕКТОР: локализация лунки по форме силуэта куска
+                # (2026-10-01, замер 87% top-1 против 20-27% у колоночных).
+                # Считаем ПО ЦЕЛОМУ фону, а не по полосе строк, — так профиль
+                # не зависит от того, насколько точно угадан yrow.
+                shape_cands = _detect_slot_shape(bg_l, mask, 0, k=3)
                 # Диагноз 2026-09-20: edges возвращает левую ГРАНЬ лунки в фоне,
                 # а цель драга — левый край img куска. У куска слева прозрачная
                 # маржа silL (6-21px), поэтому img.left должен быть на silL
@@ -579,7 +585,10 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                     log.warning(f"solve silR failed, fallback silL: {e}")
                 sil_use = silR if silR is not None else silL
                 cands = _solve_cands(mask, edge_cands, diff_cands,
-                                     va_cands, sil_use)
+                                     va_cands, sil_use,
+                                     shape_cands=shape_cands)
+                _attempt("det", shape=[x for x, _ in shape_cands],
+                         diff_mode=diff_mode)
                 log.debug(f"solve cdn bg={bg_l.shape} piece={mask.shape} p_r={p_r} "
                           f"yrow={yrow} edges={[x for x, _ in edge_cands]} "
                           f"diff={[x for x, _ in diff_cands]} "

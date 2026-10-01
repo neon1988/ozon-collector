@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 
@@ -274,12 +276,62 @@ def test_detect_slot_diff_survives_moderate_brightness_shift(hole_x):
     assert abs(cands[0][0] - hole_x) <= 2
 
 
-def test_detect_slot_diff_reports_gate_reason():
-    """Режим отказа различает причину: med / ratio / isolation.
+def test_detect_slot_shape_uses_whole_band_not_guess_yrow():
+    """Профиль строится по ВСЕМУ фону, поэтому yrow не должен влиять на x.
 
-    Замер 2026-10-01 на 33 кадрах: медиана виновата 1 раз, ratio 8, основной
-    режек - изолированность (24). Именно изолированность чинить дальше.
+    Проверяем на реальном кадре корпуса, а не на синтетике: попытка сделать
+    синтетический «фото-фон» выглядела правдоподобно, но физику задачи не
+    воспроизводила (прямая грань +90 перебивала лунку +9, а в бою такого
+    нет). Замер на 15 боевых кадрах: top-1 13/15 = 87% против 20-27% у
+    колоночных детекторов.
     """
+    import glob
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    corpus = os.path.join(os.path.dirname(here), ".tmp", "corpus")
+    hits = tot = 0
+    for jp in sorted(glob.glob(os.path.join(corpus, "*.json"))):
+        with open(jp, encoding="utf-8") as f:
+            rec = json.load(f)
+        bx = rec.get("bx_true")
+        if bx is None:
+            continue
+        base = jp[:-5]
+        try:
+            bg = np.load(base + "_bg.npy").astype(float)
+            mask = np.load(base + "_mask.npy")
+        except Exception:
+            continue
+        tot += 1
+        for y in (0, rec.get("yrow") or 0):
+            c = puzzle._detect_slot_shape(bg, mask, y, k=1)
+            if c and abs(c[0][0] - int(bx)) <= 6:
+                hits += 1
+                break
+    if tot == 0:
+        pytest.skip("корпус не собран")
+    assert hits / tot >= 0.8, f"shape-детектор дал {hits}/{tot}, ждали >=80%"
+
+
+def test_shape_cands_take_precedence_in_solve_cands():
+    """Кандидат по форме возглавляет порядок, маржа к нему не применяется."""
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[8:32, 8:32] = True
+    shape = [(200, 1.0)]
+    edges = [(215, 9.0)]        # после -silL дало бы 215-10=205
+    cands = puzzle._solve_cands(mask, edges, [], [], 10, shape_cands=shape)
+    assert cands[0][0] == 200, "shape-кандидат должен быть первым и без маржи"
+
+
+def test_solve_cands_without_shape_keeps_legacy_order():
+    """Без shape-кандидатов поведение прежнее (регресс-страховка)."""
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[8:32, 8:32] = True
+    cands = puzzle._solve_cands(mask, [(215, 9.0)], [], [], 10)
+    assert cands and cands[0][0] != 200
+
+
+def test_detect_slot_diff_reports_gate_reason():
     mask = _HoleMask().nl
     cdn = np.full((200, 400), 128.0, dtype=np.float32)
     rng = np.random.default_rng(3)
