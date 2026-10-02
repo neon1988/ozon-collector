@@ -111,17 +111,18 @@ def test_run_canary_hits_resolved_url():
 def test_run_canary_challenge_on_product():
     from ozon_collector import browser as B
     sess = _FakeSess(raise_=B.AccessChallengeError("challenge"))
-    with patch.object(S, "_ip_blocked", lambda s: None):
+    with patch.object(S, "_origin_denied", lambda s: None):
         assert S.run_canary(sess, "https://www.ozon.ru/product/p-1/") \
             == S.CANARY_CHALLENGE
 
 
-def test_run_canary_ip_blocked():
+def test_run_canary_origin_denied():
+    """Отказ origin (403) — отдельный статус canary, НЕ «бан IP»."""
     from ozon_collector import browser as B
-    sess = _FakeSess(raise_=B.AccessChallengeError("blocked"))
-    with patch.object(S, "_ip_blocked", lambda s: 403):
+    sess = _FakeSess(raise_=B.AccessChallengeError("denied"))
+    with patch.object(S, "_origin_denied", lambda s: 403):
         assert S.run_canary(sess, "https://www.ozon.ru/category/1/") \
-            == S.CANARY_IP_BLOCKED
+            == S.CANARY_ORIGIN_DENY
 
 
 class TestWorkerTaskCanary:
@@ -218,17 +219,17 @@ class TestCampaignFallbackPriority:
 
 
 class TestKpiCanaryAndPerWorker:
-    def _payload(self, challenges, canary_fails=0, ip_blocks=0):
+    def _payload(self, challenges, canary_fails=0, origin_denied=0):
         return {"recovery_metrics": {
             "access_stats": {"challenges": challenges},
-            "canary_fails": canary_fails, "ip_blocks": ip_blocks,
+            "canary_fails": canary_fails, "origin_denied": origin_denied,
             "recycles": 0, "new_tab_attempts": 0}}
 
-    def test_kpi_sums_canary_fails_and_ip_blocks(self):
+    def test_kpi_sums_canary_fails_and_origin_denied(self):
         kpi = P._kpi_summary([self._payload(1, 2, 1), self._payload(3)],
                              attempted=10)
         assert kpi["canary_fails"] == 2
-        assert kpi["ip_blocks"] == 1
+        assert kpi["origin_denied"] == 1
         assert kpi["total_challenges"] == 4
         assert kpi["challenge_rate_per_100"] == 40.0
 

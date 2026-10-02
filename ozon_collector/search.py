@@ -256,7 +256,10 @@ SESSION_BUDGET_DEFAULT = {
 CANARY_OK = "ok"
 CANARY_CHALLENGE = "challenge"
 CANARY_ERROR = "error"
-CANARY_IP_BLOCKED = "ip_blocked"
+# Отказ origin (403/429/503), а не «бан IP»: адрес обслуживает Ozon нормально
+# из другого браузера, отклонена сессия. Отдельный статус нужен, чтобы видеть
+# в телеметрии, чем именно был отказ, а не путать его с обычным challenge.
+CANARY_ORIGIN_DENY = "origin_denied"
 
 # ГЛАВНАЯ как canary-цель —Fallback, а не лучший выбор (ревизия 2.8).
 # Главная мягче по лимитам, чем карточка/категория: CANARY_OK на главной не
@@ -317,22 +320,25 @@ def resolve_canary_url(preferred: Optional[str] = None,
             return u, classify_canary_url(u)
     return CANARY_URL_HOME, CANARY_KIND_HOME
 
-# Жёсткий сетевой бан/троттлинг отдаётся статусом, а не капчей: капча приходит
-# со 200 и JS-виджетом, её снимает новая вкладка/recycle. 403/429/503 на origin
-# лестницей НЕ лечится — та же репутация IP на новой вкладке и после recycle,
-# поэтому тратить на него reload×3 + new_tab + recycle (~15-20 мин) бессмысленно.
-IP_BLOCK_STATUSES = (403, 429, 503)
+# Статусы отказа origin (403/429/503). Это НЕ бан адреса: Ozon отдаёт их
+# сессии, которую он не считает доверенной, и то же самое адрес обслуживает
+# нормально из другого браузера. Живой замер 2026-10-02 (лог демона
+# prezervativy): 16:03:11 тот же адрес отдал NORMAL_DONE (discovered 336,
+# valid 10), а 16:13-17:24 — 21 ответ 403 подряд с ярлыком «сетевой бан IP».
+# Признавать это баном было неверно вдвойне: диагноз лгал в логах, и
+# fast-fail с abort run выбрасывал остаток товаров без единой попытки
+# new_tab/recycle — а именно смена сессии отказ снимает.
+ORIGIN_DENY_STATUSES = (403, 429, 503)
 
 # HEAD и GET к origin — РАЗНЫЕ ответы, и это не деталь реализации. Замер
-# 2026-09-26 (scripts/probe_head.py, обычный Chrome, живой ozon.ru):
+# 2026-09-26 (scripts/probe_head_status.py, обычный Chrome, живой ozon.ru):
 #   HEAD /            -> 405 Method Not Allowed   (и 403, когда WAF уже в challenge)
 #   GET  /            -> 200, 475 КБ страницы
 #   GET  / (challenge)-> 200, title «Похоже, нет соединения»
 # То есть 403 на HEAD НЕ доказывает бан IP: это ответ WAF на метод, а не на
-# репутацию адреса. Признавая его баном, мы превращали каждый challenge в
-# «сетевой бан IP → SESSION_BLOCKED → abort run» и выбрасывали оставшиеся
-# товары без попытки recycle. Поэтому блок статуса подтверждается GET'ом:
-# бан засчитывается, только если оба метода отвечают блок-статусом.
+# репутацию адреса. Отказ origin поэтому подтверждается GET'ом — но даже
+# согласованные 403/429/503 значат лишь «сессия отклонена», а не «адрес в бане»,
+# поэтому отказ НЕ является основанием пропустить лестницу восстановления.
 BLOCK_PROBE_JS = """async () => {
   try {
     const url = location.origin + '/';
@@ -347,12 +353,12 @@ BLOCK_PROBE_JS = """async () => {
 
 
 def _network_block_status(sess) -> int | None:
-    """HTTP-статус origin из контекста страницы; None = неизвестно/не блок.
+    """HTTP-статус origin из контекста страницы; None = неизвестно/отказа нет.
 
     HEAD-запрос из уже открытой вкладки (без навигации, с куками сессии) дёшев
-    и не палится как отдельный переход, но ОДИН HEAD не доказывает бан IP —
-    см. BLOCK_PROBE_JS. Если HEAD ответил блок-статусом, подтверждаем GET'ом
-    (Range, чтобы не тянуть мегабайты): расхождение HEAD/GET = не бан.
+    и не палится как отдельный переход, но ОДИН HEAD не доказывает отказ —
+    см. BLOCK_PROBE_JS. Если HEAD ответил отказ-статусом, подтверждаем GET'ом
+    (Range, чтобы не тянуть мегабайты): расхождение HEAD/GET = отказа нет.
     Любая ошибка → None, т.е. поведение остаётся прежним — мы экономим время
     только там, где уверены, и не теряем товары там, где не уверены.
     """
@@ -362,7 +368,7 @@ def _network_block_status(sess) -> int | None:
     try:
         st = page.evaluate(BLOCK_PROBE_JS)
     except Exception as e:
-        log.debug(f"ip-block probe failed: {type(e).__name__}: {e}")
+        log.debug(f"origin-deny probe failed: {type(e).__name__}: {e}")
         return None
     if not isinstance(st, dict):
         return None
@@ -371,23 +377,27 @@ def _network_block_status(sess) -> int | None:
         got = int(st.get("get"))
     except (TypeError, ValueError):
         return None
-    if head not in IP_BLOCK_STATUSES:
+    if head not in ORIGIN_DENY_STATUSES:
         return head
-    if got in IP_BLOCK_STATUSES:
+    if got in ORIGIN_DENY_STATUSES:
         return head
-    log.info(f"HEAD {head} не подтверждён GET {got} — бан IP не засчитан, "
+    log.info(f"HEAD {head} не подтверждён GET {got} — отказ origin не засчитан, "
              f"лестница recovery продолжается")
     return None
 
 
-def _ip_blocked(sess) -> int | None:
-    """Статус жёсткого бана IP или None (см. _network_block_status)."""
+def _origin_denied(sess) -> int | None:
+    """Статус отказа origin (403/429/503) или None (см. _network_block_status).
+
+    Название намеренно не про IP: сессионный отказ Ozon невозможно отличить от
+    бана адреса по ответам origin, и ложный «бан IP» стоил нам и времени, и
+    доверия к логу (ADR: лестница восстановления обязана отрабатывать)."""
     st = _network_block_status(sess)
-    return st if st in IP_BLOCK_STATUSES else None
+    return st if st in ORIGIN_DENY_STATUSES else None
 
 
 def run_canary(sess, url: Optional[str] = None) -> str:
-    """Canary-проба сессии: ok / challenge / error / ip_blocked.
+    """Canary-проба сессии: ok / challenge / error / origin_denied.
 
     url=None → resolve_canary_url(): явный canary > OZON_CANARY_URL > главная.
     Вызывающий передаёт сюда УЖЕ разрешённую цель (recovery["canary_url"]),
@@ -397,8 +407,9 @@ def run_canary(sess, url: Optional[str] = None) -> str:
     Никогда не пишет raw и не трогает PID/recycle-бюджеты (ADR §14.5):
     canary-fail — системный сбой сессии, отдельный счётчик canary_fails.
 
-    ip_blocked отделён от challenge: бан IP не снимается ни вкладкой, ни
-    recycle — вызывающий видит разные причины остановки в логах/телеметрии.
+    origin_denied отделён от challenge: отказ origin (403/429/503) — это ответ
+    WAF на конкретный запрос из отклонённой сессии, а не бан адреса; вызывающий
+    видит разные причины остановки в логах/телеметрии.
     """
     target, kind = resolve_canary_url(url)
     try:
@@ -408,11 +419,11 @@ def run_canary(sess, url: Optional[str] = None) -> str:
             C.check_challenge(page, "canary")
         return CANARY_OK
     except B.AccessChallengeError:
-        res = CANARY_IP_BLOCKED if _ip_blocked(sess) else CANARY_CHALLENGE
+        res = CANARY_ORIGIN_DENY if _origin_denied(sess) else CANARY_CHALLENGE
         log.warning(f"canary({kind}) {res}: {target}")
         return res
     except Exception as e:
-        res = CANARY_IP_BLOCKED if _ip_blocked(sess) else CANARY_ERROR
+        res = CANARY_ORIGIN_DENY if _origin_denied(sess) else CANARY_ERROR
         log.warning(f"canary({kind}) {res}: {target} — "
                     f"{type(e).__name__}: {e}")
         return res
@@ -773,11 +784,22 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
             if kind == "access_challenge":
                 astats["challenges"] = astats.get("challenges", 0) + 1
 
-            # ---- FSM «один challenge-инцидент» (ADR §14.2) ----
-            # access_challenge → [ip_blocked? → сразу стоп] → reload×3 (внутри
-            # check_challenge) → new_tab×1 → recycle×1 → SESSION_BLOCKED (abort
-            # run). Лестница НЕ крутится в цикле; после исчерпания нет скрытых
-            # повторов.
+            # ---- FSM «одим challenge-инцидент» (ADR §14.2) ----
+            # access_challenge → reload×3 (внутри check_challenge) → new_tab×1 →
+            # recycle×1 → SESSION_BLOCKED (abort run). Лестница НЕ крутится в
+            # цикле; после исчерпания нет скрытых повторов.
+            #
+            # Отказ origin (403/429/503) ЛЕСТНИЦЕЙ НЕ ПРЫГАЕТ. Прежде здесь был
+            # fast-fail с ярлыком «сетевой бан IP → abort run без лестницы», и он
+            # был неверен вдвойне (живой замер 2026-10-02, лог prezervativy):
+            #   16:03:11 тот же адрес отдал NORMAL_DONE (discovered 336, valid 10),
+            #   16:13-17:24 — 21 «сетевой бан IP» и 4 CHALLENGE_STORM подряд,
+            # причём ответ 403 давали все 8 воркеров одновременно, то есть отказ
+            # был СЕССИОННЫЙ, а не адресный: пользователь в это время спокойно
+            # открывал Ozon в другом браузере и в инкогнито. Бан адреса не может
+            # выглядеть так, а значит fast-fail терял товары на ровном месте:
+            # abort run без new_tab/recycle выбрасывал остаток очереди, хотя
+            # смена сессии — единственное, что отказ снимает.
             if kind == "access_challenge":
                 # session budget: инцидент challenge тратит бюджет сессии
                 used["challenge"] = used.get("challenge", 0) + 1
@@ -793,25 +815,17 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
                     recovery.setdefault("session_exhausted", 0)
                     recovery["session_exhausted"] += 1
                     break
-                # Быстрый выход при сетевом бане IP: 403/429/503 на origin не
-                # проходит ни новая вкладка, ни recycle (та же репутация), а
-                # лестница стоит reload×3 + new_tab + recycle. Проверяем ДО
-                # траты recovery-бюджета — один HEAD из текущей вкладки.
-                ip_status = _ip_blocked(sess) if sess is not None else None
-                if ip_status is not None:
-                    res["error_kind"] = "ip_blocked"
-                    res["failure_type"] = "session_failure"
-                    res["error"] = (f"ip blocked (http {ip_status}): бан не "
-                                    f"лечится вкладкой/recycle")
-                    res["recyclable"] = False
-                    session_blocked = True
-                    recovery["ip_blocks"] = recovery.get("ip_blocks", 0) + 1
-                    recovery.setdefault("session_blocked", 0)
-                    recovery["session_blocked"] += 1
-                    log.error(f"{tag}: сетевой бан IP (http {ip_status}) → "
-                              f"SESSION_BLOCKED без лестницы (abort run)",
-                              extra={"pid": pid})
-                    break
+                # Отказ origin фиксируем как факт (для телеметрии и разбора), но
+                # НЕ как причину остановки: ниже отрабатывает обычная лестница.
+                deny_status = _origin_denied(sess) if sess is not None else None
+                if deny_status is not None:
+                    res["origin_denied"] = deny_status
+                    recovery["origin_denied"] = recovery.get("origin_denied", 0) + 1
+                    log.warning(f"{tag}: origin отклонил запрос (http "
+                                f"{deny_status}) — бан адреса не подтверждён "
+                                f"(тот же адрес обслуживается другими "
+                                f"сессиями), отрабатываю лестницу recovery",
+                                extra={"pid": pid})
                 if incident_new_tab > 0:
                     used["new_tab"] = used.get("new_tab", 0) + 1
                     if budget.get("new_tab") and \
@@ -1002,24 +1016,26 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
             # SOFT/HARD-метка блокировки (ревизия 2.9, ADR §14.6): демон по
             # ней решает эскалацию. soft = SESSION_EXHAUSTED (сессия «устала»
             # от серии проверок, бюджет исчерпан) → короткая пауза, без
-            # profile_cooldown и роста storm_streak. hard = SESSION_BLOCKED /
-            # ip_blocked / challenge не снят после лестницы → полный карантин.
+            # profile_cooldown и роста storm_streak. hard = SESSION_BLOCKED
+            # (в т.ч. отказ origin, не снятый лестницей) → полный карантин.
             kind0 = res.get("error_kind")
             block_kind = "hard" if abort_kind_of(kind0) == "session_blocked" \
                 else "soft"
             recovery["block_kind"] = block_kind
             recovery["block_kind_reason"] = kind0
-            # SESSION_BLOCKED / SESSION_EXHAUSTED / IP_BLOCKED → abort run:
-            # остаток aborted (session_failure), НЕ штрафуем PID (rescan не
-            # делаем). error_kind остатка всегда из известного набора демона,
-            # чтобы cooldown-логика не разъехалась; точная причина — в
-            # res["error"].
+            # SESSION_BLOCKED / SESSION_EXHAUSTED → abort run: остаток aborted
+            # (session_failure), НЕ штрафуем PID (rescan не делаем). error_kind
+            # остатка всегда из известного набора демона, чтобы cooldown-логика
+            # не разъехалась; точная причина — в res["error"].
             kind0 = res.get("error_kind")
             abort_kind = abort_kind_of(kind0)
-            if kind0 == "ip_blocked":
-                abort_msg = f"aborted: {res.get('error') or 'ip blocked'}"
-            elif abort_kind == "session_blocked":
-                abort_msg = "aborted: session blocked (cooldown)"
+            if abort_kind == "session_blocked":
+                deny = res.get("origin_denied")
+                if deny:
+                    abort_msg = (f"aborted: origin отклонил сессию (http {deny}), "
+                                 f"лестница не помогла")
+                else:
+                    abort_msg = "aborted: session blocked (cooldown)"
             else:
                 abort_msg = "aborted: session budget exhausted"
             for _m, (_i2, pid2, _u2) in enumerate(items[n:], n + 1):
@@ -1073,16 +1089,16 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
             if canary != CANARY_OK:
                 canary_fails = recovery.setdefault("canary_fails", 0) + 1
                 recovery["canary_fails"] = canary_fails
-                if canary == CANARY_IP_BLOCKED:
-                    recovery["ip_blocks"] = recovery.get("ip_blocks", 0) + 1
+                if canary == CANARY_ORIGIN_DENY:
+                    recovery["origin_denied"] = recovery.get("origin_denied", 0) + 1
                 log.error(f"{tag}: canary={canary} на {canary_kind} "
                           f"({canary_target}) после recovery → "
                           f"SESSION_BLOCKED (abort run)", extra={"pid": pid})
                 # Текущий товар УЖЕ собран валидно (acceptance-gate пройден) —
                 # НЕ перезаписываем его (ADR §14.1: session_failure не штрафует
                 # PID). Останавливаем только ДАЛЬНЕЙШИЙ сбор.
-                canary_msg = ("aborted: ip blocked (cooldown)"
-                              if canary == CANARY_IP_BLOCKED
+                canary_msg = ("aborted: origin отклонил сессию (cooldown)"
+                              if canary == CANARY_ORIGIN_DENY
                               else "aborted: canary challenge (cooldown)")
                 for _m, (_i2, pid2, _u2) in enumerate(items[n:], n + 1):
                     products.append({

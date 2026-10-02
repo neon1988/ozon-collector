@@ -306,8 +306,10 @@ def _drag_to(page, target_vx: float, info, bx, score,
     for _try in range(3):
         if deadline and time.monotonic() > deadline:
             return False
+        _t0_read = time.monotonic()
         r0 = _read_sl_piece(page)
-        log.debug(f"drag try={_try} gx={gx:.1f} gy={gy:.1f} r0={r0}")
+        log.debug(f"drag try={_try} gx={gx:.1f} gy={gy:.1f} r0={r0} "
+                  f"t_read={time.monotonic() - _t0_read:.2f}s")
         if not r0 or r0.get("px") is None:
             # Кусок мог исчезнуть на пересборке капчи после неудачного дропа:
             # img#puzzle грузится заново через 0.3-2s. Поллинг; если не
@@ -342,11 +344,17 @@ def _drag_to(page, target_vx: float, info, bx, score,
         r1 = r0
         if calib > 0.0:
             # калибровочный сдвиг человеческой траекторией
+            _t_probe = time.monotonic()
             _human_move(page, _human_path(gx + rng_x, gy, gx + calib + rng_x, gy,
                                           n=16, arc=3.0))
             time.sleep(random.uniform(0.1, 0.22))
+            _t_probe = time.monotonic() - _t_probe
+            _t_r1 = time.monotonic()
             r1 = _read_sl_piece(page)
+            _t_r1 = time.monotonic() - _t_r1
             k = _k_from_probe(r0, r1, calib, grip_mode)
+            log.debug(f"drag calib timing: t_probe={_t_probe:.2f}s "
+                      f"t_r1={_t_r1:.2f}s")
         else:
             # зона для зонда нет (цель вплотную): k неизвестен → берём
             # консервативную 1.0 (недооценка скорее, чем перелёт) и отдаём
@@ -420,14 +428,17 @@ def _drag_to(page, target_vx: float, info, bx, score,
             iters = _i + 1
             if deadline and time.monotonic() > deadline:
                 return False
+            _t_read = time.monotonic()
             rr = _read_sl_piece(page)
+            _t_read = time.monotonic() - _t_read
             if not rr or rr.get("px") is None:
                 log.debug(f"drag i={_i} piece gone")
                 settled = True
                 break
             last = rr
             err = (rr.get("px") or 0) - target_vx
-            log.debug(f"drag i={_i} px={rr.get('px')} s={rr.get('s')} err={err:+.2f}")
+            log.debug(f"drag i={_i} px={rr.get('px')} s={rr.get('s')} "
+                      f"err={err:+.2f} t_read={_t_read:.2f}s")
             if abs(err) <= ACC:
                 settled = True
                 break
@@ -436,8 +447,16 @@ def _drag_to(page, target_vx: float, info, bx, score,
             _dest = max(track[0] + 1, min(max_hx, cur + step_px))
             if abs(_dest - cur) < 0.3:
                 _dest = cur  # больше не двигаем — мертвая зона
+            _t_move = time.monotonic()
             _human_move(page, _human_path(cur, gy, _dest, gy,
                                           n=10, arc=1.2))
+            # ТАЙМИНГ (2026-10-02): живой лог показал 11 с между соседними
+            # шагами при норме 0.4 с, то есть CDP-вызовы висят в 25 раз
+            # дольше. Разделение read/move отвечает на вопрос, что именно
+            # тормозит, а по догадке править нельзя.
+            _t_move = time.monotonic() - _t_move
+            log.debug(f"drag i={_i} t_move={_t_move:.2f}s "
+                      f"t_step={_t_read + _t_move:.2f}s")
             time.sleep(random.uniform(0.1, 0.24))
             cur = _dest
         log.debug(f"drag settle={settled} cur={cur:.1f}")

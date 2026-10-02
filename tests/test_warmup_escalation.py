@@ -166,7 +166,7 @@ def test_warmup_no_page(monkeypatch):
 
 def test_abort_kind_of():
     assert S.abort_kind_of("session_exhausted") == "session_exhausted"
-    for kind in ("session_blocked", "ip_blocked", "access_challenge", None):
+    for kind in ("session_blocked", "origin_denied", "access_challenge", None):
         assert S.abort_kind_of(kind) == "session_blocked"
 
 

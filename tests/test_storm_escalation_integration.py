@@ -135,7 +135,7 @@ def test_clean_worker_block_kind_does_not_poison_soft_storm():
 def test_storm_reason_ignores_non_storming_worker_reasons():
     r = _decide([
         _worker({"streak": 1, "pid": "1"}, "soft", "session_exhausted"),
-        _worker(None, "hard", "ip_blocked"),
+        _worker(None, "hard", "origin_denied"),
     ], 2)
     assert r["summary"]["block_reasons"] == ["session_exhausted"]
 
@@ -163,8 +163,9 @@ def test_single_run_path_terminal_block_marks_kind():
         assert k._storm_escalates(aborted, 1) == (True, expected == "hard")
 
 
-def test_ip_block_is_hard():
-    aborted = {"reason": "ip_blocked", "block_kind": "hard"}
+def test_origin_deny_is_hard():
+    """Отказ origin, не снятый лестницей, = жёсткий блок сессии."""
+    aborted = {"reason": "origin_denied", "block_kind": "hard"}
     assert k._storm_block_kind(aborted) == "hard"
     assert k._storm_escalates(aborted, 1)[1] is True
 

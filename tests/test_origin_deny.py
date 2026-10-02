@@ -1,13 +1,18 @@
-"""Быстрый выход при сетевом бане IP (critique #3).
+"""Отказ origin (403/429/503) — это отказ СЕССИИ, а не бан адреса.
 
-Капча приходит со статусом 200 и снимается новой вкладкой/recycle. Жёсткий
-бан (403/429/503) лестницей НЕ лечится — раньше воркер тратил на него
-reload×3 + new_tab + recycle (~15-20 мин) и всё равно уходил в SESSION_BLOCKED.
-Теперь HEAD из текущей вкладки отличает эти случаи до траты бюджета.
+История файла: до 2026-10-02 он назывался test_ip_fastfail и закреплял
+fast-fail «сетевой бан IP → abort run без лестницы». Живой замер опроверг
+этот диагноз (лог демона prezervativy, 2026-10-02):
+    16:03:11  тот же адрес → NORMAL_DONE (discovered 336, valid 10)
+    16:13-17:24  21 отказ 403 подряд у всех 8 воркеров сразу
+Пользователь в это время спокойно открывал Ozon в другом браузере и в
+инкогнито. Бан адреса так не выглядит — значит отказ сессионный, и смена
+сессии (new_tab/recycle) его снимает. Поэтому отказ origin больше НЕ
+пропускает лестницу восстановления, а товары не теряются молча.
 
-Уточнение 2026-09-26 (замер scripts/probe_head.py на живом ozon.ru): HEAD и GET
-отвечают по-разному (HEAD → 405/403, GET → 200), то есть 403 на HEAD не доказывает
-бан IP. Поэтому блок-статус подтверждается GET'ом — см. BLOCK_PROBE_JS.
+Ранее подтверждённый факт сохранён: HEAD и GET отвечают по-разному
+(HEAD → 405/403, GET → 200), поэтому статус отказа подтверждается GET'ом —
+см. BLOCK_PROBE_JS.
 """
 
 from ozon_collector import browser as B
@@ -92,13 +97,13 @@ def _links(n=2):
 
 def test_network_block_status_reads_head():
     assert S._network_block_status(_Sess([], status=403)) == 403
-    assert S._ip_blocked(_Sess([], status=429)) == 429
-    assert S._ip_blocked(_Sess([], status=503)) == 503
+    assert S._origin_denied(_Sess([], status=429)) == 429
+    assert S._origin_denied(_Sess([], status=503)) == 503
 
 
-def test_captcha_status_200_is_not_ip_block():
-    """Капча = 200: баном не считаем, лестница сохраняется."""
-    assert S._ip_blocked(_Sess([], status=200)) is None
+def test_captcha_status_200_is_not_origin_deny():
+    """Капча = 200: отказом origin не считаем, лестница сохраняется."""
+    assert S._origin_denied(_Sess([], status=200)) is None
 
 
 def test_network_block_status_unknown_on_error():
@@ -114,25 +119,24 @@ def test_network_block_status_none_without_page():
 
 # ---- ложный бан: HEAD блок, но GET жив (2026-09-26) ------------------------
 
-def test_head_403_with_live_get_is_not_ip_block():
-    """ГЛАВНЫЙ баг: 403 на HEAD при живом GET — не бан IP.
+def test_head_403_with_live_get_is_not_origin_deny():
+    """403 на HEAD при живом GET — не отказ origin.
 
-    Ozon отвечает на HEAD 405/403 (WAF на метод), а GET отдаёт 200. Старый код
-    принимал 403 за бан и делал abort run, выбрасывая остаток без recycle.
+    Ozon отвечает на HEAD 405/403 (WAF на метод), а GET отдаёт 200.
     """
-    assert S._ip_blocked(_Sess([], status=403, get_status=200)) is None
+    assert S._origin_denied(_Sess([], status=403, get_status=200)) is None
     assert S._network_block_status(_Sess([], status=403, get_status=200)) is None
 
 
-def test_head_405_is_not_ip_block():
-    """Реальный ответ ozon.ru на HEAD — 405, баном не считаем."""
-    assert S._ip_blocked(_Sess([], status=405, get_status=200)) is None
+def test_head_405_is_not_origin_deny():
+    """Реальный ответ ozon.ru на HEAD — 405, отказом не считаем."""
+    assert S._origin_denied(_Sess([], status=405, get_status=200)) is None
 
 
-def test_real_ip_block_confirmed_by_both_methods():
-    """Настоящий бан: оба метода отвечают блок-статусом → fast-fail работает."""
-    for st in S.IP_BLOCK_STATUSES:
-        assert S._ip_blocked(_Sess([], status=st, get_status=st)) == st
+def test_origin_deny_confirmed_by_both_methods():
+    """Отказ подтверждён обоими методами → фиксируется как факт."""
+    for st in S.ORIGIN_DENY_STATUSES:
+        assert S._origin_denied(_Sess([], status=st, get_status=st)) == st
 
 
 def test_challenge_403_on_head_keeps_ladder(monkeypatch):
@@ -146,40 +150,67 @@ def test_challenge_403_on_head_keeps_ladder(monkeypatch):
                         lambda s, m, lid: recycled.append(lid))
     c = collect_search(sess, "https://www.ozon.ru/search/?text=u",
                        limit=1, gather_cfg={})
-    assert c["recovery"].get("ip_blocks") is None, "ложный засчитан как бан"
+    assert c["recovery"].get("origin_denied") is None, "ложный отказ засчитан"
     assert sess.new_pages == 1, "лестница не пропущена"
     assert len(recycled) == 1
-    # лестница исчерпана честно (не потому что ip_blocked), остаток aborted
+    # лестница исчерпана честно (не потому что отказ origin), остаток aborted
     assert c["products"][0]["error_kind"] == "session_blocked"
-    assert "ip blocked" not in c["products"][0]["error"]
-    assert "403" not in c["products"][0]["error"]
+    assert "origin" not in c["products"][0]["error"]
 
 
 # ---- лестница --------------------------------------------------------------
 
-def test_ip_block_skips_ladder(monkeypatch):
-    """403 на origin → сразу SESSION_BLOCKED: ни new_tab, ни recycle."""
+def test_origin_deny_runs_full_ladder(monkeypatch):
+    """ГЛАВНЫЙ баг 2026-10-02: 403 → отказ СЕССИИ, лестница обязана отработать.
+
+    Прежде код делал fast-fail «сетевой бан IP → abort run»: ни new_tab, ни
+    recycle, а весь остаток очереди aborted. Отказ при этом сессионный —
+    смена сессии его снимает, поэтому товары терялись на ровном месте.
+    """
     sess = _Sess(_links(2), status=403)
     recycled = []
     monkeypatch.setattr(S, "run_gather",
                         lambda cfg, sess=None: _challenge(cfg["pid"]))
+    monkeypatch.setattr(S, "run_canary", lambda s, url=None: "ok")
     monkeypatch.setattr(S, "_recycle_browser",
                         lambda s, m, lid: recycled.append(lid))
-    c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=2, gather_cfg={})
-    assert recycled == [], "recycle при бане IP не имеет смысла"
-    assert sess.new_pages == 0, "new_tab при бане IP не имеет смысла"
-    assert c["recovery"]["ip_blocks"] == 1
-    assert c["recovery"]["session_blocked"] == 1
-    assert c["products"][0]["error_kind"] == "ip_blocked"
-    assert "http 403" in c["products"][0]["error"]
-    # остаток aborted в Known-наборе демона, но с причиной в тексте
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u",
+                       limit=2, gather_cfg={})
+    # отказ зафиксирован как факт: проба честно срабатывает на каждом шаге
+    # лестницы (товар → new_tab → recycle), а не один раз на прогон
+    assert c["recovery"]["origin_denied"] == 3
+    # но лестница отработала полностью
+    assert sess.new_pages == 1, "new_tab пропущен при отказе origin"
+    assert len(recycled) == 1, "recycle пропущен при отказе origin"
+    # ложного abort run на первом товаре нет: session_blocked один, от лестницы
+    assert c["products"][0]["error_kind"] == "session_blocked"
+    # остаток aborted в known-наборе демона, причина — сессия, а не «IP»
     assert c["products"][1]["error_kind"] == "session_blocked"
-    assert "ip blocked" in c["products"][1]["error"]
+    assert "ip" not in c["products"][1]["error"].lower()
     assert c["aborted"]["reason"] == "session_blocked"
 
 
+def test_origin_deny_never_names_ip_ban(monkeypatch):
+    """Ни один текст при отказе origin не называет бан адреса.
+
+    Пользователь повторял это наблюдение много раз, и лог должен больше не
+    утверждать то, что неверно: адрес обслуживается другими сессиями.
+    """
+    sess = _Sess(_links(2), status=403)
+    monkeypatch.setattr(S, "run_gather",
+                        lambda cfg, sess=None: _challenge(cfg["pid"]))
+    monkeypatch.setattr(S, "run_canary", lambda s, url=None: "ok")
+    monkeypatch.setattr(S, "_recycle_browser", lambda s, m, lid: None)
+    c = collect_search(sess, "https://www.ozon.ru/search/?text=u",
+                       limit=2, gather_cfg={})
+    blob = " ".join([str(c.get("aborted") or "")] +
+                    [str(p.get("error") or "") for p in c["products"]])
+    assert "ip" not in blob.lower(), blob
+    assert "бан" not in blob.lower(), blob
+
+
 def test_status_200_keeps_challenge_ladder(monkeypatch):
-    """Капча (200) → лестница работает как раньше, ip_blocks не растёт."""
+    """Капча (200) → лестница работает как раньше, origin_denied не растёт."""
     sess = _Sess(_links(1), status=200)
     recycled = []
     monkeypatch.setattr(S, "run_gather",
@@ -188,7 +219,7 @@ def test_status_200_keeps_challenge_ladder(monkeypatch):
     monkeypatch.setattr(S, "_recycle_browser",
                         lambda s, m, lid: recycled.append(lid))
     c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1, gather_cfg={})
-    assert c["recovery"].get("ip_blocks") is None
+    assert c["recovery"].get("origin_denied") is None
     assert sess.new_pages == 1, "капча лечится новой вкладкой"
     assert len(recycled) == 1, "лестница не пропущена"
     assert c["products"][0]["error_kind"] == "session_blocked"
@@ -202,21 +233,21 @@ def test_probe_error_keeps_challenge_ladder(monkeypatch):
     monkeypatch.setattr(S, "run_canary", lambda s, url=None: "ok")
     monkeypatch.setattr(S, "_recycle_browser", lambda s, m, lid: None)
     c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1, gather_cfg={})
-    assert c["recovery"].get("ip_blocks") is None
+    assert c["recovery"].get("origin_denied") is None
     assert sess.new_pages == 1
 
 
 # ---- canary ----------------------------------------------------------------
 
-def test_canary_reports_ip_blocked(monkeypatch):
-    """Canary различает бан IP и капчу (для логов/cooldown демона)."""
+def test_canary_reports_origin_denied(monkeypatch):
+    """Canary различает отказ origin и капчу (для логов/cooldown демона)."""
     sess = _Sess([], status=429)
 
     def _boom(page, where):
         raise B.AccessChallengeError("title:похоже, нет соединения")
 
     monkeypatch.setattr(C, "check_challenge", _boom)
-    assert S.run_canary(sess) == S.CANARY_IP_BLOCKED
+    assert S.run_canary(sess) == S.CANARY_ORIGIN_DENY
 
 
 def test_canary_reports_challenge_when_200(monkeypatch):

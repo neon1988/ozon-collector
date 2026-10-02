@@ -193,7 +193,8 @@ def _storm_block_kind(aborted: dict) -> str:
     """soft | hard — вид блокировки прогона (ADR §14.6, ревизия 2.9).
 
     hard (по умолчанию, в т.ч. при нехватке данных): SESSION_BLOCKED,
-    ip_blocked, challenge не снят после лестницы, нерешённый пазл.
+    отказ origin (403/429/503) не снятый лестницей, challenge не снят после
+    лестницы, нерешённый пазл.
     soft: SESSION_EXHAUSTED — бюджет сессии исчерпан (усталость от серии
     проверок, а не доказанный бан). Разница в реакции: soft → короткая пауза
     БЕЗ profile_cooldown и БЕЗ роста storm_streak; hard → adaptive-карантин.

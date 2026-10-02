@@ -1,7 +1,8 @@
 """Probe: does ozon.ru answer HEAD with 403/405 while GET is fine?
 
-That is what `_network_block_status` (search.py) uses to declare an IP ban, and
-the mismatch is the reason a challenge used to be logged as «сетевой бан IP».
+That is what `_network_block_status` (search.py) uses to detect an origin
+deny, and the mismatch is the reason a challenge used to be logged as
+«сетевой бан IP».
 
 Замер 2026-09-26 на живом ozon.ru (обычный Chrome, свежий профиль):
     HEAD /  -> 405 Method Not Allowed
@@ -9,7 +10,14 @@ the mismatch is the reason a challenge used to be logged as «сетевой б�
                отдаётся со 200, а не 403)
 
 Вывод: 403/405 на HEAD — ответ WAF на метод, а не verdict о репутации адреса.
-`_network_block_status` поэтому подтверждает блок-статус GET'ом.
+`_network_block_status` поэтому подтверждает статус отказа GET'ом.
+
+Дальше (2026-10-02, живой лог демона) выяснилось и второе: даже согласованные
+403/429/503 не доказывают бан адреса. В 16:03 тот же адрес отдал NORMAL_DONE
+(discovered 336, valid 10), в 16:13-17:24 все 8 воркеров получили 403 подряд
+при том, что Ozon из другого браузера открывался нормально. Значит 403 — это
+отказ сессии, а не адреса, и смена сессии (new_tab/recycle) его снимает.
+Поэтому отказ origin больше НЕ является основанием пропустить лестницу.
 
 Запуск: `python scripts/probe_head_status.py`
 ВНИМАНИЕ: поднимает временный Chrome на порту 9233 с профилем в

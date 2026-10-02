@@ -918,9 +918,10 @@ def _storm_summary(wctxs, payloads, parallel: int) -> dict | None:
     if not storms:
         return None
     # soft/hard (ревизия 2.9): SESSION_EXHAUSTED = сессия устала от серии
-    # проверок (soft, короткая пауза), SESSION_BLOCKED/ip_blocked = жёсткая
-    # блокировка (hard, полный cooldown). Если воркеры разного типа — шторм
-    # считаем hard (жалко ошибаться в сторону «мягко»).
+    # проверок (soft, короткая пауза), SESSION_BLOCKED (в т.ч. отказ origin,
+    # не снятый лестницей) = жёсткая блокировка (hard, полный cooldown). Если
+    # воркеры разного типа — шторм считаем hard (жалко ошибаться в сторону
+    # «мягко»).
     #
     # ВАЖНО (ревизия 2.9): block_kind/block_kind_reason берём ТОЛЬКО из
     # штормивших воркеров. recovery.block_kind ставится любому воркеру, у
@@ -1775,12 +1776,13 @@ def _kpi_summary(payloads: list[dict], attempted: int) -> dict:
     """Агрегат health-телеметрии пула в combined.kpi (ADR §14.7).
 
     Суммирует по воркерам recovery_metrics: challenges, recoveries (recycle +
-    new_tab), session_blocked/exhausted, puzzle storms/attempts/solved, canary_fails
-    и ip_blocks; считает производные puzzle_solve_rate и challenge_rate_per_100
+    new_tab), session_blocked/exhausted, puzzle storms/attempts/solved,
+    canary_fails и origin_denied (отказ origin 403/429/503 — сессионный, не
+    бан адреса); считает производные puzzle_solve_rate и challenge_rate_per_100
     (challenge на 100 товаров).
     """
     ch = rec = blocked = exhausted = storms = p_att = p_fail = 0
-    canary_fails = ip_blocks = 0
+    canary_fails = origin_denied = 0
     for pl in payloads:
         rm = (pl or {}).get("recovery_metrics")
         if not isinstance(rm, dict):
@@ -1792,7 +1794,7 @@ def _kpi_summary(payloads: list[dict], attempted: int) -> dict:
         blocked += _kpi_int(rm.get("session_blocked"))
         exhausted += _kpi_int(rm.get("session_exhausted"))
         canary_fails += _kpi_int(rm.get("canary_fails"))
-        ip_blocks += _kpi_int(rm.get("ip_blocks"))
+        origin_denied += _kpi_int(rm.get("origin_denied"))
         if rm.get("challenge_storm"):
             storms += 1
         pz = rm.get("puzzle")
@@ -1806,7 +1808,7 @@ def _kpi_summary(payloads: list[dict], attempted: int) -> dict:
         "session_blocked": blocked,
         "session_exhausted": exhausted,
         "canary_fails": canary_fails,
-        "ip_blocks": ip_blocks,
+        "origin_denied": origin_denied,
         "puzzle_storms": storms,
         "puzzle_attempts": p_att,
         "puzzle_solved": p_solved,
