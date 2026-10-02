@@ -414,6 +414,24 @@ def _captcha_src_changed(page, info) -> bool:
         return True
 
 
+def _cand_attempt_fields(diag: dict) -> dict:
+    """Поля паспорта для JSONЛ-журнала попыток (машинночитаемый разбор).
+
+    Паспорт обязан попадать не только в текстовый лог: статистику заходов (сколько
+    времени заняло чтение позиции против ввода, чем закончил�� заход) иначе можно
+    получить только парсингом лога, а это ручной труд на каждый разбор.
+    Отдельная функция, чтобы набор полей было видно и покрывалось тестом: при
+    случайном удалении поля тест упадёт.
+    """
+    return {"t_read_s": diag.get("t_read_s"),
+            "t_move_s": diag.get("t_move_s"),
+            "t_drag_s": diag.get("t_total_s"),
+            "iters": diag.get("iters"),
+            "stop": diag.get("stop"),
+            "final_err": diag.get("final_err"),
+            "k": diag.get("k")}
+
+
 def _slot_ok(x: int, bg_w: int, piece_w: int) -> bool:
     """Может ли лунка начинаться в x? Чистая функция — ради юнит-тестов.
 
@@ -784,9 +802,13 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 # (|err|≤1px), успехом засчитаны 3 — 61 верное попадание
                 # выброшено, плюс 24s мёртвого ожидания URL на кандидата.
                 verdict = _await_verdict(page, _SOLVED_GRACE_S)
+                _d = _drag_diag()
+                # Паспорт захода идёт и в машиночитаемый JSONL (_attempt), иначе
+                # разбор требует парсинга текстового лога.
                 _attempt("cand", bx=x, score=score0, okc=bool(okc),
                          still=still, verdict=verdict, moved_px=_moved,
                          target_vx=round(target_vx, 1),
+                         **_cand_attempt_fields(_d),
                          **_page_state(page))
                 log.debug(f"solve drag okc={okc} still_challenge={still} "
                           f"verdict={verdict}")
@@ -795,7 +817,6 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 # выглядел как голое `verdict=no`, и разбор стоил часа: 11 с на
                 # шаг читалось как проблема детектора, хотя промах был 0.07 px.
                 _why = _verdict_reason(okc, still, verdict)
-                _d = _drag_diag()
                 _tail = (f"bx={x} score={score0:.3g} target={target_vx:.0f} "
                          f"err={_d.get('final_err')} k={_d.get('k')} "
                          f"moved={_d.get('moved_px')}/{_moved} "

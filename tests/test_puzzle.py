@@ -691,6 +691,33 @@ def test_slot_ok_handles_missing_piece_width():
     assert puzzle._slot_ok(513, 512, 0) is False
 
 
+def test_cand_attempt_fields_carry_whole_passport():
+    """Набор полей паспорта в JSONЛ-журнале попыток не должен таять.
+
+    Паспорт нужен для машинночитаемого разбора (охотник читает JSONL, а не
+    лог). Если поле потеряется молча, статистика заходов станет неполной, и мы
+    об этом не узнаем — поэтому набор зафиксирован тестом.
+    """
+    import json as _json
+    diag = {"t_read_s": 11.42, "t_move_s": 165.83, "t_total_s": 178.21,
+            "iters": 15, "stop": "acc_ok", "final_err": -0.07, "k": 1.7}
+    fields = puzzle._cand_attempt_fields(diag)
+    for key in ("t_read_s", "t_move_s", "t_drag_s", "iters", "stop",
+                "final_err", "k"):
+        assert key in fields, f"поле {key} потерялось в паспорте для JSONL"
+    assert fields["t_drag_s"] == 178.21, fields
+    assert fields["stop"] == "acc_ok", fields
+    # значения пригодны для json.dumps — иначе журнал молча перестанет писаться
+    _json.dumps(fields)
+
+
+def test_cand_attempt_fields_tolerate_empty_passport():
+    """Пустой паспорт (драга не было) не должен ронять запись в JSONL."""
+    fields = puzzle._cand_attempt_fields({})
+    assert fields["t_read_s"] is None, fields
+    assert fields["stop"] is None, fields
+
+
 def test_solve_puzzle_challenge_gone_stub(monkeypatch):
     """Челлендж исчез, а страница — «нет соединения» (stub-маркер в title/теле):
     on_event kind=empty reason=challenge_gone УЖЕ после ~3s, не 8s буфера."""
