@@ -3219,6 +3219,37 @@ def test_absorb_recovery_telemetry():
     assert tele["collector_tabs"] == 1
 
 
+def test_absorb_recovery_telemetry_keeps_origin_denied():
+    """origin_denied и canary_fails доезжают до progress.json.
+
+    Находка 2026-10-02: поля считались в combined.kpi, но не попадали в список
+    суммируемых ключей — метрика отказа origin (403/429/503) молча терялась на
+    финише. Именно она нужна, чтобы отличить «много отказов origin» от «много
+    капч»: это разные диагнозы с разными лекарствами.
+    """
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    combined = {"recovery": {"events": []},
+                "kpi": {"origin_denied": 4, "canary_fails": 2,
+                        "puzzle_attempts": 3, "puzzle_solved": 1}}
+    k._absorb_recovery_telemetry(p, combined)
+    acc = p["recovery_telemetry"]["kpi"]
+    assert acc["origin_denied"] == 4, acc
+    assert acc["canary_fails"] == 2, acc
+    assert acc["puzzle_solved"] == 1, acc
+    # кумулятивный solve-rate считается по измеренному успеху
+    assert acc["puzzle_solve_rate"] == round(1 / 3, 3), acc
+
+
+def test_absorb_recovery_telemetry_accumulates_origin_denied():
+    """Накопление между прогонами: отказы origin суммируются, а не перезатираются."""
+    p = k.default_manifest("c", 10, 1, "url", "out.md")
+    k._absorb_recovery_telemetry(
+        p, {"recovery": {"events": []}, "kpi": {"origin_denied": 3}})
+    k._absorb_recovery_telemetry(
+        p, {"recovery": {"events": []}, "kpi": {"origin_denied": 2}})
+    assert p["recovery_telemetry"]["kpi"]["origin_denied"] == 5
+
+
 def test_absorb_recovery_telemetry_no_events():
     """Без events/combined — recovery_telemetry не заполняется."""
     p = k.default_manifest("c", 10, 1, "url", "out.md")

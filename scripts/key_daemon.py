@@ -859,9 +859,15 @@ def _absorb_recovery_telemetry(progress: dict, combined: Optional[dict]) -> None
     kpi = combined.get("kpi")
     if kpi:
         acc = meta.setdefault("kpi", {})
+        # origin_denied и canary_fails добавлены в список 2026-10-02: без них
+        # метрика отказа origin (403/429/503) и число неотвечающих canary-проб
+        # вычислялись в combined.kpi и ТЕРЯЛИСЬ на финише — в progress.json
+        # попадали только challenges/recoveries/пазлы. Именно эти два числа
+        # нужны, чтобы отличить «много отказов origin» от «много капч».
         for k in ("total_challenges", "total_recoveries", "session_blocked",
                   "session_exhausted", "puzzle_storms",
-                  "puzzle_attempts", "puzzle_solved"):
+                  "puzzle_attempts", "puzzle_solved",
+                  "origin_denied", "canary_fails"):
             v = kpi.get(k)
             if v is not None:
                 acc[k] = (acc.get(k, 0) or 0) + int(v)
