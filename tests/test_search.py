@@ -975,6 +975,51 @@ def test_kpi_challenge_recovery_counts(monkeypatch):
     assert c["kpi"]["puzzle_solve_rate"] is None
 
 
+def test_puzzle_counter_guard_warns_on_impossible_state(monkeypatch):
+    """Неправдоподобные счётчики пазлов = баг счётчика, и мы об этом узнаём.
+
+    Раньше рассинхрон счётчиков проходил молча и портил puzzle_solve_rate в
+    отчёте (успех выводился формулой attempts - failures). Теперь search.py
+    проверяет НЕВОЗМОЖНЫЕ состояния (solved/failures > attempts) и пишет
+    предупреждение — иначе метрика «непонятно расходится» без следа.
+    """
+    lines = []
+    import ozon_collector.log as _log
+    monkeypatch.setattr(_log, "warning",
+                        lambda m, extra=None: lines.append(str(m)))
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+    # 2 успеха при 1 попытке — физически невозможно
+    monkeypatch.setattr("ozon_collector.puzzle.attempts", lambda: 1)
+    monkeypatch.setattr("ozon_collector.puzzle.failures", lambda: 0)
+    monkeypatch.setattr("ozon_collector.puzzle.solved", lambda: 2)
+    collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1,
+                   gather_cfg={})
+    assert any("СЧЁТЧИКИ пазлов невозможны" in m for m in lines), lines
+
+
+def test_puzzle_counter_guard_quiet_on_plausible_state(monkeypatch):
+    """Правдоподобные счётчики не должны шуметь предупреждениями."""
+    lines = []
+    import ozon_collector.log as _log
+    monkeypatch.setattr(_log, "warning",
+                        lambda m, extra=None: lines.append(str(m)))
+    links = [{"pid": "1", "url": "u1"}]
+    sess = _FakeSess(links)
+    monkeypatch.setattr("ozon_collector.search.run_gather",
+                        lambda cfg, sess=None: _ok_result(cfg["pid"]))
+    # юнит-тесты подставляют счётчики напрямую и НЕ обязаны их согласовывать:
+    # предупреждаем только на невозможных состояниях, иначе шум в каждом тесте
+    monkeypatch.setattr("ozon_collector.puzzle.attempts", lambda: 5)
+    monkeypatch.setattr("ozon_collector.puzzle.failures", lambda: 2)
+    monkeypatch.setattr("ozon_collector.puzzle.solved", lambda: 0)
+    collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1,
+                   gather_cfg={})
+    assert not any("СЧЁТЧИКИ пазлов невозможны" in m for m in lines), lines
+
+
 def test_kpi_puzzle_solve_rate(monkeypatch):
     """KPI отдаёт solve-rate пазла: попытки/решения (ADR §14.7)."""
     links = [{"pid": "1", "url": "u1"}]

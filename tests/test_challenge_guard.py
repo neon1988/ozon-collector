@@ -111,6 +111,28 @@ def test_check_challenge_raises_access_challenge():
         check_challenge(page, "product_page")
 
 
+def test_check_challenge_error_carries_puzzle_summary_and_no_ip_claim():
+    """Требование пользователя (2026-10-02): в отказе НЕ должно быть лжи.
+
+    Заглушка Ozon — это отказ СЕССИИ, а не бан по адресу: живой замер показал,
+    что в 16:03 тот же адрес отдал NORMAL_DONE (discovered 336, valid 10), а в
+    17:22 403 получили все 8 воркеров разом, при том что Ozon из другого
+    браузера открывался нормально. Ложный «бан IP» стоил нам 21 строки в логе за
+    прогон и выбрасывания товаров без попытки смены сессии.
+
+    Поэтому сообщение об отказе обязано: называть наблюдаемый факт, указывать
+    лечение (смена сессии) и НЕ утверждать бан по IP.
+    """
+    import ozon_collector.puzzle as puzzle_mod
+    page = _Page(title="Похоже, нет соединения")
+    with pytest.raises(B.AccessChallengeError) as ei:
+        check_challenge(page, "product_page")
+    msg = str(ei.value)
+    assert "не бан по IP" in msg, msg
+    assert "new_tab" in msg, "сообщение должно называть лечение (смену сессии)"
+    assert "пазлов:" in msg, f"в отказе нет сводки по пазлам: {msg}"
+
+
 def test_check_challenge_marks_page_invalid():
     """ADR §14.1: после детекта challenge страница помечается INVALID (K4)."""
     page = _Page(title="Похоже, нет соединения")
