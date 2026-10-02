@@ -29,6 +29,23 @@ from .puzzle_input import (_human_click, _human_drag, _human_move,
                            _human_path)
 from .puzzle_state import _attempt
 
+# Диагностика последнего захода драга (заполняется _drag_to, читает паспорт в
+# solve_puzzle). Зачем модульный хвост, а не возврат кортежа: контракт _drag_to
+# проверяется юнит-тестами как bool, и менять его ради телеметрии значило бы
+# трогать FSM, который мы сознательно не дробим (см. докстринг модуля).
+#
+# Содержимое подобрано под разбор инцидентов: сколько времени заняло чтение
+# позиции против ввода, сколько шагов дошло до допуска, что сработало раньше —
+# допуск, дедлайн или исчезновение куска. По живому логу 2026-10-02 видно, что
+# без этих чисел провал выглядел как «verdict=no» и разбор стоил часа: 11 с на
+# шаг читалось как проблема детектора, хотя промах был 0.07 px.
+_LAST_DRAG_DIAG: dict = {}
+
+
+def last_drag_diag() -> dict:
+    """Диагностика последнего захода _drag_to (пусто, если драга не было)."""
+    return dict(_LAST_DRAG_DIAG)
+
 # Калибровочный зонд (измерение k = фактический сдвиг куска / сдвиг мыши).
 # Раньше зонд был фиксированным +40px: когда лунка рядом с кусочком, зонд
 # уезжал ЗА цель (перешагивал слот), т.е. deliberate overshoot мимо слота —
@@ -245,6 +262,33 @@ def _drag_to(page, target_vx: float, info, bx, score,
     # недостижимым допуск 0.9px даже для идеального детектора.
     move_noise = random.uniform(-2.5, 2.5)
 
+    # Накопитель диагностики захода (см. _LAST_DRAG_DIAG в шапке модуля).
+    # Пишется по ходу и сбрасывается на каждом входе в _drag_to, чтобы паспорт
+    # в solve_puzzle описывал ИМЕННО последний заход, а не заход из прошлого
+    # кандидата. Держим и время чтения позиции, и время ввода по отдельности:
+    # по живому логу 2026-10-02 именно это отличает «evaluate встал» от
+    # «ввод встал», а без разделения провал выглядел как проблема детектора.
+    _t_drag = time.monotonic()
+    _diag = {"t_read_s": 0.0, "t_move_s": 0.0, "probe_reads": 0,
+             "iters": 0, "final_err": None, "settled": False,
+             "stop": None, "k": None, "moved_px": None, "grip": grip_mode,
+             "target_vx": round(target_vx, 1), "bx": bx,
+             "simple": bool(_SIMPLE_DRAG)}
+    _LAST_DRAG_DIAG.clear()
+    _LAST_DRAG_DIAG.update(_diag)
+
+    def _finish(**kw) -> bool:
+        """Закрыть заход: дописать факты в паспорт и отдать результат провала."""
+        _diag.update(kw)
+        _diag["t_total_s"] = round(time.monotonic() - _t_drag, 2)
+        for _n in ("t_read_s", "t_move_s"):
+            _diag[_n] = round(_diag[_n], 2)
+        _LAST_DRAG_DIAG.clear()
+        _LAST_DRAG_DIAG.update(_diag)
+        log.debug("drag diag: " + " ".join(f"{_k}={_v}"
+                                           for _k, _v in _diag.items()))
+        return False
+
     def _confirm_solved():
         # Пазл мог решиться, но страница медленно перестраивается: выдача
         # открывается после снятия челленджа, и DOM ещё секунды показывает
@@ -305,9 +349,11 @@ def _drag_to(page, target_vx: float, info, bx, score,
     last = {}
     for _try in range(3):
         if deadline and time.monotonic() > deadline:
-            return False
+            return _finish(stop="deadline_before_pick")
         _t0_read = time.monotonic()
         r0 = _read_sl_piece(page)
+        _diag["t_read_s"] += time.monotonic() - _t0_read
+        _diag["probe_reads"] += 1
         log.debug(f"drag try={_try} gx={gx:.1f} gy={gy:.1f} r0={r0} "
                   f"t_read={time.monotonic() - _t0_read:.2f}s")
         if not r0 or r0.get("px") is None:
@@ -352,7 +398,11 @@ def _drag_to(page, target_vx: float, info, bx, score,
             _t_r1 = time.monotonic()
             r1 = _read_sl_piece(page)
             _t_r1 = time.monotonic() - _t_r1
+            _diag["t_move_s"] += _t_probe
+            _diag["t_read_s"] += _t_r1
+            _diag["probe_reads"] += 1
             k = _k_from_probe(r0, r1, calib, grip_mode)
+            _diag["k"] = None if k is None else round(float(k), 3)
             log.debug(f"drag calib timing: t_probe={_t_probe:.2f}s "
                       f"t_r1={_t_r1:.2f}s")
         else:
@@ -371,6 +421,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
         if r1 and r1.get("px") is not None and r0.get("px") is not None:
             _moved = round(r1["px"] - r0["px"], 2)
         _LAST_MOVE[0] = _moved
+        _diag["moved_px"] = _moved
         log.debug(f"drag r1={r1} calib={calib} moved_px={_moved} k={k}")
         if k is None or not (0.4 <= k <= 3.0):
             page.mouse.up()
@@ -426,21 +477,29 @@ def _drag_to(page, target_vx: float, info, bx, score,
         iters = 0
         for _i in range(18):
             iters = _i + 1
+            _diag["iters"] = iters
             if deadline and time.monotonic() > deadline:
-                return False
+                return _finish(stop="deadline_micro",
+                               final_err=round(err, 2) if last.get("px")
+                               is not None else None)
             _t_read = time.monotonic()
             rr = _read_sl_piece(page)
             _t_read = time.monotonic() - _t_read
+            _diag["t_read_s"] += _t_read
+            _diag["probe_reads"] += 1
             if not rr or rr.get("px") is None:
                 log.debug(f"drag i={_i} piece gone")
                 settled = True
+                _diag["stop"] = "piece_gone"
                 break
             last = rr
             err = (rr.get("px") or 0) - target_vx
+            _diag["final_err"] = round(err, 2)
             log.debug(f"drag i={_i} px={rr.get('px')} s={rr.get('s')} "
                       f"err={err:+.2f} t_read={_t_read:.2f}s")
             if abs(err) <= ACC:
                 settled = True
+                _diag["stop"] = "acc_ok"
                 break
             step_px = -err / k if k else -err
             step_px = max(-12.0, min(12.0, step_px))
@@ -455,29 +514,40 @@ def _drag_to(page, target_vx: float, info, bx, score,
             # дольше. Разделение read/move отвечает на вопрос, что именно
             # тормозит, а по догадке править нельзя.
             _t_move = time.monotonic() - _t_move
+            _diag["t_move_s"] += _t_move
             log.debug(f"drag i={_i} t_move={_t_move:.2f}s "
                       f"t_step={_t_read + _t_move:.2f}s")
             time.sleep(random.uniform(0.1, 0.24))
             cur = _dest
+        else:
+            _diag["stop"] = _diag.get("stop") or "iters_exhausted"
+        _diag["settled"] = settled
         log.debug(f"drag settle={settled} cur={cur:.1f}")
         cur2 = cur
         if last.get("px") is not None:
             _e = (last.get("px") or 0) - target_vx
             for _n in range(random.randint(1, 3)):
                 if deadline and time.monotonic() > deadline:
-                    return False
+                    return _finish(stop="deadline_nudge",
+                                   final_err=round(_e, 2))
                 if abs(_e) <= 0.4:
                     break
                 _sd = (-_e / k) if k else (-_e if abs(_e) < 5 else -4.0)
                 _sd = max(-4.0, min(4.0, _sd))
                 _nc = max(track[0] + 1, min(max_hx, cur2 + _sd))
+                _t_move = time.monotonic()
                 _human_move(page, _human_path(cur2, gy, _nc, gy, n=6, arc=0.8))
+                _diag["t_move_s"] += time.monotonic() - _t_move
                 time.sleep(random.uniform(0.18, 0.45))
                 cur2 = _nc
+                _t_read = time.monotonic()
                 rr2 = _read_sl_piece(page)
+                _diag["t_read_s"] += time.monotonic() - _t_read
+                _diag["probe_reads"] += 1
                 if not rr2 or rr2.get("px") is None:
                     break
                 _e = (rr2.get("px") or 0) - target_vx
+                _diag["final_err"] = round(_e, 2)
                 last = rr2
                 settled = True
         time.sleep(random.uniform(0.25, 0.4))
@@ -485,12 +555,25 @@ def _drag_to(page, target_vx: float, info, bx, score,
         _err_last = None
         if last.get("px") is not None:
             _err_last = round((last.get("px") or 0) - target_vx, 1)
+        _diag["settled"] = settled
+        _diag["final_err"] = _err_last
+        _diag["solved"] = bool(_solved)
+        _diag["stop"] = _diag.get("stop") or ("settle_end" if _solved
+                                              else "dropped_not_solved")
         _attempt("drag", note="settle_end", bx=bx, score=score,
                  target_vx=round(target_vx, 1), k=k, calib=calib,
                  settled=settled,
                  solved=_solved, err=_err_last, cur=round(cur, 1),
                  iters=iters, px=last.get("px"), s=last.get("s"),
                  ps=last.get("ps"), ss=last.get("ss"), grip=grip_mode)
+        if _solved:
+            _diag["t_total_s"] = round(time.monotonic() - _t_drag, 2)
+            for _n in ("t_read_s", "t_move_s"):
+                _diag[_n] = round(_diag[_n], 2)
+            _LAST_DRAG_DIAG.clear()
+            _LAST_DRAG_DIAG.update(_diag)
+        else:
+            _finish()
         return _solved
     try:
         page.mouse.up()
@@ -498,7 +581,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
         pass
     _attempt("drag", note="grip_exhausted", bx=bx, score=score,
              target_vx=round(target_vx, 1))
-    return False
+    return _finish(stop="grip_exhausted")
 
 
 def _piece_grip_offset(page):

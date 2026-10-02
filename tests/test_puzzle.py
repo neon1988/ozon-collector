@@ -507,6 +507,77 @@ def test_solve_puzzle_counts_attempts(monkeypatch):
     assert puzzle.failures() == 2
 
 
+# ---- паспорт попытки и разбор причины (2026-10-02) ------------------------
+
+def _fill_diag(**kw):
+    from ozon_collector import puzzle_drag as pd
+    base = {"t_read_s": 0.0, "t_move_s": 0.0, "probe_reads": 0, "iters": 0,
+            "final_err": None, "settled": False, "stop": None, "k": None,
+            "moved_px": None, "grip": "slider", "target_vx": 791.0, "bx": 335,
+            "simple": False, "t_total_s": 0.0}
+    base.update(kw)
+    pd._LAST_DRAG_DIAG.clear()
+    pd._LAST_DRAG_DIAG.update(base)
+
+
+def test_verdict_reason_separates_miss_from_not_counted():
+    """ГЛАВНОЕ различие паспорта: промахнулись vs попали, но не засчиталось.
+
+    Живой замер 2026-10-02: провал с финальным err=-0.07px (кусок в лунке) давал
+    то же `verdict=no`, что и реальный промах. Это РАЗНЫЕ болезни: промах —
+    детектор/калибровка, попадание без засчёта — антибот или подмена заглушкой.
+    Если различие снова потеряется, разбор инцидента снова уйдёт в догадки.
+    """
+    _fill_diag(final_err=-0.07, moved_px=68.16, iters=15, settled=True)
+    not_counted = puzzle._verdict_reason(False, False, "no")
+    assert "позиция верна" in not_counted, not_counted
+    assert "не засчитал" in not_counted, not_counted
+
+    _fill_diag(final_err=-27.4, moved_px=68.16, iters=15, settled=False)
+    missed = puzzle._verdict_reason(False, False, "no")
+    assert "промах по позиции" in missed, missed
+    assert "позиция верна" not in missed, missed
+
+
+def test_verdict_reason_reports_no_move():
+    """Кусок не сдвинулся — это поломка захвата, а не промах: разные лекарства."""
+    _fill_diag(final_err=250.0, moved_px=0.0)
+    why = puzzle._verdict_reason(False, True, "no")
+    assert "НЕ ДВИНУЛСЯ" in why, why
+
+
+def test_verdict_reason_says_not_ip_ban_for_stub():
+    """Заглушка ≠ бан по IP: утверждение обязано быть в логе отказа-заглушки.
+
+    Только для ветки «капча исчезла» (это и есть заглушка/подмена). Если капча
+    осталась в DOM — провал другой (не засчитано), и упоминание бана было бы
+    ложным придиранием к формулировке.
+    """
+    _fill_diag(final_err=-0.07, moved_px=68.16)
+    stub = puzzle._verdict_reason(False, False, "no")
+    assert "НЕ бан по IP" in stub, stub
+    kept = puzzle._verdict_reason(False, True, "no")
+    assert "капча осталась в DOM" in kept, kept
+
+
+def test_verdict_reason_success_is_plain():
+    _fill_diag(final_err=-0.07, moved_px=68.16)
+    assert puzzle._verdict_reason(True, False, "done") == "капча снята, доступ открыт"
+    assert puzzle._verdict_reason(False, False, "unblocked") == \
+        "капча снята, содержимое на месте"
+
+
+def test_summary_numbers_are_consistent():
+    """Сводка не может показать «решено больше, чем попыток»."""
+    puzzle.reset()
+    puzzle.note_solved()
+    line = puzzle.puzzle_summary()
+    assert "решено=1" in line, line
+    assert "попыток=1" in line, line
+    puzzle.reset()
+    assert "решено=0" in puzzle.puzzle_summary()
+
+
 def test_solve_puzzle_budget_default_is_safe():
     """Бюджет времени на решение пазла НЕ выключен по умолчанию.
 

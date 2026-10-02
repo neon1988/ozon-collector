@@ -111,6 +111,29 @@ def _recording_drag(target_vx, px_seq):
     return paths, res
 
 
+def test_drag_diag_filled_on_failure():
+    """Паспорт заполняется даже когда заход ПРОВАЛИЛСЯ.
+
+    Зачем: паспорт читается в solve_puzzle при разборе причины отказа. Если он
+    заполняется только на успехе, то провал (тот случай, который и разбирают)
+    останется без фактов — то есть без t_read/t_move/финальной ошибки.
+    Живой замер 2026-10-02: провал шёл 178 с, и по логу не было видно ни
+    сколько времени заняло чтение позиции, ни ввода.
+    """
+    # кусок стабильно НЕ доезжает до цели → доводка исчерпывает итерации
+    paths, res = _recording_drag(900.0, [500.0, 500.0, 500.0])
+    d = puzzle_drag.last_drag_diag()
+    assert d, "паспорт пуст — причина провала останется без фактов"
+    assert d.get("stop"), d
+    assert "t_total_s" in d, d
+    assert "t_read_s" in d and "t_move_s" in d, d
+    assert d.get("probe_reads", 0) >= 1, d
+    assert d.get("bx") == 200 and d.get("target_vx") == 900.0, d
+    # iters может остаться 0, если до микрокоррекций не дошли (напр. кусок не
+    # зацепили мышью) — тогда stop описывает именно эту ветку
+    assert d.get("iters", 0) >= 0, d
+
+
 def test_drag_probe_is_half_distance_for_near_target():
     """Близкая цель: зонд НЕ 40px, а ~половины расстояния (без перелёта)."""
     dist = 10.0

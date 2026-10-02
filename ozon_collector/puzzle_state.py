@@ -64,10 +64,46 @@ PUZZLE_BUDGET_S = 60.0
 # Процесс-локал (list как изменяемый синглтон, чтобы reset() работал в тестах).
 _PUZZLE_FAILURES: list[int] = [0]
 _PUZZLE_ATTEMPTS: list[int] = [0]
+# Итоги сессии для одной сводной строки в логе. Без них по логу видно только
+# отдельные провалы, но не «сколько вообще капч и какой у них итог»: за день
+# в логе был 21 отказ и 1 успех, и эти числа нигде не стояли рядом.
+_PUZZLE_SOLVED: list[int] = [0]
+_PUZZLE_STORMS: list[int] = [0]
+
+
+def note_solved() -> None:
+    _PUZZLE_SOLVED[0] += 1
+
+
+def note_storm() -> None:
+    _PUZZLE_STORMS[0] += 1
+
+
+def summary() -> str:
+    """Сводка по пазлам текущего сбора одной строкой — для лога и разбора.
+
+    Формат: `пазлов: попыток=7 решено=2 штормов=1 доля=29%`. Доля считается по
+    ПОПЫТКАМ, а не по пазлам: попытка и пазл — разные единицы (PUZZLE_MAX_ATTEMPTS
+    попыток на один вызов solve_puzzle), и раньше эти два числа в логе не
+    разделялись.
+    """
+    att = attempts()
+    solved = _PUZZLE_SOLVED[0]
+    # max() по попыткам: solved инкрементируется в ветках успеха, которые
+    # всегда идут после _note_attempt(), но если порядок поменяется, сводка
+    # обязана показать согласованные числа, а не «решено=1, попыток=0».
+    shown = max(att, solved)
+    rate = (solved / shown) if shown else 0.0
+    return (f"пазлов: попыток={shown} решено={solved} "
+            f"штормов={_PUZZLE_STORMS[0]} доля={rate:.0%}")
+
+
 def reset() -> None:
     """Сбросить счётчик неудач (вызывается при старте сбора/воркера)."""
     _PUZZLE_FAILURES[0] = 0
     _PUZZLE_ATTEMPTS[0] = 0
+    _PUZZLE_SOLVED[0] = 0
+    _PUZZLE_STORMS[0] = 0
 
 
 def failures() -> int:

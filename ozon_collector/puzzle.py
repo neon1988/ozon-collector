@@ -80,6 +80,7 @@ from .puzzle_drag import (  # noqa: F401  (реэкспорт: puzzle.X рабо
     _piece_grip_offset,
     _read_sl_piece,
     _wait_piece,
+    last_drag_diag,
 )
 from .puzzle_state import (  # noqa: F401
     PUZZLE_BUDGET_S,
@@ -91,7 +92,10 @@ from .puzzle_state import (  # noqa: F401
     _note_attempt,
     attempts,
     failures,
+    note_solved,
+    note_storm,
     reset,
+    summary as puzzle_summary,
 )
 
 from ozon_collector import log
@@ -407,6 +411,52 @@ def _captcha_src_changed(page, info) -> bool:
         return True
 
 
+def _verdict_reason(okc: bool, still: bool, verdict: str) -> str:
+    """Причина вердикта на человеческом языке — одна строка для паспорта.
+
+    Главная ценность: РАЗДЕЛИТЬ «промахнулись» и «попали, но не засчиталось».
+    Это разные болезни с разными лекарствами: первое — детектор/калибровка,
+    второе — антибот или подмена заглушкой. Раньше оба случая давали одинаковое
+    `verdict=no`, и в логе не было видно, что кусок вставал в лунку с промахом
+    0.07 px (живой замер 2026-10-02).
+    """
+    err = _drag_diag().get("final_err")
+    moved = _drag_diag().get("moved_px")
+    if verdict == "done":
+        return "капча снята, доступ открыт"
+    if verdict == "unblocked":
+        return "капча снята, содержимое на месте"
+    if verdict != "no":
+        return f"вердикт={verdict}"
+    parts = []
+    if moved is not None and abs(moved) <= 1.0:
+        parts.append("кусок НЕ ДВИНУЛСЯ (мышь не зацепила цель)")
+    if err is not None and abs(err) > 2.0:
+        parts.append(f"промах по позиции {err:+.1f}px")
+    elif err is not None:
+        parts.append(f"позиция верна (err={err:+.2f}px, в допуске), "
+                     f"но Ozon не засчитал")
+    if still:
+        parts.append("капча осталась в DOM")
+    else:
+        parts.append("капча исчезла из DOM, но captchaDone/контента нет — "
+                     "похоже на подмену заглушкой или перерисовку капчи; "
+                     "это НЕ бан по IP")
+    if okc:
+        parts.append("кусок пропал из DOM после дропа")
+    return "; ".join(parts)
+
+
+def _drag_diag() -> dict:
+    """Паспорт последнего захода драга (пусто, если драга не было)."""
+    return last_drag_diag()
+
+
+def _note_seen() -> str:
+    """«2/3» — номер попытки этого вызова и сколько их всего разрешено."""
+    return f"{attempts()}/{PUZZLE_MAX_ATTEMPTS}"
+
+
 def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                  timeout_s: float = PUZZLE_BUDGET_S, on_event=None) -> bool:
     """Решить слайдер-пазл на странице. True — пазл снят.
@@ -707,8 +757,29 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                          **_page_state(page))
                 log.debug(f"solve drag okc={okc} still_challenge={still} "
                           f"verdict={verdict}")
+                # ПАСПОРТ ПОПЫТКИ (2026-10-02). Одна строка, по которой видно
+                # ВСЁ про заход, без чтения десятков debug-строк. Раньше провал
+                # выглядел как голое `verdict=no`, и разбор стоил часа: 11 с на
+                # шаг читалось как проблема детектора, хотя промах был 0.07 px.
+                _why = _verdict_reason(okc, still, verdict)
+                _d = _drag_diag()
+                _tail = (f"bx={x} score={score0:.3g} target={target_vx:.0f} "
+                         f"err={_d.get('final_err')} k={_d.get('k')} "
+                         f"moved={_d.get('moved_px')}/{_moved} "
+                         f"шагов={_d.get('iters')} stop={_d.get('stop')} "
+                         f"settled={_d.get('settled')} "
+                         f"t_drag={_d.get('t_total_s')}с "
+                         f"t_read={_d.get('t_read_s')}с "
+                         f"t_move={_d.get('t_move_s')}с "
+                         f"чтений={_d.get('probe_reads')} "
+                         f"попытка={_note_seen()}")
+                if verdict in ("done", "unblocked"):
+                    log.info(f"solve: РЕШЁН ({verdict}) — {_why}; {_tail}")
+                else:
+                    log.warning(f"solve: НЕ РЕШЁН — {_why}; {_tail}")
                 if verdict in ("done", "unblocked"):
                     _attempt("solve", ok=True, via=verdict, bx=x)
+                    note_solved()
                     return "solved"
                 # Не снят. Челлендж исчез, но контента нет: это либо подмена
                 # заглушкой, либо капча успела перерисоваться. Различаем
@@ -766,6 +837,8 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
             for bx, sc in shots:
                 r = _drag_bx(bx, sc)
                 if r == "solved":
+                    log.info(f"solve: ИТОГ — пазл снят за {_note_seen()} "
+                             f"попытки; {puzzle_summary()}")
                     return True
                 if r == "timeout":
                     # Бюджет времени исчерпан: значит вкладка зависла (медленный
@@ -773,10 +846,11 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                     # в логе неотличимо от «солвер не попал». Замер 2026-10-02:
                     # без этого бюджета одна попытка жгла 178 с, а новая
                     # вкладка решала ту же капчу за 10 с.
-                    log.warning(f"solve: исчерпан бюджет времени "
-                                f"({timeout_s:.0f}с) — вкладка, вероятно, "
+                    log.warning(f"solve: ИТОГ — исчерпан бюджет времени "
+                                f"({timeout_s:.0f}с), вкладка, вероятно, "
                                 f"зависла; отдаём в лестницу восстановления "
-                                f"(FAB-reload → new_tab → recycle)")
+                                f"(FAB-reload → new_tab → recycle); "
+                                f"{puzzle_summary()}")
                     return False
                 if r == "reroll":
                     break
@@ -806,6 +880,11 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
         # Вердикт снятия теперь полностью живёт в _drag_bx (_await_verdict).
         if _captcha_done(page):
             _attempt("solve", ok=True, note="late_url")
+            note_solved()
+            log.info(f"solve: ИТОГ — капча снята поздно (URL-маркер); "
+                     f"{puzzle_summary()}")
             return True
         _PUZZLE_FAILURES[0] += 1
+        log.warning(f"solve: ИТОГ — НЕ решён за {_note_seen()} попытки "
+                    f"(капча ушла, но доступа нет); {puzzle_summary()}")
         return False

@@ -1112,8 +1112,10 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
             log.warning(f"[collect] после решения пазла вылезла заглушка "
                         f"({late}, {where}) → reload")
         else:
+            _puzzle.note_storm()
             log.warning(f"[collect] пазл не решён за {_puzzle.failures()} "
-                        f"попыток ({where}) → ждём заглушку, FAB-reload")
+                        f"попыток ({where}) → ждём заглушку, FAB-reload | "
+                        f"{_puzzle.puzzle_summary()}")
             sig = _await_challenge_sig(page) or _challenge_sig(page)
     for _ in range(FAB_RELOAD_ATTEMPTS) if (sig and reload_on_fab) else range(0):
         log.warning(f"[collect] FAB-заглушка ({sig}) → reload для разблокировки")
@@ -1129,7 +1131,16 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
             page.is_invalid = True
         except Exception:
             pass
-        raise B.AccessChallengeError(f"анти-бот ({where}): {sig}")
+        # ПРИЧИНА ОТКАЗА В ЛОГ — разбор инцидентов (2026-10-02). Заглушка Ozon
+        # не означает бан по адресу: тот же адрес в 16:03 отдал NORMAL_DONE
+        # (discovered 336, valid 10), а в 17:22 дал 403 у всех 8 воркеров сразу,
+        # при том что Ozon из другого браузера открывался нормально. Это отказ
+        # СЕССИИ, лечится сменой сессии (reload → new_tab → recycle). Поэтому в
+        # сообщении пишем наблюдаемые факты, а не лозунг про IP.
+        raise B.AccessChallengeError(
+            f"анти-бот ({where}): {sig} | {_puzzle.puzzle_summary()} | "
+            f"лечение: FAB-reload → new_tab → recycle; это отказ сессии, "
+            f"не бан по IP")
     if _looks_like_challenge(page):
         # Маркеров капчи нет, но страница так и не отрисовалась: нет h1 и
         # почти нет текста даже после CHALLENGE_RECHECKS переспросов. Считать
@@ -1141,7 +1152,8 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
             page.is_invalid = True
         except Exception:
             pass
-        raise B.AccessChallengeError(f"страница не отрисована ({where}): нет h1/контента")
+        raise B.AccessChallengeError(f"страница не отрисована ({where}): нет h1/контента"
+                                    f" | {_puzzle.puzzle_summary()}")
 
 
 _AGE_GATE_PROBE_JS = (
