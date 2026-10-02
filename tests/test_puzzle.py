@@ -665,6 +665,32 @@ def test_solve_puzzle_src_empty_quick_stub(monkeypatch):
     assert evs[0].get("reason") == "src_empty"
 
 
+def test_slot_ok_rejects_candidates_outside_background():
+    """Мусорный дроп запрещён: лунка не бывает на 1-м пикселе и не встанет
+    правее (фон − кусок).
+
+    Почему это важно: кандидат вне границ тратит попытку И вызывает реролл
+    капчи, из-за чего теряются остальные кандидаты того же захода. Детекторы по
+    маске такое не возвращают, но кандидат по форме/краям может — а проверять
+    было нечем.
+    """
+    bg_w, piece_w = 512, 140          # размеры из живого лога
+    x_max = bg_w - piece_w            # 372
+    assert puzzle._slot_ok(1, bg_w, piece_w) is True
+    assert puzzle._slot_ok(335, bg_w, piece_w) is True       # б��й кандидат
+    assert puzzle._slot_ok(x_max, bg_w, piece_w) is True
+    assert puzzle._slot_ok(x_max + 1, bg_w, piece_w) is False, "кусок не встанет"
+    assert puzzle._slot_ok(bg_w, bg_w, piece_w) is False
+    assert puzzle._slot_ok(0, bg_w, piece_w) is False
+    assert puzzle._slot_ok(-5, bg_w, piece_w) is False
+
+
+def test_slot_ok_handles_missing_piece_width():
+    """Без маски куска (piece_w=0) верхняя граница — сам фон, а не ноль."""
+    assert puzzle._slot_ok(400, 512, 0) is True
+    assert puzzle._slot_ok(513, 512, 0) is False
+
+
 def test_solve_puzzle_challenge_gone_stub(monkeypatch):
     """Челлендж исчез, а страница — «нет соединения» (stub-маркер в title/теле):
     on_event kind=empty reason=challenge_gone УЖЕ после ~3s, не 8s буфера."""

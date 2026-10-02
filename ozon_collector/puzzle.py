@@ -414,6 +414,23 @@ def _captcha_src_changed(page, info) -> bool:
         return True
 
 
+def _slot_ok(x: int, bg_w: int, piece_w: int) -> bool:
+    """Может ли лунка начинаться в x? Чистая функция — ради юнит-тестов.
+
+    Границы:
+      * x >= 1 — лунка не начинается на первом пикселе (там край кадра, и дроп
+        бессмысленен: пиксель-в-пиксель попасть нельзя);
+      * x + piece_w <= bg_w — кусочек не встанет правее фона, значит лунка,
+        начинающаяся за этой границей, физически невозможна.
+
+    Зачем: кандидат вне границ = мусорный дроп, который тратит попытку И вызывает
+    реролл капчи, из-за чего теряются остальные кандидаты того же захода.
+    Детекторы по маске такое не возвращают, но кандидат по форме/краям может.
+    """
+    x_max = max(1, bg_w - piece_w) if piece_w > 0 else bg_w
+    return 1 <= x <= x_max
+
+
 def _verdict_reason(okc: bool, still: bool, verdict: str) -> str:
     """Причина вердикта на человеческом языке — одна строка для паспорта.
 
@@ -725,7 +742,19 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
             def _drag_bx(x: int, score0: float):
                 """Один драг к bx=x. Возвращает статус."""
 
-                if x < 1 or x in tried:
+                # Границы кандидата: лунка не бывает на первом пикселе и не может
+                # начинаться правее (фон − кусок). Кандидат вне границ — это мусорный
+                # дроп: он тратит попытку и вызывает реролл капчи, из-за чего
+                # теряются остальные кандидаты захода.
+                bg_w = bg_l.shape[1]
+                piece_w = mask.shape[1] if mask is not None else 0
+                if x in tried or not _slot_ok(x, bg_w, piece_w):
+                    _attempt("solve", note="cand_out_of_range", bx=x,
+                             score=score0, bg_w=bg_w, piece_w=piece_w)
+                    log.debug(f"solve: кандидат bx={x} вне фона "
+                              f"(допустимо 1..{max(1, bg_w - piece_w)}, "
+                              f"фон {bg_w}, кусок {piece_w}) — пропускаю "
+                              f"без дропа")
                     return "skip"
                 tried.add(x)
                 if _expired():
