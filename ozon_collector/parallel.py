@@ -1781,7 +1781,7 @@ def _kpi_summary(payloads: list[dict], attempted: int) -> dict:
     бан адреса); считает производные puzzle_solve_rate и challenge_rate_per_100
     (challenge на 100 товаров).
     """
-    ch = rec = blocked = exhausted = storms = p_att = p_fail = 0
+    ch = rec = blocked = exhausted = storms = p_att = p_fail = p_solved = 0
     canary_fails = origin_denied = 0
     for pl in payloads:
         rm = (pl or {}).get("recovery_metrics")
@@ -1801,7 +1801,15 @@ def _kpi_summary(payloads: list[dict], attempted: int) -> dict:
         if isinstance(pz, dict):
             p_att += _kpi_int(pz.get("attempts"))
             p_fail += _kpi_int(pz.get("failures"))
-    p_solved = max(0, p_att - p_fail)
+            p_solved += _kpi_int(pz.get("solved"))
+    # solved берётся ИЗМЕРЕННЫМ (счётчик note_solved), а не вычисляется как
+    # attempts - failures: вычисление молча ломается, если счётчики разъедутся
+    # (например, заход завершился поворотом из середины), и тогда отчёт
+    # показывает неверную долю успеха без следа. Если поле отсутствует (старый
+    # payload), откатываемся на прежнюю формулу — совместимость с воркерами,
+    # запущенными до 2026-10-02.
+    if not p_solved and p_att:
+        p_solved = max(0, p_att - p_fail)
     return {
         "total_challenges": ch,
         "total_recoveries": rec,

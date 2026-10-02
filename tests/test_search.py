@@ -983,8 +983,10 @@ def test_kpi_puzzle_solve_rate(monkeypatch):
                         lambda cfg, sess=None: _ok_result(cfg["pid"]))
     monkeypatch.setattr("ozon_collector.puzzle.attempts", lambda: 5)
     monkeypatch.setattr("ozon_collector.puzzle.failures", lambda: 2)
+    # solved считается ЯВНО с 2026-10-02 (раньше выводился как attempts-failures)
+    monkeypatch.setattr("ozon_collector.puzzle.solved", lambda: 3)
     c = collect_search(sess, "https://www.ozon.ru/search/?text=u", limit=1, gather_cfg={})
-    assert c["recovery"]["puzzle"] == {"attempts": 5, "failures": 2}
+    assert c["recovery"]["puzzle"] == {"attempts": 5, "failures": 2, "solved": 3}
     assert c["kpi"]["puzzle_attempts"] == 5
     assert c["kpi"]["puzzle_solved"] == 3
     assert c["kpi"]["puzzle_solve_rate"] == 0.6

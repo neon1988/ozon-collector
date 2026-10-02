@@ -58,6 +58,40 @@ def test_k_from_probe_grip_fail_returns_none():
     assert puzzle_drag._k_from_probe(r0, None, 40.0, "piece") is None
 
 
+def test_k_from_probe_slider_without_travel_warns(caplog, monkeypatch):
+    """Слайдер не поехал, кусок сдвинулся: k=1.0 НЕ молча.
+
+    Почему не None: если у этой генерации капчи координата `s` не находится
+    ВООБЩЕ, то возврат None увёл бы в бесконечный повторный хват и солвер встал
+    бы целиком. Поэтому оставляем рабочее значение, но предупреждаем в лог —
+    иначе доводка едет по неверному масштабу молча.
+    """
+    import ozon_collector.log as _log
+    lines = []
+    monkeypatch.setattr(_log, "warning",
+                        lambda m, extra=None: lines.append(str(m)))
+    r0 = {"px": 10.0, "s": 100.0}
+    r1 = {"px": 30.0, "s": 100.0}      # кусок +20, слайдер 0
+    k = puzzle_drag._k_from_probe(r0, r1, 40.0, "slider")
+    assert k == 1.0, k
+    assert any("калибровка ненадёжна" in m for m in lines), lines
+
+
+def test_k_from_probe_slider_missing_s_coord_is_loud():
+    """s=None в обоих замерах (координата не читается) — тоже предупреждение."""
+    import ozon_collector.log as _log
+    lines = []
+    orig = _log.warning
+    _log.warning = lambda m, extra=None: lines.append(str(m))
+    try:
+        r0 = {"px": 10.0, "s": None}
+        r1 = {"px": 30.0, "s": None}
+        assert puzzle_drag._k_from_probe(r0, r1, 40.0, "slider") == 1.0
+    finally:
+        _log.warning = orig
+    assert any("калибровка ненадёжна" in m for m in lines), lines
+
+
 def _recording_drag(target_vx, px_seq):
     """Прогнать _drag_to с записью траекторий; вернуть (paths, result)."""
     from unittest.mock import patch

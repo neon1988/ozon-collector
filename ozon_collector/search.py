@@ -1176,8 +1176,20 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
         pause_s = gather_cfg.get("pause_s") or 0
         if pause_s > 0 and n < total:
             time.sleep(pause_s)
-    recovery["puzzle"] = {"attempts": _puzzle.attempts(),
-                          "failures": _puzzle.failures()}
+    # Счётчики пазлов сверяем В РАНТАЙМЕ. Строгий инвариант
+    # attempts == failures + solved в бою выполняется (каждый заход solve_puzzle
+    # начинается с _note_attempt(), а заканчивается либо note_solved(), либо
+    # failures += 1), но юнит-тесты подставляют счётчики напрямую, поэтому
+    # проверяем только НЕВОЗМОЖНЫЕ состояния — они-то и означают баг счётчика.
+    # Раньше ни одной проверки не было: тихий рассинхрон портил бы
+    # puzzle_solve_rate в отчёте, который считается как attempts - failures.
+    _puz = {"attempts": _puzzle.attempts(), "failures": _puzzle.failures(),
+            "solved": _puzzle.solved()}
+    if _puz["solved"] > _puz["attempts"] or _puz["failures"] > _puz["attempts"]:
+        log.warning(f"[search] СЧЁТЧИКИ пазлов невозможны: {_puz} "
+                    f"(решено или отказов больше, чем попыток) — "
+                    f"puzzle_solve_rate в отчёте будет недостоверным")
+    recovery["puzzle"] = _puz
     return products
 
 

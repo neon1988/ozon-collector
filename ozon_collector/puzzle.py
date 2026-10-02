@@ -95,6 +95,7 @@ from .puzzle_state import (  # noqa: F401
     note_solved,
     note_storm,
     reset,
+    solved,
     summary as puzzle_summary,
 )
 

@@ -858,17 +858,48 @@ def test_ff_bootstrap_policy_matches_chrome(profile_base):
     assert hold[1] == "skipped:post_storm_hold"
 
 
+def test_kpi_puzzle_solved_is_measured_not_derived():
+    """solved берётся ИЗМЕРЕННЫМ, а не вычисляется как attempts - failures.
+
+    Замер 2026-10-02: успех считал��ся формулой, поэтому любой рассинхрон
+    счётчиков тихо давал неверную долю успеха в отчёте. Теперь при наличии поля
+    `solved` в payload вер��им ему, даже если оно противоречит формуле.
+    """
+    # 6 попыток, 1 отказ, но измерено 5 успехов (формула дала бы 5 — сходится),
+    # а вот другой случай: 10 попыток, 3 отказа, измерено 2 успеха
+    payloads = [{"recovery_metrics": {
+        "access_stats": {"challenges": 1},
+        "puzzle": {"attempts": 10, "failures": 3, "solved": 2}}}]
+    kpi = PL._kpi_summary(payloads, attempted=10)
+    assert kpi["puzzle_solved"] == 2, "измеренный успех должен побеждать формулу"
+    assert kpi["puzzle_solve_rate"] == 0.2
+
+
+def test_kpi_puzzle_falls_back_for_legacy_payload():
+    """Воркер, запущенный до 2026-10-02, поля `solved` не шлёт.
+
+    Без отката его отказы обнулили бы метрику всего пула, что выглядело бы как
+    «пазлы перестали решаться».
+    """
+    payloads = [{"recovery_metrics": {
+        "access_stats": {"challenges": 1},
+        "puzzle": {"attempts": 10, "failures": 3}}}]
+    kpi = PL._kpi_summary(payloads, attempted=10)
+    assert kpi["puzzle_solved"] == 7, "нужен откат на attempts - failures"
+    assert kpi["puzzle_solve_rate"] == 0.7
+
+
 def test_kpi_summary_aggregates_workers():
     """combined.kpi суммирует телеметрию пула и считает rate (ADR §14.7)."""
     payloads = [
         {"recovery_metrics": {
             "recycles": 1, "new_tab_attempts": 2, "session_blocked": 1,
             "access_stats": {"challenges": 3},
-            "puzzle": {"attempts": 4, "failures": 1}}},
+            "puzzle": {"attempts": 4, "failures": 1, "solved": 3}}},
         {"recovery_metrics": {
             "recycles": 0, "new_tab_attempts": 1, "session_blocked": 0,
             "access_stats": {"challenges": 1},
-            "puzzle": {"attempts": 2, "failures": 2}}},
+            "puzzle": {"attempts": 2, "failures": 2, "solved": 0}}},
     ]
     kpi = PL._kpi_summary(payloads, attempted=100)
     assert kpi["total_challenges"] == 4
