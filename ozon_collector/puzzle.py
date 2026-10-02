@@ -82,6 +82,7 @@ from .puzzle_drag import (  # noqa: F401  (реэкспорт: puzzle.X рабо
     _wait_piece,
 )
 from .puzzle_state import (  # noqa: F401
+    PUZZLE_BUDGET_S,
     PUZZLE_MAX_ATTEMPTS,
     _ATTEMPT_LOG_DIR,
     _PUZZLE_ATTEMPTS,
@@ -407,7 +408,7 @@ def _captcha_src_changed(page, info) -> bool:
 
 
 def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
-                 timeout_s: float = 0.0, on_event=None) -> bool:
+                 timeout_s: float = PUZZLE_BUDGET_S, on_event=None) -> bool:
     """Решить слайдер-пазл на странице. True — пазл снят.
 
     Живой метод: прятки кусочка + силуэтный детектор Вариант A по кадру фона.
@@ -416,8 +417,11 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
     нет картинок, не нашлась выемка, обрыв CDP) — False. Счётчик неудач растёт
     за каждый неудачный заход.
 
-    timeout_s > 0 — жёсткий лимит на всё решение: кандидаты прекращаются,
-    неснятый пазл возвращается False (защита охотника от долгих свипов).
+    timeout_s — жёсткий лимит на всё решение: кандидаты прекращаются,
+    неснятый пазл возвращается False. По умолчанию PUZZLE_BUDGET_S (60 с), а
+    НЕ 0: бюджет нужен не «охотнику», а боевому сбору, где зависшая вкладка
+    растягивала попытку на 178 с (замер 2026-10-02), а новая вкладка решала
+    ту же капчу за 10 с. Передать 0 осознанно можно только точечному свипу.
 
     on_event: опциональный колбек `on_event(dict)` для журнала решателя
     (puzzle_hunter пишет из него в свой журнал про «что внутри окна»):
@@ -460,6 +464,10 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
         if _expired():
             _PUZZLE_FAILURES[0] += 1
             _attempt("solve", ok=False, reason="timeout")
+            log.warning(f"solve: бюджет времени ({timeout_s:.0f}с) исчерпан "
+                        f"до захвата кадра — вкладка, вероятно, зависла; "
+                        f"отдаём в лестницу восстановления "
+                        f"(FAB-reload → new_tab → recycle)")
             return False
         try:
             info = _capture_info(page)
@@ -760,6 +768,15 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 if r == "solved":
                     return True
                 if r == "timeout":
+                    # Бюджет времени исчерпан: значит вкладка зависла (медленный
+                    # CDP), а не капча сложная. Логируем явно — иначе «не решён»
+                    # в логе неотличимо от «солвер не попал». Замер 2026-10-02:
+                    # без этого бюджета одна попытка жгла 178 с, а новая
+                    # вкладка решала ту же капчу за 10 с.
+                    log.warning(f"solve: исчерпан бюджет времени "
+                                f"({timeout_s:.0f}с) — вкладка, вероятно, "
+                                f"зависла; отдаём в лестницу восстановления "
+                                f"(FAB-reload → new_tab → recycle)")
                     return False
                 if r == "reroll":
                     break

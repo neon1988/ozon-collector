@@ -507,6 +507,56 @@ def test_solve_puzzle_counts_attempts(monkeypatch):
     assert puzzle.failures() == 2
 
 
+def test_solve_puzzle_budget_default_is_safe():
+    """Бюджет времени на решение пазла НЕ выключен по умолчанию.
+
+    Замер 2026-10-02: без бюджета одна попытка жгла 178 с (11 с на шаг вместо
+    0.4 с), а новая вкладка решала ту же капчу за 10 с. Раньше дефолт был 0.0
+    (бесконечный свип) и вызывающий должен был вспомнить про лимит — не
+    вспоминал никто, включая боевой сбор.
+    """
+    import inspect
+    sig = inspect.signature(puzzle.solve_puzzle)
+    assert sig.parameters["timeout_s"].default == puzzle.PUZZLE_BUDGET_S
+    assert puzzle.PUZZLE_BUDGET_S > 0, "бюджет обязан быть включён по умолчанию"
+    # нормативный случай обязан в него укладываться с запасом: 3 кандидата
+    # по 10 с — это 30 с, запас 2x
+    assert puzzle.PUZZLE_BUDGET_S >= 3 * 10
+
+
+def test_solve_puzzle_timeout_logs_and_returns_false(monkeypatch):
+    """Бюджет исчерпан → в лог явная строка и False (лестница восстановления).
+
+    Замер 2026-10-02: без бюджета провальная попытка жгла 178 с, а новая
+    вкладка решала ту же капчу за 10 с. Бюджет обязан быть ВИДЕН в логе, иначе
+    «не решён» неотличимо от «солвер промахнулся».
+    """
+    lines = []
+    import ozon_collector.log as _log
+    for lvl in ("info", "warning", "debug"):
+        monkeypatch.setattr(_log, lvl,
+                            lambda m, extra=None, _lvl=lvl: lines.append(str(m)))
+
+    t = [1000.0]
+
+    def _mono():
+        t[0] += 10.0          # каждый вызов «проходит» 10 с
+        return t[0]
+
+    monkeypatch.setattr(puzzle.time, "sleep", lambda s: None)
+    monkeypatch.setattr(puzzle.time, "monotonic", _mono)
+    monkeypatch.setattr(puzzle, "_capture_info", lambda page: None)
+    monkeypatch.setattr(puzzle, "_captcha_done", lambda page: False)
+    monkeypatch.setattr(puzzle, "_still_challenge", lambda page: True)
+    puzzle.reset()
+    # timeout_s > 0 (при 0 бюджет выключен по замыслу), но часы ушли далеко
+    ok = puzzle.solve_puzzle(_FakePage("puzzle"), attempts=3, timeout_s=1.0)
+    assert ok is False
+    assert any("бюджет времени" in m for m in lines), lines
+    # бюджет исчерпан ДО работы: попытка не растянулась
+    assert puzzle.attempts() == 1
+
+
 def test_solve_puzzle_empty_capture_emits_on_event(monkeypatch):
     """Капча есть, а пазл не пришёл (capture пустой, captchaDone нет):
     on_event получает kind=empty — хантер пишет «заглушку пустой капчи»."""
