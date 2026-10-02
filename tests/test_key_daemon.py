@@ -1481,9 +1481,9 @@ def test_pidlock_stale_pid_overwritten(tmp_path):
 
 # --- classify_new_pids: пиды без raw-файла исключаются из need ---
 
-def test_classify_skips_pid_without_raw(tmp_path):
+def test_classify_missing_raw_file_no_qa_call(tmp_path):
     prog = _manifest(tmp_path)
-    # нет 101_raw.json — не должен попасть в need и вызвать QA
+    # нет 101_raw.json - нечего проверять, QA не вызывается, но разбор не падает
     called = []
     r = k.classify_new_pids(prog, ["101"], qa_fn=lambda b: called.append(1) or
                             _make_qa(products=0, ok=0, warn=0, fail=0))
@@ -1569,8 +1569,12 @@ def test_replacement_pids_multiple_replacements(tmp_path):
 
 # --- mtime-инвалидация вердиктов ---
 
-def test_classify_verdict_stale_mtime_reqa(tmp_path):
-    """Если fingerprint (mtime_ns) не совпадает с сохранённым — вердикт перепроверяется."""
+def test_classify_verdict_stale_reqa_adds_to_valid(tmp_path):
+    """Вердикт протух по mtime_ns → перепроверка, pid попадает в valid_add.
+
+    Парный тест выше (test_classify_verdict_stale_mtime_reqa) проверяет другую
+    сторону того же кейса: checked/verdicts. Имена разведены намеренно — раньше
+    они совпадали, и верхний молча не выполнялся."""
     pid = "101"
     raw = tmp_path / f"{pid}_raw.json"
     raw.write_text("{}", encoding="utf-8")
@@ -1664,13 +1668,6 @@ def test_compute_final_not_exhausted_not_enough():
     p = {"valid_pids": ["1", "2"], "target_count": 3, "min_valid": 1}
     assert k.compute_final(p, False) is None
 
-
-def test_compute_final_min_valid_zero():
-    p = {"valid_pids": [], "target_count": 3, "min_valid": 0}
-    assert k.compute_final(p, True) == "COMPLETED_MIN"
-
-
-# --- backoff_delay edge cases ---
 
 def test_backoff_delay_zero_index():
     assert k.backoff_delay(0) == 0
@@ -1817,7 +1814,8 @@ def test_parse_qa_stdout_partial_fields():
 
 # --- _parse_qa_per_pid ---
 
-def test_parse_qa_per_pid_rows():
+def test_parse_qa_per_pid_rows_plain():
+    """Разбор строк qa_raw БЕЗ служебной преамбулы ([qa] товаров: ...)."""
     stdout = "101 OK 5 reviews\n102 FAIL 3 reviews\n103 WARN 2 reviews\n104 INFO text"
     result = k._parse_qa_per_pid(stdout)
     assert result == {"101": "OK", "102": "FAIL", "103": "WARN", "104": "INFO"}

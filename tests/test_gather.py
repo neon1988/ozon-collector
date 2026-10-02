@@ -342,13 +342,6 @@ def test_variant_problems_no_widget_rating_count_short_sort():
     assert "short_sort(score_asc=50" in problems[0]
 
 
-def test_variant_problems_no_counts_no_check():
-    """Ни variant_count, ни rating_count — числовой проверки нет."""
-    raw = _raw()
-    raw["reviews_variant_mode"] = {"used": False, "reason": "no_widget"}
-    assert variant_review_problems(raw) == []
-
-
 def test_variant_problems_no_widget_ok():
     """no_widget — легитимно (тумблера нет), браком не считается."""
     raw = _raw()

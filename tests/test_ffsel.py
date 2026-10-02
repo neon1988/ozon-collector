@@ -43,7 +43,7 @@ class TestJsIsFunction:
     def test_parenthesised_expression_is_not_function(self):
         assert not ffsel_js.js_is_function("(1 + 1)")
 
-    def test_none_safe(self):
+    def test_js_is_function_none_safe(self):
         assert not ffsel_js.js_is_function(None)
 
 

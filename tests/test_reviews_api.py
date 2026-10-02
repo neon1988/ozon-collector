@@ -278,7 +278,7 @@ class TestReviewsStage:
         assert rec.max_pages == 1
         assert tel["dom_short_circuit"] is True
 
-    def test_multi_sort_never_short_circuits(self):
+    def test_stage_multi_sort_no_dom_short_circuit(self):
         rec = _StageRecorder([{"uuid": "d1"}])
         _reviews, _p, _pl, _vm, tel = _stage(
             rec, rating_count=1, sorts=["score_asc"],
