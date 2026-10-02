@@ -109,8 +109,17 @@ def test_run_gather_classifies_non_recyclable(monkeypatch, capsys):
 # ---- acceptance-gate: assert_raw_structure ---------------------------------
 
 def test_structure_gate_valid_raw():
-    raw = _raw()
-    assert_raw_structure(raw, "42")          # не бросает
+    """Валидный raw проходит гейт.
+
+    Гейт возвращает None и сигналит только исключением, поэтому «не упало» —
+    единственная доступная проверка. Делаем её явной, чтобы при поломке читалось
+    «валидный raw отклонён», а не «тест упал где-то».
+    """
+    try:
+        assert_raw_structure(_raw(), "42")
+    except (B.StructureError, B.AccessChallengeError) as e:
+        pytest.fail(f"валидный raw не должен отклоняться гейтом: "
+                    f"{type(e).__name__}: {e}")
 
 
 def test_structure_gate_pid_mismatch():
@@ -145,9 +154,19 @@ def test_structure_gate_reviews_not_list():
 
 
 def test_structure_gate_zero_reviews_ok():
+    """0 отзывов ≠ ошибка: карточка без отзывов остаётся товаром.
+
+    Явная проверка вместо «не упало» — падение гейта на пустом списке отзывов
+    отправил бы в брак нормальные карточки (инвариант ADR §14.1: собранное =
+    отзывы именно этого варианта, а их ноль — допустимо).
+    """
     raw = _raw()
     raw["reviews"] = []
-    assert_raw_structure(raw, "42")          # 0 отзывов ≠ ошибка
+    try:
+        assert_raw_structure(raw, "42")
+    except (B.StructureError, B.AccessChallengeError) as e:
+        pytest.fail(f"карточка без отзывов не должна отклоняться гейтом: "
+                    f"{type(e).__name__}: {e}")
 
 
 def test_structure_gate_challenge_title_recyclable():

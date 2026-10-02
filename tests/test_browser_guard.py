@@ -36,7 +36,13 @@ def test_autouse_guard_blocks_cdp_launch():
 
 @pytest.mark.allow_browser_launch
 def test_marker_opts_out_of_guard(monkeypatch, tmp_path):
-    """С маркером лаунчер вызывается (Popen и скрипт здесь замоканы)."""
+    """С маркером разрешён запуск (Popen доходит до реального вызова).
+
+    Тест без assert полагался на «если guard сработает — pytest.fail», но это
+    проверяет только ОТСУТСТВИЕ исключения: запуск мог бы и не состояться по
+    другой причине, и тест остался бы зелёным. Теперь проверяем, что Popen
+    действительно вызван, с портом из аргумента.
+    """
     import subprocess
     from unittest import mock
 
@@ -45,5 +51,17 @@ def test_marker_opts_out_of_guard(monkeypatch, tmp_path):
     script = tmp_path / "launch_chrome.ps1"
     script.write_text("# stub", encoding="utf-8")
     monkeypatch.setattr(B, "_launch_script_path", lambda: script)
-    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: mock.Mock())
+    calls = []
+
+    def _popen(*a, **k):
+        calls.append((a, k))
+        return mock.Mock()
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
     B._launch_script("http://127.0.0.1:9277", profile_path=r"C:\prof\ozon")
+    assert calls, "с маркером allow_browser_launch запуск обязан дойти до Popen"
+    # порт и профиль передаются в лаунчер через env (PORT/PROFILE), а не argv
+    env = calls[0][1].get("env") or {}
+    assert str(env.get("PORT")) == "9277", \
+        f"порт из аргумента не дошёл до лаунчера: PORT={env.get('PORT')}"
+    assert env.get("PROFILE") == r"C:\prof\ozon", env.get("PROFILE")
