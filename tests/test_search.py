@@ -1119,7 +1119,8 @@ def test_collect_search_links_recovery(monkeypatch):
     calls = {"n": 0}
 
     def fake_collect_links(sess, limit, scan_limit=None, max_scrolls=40,
-                           scroll_by=1500, wait_ms=1000, quiet_after=2,
+                           scroll_by=1500, wait_ms=1000, quiet_after=3,
+                           quiet_wait_ms=2500,
                            stop_event=None, force_event=None):
         calls["n"] += 1
         if calls["n"] == 1:
@@ -1160,7 +1161,9 @@ def test_collect_search_scrolls_until_stagnation(monkeypatch):
     assert c["found"] == 32
     assert c["collected"] == 32
     assert len(c["products"]) == 32
-    assert sess.scrolls == 4  # 2 скролла без роста → стоп
+    # 3 скролла с ростом + 2 тихие со скроллом; на 3-й тихой цикл выходит
+    # (quiet_after=3) — скролла на ней уже нет
+    assert sess.scrolls == 5
 
 
 def test_collect_search_found_full_selected_limit(monkeypatch):
@@ -1403,6 +1406,92 @@ def test_collect_links_force_beats_stop():
         assert exc.forced
     else:
         raise AssertionError("ожидали CollectionInterrupted (forced)")
+
+
+# ---- недобор выдачи: тишина догрузки ≠ конец списка (регресс 2026-10-02) -----
+
+class _ScriptedSess:
+    """Выдача отдаёт порциями: тишина на 2 итерации, потом снова рост.
+
+    Сценарий взят из живого лога: прогон 17:29 умел продолжить после тихой
+    итерации (248/0 248/0 256/1 264/0), а прогон 18:22 на той же тишине
+    выходил и объявлял 72 товара вместо 320+.
+    """
+
+    def __init__(self, script):
+        self._script = list(script)   # список списков pid на каждой итерации
+        self._i = 0
+        self.waits = []
+        self.scrolls = 0
+
+    def eval(self, js):
+        batch = self._script[min(self._i, len(self._script) - 1)]
+        self._i += 1
+        return [{"pid": p, "url": "u" + p} for p in batch]
+
+    def scroll(self, by=1500):
+        self.scrolls += 1
+
+    def wait(self, ms=1000):
+        self.waits.append(ms)
+
+
+def test_collect_links_survives_two_quiet_iterations():
+    """Две тихие итерации подряд — НЕ конец выдачи: докрутка продолжается."""
+    sess = _ScriptedSess([
+        ["1", "2"],                    # iter 0: 2
+        ["3", "4"],                    # iter 1: 4
+        ["3", "4"],                    # iter 2: тишина (stagnant=1)
+        ["3", "4"],                    # iter 3: тишина (stagnant=2) — НЕ выход
+        ["5"],                         # iter 4: рост возобновился
+        ["5", "6"],                    # iter 5: 6
+    ])
+    got = _collect_links(sess, limit=100, scan_limit=100, max_scrolls=10)
+    assert [g["pid"] for g in got] == ["1", "2", "3", "4", "5", "6"]
+
+
+def test_collect_links_first_quiet_iteration_waits_longer():
+    """Первая тихая итерация — двойная пауза (ленивая догрузка), дальше обычная."""
+    sess = _ScriptedSess([["1"], ["1"], ["1"], ["1"], ["1"], ["1"], ["1"]])
+    _collect_links(sess, limit=100, scan_limit=100, max_scrolls=10,
+                   wait_ms=1000, quiet_wait_ms=2500)
+    assert 2500 in sess.waits, sess.waits
+    assert sess.waits[-1] == 1000, sess.waits
+
+
+def test_collect_links_stops_after_three_quiet_iterations():
+    """Три тихие подряд — правда конец: выход, товары не теряются."""
+    sess = _ScriptedSess([["1"], ["1"], ["1"], ["1"], ["1"], ["1"], ["1"],
+                         ["1"]])
+    got = _collect_links(sess, limit=100, scan_limit=100, max_scrolls=10)
+    assert [g["pid"] for g in got] == ["1"]
+
+
+def test_collect_links_logs_exit_reason(monkeypatch):
+    """Причина выхода в логе обязательна: иначе «вышли рано» неотличимо от
+    «выдача кончилась», и повторяющийся недобор не виден (жалоба пользователя).
+
+    Логи проекта своя обёртка (ozon_collector.log пишет в stdout/файл, а не
+    через logging), поэтому подменяем log.info, а не caplog."""
+    import ozon_collector.log as _log
+    lines = []
+    monkeypatch.setattr(_log, "info", lambda msg, extra=None: lines.append(msg))
+    sess = _ScriptedSess([["1"], ["1"], ["1"], ["1"], ["1"], ["1"], ["1"],
+                         ["1"]])
+    _collect_links(sess, limit=100, scan_limit=100, max_scrolls=10)
+    text = "\n".join(lines)
+    assert "причина выхода" in text, text
+    assert "quiet_after" in text, text
+
+
+def test_collect_links_logs_scan_limit_exit_reason(monkeypatch):
+    import ozon_collector.log as _log
+    lines = []
+    monkeypatch.setattr(_log, "info", lambda msg, extra=None: lines.append(msg))
+    sess = _ScriptedSess([["1", "2"], ["3", "4"], ["5", "6"]])
+    _collect_links(sess, limit=6, scan_limit=6, max_scrolls=10)
+    text = "\n".join(lines)
+    assert "scan_limit" in text, text
 
 
 def test_collect_links_with_recovery_stop_blocks_retry(monkeypatch):

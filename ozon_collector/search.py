@@ -107,7 +107,8 @@ def _feed_appeared(sess, tries: int = FEED_APPEAR_TRIES,
 
 def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
                    max_scrolls: int = 40, scroll_by: int = 1500,
-                   wait_ms: int = 1000, quiet_after: int = 2,
+                   wait_ms: int = 1000, quiet_after: int = 3,
+                   quiet_wait_ms: int = 2500,
                    stop_event=None, force_event=None) -> list[dict]:
     """Докручивает выдачу (tileGridDesktop), пока прибавляются товары.
 
@@ -120,6 +121,23 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
       сканировать гигантские каталоги ради счётчика);
     - quiet_after скроллов подряд без роста (товары закончились);
     - упёрлись в max_scrolls (предохранитель).
+
+    ПОЧЕМУ quiet_after=3 и quiet_wait_ms (живой замер 2026-10-02). Догрузка
+    Ozon ленивая: прокрутка может молчать 2+ секунды и продолжить сама. Живой
+    лог за день, шесть прогонов подряд — один и тот же солвер, один и тот же
+    код, разные числа:
+        15:42 336   17:17 336   17:29 304   18:02 320   18:06 320
+        18:22  72  <- выход по тишине, links iter: 64/0 72/0 72/0 72/1
+    В прогоне 17:29 рост возобновился САМ после тихой итерации (248/0 248/0
+    256/1 264/0), а в 18:22 та же тишина оказалась последней. При quiet_after=2
+    цикл выходил по первой же паузе догрузки, то есть выдача объявлялась
+    собранной на 72 товарах из 320+, и по логу это было неотличимо от «выдача
+    кончилась». Первая тихая итерация теперь ждёт quiet_wait_ms вместо
+    wait_ms — двойная пауза перед тем, как признать выдачу исчерпанной.
+
+    Причина выхода пишется в лог ВСЕГДА: без неё «вышли рано» и «вышли
+    досрочно по лимиту» выглядят одинаково, и повторяющийся недобор никого
+    не настораживает.
 
     seen копим в Python: virtual-лист может размонтировать ушедшие вверх
     карточки, и они не должны потеряться.
@@ -138,6 +156,7 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
     seen = {}
     stagnant = 0
     prev = 0
+    why = "max_scrolls"
     for i in range(max_scrolls + 1):
         if force_event is not None and force_event.is_set():
             raise CollectionInterrupted(
@@ -150,17 +169,26 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
         for item in sess.eval(SEARCH_JS):
             seen.setdefault(item["pid"], item["url"])
         log.debug(f"links iter {i}: seen={len(seen)} stagnant={stagnant}")
-        if len(seen) >= scan_limit or i >= max_scrolls:
+        if len(seen) >= scan_limit:
+            why = f"scan_limit({scan_limit})"
+            break
+        if i >= max_scrolls:
+            why = f"max_scrolls({max_scrolls})"
             break
         if len(seen) == prev:
             stagnant += 1
             if stagnant >= quiet_after:
+                why = f"quiet_after({quiet_after})"
                 break
         else:
             stagnant = 0
         prev = len(seen)
         sess.scroll(scroll_by)
-        sess.wait(wait_ms)
+        # Первая тихая итерация — не приговор: догрузка ленивая, ждём дольше.
+        sess.wait(quiet_wait_ms if stagnant == 1 else wait_ms)
+    log.info(f"links: собрано {len(seen)}, причина выхода: {why}, "
+             f"итераций: {i + 1}/{max_scrolls + 1}, "
+             f"тихих подряд: {stagnant}/{quiet_after}")
     return [{"pid": p, "url": u} for p, u in seen.items()]
 
 
