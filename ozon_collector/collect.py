@@ -1116,6 +1116,25 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
             log.warning(f"[collect] пазл не решён за {_puzzle.failures()} "
                         f"попыток ({where}) → ждём заглушку, FAB-reload | "
                         f"{_puzzle.puzzle_summary()}")
+            if _puzzle.last_was_timeout():
+                # Бюджет пазла исчерпан = вкладка ЗАВИСЛА, а не «капча сложная».
+                # Ждать здесь заглушку (12 с _await_challenge_sig) и делать до
+                # трёх FAB-reload в зависшей вкладке — чистая трата: живой замер
+                # 2026-10-02 показал, что та же капча решилась за 10 с на новой
+                # вкладке, а провал шёл 178 с. Отдаём товар в лестницу сразу, где
+                # new_tab как раз и снимает проблему.
+                try:
+                    page.is_invalid = True
+                except Exception:
+                    pass
+                log.warning(f"[collect] бюджет пазла исчерпан — не жду заглушку, "
+                            f"ухожу в лестницу (new_tab → recycle); это отказ "
+                            f"сессии, не бан по IP | "
+                            f"{_puzzle.puzzle_summary()}")
+                raise B.AccessChallengeError(
+                    f"пазл исчерпал бюджет времени ({where}): вкладка зависла "
+                    f"| {_puzzle.puzzle_summary()} | лечение: new_tab → recycle; "
+                    f"это отказ сессии, не бан по IP")
             sig = _await_challenge_sig(page) or _challenge_sig(page)
     for _ in range(FAB_RELOAD_ATTEMPTS) if (sig and reload_on_fab) else range(0):
         log.warning(f"[collect] FAB-заглушка ({sig}) → reload для разблокировки")

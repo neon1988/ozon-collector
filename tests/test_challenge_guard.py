@@ -133,6 +133,76 @@ def test_check_challenge_error_carries_puzzle_summary_and_no_ip_claim():
     assert "пазлов:" in msg, f"в отказе нет сводки по пазлам: {msg}"
 
 
+def test_puzzle_timeout_skips_stub_wait(monkeypatch):
+    """Зависшая вкладка (бюджет пазла исчерпан) НЕ ждёт заглушку.
+
+    Живой замер 2026-10-02: провал шёл 178 с, потом код ждал бы ещё 12 с
+    (_await_challenge_sig) и делал до трёх FAB-reload в ТОЙ ЖЕ зависшей вкладке,
+    а новая вкладка решала ту же капчу за 10 с. При исчерпанном бюджете
+    ожидание бессмысленно — товар надо отдать в лестницу (new_tab → recycle).
+    """
+    import ozon_collector.collect as C
+    import ozon_collector.puzzle as P
+    from ozon_collector import browser as B
+
+    waited = []
+    reloads = []
+    # Первый вызов _challenge_sig открывает ветку пазла, дальше пауз нет
+    sig_seq = iter(["puzzle", None, None, None, None, None, None, None])
+
+    monkeypatch.setattr(P, "is_puzzle", lambda sig: True)
+    monkeypatch.setattr(P, "looks_like_puzzle", lambda page: True)
+    monkeypatch.setattr(P, "solve_puzzle", lambda page, **kw: False)
+    monkeypatch.setattr(P, "note_storm", lambda: None)
+    monkeypatch.setattr(P, "last_was_timeout", lambda: True)
+    monkeypatch.setattr(C, "_puzzle", P)
+    monkeypatch.setattr(C, "_await_challenge_sig",
+                        lambda page, seconds=None: waited.append(1) or None)
+    monkeypatch.setattr(C, "_reload_fn",
+                        lambda page: reloads.append(1), raising=False)
+    monkeypatch.setattr(C, "_challenge_sig",
+                        lambda page: next(sig_seq, None))
+
+    page = _Page(title="Antibot")
+    with pytest.raises(B.AccessChallengeError) as ei:
+        C.check_challenge(page, "product_page")
+    assert not waited, "зависшая вкладка не должна ждать заглушку"
+    assert not reloads, "зависшая вкладка не должна делать FAB-reload"
+    assert "бюджет" in str(ei.value), str(ei.value)
+    assert "не бан по IP" in str(ei.value), str(ei.value)
+
+
+def test_puzzle_miss_still_waits_stub(monkeypatch):
+    """Обычный промах (бюджет НЕ исчерпан) по-прежнему ждёт заглушку.
+
+    Разделять эти случаи обязательно: при промахе капча жива и FAB-reload её
+    снимает, а отказ сюрать на лестницу зрядно потратил бы её бюджет.
+    """
+    import ozon_collector.collect as C
+    import ozon_collector.puzzle as P
+    from ozon_collector import browser as B
+
+    waited = []
+    sig_seq = iter(["puzzle", None, None, None, None, None, None, None])
+
+    monkeypatch.setattr(P, "is_puzzle", lambda sig: True)
+    monkeypatch.setattr(P, "looks_like_puzzle", lambda page: True)
+    monkeypatch.setattr(P, "solve_puzzle", lambda page, **kw: False)
+    monkeypatch.setattr(P, "note_storm", lambda: None)
+    monkeypatch.setattr(P, "last_was_timeout", lambda: False)
+    monkeypatch.setattr(C, "_puzzle", P)
+    monkeypatch.setattr(C, "_await_challenge_sig",
+                        lambda page, seconds=None: waited.append(1) or None)
+    monkeypatch.setattr(C, "_challenge_sig",
+                        lambda page: next(sig_seq, None))
+    monkeypatch.setattr(C, "_looks_like_challenge", lambda page: True)
+
+    page = _Page(title="Antibot")
+    with pytest.raises(B.AccessChallengeError):
+        C.check_challenge(page, "product_page")
+    assert waited, "при промахе заглушку ждать обязаны"
+
+
 def test_check_challenge_marks_page_invalid():
     """ADR §14.1: после детекта challenge страница помечается INVALID (K4)."""
     page = _Page(title="Похоже, нет соединения")

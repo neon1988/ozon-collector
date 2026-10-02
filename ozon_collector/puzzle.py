@@ -92,8 +92,10 @@ from .puzzle_state import (  # noqa: F401
     _note_attempt,
     attempts,
     failures,
+    last_was_timeout,
     note_solved,
     note_storm,
+    note_timeout,
     reset,
     solved,
     summary as puzzle_summary,
@@ -515,6 +517,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
         if _expired():
             _PUZZLE_FAILURES[0] += 1
             _attempt("solve", ok=False, reason="timeout")
+            note_timeout()
             log.warning(f"solve: бюджет времени ({timeout_s:.0f}с) исчерпан "
                         f"до захвата кадра — вкладка, вероятно, зависла; "
                         f"отдаём в лестницу восстановления "
@@ -847,6 +850,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                     # в логе неотличимо от «солвер не попал». Замер 2026-10-02:
                     # без этого бюджета одна попытка жгла 178 с, а новая
                     # вкладка решала ту же капчу за 10 с.
+                    note_timeout()
                     log.warning(f"solve: ИТОГ — исчерпан бюджет времени "
                                 f"({timeout_s:.0f}с), вкладка, вероятно, "
                                 f"зависла; отдаём в лестницу восстановления "

@@ -69,6 +69,22 @@ _PUZZLE_ATTEMPTS: list[int] = [0]
 # в логе был 21 отказ и 1 успех, и эти числа нигде не стояли рядом.
 _PUZZLE_SOLVED: list[int] = [0]
 _PUZZLE_STORMS: list[int] = [0]
+# Был ли ПОСЛЕДНИЙ вызов solve_puzzle прерван по бюджету времени (а не промах).
+# Различие нужно вызывающему: исчерпанный бюджет означает зависшую вкладку, и
+# ждать заглушку в ней бессмысленно (12 с _await_challenge_sig + до 3 reload'ов),
+# надо сразу отдавать товар в лестницу восстановления, где new_tab снимает
+# проблему (живой замер 2026-10-02: та же капча решилась за 10 с на новой вкладке
+# через 38 с после 178-секундного провала).
+_PUZZLE_TIMEOUT: list[int] = [0]
+
+
+def note_timeout() -> None:
+    _PUZZLE_TIMEOUT[0] = 1
+
+
+def last_was_timeout() -> bool:
+    """Последний вызов solve_puzzle исчерпал бюджет времени (True) или нет."""
+    return bool(_PUZZLE_TIMEOUT[0])
 
 
 def note_solved() -> None:
@@ -115,6 +131,7 @@ def reset() -> None:
     _PUZZLE_ATTEMPTS[0] = 0
     _PUZZLE_SOLVED[0] = 0
     _PUZZLE_STORMS[0] = 0
+    _PUZZLE_TIMEOUT[0] = 0
 
 
 def failures() -> int:
