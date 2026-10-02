@@ -1197,11 +1197,16 @@ class Session:
 
 
 def browser_alive(cdp_url: str = "http://127.0.0.1:9222") -> bool:
-    """Проверка, что CDP-браузер жив (без полной сессии)."""
+    """Проверка, что CDP-браузер жив (без полной сессии).
+
+    Таймаут 0.5 с по той же причине, что и в browser_tabs_count: отказ
+    соединения к localhost на машине разработки занимает ~2 с (замер
+    2026-10-02), а живой CDP отвечает на /json/version за миллисекунды.
+    """
     import urllib.request
 
     try:
-        with urllib.request.urlopen(cdp_url + "/json/version", timeout=3) as r:
+        with urllib.request.urlopen(cdp_url + "/json/version", timeout=0.5) as r:
             data = json.loads(r.read().decode())
             return bool(data.get("Browser"))
     except Exception:
@@ -1239,11 +1244,19 @@ def browser_tabs_count(cdp_url: str = "http://127.0.0.1:9222") -> Optional[int]:
     status.json. НЕ является источником истины для ownership (см. ADR §14.5):
     `collector_tabs` считается по собственному набору страниц Session.
     Возвращает None, если браузер/CDP недоступен.
+
+    Таймаут 0.5 с, а не 3: это ТЕЛЕМЕТРИЯ, и она зовётся на каждом
+    recovery-событии (`search._recovery_meta`). Замер 2026-10-02: отказ
+    соединения к localhost на этой машине занимает 2.05 с (обычно мгновенно),
+    поэтому старые 3 с превращали каждый снимок в 2 с ожидания — в юнит-тестах
+    это был 81% времени набора (15 вызовов = 30.7 с из 38 с профиля), а в бою
+    платило 2 с за событие при мёртвом браузере. Живой CDP отвечает на
+    /json/list за миллисекунды, поэтому 0.5 с с запасом.
     """
     import urllib.request
 
     try:
-        with urllib.request.urlopen(cdp_url + "/json/list", timeout=3) as r:
+        with urllib.request.urlopen(cdp_url + "/json/list", timeout=0.5) as r:
             data = json.loads(r.read().decode())
             if not isinstance(data, list):
                 return None

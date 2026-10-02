@@ -138,6 +138,64 @@ def _assume_browser_alive(monkeypatch):
                         lambda url: True, raising=False)
 
 
+# НЕ глушим browser_tabs_count фикстурой: search._recovery_meta() берёт
+# browser_tabs по HTTP /json/list (cdp.browser_tabs_count), и подмена функции
+# выключала исполнение её тела — минус 8 строк покрытия (cdp.py:1256-1265),
+# что ровно тот обмен, который тут запрещён. Вместо этого в самой функции
+# сокращён таймаут (3 -> 0.5 с): отказ соединения к localhost на этой машине
+# занимает ~2 с, а живой CDP отвечает за миллисекунды. Выигрыш по времени тот
+# же, покрытие цело.
+
+
+@pytest.fixture(autouse=True)
+def _no_challenge_settle_delay(monkeypatch):
+    """Паузы ожидания капчи в юнит-тестах не нужны, ЧИСЛО переспросов — нужно.
+
+    `collect.check_challenge` на тонкой странице делает CHALLENGE_RECHECKS (=4)
+    переспросов с паузой CHALLENGE_RECHECK_DELAY_S (=1.5 с) между ними, то есть
+    6 с ожидания на тест (замер 2026-10-02: 7.3-8.2 с у
+    test_check_challenge_raises_access_challenge и соседей). Пауза нужна
+    браузеру, чтобы капч�� успела подгрузиться, и НЕ является логикой: цикл
+    переспросов и его результат остаются теми же, убирается только ожидание.
+    Число переспросов не трогаем — тесты, проверяющие сам recheck-цикл, продолжают
+    его видеть.
+    """
+    from ozon_collector import collect as _collect_mod
+    monkeypatch.setattr(_collect_mod, "CHALLENGE_RECHECK_DELAY_S", 0.0,
+                        raising=False)
+
+    class _NoSleepTime:
+        """time с заглушенным sleep, остальное (monotonic) — настоящее.
+
+        Подменяется ИМЕННО `collect.time`, а не глобальный `time.sleep`:
+        глушить глобально нельзя, это затронуло бы ожидания других модулей и
+        сам pytest-раннер.
+        """
+
+        def __init__(self, real):
+            self._real = real
+
+        def sleep(self, *_a, **_kw):
+            return None
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(_collect_mod, "time", _NoSleepTime(_collect_mod.time),
+                        raising=False)
+
+    # Модули пазла: там паузы человеческой траектории мыши (puzzle_input
+    # _human_move — до 45 Sleep на драг). В юнит-тесте траектория не важна,
+    # важны координаты и вердикт: test_drag_to_piece_mode_no_slider стоил
+    # 10.2 с (замер 2026-10-02).
+    from ozon_collector import puzzle_drag as _pd
+    from ozon_collector import puzzle_input as _pi
+    from ozon_collector import puzzle as _pz
+    for _mod in (_pd, _pi, _pz):
+        monkeypatch.setattr(_mod, "time", _NoSleepTime(_mod.time),
+                            raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _redirect_log_dirs(tmp_path, monkeypatch):
     """Юнит-тесты не должны писать в боевой каталог logs/ проекта.
