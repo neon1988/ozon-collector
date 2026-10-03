@@ -282,21 +282,61 @@ def _launcher_tail_after_grace(path, grace_s: float = 3.0,
     return tail
 
 
-def _await_browser(cdp_url: str, run: LaunchRun, deadline: float) -> bool:
+# Запас на «опоздавший» браузер. Живой замер 2026-10-03 16:02-16:03: лаунчер
+# сам писал «LAUNCHER-ERROR: Chromium pid=48408 is ALIVE but /json/version is
+# silent» — то есть Chromium ЖИВ, DevTools ещё поднимается (профиль тяжёлый, на
+# это уходит до минуты). Демон считал это провалом, снимал держателей и
+# поднимал новый — тот умирал о тот же профиль, четыре раза подряд
+# UNKNOWN_FAILURE, при том что браузер в итоге ЖИЛ и отвечал на 9222.
+#
+# Grace даётся ТОЛЬКО когда лаунчер прямо сообщил, что Chromium жив: признак
+# «is ALIVE» в его выводе. При «EXITED» ждать нечего и fail-fast остаётся
+# мгновенным (иначе каждая неудачная попытка стоила бы +30 с).
+_LAUNCHER_EXIT_GRACE_S = 30.0
+
+
+def _launcher_says_browser_alive(path: str) -> bool:
+    """Лаунчер сообщил, что Chromium жив, но CDP молчит (браузер поднимается)."""
+    try:
+        tail = _launcher_log_tail(path, 40) or ""
+    except Exception:
+        return False
+    low = tail.lower()
+    return ("is alive" in low) or ("жив" in low)
+
+
+def _await_browser(cdp_url: str, run: LaunchRun, deadline: float,
+                   grace_s: float = _LAUNCHER_EXIT_GRACE_S) -> bool:
     """Ждать готовности CDP до deadline. False — не дождались.
 
     Отдельный хелпер, потому что попытка запуска может повторяться (см.
     _free_stale_profile): тело цикла и fail-fast на умершем лаунчере должны
     быть одними и теми же.
+
+    Умерший лаунчер — fail-fast, ЕСЛИ он сообщил, что Chromium умер («EXITED»):
+    ждать остаток 30 с бессмысленно, раньше неудачный старт стоил полные 30 с.
+    Но если лаунчер написал, что Chromium ЖИВ, а CDP молчит — браузер ещё
+    поднимается, и мы ждём grace_s. Иначе объявляем провал при живом браузере.
     """
+    exited_at: float | None = None
+    grace: float | None = None
     while time.monotonic() < deadline:
         if browser_alive(cdp_url):
             return True
         if run.proc.poll() is not None:
-            # Лаунчер завершился: он уже знает, поднялся браузер или нет
-            # (exit 1 + LAUNCHER-ERROR). Ждать остаток wait_s бессмысленно —
-            # раньше неудачный старт стоил полные 30с на попытку.
-            return False
+            if exited_at is None:
+                exited_at = time.monotonic()
+                if _launcher_says_browser_alive(run.path):
+                    grace = grace_s
+                    log.warning(f"[cdp] лаунчер сообщил, что Chromium жив, но CDP "
+                                f"молчит — жду до {grace_s:.0f}с подъёма "
+                                f"(профиль тяжёлый)")
+                else:
+                    # Лаунчер прямо сказал, что Chromium мёртв: ждать нечего,
+                    # fail-fast без единого сна (иначе +30 с на каждую попытку).
+                    return False
+            elif time.monotonic() - exited_at >= (grace or 0.0):
+                return False
         time.sleep(0.5)
     return False
 

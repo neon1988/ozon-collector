@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import pytest
 
@@ -236,6 +237,55 @@ def test_launch_and_wait_fails_fast_when_launcher_exits(monkeypatch):
     assert waited == [], "не должен ни разу спать, лаунчер уже ушёл"
     assert "код возврата лаунчера=1" in str(e.value)
     assert "EXITED" in str(e.value)
+
+
+def test_launcher_says_browser_alive_detected(tmp_path):
+    """Распознаём «Chromium жив, CDP молчит» — браузер ещё поднимается.
+
+    Живой замер 2026-10-03 16:03 лог лаунчера:
+      LAUNCHER-ERROR: Chromium pid=48408 is ALIVE but /json/version is silent
+    Раньше это читалось как провал: демон снимал держателей и поднимал новый,
+    тот умирал о тот же профиль — четыре UNKNOWN_FAILURE подряд при живом
+    браузере на 9222.
+    """
+    p = _fake_launcher(tmp_path, "LAUNCHER-ERROR: Chromium pid=48408 is ALIVE "
+                               "but http://127.0.0.1:9222/json/version is "
+                               "silent\n")
+    assert cdp._launcher_says_browser_alive(p) is True
+    p2 = _fake_launcher(tmp_path, "LAUNCHER-ERROR: Chromium pid=1 EXITED, CDP "
+                                "never came up on port 9222\n",
+                        name="exit.log")
+    assert cdp._launcher_says_browser_alive(p2) is False
+
+
+def test_await_browser_graces_when_launcher_says_alive(tmp_path, monkeypatch):
+    """Лаунчер ушёл, но Chromium ЖИВ → ждём подъёма, а не объявляем провал."""
+    log = _fake_launcher(tmp_path, "LAUNCHER-ERROR: Chromium pid=48408 is "
+                                  "ALIVE but /json/version is silent\n")
+    checks = {"n": 0}
+
+    def _alive(*_a, **_k):
+        checks["n"] += 1
+        return checks["n"] >= 4        # CDP ожил на четвёртой проверке
+
+    monkeypatch.setattr(cdp, "browser_alive", _alive)
+    run = cdp.LaunchRun(log, _DeadProc(1))
+    assert cdp._await_browser("http://127.0.0.1:9222", run,
+                              time.monotonic() + 30, grace_s=10) is True
+    assert checks["n"] >= 4
+
+
+def test_await_browser_no_grace_when_launcher_reports_death(tmp_path, monkeypatch):
+    """Лаунчер сказал EXITED → fail-fast мгновенно (без сна)."""
+    log = _fake_launcher(tmp_path, "LAUNCHER-ERROR: Chromium pid=1 EXITED, CDP "
+                                  "never came up\n")
+    slept = []
+    monkeypatch.setattr(cdp, "browser_alive", lambda *_a, **_k: False)
+    monkeypatch.setattr(cdp.time, "sleep", lambda s: slept.append(s))
+    run = cdp.LaunchRun(log, _DeadProc(1))
+    assert cdp._await_browser("http://127.0.0.1:9222", run,
+                              time.monotonic() + 30) is False
+    assert slept == [], "при EXITED ждать нечего"
 
 
 def test_launch_and_wait_keeps_waiting_while_launcher_alive(monkeypatch):
