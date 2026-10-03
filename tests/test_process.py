@@ -68,6 +68,71 @@ def test_cdp_port():
     assert P.cdp_port("http://127.0.0.1") == 9222
 
 
+# ---- порт CDP: зарезервирован Windows vs занят процессом (2026-10-03) -------
+
+def test_port_bindable_distinguishes_reserved_from_occupied():
+    """Диагностика порта различает «зарезервирован Windows» и «занят».
+
+    Живой замер 2026-10-03: и main (9222), и все воркерские (9223-9230) попали в
+    диапазон исключений 9172-9271 (WSL/Hyper-V пересчитали резервации). Bind
+    давал WSAEACCES, поэтому Chromium не мог поднять DevTools, и демон получал
+    «Chromium EXITED, CDP never came up» при ПОЛНОСТЬЮ СВОБОДНОМ порте. Старая
+    подсказка «порт занят старым» уводила в сторону.
+    """
+    ok_free, why_free = P.port_bindable(0)      # порт 0 = любой свободный
+    assert ok_free is True, why_free
+    reserved = None
+    for cand in range(9200, 9300):
+        ok, _why = P.port_bindable(cand)
+        if not ok:
+            reserved = cand
+            break
+    if reserved is not None:
+        ok, why = P.port_bindable(reserved)
+        assert ok is False
+        assert "WSAEACCES" in why or "зарезервирован" in why.lower(), why
+        assert "netsh" in why, f"в диагностике нужна команда проверки: {why}"
+
+
+def test_cdp_port_base_falls_back_when_preferred_unusable(monkeypatch):
+    """Предпочитаемый порт недоступен → база уезжает на свободный, с причиной."""
+    calls = []
+
+    def _bindable(port):
+        calls.append(port)
+        good = port != P.MAIN_CDP_PORT
+        return (good, "свободен" if good
+                else "порт зарезервирован Windows (WSAEACCES)")
+
+    monkeypatch.setattr(P, "port_bindable", _bindable)
+    base, why = P.cdp_port_base()
+    assert base != P.MAIN_CDP_PORT, "при зарезервированном порте база обязана уехать"
+    assert "WSAEACCES" in why, why
+    assert calls, "проверка доступности обязана быть"
+
+
+def test_cdp_port_base_keeps_preferred_when_free(monkeypatch):
+    monkeypatch.setattr(P, "port_bindable", lambda port: (True, "свободен"))
+    base, why = P.cdp_port_base()
+    assert base == P.MAIN_CDP_PORT
+    assert why == "свободен"
+
+
+def test_worker_ports_shift_with_base(monkeypatch):
+    """Порты воркеров следуют за базой, а не за жёстким 9222."""
+    monkeypatch.setattr(P, "port_bindable", lambda port: (True, "свободен"))
+    monkeypatch.setattr(P, "MAIN_CDP_PORT", 9222)
+    assert P.worker_cdp_port(1) == 9223
+    monkeypatch.setattr(P, "MAIN_CDP_PORT", 9444)
+    assert P.worker_cdp_port(1) == 9445
+    assert P.worker_cdp_url(7) == "http://127.0.0.1:9451"
+
+
+def test_worker_port_env_override(monkeypatch):
+    monkeypatch.setenv("OZON_WORKER_CDP_PORT", "9500")
+    assert P.worker_cdp_port(1) == 9501
+
+
 def test_tokenize_cmdline_respects_quotes():
     s = ('"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
          '--remote-debugging-port=9222 '

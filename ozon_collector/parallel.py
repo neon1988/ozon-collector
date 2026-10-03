@@ -97,8 +97,14 @@ def worker_spec(k: int) -> dict:
         spec["port"] = None
         spec["cdp_url"] = None
     else:
-        spec["port"] = 9222 + k
-        spec["cdp_url"] = f"http://127.0.0.1:{9222 + k}"
+        # Порт воркера — от РАЗРЕШЁННОЙ базы CDP, а не жёстко 9222+k. Живой
+        # замер 2026-10-03: Windows взял диапазон 9172-9271 в исключения
+        # (WSL/Hyper-V пересчитали резервации), поэтому 9222 И все 9223-9230
+        # давали bind WSAEACCES, DevTools не поднимался, и каждый воркер падал
+        # с «Chromium EXITED, CDP never came up» при полностью свободном порте.
+        _wport = P.worker_cdp_port(k)
+        spec["port"] = _wport
+        spec["cdp_url"] = f"http://127.0.0.1:{_wport}"
     return spec
 
 
@@ -1519,7 +1525,8 @@ def _stop_main_browser():
             log.warning(f"stop main Firefox: {type(e).__name__}: {e}")
         return
 
-    cdp_url = "http://127.0.0.1:9222"
+    _base, _base_why = P.cdp_port_base()
+    cdp_url = f"http://127.0.0.1:{_base}"
     records = [P.ProcessRecord("main-stop", ident)
                for ident in P.browser_processes(cdp_url)]
     if not records:

@@ -317,11 +317,11 @@ def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
     if main_profile is None:
         main_profile = profile_path(PROFILE_TOKEN)
     if main_alive_check is None:
-        main_alive_check = lambda: _ba("http://127.0.0.1:9222")
+        main_alive_check = lambda: _ba(f"http://127.0.0.1:{MAIN_CDP_PORT}")
     if worker_alive_check is None:
         def _w(k):
-            url = f"http://127.0.0.1:{9222 + int(k)}"
-            return bool(browser_processes(url, worker_profile_token(k)))
+            return bool(browser_processes(worker_cdp_url(k),
+                                          worker_profile_token(k)))
         worker_alive_check = _w
 
     status = {}
@@ -667,6 +667,92 @@ def _tokenize_cmdline(s: str) -> list[str]:
     if cur:
         args.append("".join(cur))
     return args
+
+
+MAIN_CDP_PORT = int(os.environ.get("OZON_CDP_PORT", "9222") or 9222)
+
+# Порты, которые Windows берёт в исключения при старте WSL/Hyper-V/Docker
+# (netsh int ipv4 show excludedportrange protocol=tcp). Живой замер 2026-10-03:
+# диапазон 9172-9271 включал и 9222, и воркерские 9223-9230, поэтому bind давал
+# WSAEACCES, Chromium не мог поднять DevTools — и демон получал
+# «Chromium EXITED, CDP never came up», хотя порт был СВОБОДЕН. Старый текст
+# подсказки («порт занят старым») вводил в заблуждение: виновником был не
+# процесс, а само ОС.
+_CDP_FALLBACK_PORT = 9444
+
+
+def port_bindable(port: int) -> tuple[bool, str]:
+    """Можно ли занять порт для прослушивания. (ok, причина).
+
+    Различает три случая, которые нельзя смешивать в диагностике:
+      * PermissionError (WSAEACCES) — порт ЗАРЕЗЕРВИРОВАН Windows (исключение
+        из диапазона), освободить его можно только сменой номера;
+      * OSError — порт ЗАНЯТ процессом;
+      * успех — свободен.
+    """
+    import socket
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", int(port)))
+        return True, "свободен"
+    except PermissionError:
+        return False, (f"порт {port} ЗАРЕЗЕРВИРОВАН Windows (WSAEACCES) — "
+                       f"проверь диапазон: netsh int ipv4 show "
+                       f"excludedportrange protocol=tcp")
+    except OSError as e:
+        return False, f"порт {port} занят ({type(e).__name__}: {e})"
+    finally:
+        s.close()
+
+
+def resolve_cdp_port(preferred: int = MAIN_CDP_PORT,
+                     fallback: int = _CDP_FALLBACK_PORT) -> int:
+    """Порт CDP: preferred, если его можно слушать, иначе свободный от fallback.
+
+    Возврат не молчаливый: вызывающий обязан залогировать факт смены порта,
+    потому что профиль и воркеры привязаны к номеру порта (ownership identity
+    включает порт — см. _matches_browser).
+    """
+    ok, why = port_bindable(preferred)
+    if ok:
+        return int(preferred)
+    for cand in range(int(fallback), int(fallback) + 100):
+        ok2, _ = port_bindable(cand)
+        if ok2:
+            return cand
+    raise RuntimeError(f"не нашётся свободный CDP-порт: {preferred} — {why}")
+
+
+def cdp_port_base() -> tuple[int, str]:
+    """Базовый порт CDP для main. (порт, причина выбора).
+
+    9222 — исторический и зашитый в инвариант проекта. Но Windows может взять
+    его в исключения (живой замер 2026-10-03: диапазон 9172-9271), и тогда bind
+    даёт WSAEACCES, а Chromium не может поднять DevTools вообще. Поэтому база
+    выбирается динамически, а причина возвращается для ЛОГА — молча менять порт
+    нельзя, от него зависит ownership identity процессов.
+    """
+    ok, why = port_bindable(MAIN_CDP_PORT)
+    if ok:
+        return MAIN_CDP_PORT, why
+    return resolve_cdp_port(), why
+
+
+def worker_cdp_port(k: int) -> int:
+    """Порт воркера k: base + k (воркеры нумеруются с 1, base занят main).
+
+    Сохранён прежний сдвиг: при base=9222 воркер 1 получал 9223 — так было
+    всегда, и от этого зависят проверки воркеров в тестах и логах.
+    """
+    explicit = int(os.environ.get("OZON_WORKER_CDP_PORT", "0") or 0)
+    if explicit:
+        return explicit + int(k)
+    base, _why = cdp_port_base()
+    return base + int(k)
+
+
+def worker_cdp_url(k: int) -> str:
+    return f"http://127.0.0.1:{worker_cdp_port(k)}"
 
 
 def _matches_browser(args, port: int,

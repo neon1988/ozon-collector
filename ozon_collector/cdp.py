@@ -428,14 +428,25 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
             # Подсказка — платформенная (DISPLAY значим только для X-сервера),
             # плюс фактический вывод лаунчера: иначе «не поднялся за 30с» без
             # причины (ревизия 2.9: так и не увидели обнулённый launch_chrome.ps1).
+            #
+            # ВАЖНО: различаем «порт занят» и «порт зарезервирован Windows».
+            # Живой замер 2026-10-03: Chromium EXITED, CDP never came up — а порт
+            # был СВОБОДЕН, просто лежал в диапазоне исключений 9172-9271
+            # (WSL/Hyper-V пересчитали резервации), и bind давал WSAEACCES.
+            # Старая подсказка «порт занят старым» уводила в сторону.
+            _port = P.cdp_port(cdp_url)
+            _ok, _why = P.port_bindable(_port)
+            _port_note = ("" if _ok else
+                          f"; ДИАГНОСТИКА ПОРТА: {_why}")
             if os.name == "nt":
                 hint = (r"проверьте Chromium и профиль (частая причина: профиль "
-                        r"уже открыт другим Chrome, либо порт занят старым), либо "
-                        r"запустите вручную: powershell -ExecutionPolicy Bypass "
-                        r"-File scripts\launch_chrome.ps1")
+                        r"уже открыт другим Chrome), либо запустите вручную: "
+                        r"powershell -ExecutionPolicy Bypass "
+                        r"-File scripts\launch_chrome.ps1"
+                        + _port_note)
             else:
                 hint = ("проверьте DISPLAY/Xvfb и Chromium, либо запустите вручную: "
-                        "sh scripts/launch_chrome.sh")
+                        "sh scripts/launch_chrome.sh" + _port_note)
             code = run.proc.poll()
             exit_note = ("лаунчер ещё работает" if code is None
                          else f"код возврата лаунчера={code}")

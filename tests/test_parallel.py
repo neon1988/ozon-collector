@@ -50,18 +50,37 @@ def _ok_payload(k, indexes, ok=True):
 # ---- worker_spec / профильный контракт --------------------------------------
 
 def test_worker_spec_ports_and_tokens(profile_base):
+    """Порты воркеров — от РАЗРЕШЁННОЙ базы, профили/токены прежние.
+
+    База выбирается динамически: Windows может взять 9222 (и 9223+) в
+    исключения — живой замер 2026-10-03, диапазон 9172-9271. Раньше порты были
+    жёстко 9222+k, и при зарезервированном диапазоне КАЖДЫЙ воркер падал с
+    «Chromium EXITED, CDP never came up» при свободном порте.
+    """
     s1 = PL.worker_spec(1)
     s2 = PL.worker_spec(2)
-    assert s1["port"] == 9223
-    assert s2["port"] == 9224
-    assert s1["cdp_url"] == "http://127.0.0.1:9223"
-    assert s2["cdp_url"] == "http://127.0.0.1:9224"
+    base, _why = P.cdp_port_base()
+    assert s1["port"] == P.worker_cdp_port(1) == base + 1
+    assert s2["port"] == P.worker_cdp_port(2) == base + 2
+    assert s1["cdp_url"] == f"http://127.0.0.1:{s1['port']}"
+    assert s2["cdp_url"] == f"http://127.0.0.1:{s2['port']}"
     assert s1["profile_token"] == "ozon-profile-worker-1"
     assert s2["profile_token"] == "ozon-profile-worker-2"
     assert s1["profile_token"] != P.PROFILE_TOKEN
     assert s1["profile_path"] != s2["profile_path"]
     assert s1["profile_path"].endswith("ozon-profile-worker-1")
     assert s1["log_path"].endswith("ozon_worker_1.log")
+
+
+def test_worker_ports_are_not_reserved_by_windows():
+    """Порт воркера обязан быть СЛУШАЕЛЬНЫМ, иначе DevTools не поднимется.
+
+    Регресс на 2026-10-03: порты 9222/9223 были в диапазоне исключений Windows
+    (WSAEACCES на bind), и падение выглядело как «порт занят старым».
+    """
+    for k in (1, 2, 3):
+        ok, why = P.port_bindable(P.worker_cdp_port(k))
+        assert ok, f"порт воркера {k} не слушается: {why}"
 
 
 def test_worker_profile_paths_pairwise_unique(profile_base):
@@ -284,30 +303,33 @@ def test_preflight_ok(monkeypatch, profile_base):
 
 
 def test_preflight_port_busy(monkeypatch, profile_base):
-    monkeypatch.setattr(PL, "_port_free", lambda port: port != 9223)
+    busy = P.worker_cdp_port(1)
+    monkeypatch.setattr(PL, "_port_free", lambda port: port != busy)
     monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
     monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
     errs = PL.preflight_check([PL.worker_spec(1)])
-    assert any("порт 9223 уже занят" in e for e in errs)
+    assert any(f"порт {busy} уже занят" in e for e in errs), errs
 
 
 def test_preflight_process_present(monkeypatch, profile_base):
+    busy = P.worker_cdp_port(2)
     _free_ports(monkeypatch)
     monkeypatch.setattr(P, "browser_processes",
                         lambda url, profile_token=None:
-                        [object()] if url.endswith("9224") else [])
+                        [object()] if url.endswith(str(busy)) else [])
     monkeypatch.setattr(PL.cdp, "browser_alive", lambda url: False)
     errs = PL.preflight_check([PL.worker_spec(1), PL.worker_spec(2)])
-    assert any("9224" in e for e in errs)
+    assert any(str(busy) in e for e in errs), errs
 
 
 def test_preflight_cdp_alive(monkeypatch, profile_base):
+    alive_port = P.worker_cdp_port(1)
     _free_ports(monkeypatch)
     monkeypatch.setattr(P, "browser_processes", lambda *a, **kw: [])
     monkeypatch.setattr(PL.cdp, "browser_alive",
-                        lambda url: url.endswith("9223"))
+                        lambda url: url.endswith(str(alive_port)))
     errs = PL.preflight_check([PL.worker_spec(1), PL.worker_spec(2)])
-    assert any("9223" in e for e in errs)
+    assert any(str(alive_port) in e for e in errs), errs
 
 
 def test_preflight_profile_collision_with_main(monkeypatch, profile_base):

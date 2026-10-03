@@ -57,7 +57,17 @@
 
 ## Ловушки (самые дорогие)
 
-- Порт 9333 попадает в зарезервированный диапазон Windows 9255–9354 (WSAEACCES) →
+- **Порт 9222 (и 9223-9230) может уйти в зарезервированные диапазоны Windows.**
+  Живой замер 2026-10-03: `netsh int ipv4 show excludedportrange protocol=tcp`
+  показал диапазон **9172-9271**, куда попали и main, и все воркеры. bind даёт
+  `PermissionError [WinError 10013]` (WSAEACCES), Chromium не может поднять
+  DevTools, и демон сыплет «Chromium EXITED, CDP never came up» при **свободном**
+  порте — виновник не процесс, а само ОС (WSL/Hyper-V/Docker пересчитывают
+  резервации при старте). Старый текст подсказки «порт занят старым» уводил в
+  сторону. База теперь выбирается динамически (`process.cdp_port_base()`, фоллбэк
+  9444+), переопределяется `OZON_CDP_PORT` / `OZON_WORKER_CDP_PORT`. Проверить:
+  `python .tmp/port_check.py` или `netsh … excludedportrange`.
+- Порт 9333 попадает в зарезервированный диапазон Windows (WSAEACCES) →
   альтернативные браузеры вешать на **9444**.
 - `ms-playwright/chromium` через launch нестабильна — не использовать.
 - Убивать браузер можно только со сверкой identity (PID + cmdline + маркер),
