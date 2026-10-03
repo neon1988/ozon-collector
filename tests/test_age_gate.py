@@ -116,6 +116,74 @@ def test_pass_age_gate_skips_when_no_gate(monkeypatch):
     assert C._pass_age_gate(_NoGate()) is False
 
 
+def test_pass_age_gate_waits_for_late_modal(monkeypatch):
+    """Модалка 18+ появляется ПОЗЖЕ: без ожидания гейт не проходился.
+
+    Живой замер 2026-10-03: на карточках 4859784413 и 1639540706 гейт не
+    проходился, страница отзывов оставалась пустой (stop_reason
+    no_cards_no_count_hint, 0 отзывов, у карточки не было даже цены и
+    рейтинга), хотя текст «Подтвердите возраст» в DOM присутствовал. Проба была
+    однократной, сразу после загрузки, а модалка рендерится позже.
+    """
+    calls = {"waits": 0, "probes": 0}
+
+    class _LateGate(_AgePage):
+        def evaluate(self, expr, *a, **k):
+            if "Подтвердите возраст" in expr:
+                calls["probes"] += 1
+                # модалка появляется только с третьей пробы
+                return calls["probes"] >= 3
+            # страница не готова: виджетов нет
+            return False
+
+        def wait_for_timeout(self, ms):
+            calls["waits"] += 1
+
+    page = _LateGate()
+    assert C._pass_age_gate(page) is True, "модалка должна была догрузиться"
+    assert calls["probes"] >= 3, calls
+    assert calls["waits"] >= 2, calls
+
+
+def test_pass_age_gate_does_not_wait_when_page_ready(monkeypatch):
+    """Готовая карточка без модалки: НЕ ждём (лишние секунды на 336 товаров)."""
+    calls = {"waits": 0}
+
+    class _ReadyNoGate:
+        def evaluate(self, expr, *a, **k):
+            if "Подтвердите возраст" in expr:
+                return False
+            return True          # страница отрисовалась
+
+        def wait_for_timeout(self, ms):
+            calls["waits"] += 1
+
+    assert C._pass_age_gate(_ReadyNoGate()) is False
+    assert calls["waits"] == 0, f"на готовой странице ждать нельзя: {calls}"
+
+
+def test_pass_age_gate_warns_when_unrendered_without_modal(monkeypatch):
+    """Страница не отрисовалась и модалки нет → предупреждение, а не молчание.
+
+    Молчаливый False стоил нам карточек: по логу было видно только «0 отзывов»,
+    и причина (гейт не догрузился) не была видна нигде.
+    """
+    lines = []
+    import ozon_collector.log as _log
+    monkeypatch.setattr(_log, "warning",
+                        lambda m, extra=None: lines.append(str(m)))
+
+    class _Unrendered:
+        def evaluate(self, expr, *a, **k):
+            return False
+
+        def wait_for_timeout(self, ms):
+            return None
+
+    assert C._pass_age_gate(_Unrendered(), wait_ms=300) is False
+    assert any("модалка 18+ не появилась" in m for m in lines), lines
+
+
 def test_pass_age_gate_false_when_button_disabled():
     """Кнопка disabled → гейт не пройден (False)."""
     class _DisabledBtn:

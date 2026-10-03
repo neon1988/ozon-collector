@@ -1179,8 +1179,28 @@ _AGE_GATE_PROBE_JS = (
     "() => /Подтвердите возраст/.test(document.body.innerText || '')"
 )
 
+# Готовность карточки: если виджеты цены/рейтинга/отзывов уже на месте, страница
+# отрисовалась и модалки 18+ не будет — значит, ждать нечего.
+_PAGE_READY_JS = (
+    "() => !!document.querySelector("
+    "'[data-widget=\"webPrice\"],[data-widget=\"webRating\"],"
+    "[data-widget=\"webReviews\"],a[href*=\"tab=reviews\"]')"
+)
 
-def _pass_age_gate(page) -> bool:
+# Ждать появления модалки (замер 2026-10-03). Проба была ОДНОКРАТНОЙ, сразу
+# после check_challenge, а модалка 18+ рендерится позже загрузки. Из-за этого
+# на части карточек (2859784413/1639540706) проба возвращала False, гейт не
+# проходился, и страница отзывов оставалась пустой: stop_reason
+# no_cards_no_count_hint, 0 отзывов, у карточки не оказалось даже цены и
+# рейтинга. При этом текст «Подтвердите возраст» в DOM присутствовал.
+#
+# Ждём ТОЛЬКО когда страница не отрисована: у нормальных карточек виджеты уже
+# есть и ожидания не происходит, поэтому на 336 товарах лишних секунд нет.
+_AGE_GATE_WAIT_MS = 2500
+_AGE_GATE_POLL_MS = 250
+
+
+def _pass_age_gate(page, wait_ms: int = _AGE_GATE_WAIT_MS) -> bool:
     """Пройти модалку «Подтвердите возраст» (18+ категории).
 
     Маска даты ДД.ММ.ГГГГ не принимает программный value — вводим
@@ -1189,7 +1209,28 @@ def _pass_age_gate(page) -> bool:
     """
     try:
         if not page.evaluate(_AGE_GATE_PROBE_JS):
-            return False
+            # Модалки нет — но, возможно, она ещё не отрисовалась. Ждём только
+            # если страница явно не готова (нет виджетов цены/рейтинга/отзывов):
+            # иначе ждать бессмысленно и каждый товар получит лишние секунды.
+            try:
+                ready = bool(page.evaluate(_PAGE_READY_JS))
+            except Exception:
+                ready = True   # не смогли определить — не ждём
+            if not ready and wait_ms > 0:
+                deadline = time.monotonic() + wait_ms / 1000.0
+                while time.monotonic() < deadline:
+                    page.wait_for_timeout(_AGE_GATE_POLL_MS)
+                    if page.evaluate(_AGE_GATE_PROBE_JS):
+                        log.debug("[collect] age-gate: модалка 18+ догрузилась "
+                                  f"через ждание ({wait_ms}мс бюджет)")
+                        break
+                else:
+                    log.warning("[collect] age-gate: страница не отрисована и "
+                                f"модалка 18+ не появилась за {wait_ms}мс — "
+                                f"возможно, отзывы скрыты гейтом; иду дальше")
+                    return False
+            else:
+                return False
         inp = page.locator("input:visible").first
         inp.click()
         try:
