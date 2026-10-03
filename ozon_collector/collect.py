@@ -1361,40 +1361,37 @@ def _pass_age_gate(page, wait_ms: int = _AGE_GATE_WAIT_MS,
                 log.warning(f"[collect] age-gate: {last_why} "
                             f"(попытка {attempt}/{attempts})")
                 continue
+            # ПОДТВЕРЖДЕНИЕ. Порядок важен и проверен на живых прогонах:
+            #   1) реальный клик мышью по координатам кнопки (page.mouse.click) —
+            #      это ДОВЕРЕННОЕ событие через CDP, его принимает Vue-обработчик
+            #      Ozon;
+            #   2) Enter в поле даты — дешёвый запасной путь;
+            #   3) JS-dispatch pointerdown/mousedown/... — оставлен как последний,
+            #      он даёт недоверенное событие и на части карточек не срабатывал
+            #      вовсе (замер 2026-10-03: «подтверждение не сработало, модалка
+            #      осталась на месте», поле при этом было заполнено).
+            _clicked_ok = False
             try:
-                # Обычный Playwright click падает на перехвате pointer events
-                # оверлеем модалки.  el.click() даёт synthetic click, но
-                # Vue-компонент Ozon слушает pointerdown/pointerup — нужна
-                # полная цепочка pointer+mouse events, иначе setBirthdate
-                # API не вызывается и модалка остаётся.
-                h = btn.element_handle()
-                if h is not None:
-                    h.evaluate("""(el) => {
-                        const rect = el.getBoundingClientRect();
-                        const cx = rect.x + rect.width / 2;
-                        const cy = rect.y + rect.height / 2;
-                        for (const type of ['pointerdown','mousedown','pointerup','mouseup','click']) {
-                            el.dispatchEvent(new PointerEvent(type, {
-                                bubbles: true, cancelable: true, composed: true,
-                                clientX: cx, clientY: cy, button: 0, buttons: 1,
-                                pointerId: 1, pointerType: 'mouse',
-                                view: window
-                            }));
-                        }
-                    }""", timeout=5000)
-                else:
-                    btn.click(timeout=8000, force=True)
+                _box = btn.element_handle()
+                _rect = _box.evaluate(
+                    """(el) => { const r = el.getBoundingClientRect();
+                        return {x: r.x, y: r.y, w: r.width, h: r.height}; }"""
+                ) if _box is not None else None
+                if _rect and _rect.get("w") and _rect.get("h"):
+                    page.mouse.click(_rect["x"] + _rect["w"] / 2.0,
+                                     _rect["y"] + _rect["h"] / 2.0)
+                    _clicked_ok = True
             except Exception as e:
-                if B.is_renderer_failure(e) and not _is_sticky_intercept(e):
-                    try:
-                        btn.click(timeout=8000, force=True)
-                    except Exception as e2:
-                        if B.is_renderer_failure(e2):
-                            raise
-            # ГЛАВНОЕ: успех заявляем ТОЛЬКО после проверки результата. Прежде
-            # здесь стоял безусловный return True через 1.5 с — поэтому лог врал
-            # («гейт пройден»), а страница оставалась с модалкой и отзывы не
-            # грузились (наблюдение пользователя 2026-10-03).
+                if B.is_renderer_failure(e):
+                    raise
+                log.debug(f"[collect] age-gate: реальный клик не удался: {e}")
+            if not _clicked_ok:
+                try:
+                    _field.press("Enter")
+                except Exception as e:
+                    if B.is_renderer_failure(e):
+                        raise
+                    log.debug(f"[collect] age-gate: Enter не удался: {e}")
             ok, why = _age_gate_confirmed(page)
             if ok:
                 log.info(f"[collect] возрастной гейт 18+ пройден "

@@ -19,6 +19,10 @@ class _Handle:
         self._on_click = on_click
 
     def evaluate(self, expr, *a, **k):
+        s = str(expr)
+        if "getBoundingClientRect" in s:
+            # чтение геометрии для реального клика мышью — это НЕ клик
+            return {"x": 100.0, "y": 200.0, "w": 160.0, "h": 44.0}
         self._calls["js_click"] = self._calls.get("js_click", 0) + 1
         if self._on_click:
             self._on_click()
@@ -101,6 +105,7 @@ class _AgePage:
         self._clicked = False
         self.gate_after_click = gate_after_click
         self.date = date          # None = поле остаётся пустым (баг маски)
+        self.mouse = _MouseSpy(self.calls, on_click=self._mark_clicked)
 
     def _mark_clicked(self):
         self._clicked = True
@@ -154,7 +159,8 @@ def test_pass_age_gate_fails_when_modal_stays(monkeypatch):
     page = _AgePage(gate_after_click=True)   # модалка НЕ уходит после клика
     ok = C._pass_age_gate(page)
     assert ok is False, "модалка осталась — гейт не пройден"
-    assert page.calls.get("js_click", 0) >= 2, "ожидалась повторная попытка"
+    clicks = page.calls.get("js_click", 0) + page.calls.get("mouse_clicks", 0)
+    assert clicks >= 2, f"ожидалась повторная попытка: {page.calls}"
     blob = "\n".join(lines)
     assert "подтверждение не сработало" in blob, blob
     assert "модалка осталась на месте" in blob, blob
@@ -194,6 +200,7 @@ def test_age_gate_uses_modal_input_not_first_page_input():
             self.calls = {}
             self._btn = _Button(self.calls, on_click=self._mark)
             self._clicked = False
+            self.mouse = _MouseSpy(self.calls, on_click=self._mark)
 
         def _mark(self):
             self._clicked = True
@@ -230,12 +237,50 @@ def test_age_gate_uses_modal_input_not_first_page_input():
         "первым должен идти якорь модалки, а не первый input страницы"
 
 
-def test_pass_age_gate_uses_js_click():
-    """Подтверждение возраста идёт JS el.click() (не Playwright click)."""
+class _MouseSpy:
+    """page.mouse: настоящий (доверенный) клик через CDP."""
+
+    def __init__(self, calls, on_click=None):
+        self._calls = calls
+        self._on_click = on_click
+
+    def click(self, x, y, **k):
+        self._calls["mouse_clicks"] = self._calls.get("mouse_clicks", 0) + 1
+        self._calls["mouse_click"] = (round(float(x)), round(float(y)))
+        if self._on_click:
+            self._on_click()
+
+
+def test_age_gate_confirms_with_real_mouse_click():
+    """Подтверждение — НАСТОЯЩИМ кликом мышью по координатам кнопки.
+
+    Замер 2026-10-03: JS-dispatch pointerdown/mousedown/... даёт НЕДОВЕРЕННОЕ
+    событие, и Vue-обработчик Ozon его игнорирует — в логе было 20 случаев
+    «подтверждение не сработало, модалка осталась на месте» при заполненном поле.
+    Доверенное событие даёт только клик через CDP (page.mouse.click) — тем же
+    путём, что работает перетаскивание пазла.
+    """
     page = _AgePage()
     assert C._pass_age_gate(page) is True
-    assert page.calls.get("js_click", 0) >= 1
-    assert page.calls.get("pw_click", 0) == 0
+    assert "mouse_click" in page.calls, \
+        "подтверждение должно идти реальным кликом мышью, не JS-событием"
+    assert page.calls.get("js_click", 0) == 0, \
+        "JS-dispatch больше не основной путь подтверждения"
+
+
+def test_pass_age_gate_avoids_playwright_click():
+    """Подтверждение НЕ идёт обычным Playwright .click().
+
+    Исторически: .click() падал на перехвате pointer events оверлеем модалки,
+    поэтому сначала перешли на JS-dispatch, а теперь (замер 2026-10-03) на
+    page.mouse.click — он доверенный и проходит через тот же CDP, что и
+    перетаскивание пазла. Playwright .click() остаётся неиспользованным.
+    """
+    page = _AgePage()
+    assert C._pass_age_gate(page) is True
+    assert page.calls.get("pw_click", 0) == 0, \
+        "обычный Playwright click всё ещё вызывается"
+    assert "mouse_click" in page.calls, "ожидается доверенный клик мышью"
 
 
 def test_pass_age_gate_skips_when_no_gate(monkeypatch):
