@@ -14,19 +14,23 @@ from ozon_collector import collect as C
 class _Handle:
     """element_handle: JS-клик записывается, Playwright-аналогов нет."""
 
-    def __init__(self, calls):
+    def __init__(self, calls, on_click=None):
         self._calls = calls
+        self._on_click = on_click
 
     def evaluate(self, expr, *a, **k):
         self._calls["js_click"] = self._calls.get("js_click", 0) + 1
+        if self._on_click:
+            self._on_click()
         return None
 
 
 class _Button:
     """locator кнопки «Подтвердить»: enabled, отдаёт JS-хэндл."""
 
-    def __init__(self, calls):
+    def __init__(self, calls, on_click=None):
         self._calls = calls
+        self._on_click = on_click
 
     def wait_for(self, state="visible", timeout=5000):
         return None
@@ -35,14 +39,19 @@ class _Button:
         return True
 
     def element_handle(self):
-        return _Handle(self._calls)
+        return _Handle(self._calls, self._on_click)
 
     def click(self, *a, **k):
         self._calls["pw_click"] = self._calls.get("pw_click", 0) + 1
+        if self._on_click:
+            self._on_click()
 
 
 class _Input:
     def click(self, *a, **k):
+        return None
+
+    def press(self, *a, **k):
         return None
 
     def press_sequentially(self, text, delay=0):
@@ -62,6 +71,9 @@ class _First:
     def press_sequentially(self, text, delay=0):
         return None
 
+    def count(self):
+        return 1
+
 
 class _Locator:
     def __init__(self, calls):
@@ -73,16 +85,41 @@ class _Locator:
 
 
 class _AgePage:
-    """Страница с возрастным гейтом: probe=True, кнопка активна."""
+    """Страница с возрастным гейтом: probe=True, кнопка активна.
 
-    def __init__(self):
+    Моделирует РЕАЛЬНУЮ картину: до клика модалка есть и виджетов нет, после
+    клика модалка исчезает. Проверка результата (_age_gate_confirmed) появилась
+    именно потому, что прежний код заявлял успех без проверки, а Ozon на части
+    карточек модалку не убирал (наблюдение пользователя 2026-10-03).
+    """
+
+    def __init__(self, gate_after_click=False, date="01.01.1990"):
         self.calls = {}
-        self._btn = _Button(self.calls)
+        self._btn = _Button(self.calls, on_click=self._mark_clicked)
         self._inp = _Input()
         self._loc = _Locator(self.calls)
+        self._clicked = False
+        self.gate_after_click = gate_after_click
+        self.date = date          # None = поле остаётся пустым (баг маски)
+
+    def _mark_clicked(self):
+        self._clicked = True
 
     def evaluate(self, expr, *a, **k):
-        if "Подтвердите возраст" in str(expr):
+        s = str(expr)
+        if "userAdultModal" in s:
+            # _AGE_GATE_CONFIRM_JS: разметка реальной модалки
+            # [data-widget=userAdultModal] с полем даты и кнопкой
+            return {"hasModal": True, "hasInput": True, "hasBtn": True,
+                    "value": self.date if self.date else ""}
+        if "Подтвердите возраст" in s and "gate:" in s:
+            # _AGE_GATE_STATE_JS: dict{gate, ready}
+            if self._clicked and not self.gate_after_click:
+                return {"gate": False, "ready": True}
+            return {"gate": True, "ready": False}
+        if "Подтвердите возраст" in s:
+            if self._clicked and not self.gate_after_click:
+                return False
             return True
         return None
 
@@ -97,6 +134,100 @@ class _AgePage:
 
     def query_selector(self, sel):
         return None
+
+
+def test_pass_age_gate_fails_when_modal_stays(monkeypatch):
+    """ГЛАВНЫЙ баг 2026-10-03: модалка осталась, а код рапортовал успех.
+
+    Пользователь наблюдал вживую: «пишет, что возрастной гейт пройден, но на
+    самом деле не пройден, страница так и зависает». Прежний код нажимал кнопку,
+    ждал 1.5 с и БЕЗ ПРОВЕРКИ писал «гейт пройден» → возвращал True. След в
+    данных: 483601244, 4818407500, 1701665910 дали 0 отзывов при формально
+    успешном гейте.
+    """
+    lines = []
+    import ozon_collector.log as _log
+    monkeypatch.setattr(_log, "info", lambda m, extra=None: lines.append(str(m)))
+    monkeypatch.setattr(_log, "warning",
+                        lambda m, extra=None: lines.append(str(m)))
+
+    page = _AgePage(gate_after_click=True)   # модалка НЕ уходит после клика
+    ok = C._pass_age_gate(page)
+    assert ok is False, "модалка осталась — гейт не пройден"
+    assert page.calls.get("js_click", 0) >= 2, "ожидалась повторная попытка"
+    blob = "\n".join(lines)
+    assert "подтверждение не сработало" in blob, blob
+    assert "модалка осталась на месте" in blob, blob
+    assert "возрастной гейт 18+ пройден" not in blob, "лог не должен врать"
+    assert "НЕ пройден" in blob, blob
+
+
+def test_pass_age_gate_passes_when_widgets_appear(monkeypatch):
+    """Гейт пройден, если модалка ещё в DOM, но виджеты товара появились.
+
+    Ozon после подтверждения перерисовывает страницу, и текст модалки может
+    ещё какое-то время оставаться — считать это провалом было бы ошибкой.
+    """
+    class _GateStaysButReady(_AgePage):
+        def evaluate(self, expr, *a, **k):
+            if "Подтвердите возраст" in str(expr) and "gate:" in str(expr):
+                return {"gate": True, "ready": True}
+            return super().evaluate(expr, *a, **k)
+
+    page = _GateStaysButReady()
+    assert C._pass_age_gate(page) is True
+
+
+def test_age_gate_uses_modal_input_not_first_page_input():
+    """Дата вводится в поле МОДАЛКИ, а не в первый input страницы.
+
+    Разметка реальной модалки (DOM-снимок 2026-09-08):
+        [data-widget="userAdultModal"] > div[name=birthdate][mask=##.##.####]
+          > ... > input
+    В шапке Ozon всегда есть поисковая строка, и прежний `input:visible` .first
+    уводил дату туда — кнопка подтверждала пустое значение, модалка не уходила.
+    """
+    asked = []
+
+    class _Page:
+        def __init__(self):
+            self.calls = {}
+            self._btn = _Button(self.calls, on_click=self._mark)
+            self._clicked = False
+
+        def _mark(self):
+            self._clicked = True
+
+        def evaluate(self, expr, *a, **k):
+            s = str(expr)
+            if "userAdultModal" in s:
+                return {"hasModal": True, "hasInput": True, "hasBtn": True,
+                        "value": "01.01.1990"}
+            if "Подтвердите возраст" in s and "gate:" in s:
+                return {"gate": not self._clicked, "ready": self._clicked}
+            if "Подтвердите возраст" in s:
+                return True
+            return None
+
+        def locator(self, sel, *a, **k):
+            asked.append(sel)
+            return _Locator(self.calls)
+
+        def get_by_role(self, role, name=None, *a, **k):
+            return self._btn
+
+        def wait_for_timeout(self, ms):
+            return None
+
+        def query_selector(self, sel):
+            return None
+
+    page = _Page()
+    assert C._pass_age_gate(page) is True
+    assert asked, "поля ввода вообще не искали"
+    assert asked[0] == '[data-widget="userAdultModal"] input', asked
+    assert 'input:visible' not in asked[:1], \
+        "первым должен идти якорь модалки, а не первый input страницы"
 
 
 def test_pass_age_gate_uses_js_click():
@@ -129,7 +260,16 @@ def test_pass_age_gate_waits_for_late_modal(monkeypatch):
 
     class _LateGate(_AgePage):
         def evaluate(self, expr, *a, **k):
-            if "Подтвердите возраст" in expr:
+            s = str(expr)
+            if "userAdultModal" in s:
+                # поле даты появляется вместе с модалкой
+                return {"hasModal": True, "hasInput": True, "hasBtn": True,
+                        "value": self.date}
+            if "Подтвердите возраст" in s and "gate:" in s:
+                # после клина подтверждение сработало: модалка ушла
+                return {"gate": bool(self._clicked),
+                        "ready": bool(self._clicked)}
+            if "Подтвердите возраст" in s:
                 calls["probes"] += 1
                 # модалка появляется только с третьей пробы
                 return calls["probes"] >= 3

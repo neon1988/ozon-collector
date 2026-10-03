@@ -1199,8 +1199,68 @@ _PAGE_READY_JS = (
 _AGE_GATE_WAIT_MS = 2500
 _AGE_GATE_POLL_MS = 250
 
+# Проверка РЕЗУЛЬТАТА подтверждения. Прежде код нажимал кнопку, ждал 1.5 с и
+# писал «возрастной гейт пройден» — НЕ ПРОВЕРЯЯ, ушла ли модалка (наблюдение
+# пользователя 2026-10-03: «пишет, что возрастной гейт пройден, но на самом деле
+# не пройден, страница так и зависает»). След в данных: карточки 483601244,
+# 4818407500, 1701665916 дали 0 отзывов и incomplete=True при формально
+# «успешном» гейте.
+#
+# Гейт считается пройденным, когда модалка УШЛА или на странице появились
+# виджеты товара. Второе нужно потому, что после подтверждения Ozon перерисовывает
+# страницу и текст модалки может ещё какое-то время оставаться в DOM.
+_AGE_GATE_STATE_JS = """() => {
+  const b = (document.body && document.body.innerText) || '';
+  const gate = /Подтвердите возраст/.test(b);
+  const ready = !!document.querySelector(
+    '[data-widget="webPrice"],[data-widget="webRating"],'
+    + '[data-widget="webReviews"],a[href*="tab=reviews"]');
+  return {gate: gate, ready: ready};
+}"""
 
-def _pass_age_gate(page, wait_ms: int = _AGE_GATE_WAIT_MS) -> bool:
+_AGE_GATE_CONFIRM_JS = """() => {
+  const m = document.querySelector('[data-widget="userAdultModal"]');
+  if (!m) return null;
+  const inp = m.querySelector('input');
+  const btn = [...m.querySelectorAll('button')]
+    .find(b => /Подтвердить/.test(b.innerText || ''));
+  return {hasModal: true, hasInput: !!inp, hasBtn: !!btn,
+          value: inp ? (inp.value || '') : null};
+}"""
+
+# Дата рождения в маске ##.##.#### — вводим с разделителями. Прежний ввод
+# «01011990» без точек опирался на то, что маска расставит их сама; на части
+# карточек этого не происходит, поле остаётся пустым, кнопка не подтверждает
+# дату, модалка не уходит — и код рапортовал успех (до проверки результата).
+_AGE_GATE_DATE = "01.01.1990"
+
+_AGE_GATE_VERIFY_MS = 4000
+
+
+def _age_gate_confirmed(page, wait_ms: int = _AGE_GATE_VERIFY_MS) -> tuple:
+    """Ждёт фактического подтверждения гейта. Возвращает (ok, причина).
+
+    ok=True только если модалка исчезла ИЛИ появились виджеты товара. Иначе False
+    с наблюдаемым состоянием, чтобы разбор не гадал.
+    """
+    last = {"gate": True, "ready": False}
+    deadline = time.monotonic() + wait_ms / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            last = page.evaluate(_AGE_GATE_STATE_JS) or last
+        except Exception:
+            last = {"gate": True, "ready": False}
+        if not last.get("gate") or last.get("ready"):
+            return True, ("модалка ушла" if not last.get("gate")
+                          else "виджеты товара появились")
+        page.wait_for_timeout(_AGE_GATE_POLL_MS)
+    if last.get("gate") and not last.get("ready"):
+        return False, "модалка осталась на месте"
+    return False, f"состояние неизвестно: {last}"
+
+
+def _pass_age_gate(page, wait_ms: int = _AGE_GATE_WAIT_MS,
+                   attempts: int = 2) -> bool:
     """Пройти модалку «Подтвердите возраст» (18+ категории).
 
     Маска даты ДД.ММ.ГГГГ не принимает программный value — вводим
@@ -1231,23 +1291,76 @@ def _pass_age_gate(page, wait_ms: int = _AGE_GATE_WAIT_MS) -> bool:
                     return False
             else:
                 return False
-        inp = page.locator("input:visible").first
-        inp.click()
-        try:
-            inp.press_sequentially("01011990", delay=40)
-        except Exception as e:
-            if B.is_renderer_failure(e):
-                raise
-            log.warning(f"[collect] age-gate press_sequentially warn: {e}")
-            inp.type("01011990", delay=40)
+        # Ввод идёт в поле МОДАЛКИ, а не в первый видимый input страницы: в шапке
+        # Ozon всегда есть поисковая строка, и прежний `input:visible` .first
+        # уводил дату туда. Разметка модалки (DOM-снимок 2026-09-08):
+        #   [data-widget="userAdultModal"] > div[name=birthdate][mask=##.##.####]
+        #     > ... > input
+        #   > button: «Подтвердить»
+        _MODAL_SEL = '[data-widget="userAdultModal"]'
+        _field = None
+        for _sel in (f"{_MODAL_SEL} input", f"{_MODAL_SEL} [contenteditable]",
+                     "[name=birthdate]", "input:visible"):
+            try:
+                _loc = page.locator(_sel).first
+                if _loc.count() > 0:
+                    _field = _loc
+                    break
+            except Exception:
+                continue
+        if _field is None:
+            log.warning("[collect] age-gate: модалка есть, но поле ввода не "
+                        "найдено (селекторы: input/[contenteditable]/birthdate)")
+            return False
         btn = page.get_by_role("button", name="Подтвердить")
-        try:
-            btn.wait_for(state="visible", timeout=5000)
-        except Exception as e:
-            if B.is_renderer_failure(e):
-                raise
-            log.warning(f"[collect] age-gate button wait warn: {e}")
-        if btn.is_enabled():
+        last_why = ""
+        # Попыток две: первый клик может не сработать (Ozon слушает
+        # pointerdown/up, а не click), и повтор с вводом заново часто проходит.
+        for attempt in range(1, max(1, attempts) + 1):
+            _field.click()
+            # Очистить перед вводом: маска могла оставить прошлые символы, и
+            # новая дата тогда не встанет в начало поля.
+            try:
+                _field.press("Control+a")
+                _field.press("Delete")
+            except Exception as e:
+                if B.is_renderer_failure(e):
+                    raise
+            for _chunk in (_AGE_GATE_DATE, _AGE_GATE_DATE.replace(".", "")):
+                try:
+                    _field.press_sequentially(_chunk, delay=40)
+                except Exception as e:
+                    if B.is_renderer_failure(e):
+                        raise
+                    log.warning(f"[collect] age-gate press_sequentially warn: {e}")
+                    _field.type(_chunk, delay=40)
+                try:
+                    _st = page.evaluate(_AGE_GATE_CONFIRM_JS) or {}
+                    if _st.get("value"):
+                        break
+                except Exception:
+                    pass
+            # Поле должно содержать дату — иначе кнопка не подтвердит ничего.
+            try:
+                _st = page.evaluate(_AGE_GATE_CONFIRM_JS) or {}
+            except Exception:
+                _st = {}
+            if not _st.get("value"):
+                last_why = f"поле даты осталось пустым (селектор {_sel})"
+                log.warning(f"[collect] age-gate: {last_why} "
+                            f"(попытка {attempt}/{attempts})")
+                continue
+            try:
+                btn.wait_for(state="visible", timeout=5000)
+            except Exception as e:
+                if B.is_renderer_failure(e):
+                    raise
+                log.warning(f"[collect] age-gate button wait warn: {e}")
+            if not btn.is_enabled():
+                last_why = "кнопка Подтвердить осталась disabled"
+                log.warning(f"[collect] age-gate: {last_why} "
+                            f"(попытка {attempt}/{attempts})")
+                continue
             try:
                 # Обычный Playwright click падает на перехвате pointer events
                 # оверлеем модалки.  el.click() даёт synthetic click, но
@@ -1278,10 +1391,19 @@ def _pass_age_gate(page, wait_ms: int = _AGE_GATE_WAIT_MS) -> bool:
                     except Exception as e2:
                         if B.is_renderer_failure(e2):
                             raise
-            page.wait_for_timeout(1500)
-            log.info("[collect] возрастной гейт 18+ пройден")
-            return True
-        log.warning("[collect] age-gate: кнопка Подтвердить осталась disabled")
+            # ГЛАВНОЕ: успех заявляем ТОЛЬКО после проверки результата. Прежде
+            # здесь стоял безусловный return True через 1.5 с — поэтому лог врал
+            # («гейт пройден»), а страница оставалась с модалкой и отзывы не
+            # грузились (наблюдение пользователя 2026-10-03).
+            ok, why = _age_gate_confirmed(page)
+            if ok:
+                log.info(f"[collect] возрастной гейт 18+ пройден "
+                         f"(попытка {attempt}/{attempts}, {why})")
+                return True
+            last_why = why
+            log.warning(f"[collect] age-gate: подтверждение не сработало "
+                        f"(попытка {attempt}/{attempts}): {why}")
+        log.warning(f"[collect] возрастной гейт 18+ НЕ пройден — {last_why}")
         return False
     except Exception as e:
         if B.is_renderer_failure(e):
