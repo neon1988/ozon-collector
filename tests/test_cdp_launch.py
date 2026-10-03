@@ -83,9 +83,42 @@ class TestFreeStaleProfile:
         holders = [cdp.P.ProcessIdentity(pid=111, start_key="k1"),
                    cdp.P.ProcessIdentity(pid=222, start_key="k2")]
         m_kill = self._install(monkeypatch, procs=holders, killed=[111, 222])
+        # потомков нет — ждать освобождения нечего
+        monkeypatch.setattr(cdp.P, "wait_profile_released",
+                            lambda *_a, **_k: [])
         freed = cdp._free_stale_profile("http://127.0.0.1:9222", "ozon-profile")
         assert freed == [111, 222]
         m_kill.assert_called_once_with(holders)
+
+    def test_surviving_children_are_killed_and_profile_freed(self, monkeypatch):
+        """Потомки renderer/gpu держат профиль — их надо дождаться и добить.
+
+        Живой замер 2026-10-03 16:0x: MAIN найден и убит, семь процессов-потомков
+        остались жить, следующий Chromium EXITED с «profile captured by a live
+        instance» — четыре запуска подряд. browser_processes() их не видит
+        (ищет по порту и отбрасывает --type=), поэтому нужен отдельный проход.
+        """
+        holders = [cdp.P.ProcessIdentity(pid=111, start_key="k1")]
+        children = [cdp.P.ProcessIdentity(pid=222, start_key="k2"),
+                    cdp.P.ProcessIdentity(pid=333, start_key="k3")]
+        m_kill = self._install(monkeypatch, procs=holders, killed=[111])
+        m_prof = mock.Mock(return_value=children)
+        monkeypatch.setattr(cdp.P, "profile_processes", m_prof)
+        waits = []
+
+        def _wait(_token, timeout_s=8.0):
+            waits.append(timeout_s)
+            return children if not waits[-1] or timeout_s >= 8.0 else []
+
+        # первый вызов (после MAIN) возвращает потомков, второй — пусто
+        monkeypatch.setattr(cdp.P, "wait_profile_released",
+                            mock.Mock(side_effect=[[222, 333], []]))
+        m_kill2 = mock.Mock(return_value=[222, 333])
+        monkeypatch.setattr(cdp.P, "kill_identities", m_kill2)
+        cdp._free_stale_profile("http://127.0.0.1:9222", "ozon-profile")
+        killed_sets = [c[0][0] for c in m_kill2.call_args_list]
+        assert children in killed_sets, \
+            f"потомки должны быть добиты, убито: {killed_sets}"
 
     def test_foreign_profile_untouched(self, monkeypatch):
         """Без маркера запуска профиль считается чужим — окно не рвём."""

@@ -369,6 +369,23 @@ def _free_stale_profile(cdp_url: str, profile_token: str) -> list[int]:
         return []
     pids = [h.pid for h in holders]
     freed = P.kill_identities(holders)
+    # Главный процесс убит — но renderer/gpu/utility держат профиль ещё секунды.
+    # Живой замер 2026-10-03 16:0x: MAIN найден и убит, семь потомков остались,
+    # и четыре запуска подряд Chromium EXITED с «profile captured by a live
+    # instance». Поэтому ждём освобождения и добиваем тех, кто не ушёл.
+    left = P.wait_profile_released(profile_token)
+    if left:
+        log.warning(f"[cdp] профиль {profile_token!r} всё ещё держат "
+                    f"{len(left)} процессов-потомков {left} после убийства "
+                    f"главного — добиваю")
+        leftover = P.profile_processes(profile_token)
+        freed += P.kill_identities(leftover)
+        still = P.wait_profile_released(profile_token, timeout_s=5.0)
+        if still:
+            log.error(f"[cdp] профиль {profile_token!r} НЕ освободился: "
+                      f"{still} держат профиль, следующий Chromium упадёт")
+        else:
+            log.info(f"[cdp] профиль {profile_token!r} освобождён полностью")
     log.warning(f"[cdp] профиль {profile_token!r} держал нерабочий браузер "
                 f"(CDP не отвечает): снят pid={pids} -> освобождён={freed}")
     return freed

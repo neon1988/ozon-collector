@@ -1250,6 +1250,52 @@ def wait_exit(identity: ProcessIdentity, wait_s: float = 3.0) -> bool:
     return _linux_wait_exit(identity, wait_s)
 
 
+def profile_processes(profile_token: str = PROFILE_TOKEN
+                     ) -> list[ProcessIdentity]:
+    """ВСЕ процессы Chromium с нашим profile_token — включая потомков.
+
+    Зачем шире browser_processes: тот ищет по (порт + профиль) и отбрасывает
+    --type= (renderer/gpu/utility/crashpad). Но именно эти потомки держат
+    профиль: главный процесс можно убить, а renderer/gpu остаются жить, и
+    следующий Chromium стартует, сразу упирается в занятый профиль и умирает
+    («profile captured by a live instance is the usual one» — так и было в живом
+    прогоне 2026-10-03 16:0x: MAIN найден и убит, семь потомков остались,
+    четыре запуска подряд Chromium EXITED).
+
+    Профиль проверяется по имени последнего компонента --user-data-dir плюс
+    маркер запуска .ozon_collector_launched, поэтому ручное окно пользователя не
+    затрагивается (см. ADR §14.5 про ownership identity).
+    """
+    out: list[ProcessIdentity] = []
+    for pid, argv, _ppid in _iter_chromium_processes():
+        udd = None
+        for a in argv:
+            if a.startswith("--user-data-dir="):
+                udd = a.split("=", 1)[1].strip("\"'")
+                break
+        if not udd or os.path.basename(udd.rstrip("/\\")) != profile_token:
+            continue
+        ident = process_identity(pid)
+        if ident is not None:
+            out.append(ident)
+    return out
+
+
+def wait_profile_released(profile_token: str = PROFILE_TOKEN,
+                          timeout_s: float = 8.0) -> list[int]:
+    """Ждать, пока профиль реально освободится. Возвращает оставшиеся pid.
+
+    Убийства главного процесса мало: renderer/gpu живут ещё секунды и держат
+    профиль. Возвращаем то, что осталось, чтобы вызывающий мог добить.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        left = [i.pid for i in profile_processes(profile_token)]
+        if not left or time.monotonic() >= deadline:
+            return left
+        time.sleep(0.5)
+
+
 def kill_identities(identities, wait_s: float = 3.0) -> list[int]:
     """Завершить процессы по чистым identity (best-effort, с проверкой PID-reuse).
 
