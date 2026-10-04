@@ -288,6 +288,48 @@ def test_await_browser_no_grace_when_launcher_reports_death(tmp_path, monkeypatc
     assert slept == [], "при EXITED ждать нечего"
 
 
+def test_launch_and_wait_switches_port_before_starting(monkeypatch):
+    """Порт подменяется ДО запуска Chromium, а не только в тексте ошибки.
+
+    Живой замер 2026-10-03: диагностика «порт 9222 ЗАРЕЗЕРВИРОВАН Windows»
+    печаталась, но запуск всё равно шёл на зарезервированный порт — четыре
+    раунда подряд Chromium EXITED, CDP never came up при свободном порте.
+    """
+    log = _write_launch_log("")
+    used = {}
+
+    def _launch(cdp_url, profile_path=None, profile_token=None):
+        used["url"] = cdp_url
+        return cdp.LaunchRun(log, _AliveProc())
+
+    monkeypatch.setattr(cdp, "_launch_browser", _launch)
+    monkeypatch.setattr(cdp, "browser_alive", lambda *_a, **_k: False)
+    monkeypatch.setattr(cdp, "_await_browser", lambda *_a, **_k: True)
+    real_base, _why = cdp.P.cdp_port_base()
+    cdp.launch_and_wait("http://127.0.0.1:9222", wait_s=0.2)
+    assert used.get("url"), "Chromium не запускался"
+    assert used["url"] == f"http://127.0.0.1:{real_base}", \
+        f"запуск пошёл на негодный порт: {used['url']}"
+
+
+def test_launch_and_wait_keeps_port_when_bindable(monkeypatch):
+    """Порт, который слушается, не меняется (инвариант 9222 сохранён)."""
+    log = _write_launch_log("")
+    used = {}
+
+    def _launch(cdp_url, profile_path=None, profile_token=None):
+        used["url"] = cdp_url
+        return cdp.LaunchRun(log, _AliveProc())
+
+    monkeypatch.setattr(cdp, "_launch_browser", _launch)
+    monkeypatch.setattr(cdp, "browser_alive", lambda *_a, **_k: False)
+    monkeypatch.setattr(cdp, "_await_browser", lambda *_a, **_k: True)
+    monkeypatch.setattr(cdp.P, "port_bindable",
+                        lambda p: (True, "свободен"))
+    cdp.launch_and_wait("http://127.0.0.1:9222", wait_s=0.2)
+    assert used["url"] == "http://127.0.0.1:9222"
+
+
 def test_launch_and_wait_keeps_waiting_while_launcher_alive(monkeypatch):
     """Живой лаунчер = продолжаем ждать порт (false alarm не делаем)."""
     log = _write_launch_log("")

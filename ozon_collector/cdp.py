@@ -406,6 +406,23 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
     """
     if browser_alive(cdp_url):
         return True
+
+    # ПОРТ ПРОВЕРЯЕТСЯ ДО ЗАПУСКА. Живой замер 2026-10-03: Windows взяла
+    # диапазон 9172-9271 в исключения, поэтому 9222 (и воркерские 9223-9230)
+    # давали bind WSAEACCES — Chromium физически не мог поднять DevTools, и
+    # каждый запуск падал с «EXITED, CDP never came up» при свободном порте.
+    # Диагностика печаталась в тексте ошибки, но запуск всё равно шёл на
+    # зарезервированный порт, поэтому здесь порт ПОДМЕНЯЕТСЯ до запуска.
+    _want_port = P.cdp_port(cdp_url)
+    _bindable, _why = P.port_bindable(_want_port)
+    if not _bindable:
+        _base, _base_why = P.cdp_port_base()
+        cdp_url = f"http://127.0.0.1:{_base}"
+        log.error(f"[cdp] ПОРТ {_want_port} НЕПРИГОДЕН ({_why}); переключаюсь "
+                  f"на {_base} — {_base_why}. Если 9222 нужен именно, освободи "
+                  f"диапазон: netsh int ipv4 show excludedportrange "
+                  f"protocol=tcp")
+
     log.warning(f"[cdp] браузер не запущен на {cdp_url}, запускаю…",
                 extra={"cdp_url": cdp_url})
     profile_path = None
