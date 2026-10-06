@@ -19,6 +19,7 @@ from . import launchlog as _LL
 from . import log
 from . import ffsel
 from . import process as P
+from . import window_policy as _WP
 
 
 # ---- Firefox-бэкенд (OZON_BROWSER=firefox) ---------------------------------
@@ -619,8 +620,20 @@ class Session:
         if self.kind == "firefox":
             self._connect_firefox()
             return
+        # Окно пользователя запоминаем ТОЛЬКО когда нашего браузера ещё нет:
+        # Chromium крадёт фокус на старте (замер 2026-10-06: foreground ==
+        # chrome через 0.3-0.4 с при скрытом окне), и вернуть фокус можно
+        # только на то окно, которое было в фокусе ДО запуска. Если браузер
+        # уже жив и фокус на нём — запоминать нечего, и запомнить своё же
+        # окно нельзя (`note_user_window` отфильтровывает pid из реестра гварда,
+        # а на этом шаге pid ещё не зарегистрирован — ревью 2026-10-06).
+        # Второй вызов — после регистрации pid, для случая «браузер уже был жив».
+        # Гвард по умолчанию выключен, guard() может быть None.
+        _wp_guard = _WP.guard()
         was_alive = browser_alive(self.cdp_url)
         if self.auto_launch and not was_alive:
+            if _wp_guard is not None:
+                _wp_guard.note_user_window()
             launch_and_wait(self.cdp_url, profile_token=self.profile_token)
             # База могла сдвинуться (9222 забрала Windows) — подключаться
             # надо к фактическому порту, иначе ECONNREFUSED при живом браузере.
@@ -667,8 +680,14 @@ class Session:
             # --window-mode visible). SWP/ShowWindow снаружи бесполезны,
             # т.к. Chrome возвращает окно: запрет минимизации — здесь.
             self._keep_window_visible()
+            self._sync_window_guard(" (connect)", enforce_hidden=False)
         else:
             self._minimize_window()
+            self._sync_window_guard(" (connect)", enforce_hidden=True)
+        # Теперь pid зарегистрирован (или гвард выключен/в external — тогда
+        # note_user_window ничего не запомнит, см. его проверку по реестру).
+        if _wp_guard is not None:
+            _wp_guard.note_user_window()
 
     def _connect_firefox(self):
         """Firefox-бэкенд: stock Firefox через geckodriver (Selenium/Marionette).
@@ -785,15 +804,48 @@ class Session:
         воркерами отваливался на «Browsing context has been discarded» (worker
         падал на ПЕРВОМ товаре, когда new_page сворачивал окно).
         Chromium → свернуть, чтобы не перекрывал работу пользователя.
+
+        Сторож окон (window_policy) держит инвариант ПОСЛЕ этих вызовов: окно
+        само всплывает через ~30-40 с после старта и забирает фокус, а этот
+        код вызывается только на connect/new_page/recycle.
         """
         if getattr(self, "keep_window", False):
             self._keep_window_visible()
+            self._sync_window_guard(why, enforce_hidden=False)
         elif getattr(self, "kind", "chrome") == "firefox":
             log.debug("firefox: окно разворачиваю без фокуса%s", why)
             self._restore_window_native(pids=self._firefox_pids(),
                                         window_class=FIREFOX_WINDOW_CLASS)
+            self._sync_window_guard(why, enforce_hidden=False)
         else:
             self._minimize_window()
+            self._sync_window_guard(why, enforce_hidden=True)
+
+    def _sync_window_guard(self, why: str = "", enforce_hidden: bool = False):
+        """Регистрировать окно браузера в стороже окон (см. window_policy).
+
+        По умолчанию сторож ВЫКЛЮЧЕН (`OZON_WINDOW_GUARD=1` включает): окна
+        браузеров коллектора — рабочие окна пользователя, он сам их открывает
+        и сворачивает, и просьба «трогай только свои» (2026-10-06) означает
+        отказ от любого вмешательства по умолчанию. Здесь же проверяется
+        keep_window, owner и движок: даже при включённом флаге сторож работает
+        только для собственных браузеров коллектора в режиме hidden.
+        """
+        pid = getattr(getattr(self, "browser_pid", None), "pid", None)
+        if not pid:
+            return
+        guard = _WP.guard()
+        if guard is None:
+            return                      # выключено — окна пользователя не трогаем
+        hide = (enforce_hidden
+                and not getattr(self, "keep_window", False)
+                and getattr(self, "browser_owner", None) == "collector"
+                and getattr(self, "kind", "chrome") == "chrome")
+        if hide:
+            guard.watch(pid, P.cdp_port(self.cdp_url))
+        else:
+            guard.forget(pid)
+        log.debug(f"window_policy: pid={pid} hidden={hide}{why}")
 
     def _firefox_pids(self) -> list:
         """PIDs нашего Firefox (все процессы на профиле, для native-окна).

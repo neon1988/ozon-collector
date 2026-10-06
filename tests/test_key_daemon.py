@@ -1934,9 +1934,11 @@ def test_summarize_all_keys():
     p["final_state"] = "COMPLETED"
     p["final_reason"] = "target_reached"
     s = k.summarize(p)
+    # pending добавлен 2026-10-06: «нормально завершил», а товары из выдачи
+    # без результата не видно — ровно то, что смущало пользователя в логах.
     assert set(s.keys()) == {"campaign", "target", "min_valid", "valid",
                              "discovered", "failed", "permanently_failed",
-                             "runs", "final_state", "final_reason"}
+                             "pending", "runs", "final_state", "final_reason"}
 
 
 # --- default_manifest: базовые дефолты ---
@@ -4181,6 +4183,71 @@ def test_raw_pids_since_ignores_backups_and_junk(tmp_path):
     assert k.raw_pids_since(str(tmp_path), now - 100) == ["111"]
     assert sorted(k.raw_pids_since(str(tmp_path), 0)) == ["111", "333"]
     assert k.raw_pids_since(str(tmp_path / "нет"), 0) == []
+
+
+# ---------------------------------------------------------------------------
+# Очередь прогона: discovered ≠ собранные (регрессия 2026-10-06)
+# ---------------------------------------------------------------------------
+def test_pending_pids_are_discovered_without_result(tmp_path):
+    """Пиды из выдачи без raw и без вердикта — «без результата».
+
+    Именно они терялись: демон считал весь discovered «уже обработанным»
+    и выкидал из очереди (в логе: «пропущено 336, осталось 0» при 66 raw).
+    """
+    (tmp_path / "111_raw.json").write_text("{}", encoding="utf-8")
+    prog = {"discovered_pids": ["111", "222", "333"],
+            "valid_pids": [], "failed_pids": ["333"],
+            "permanently_failed_pids": []}
+    assert k.pending_pids(prog, str(tmp_path)) == ["222"]
+
+
+def test_pending_pids_empty_when_everything_collected(tmp_path):
+    (tmp_path / "111_raw.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "222_raw.json").write_text("{}", encoding="utf-8")
+    prog = {"discovered_pids": ["111", "222"], "valid_pids": ["222"],
+            "failed_pids": [], "permanently_failed_pids": []}
+    assert k.pending_pids(prog, str(tmp_path)) == []
+
+
+def test_pending_pids_counts_valid_as_processed(tmp_path):
+    """valid без файла на диске тоже «обработан» (есть куда спрятать raw)."""
+    prog = {"discovered_pids": ["111", "222"], "valid_pids": ["111"],
+            "failed_pids": [], "permanently_failed_pids": []}
+    assert k.pending_pids(prog, str(tmp_path)) == ["222"]
+
+
+def test_summarize_reports_pending(tmp_path):
+    prog = {"campaign": "c", "target_count": 500, "min_valid": 1,
+            "discovered_pids": ["111", "222"], "valid_pids": [],
+            "failed_pids": [], "permanently_failed_pids": [], "runs": []}
+    s = k.summarize(prog)
+    assert s["discovered"] == 2 and s["pending"] == 2
+
+
+def test_skip_pids_excludes_pending_from_queue(tmp_path):
+    """skip_pids (= результат split_done_pending) НЕ содержит пидов без raw.
+
+    Это ровно та величина, которая уходит в collect_parallel: раньше туда
+    попадал весь discovered, и товары без результата выпадали из работы.
+    """
+    (tmp_path / "111_raw.json").write_text("{}", encoding="utf-8")
+    prog = {"discovered_pids": ["111", "222"], "valid_pids": ["333"],
+            "failed_pids": [], "permanently_failed_pids": [], "runs": []}
+    done, retry = k.split_done_pending(prog, str(tmp_path))
+    assert sorted(done) == ["111", "333"]
+    assert retry == ["222"], "222 обязан вернуться в очередь"
+    skip = sorted(done) or None
+    assert "222" not in (skip or [])
+
+
+def test_split_done_pending_keeps_failed_out_of_queue(tmp_path):
+    """Брак и безнадёжные не пересобираются каждый раунд (исходное требование)."""
+    prog = {"discovered_pids": ["1", "2", "3", "4"],
+            "valid_pids": ["1"], "failed_pids": ["2"],
+            "permanently_failed_pids": ["3"], "runs": []}
+    done, retry = k.split_done_pending(prog, str(tmp_path))
+    assert {"1", "2", "3"} <= done
+    assert retry == ["4"], "только 4 (без результата) возвращается в очередь"
 
 
 def test_checkpoint_thread_writes_inflight_and_stop_is_clean(tmp_path):

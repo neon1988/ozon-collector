@@ -197,8 +197,31 @@ fingerprint — грубый отпечаток сессии; полный probe
 - **Маркер ownership:** скрипты пишут файл `.ozon_collector_launched` в профиль —
   по нему `Session` отличает «наш» запуск (collector) от ручного (external).
 - **Скрытый запуск и фокус:** окно создаётся скрытым (SW_HIDE), затем
-  свёрнутым без активации (SW_SHOWMINNOACTIVE + WS_EX_NOACTIVATE), фокус
-  возвращается предыдущему окну.
+  свёрнутым без активации (SW_SHOWMINNOACTIVE + WS_EX_NOACTIVATE + HWND_TOPMOST).
+  Фокус возвращается предыдущему окну силами лаунчера (см. оговорку ниже).
+- **Оговорка, измеренная 2026-10-06:** «фокус возвращается» выполняется не
+  всегда. Когда фокус уже сидит на окне Chromium, ни `AttachThreadInput`
+  (возвращает 0), ни `SwitchToThisWindow`, ни `SetForegroundWindow` из
+  PowerShell не переводят фокус назад; работает только синтетический Alt.
+- **Сторож окон отключён по умолчанию.** `ozon_collector/window_policy.py`
+  умеет возвращать окно коллектора в minimized (0.06 с) и возвращать фокус,
+  но включается только через `OZON_WINDOW_GUARD=1`: окна браузеров коллектора —
+  рабочие окна пользователя, он сам их открывает и сворачивает
+  (требование 2026-10-06: «трогай только свои»).
+
+### Окна и фокус — что измерено 2026-10-06
+
+Замерял Win32-монитор (EnumWindows каждые 20 мс, 4 серии по 60-120 с).
+
+| Наблюдение | Статус |
+|---|---|
+| Chromium крадёт фокус на старте даже при SW_HIDE (`foreground == chrome` через 0.3-0.4 с, окно `IsWindowVisible == false`) | [FACT] |
+| Окно браузера коллектора само выходит из minimized в normal и забирает фокус через ~30-40 с после старта; живёт в normal ~1.4 с | [FACT], воспроизведено 2 раза |
+| Воспроизводится и без кода коллектора (только `launch_chrome.ps1`), и не лечится ни SW_HIDE, ни `ShowWindow(SW_SHOWMINNOACTIVE)`, ни `SetTopmost`, ни чистым профилем, ни одним браузером вместо трёх | [FACT] |
+| Источник — внутри Chromium/Windows, не в одной строке нашего кода | [FACT] (ограничение вывода) |
+| `ozon_collector/window_policy.py` (сторож, **выключен** без `OZON_WINDOW_GUARD=1`): окно в minimized за ~0.06 с, фокус возвращается ALT-trick'ом | [FACT] на живых прогонах 06.10; по умолчанию не применяется |
+| `GetLastInputInfo` не учитывает ни программные `ShowWindow`, ни `SendInput` — ручное открытие окна отличается от самовсплытия | [FACT], замер 06.10 |
+| Влияние режима окна на challenge rate (document.hidden) | [HYPOTHESIS], A/B не проводился |
 - **Порт:** `--remote-debugging-port=9222` (воркеры `9222+k`), CDP на localhost.
 
 **Авто-запуск:** `cdp.launch_and_wait` запускает браузер сам, если закрыт
@@ -1103,7 +1126,8 @@ opt-in** (`--reviews-api` / `OZON_REVIEWS_API=1`, дефолт — выключ�
 товаров: `access_challenge → new_tab×1 → recycle×1 → raise (SESSION_BLOCKED)`.
 Константа `NEW_TAB_ATTEMPTS=2` удалена; `INCIDENT_NEW_TAB_MAX/INCIDENT_RECYCLE_MAX`
 общие с `_collect_shard`. Это закрывает старое несоответствие ADR-лестнице.
-(Реализовано в ревизии по фидбеку; см. PROJECT_NOTES.)
+(Реализовано в ревизии по фидбеку; см. архив журнала
+`docs/archive/PROJECT_NOTES_2026-10-06.md`.)
 
 **Докрутка и session budget (ревизия 2.7):** докрутка выдачи НЕ расходует
 `session_used{challenge,new_tab,browser_recycle}` — она использует собственные

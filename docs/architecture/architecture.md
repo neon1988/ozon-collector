@@ -95,7 +95,8 @@ scripts/qa_raw.py  ← QA-гейт (офлайн проверка raw; маши�
   Ozon отдаёт заглушку «похоже, нет соединения» на первом `goto` любой сессии
   geckodriver/Marionette; webdriver-флаг причиной не является (Chromium с
   `--enable-automation`, `webdriver=true`, проходит). Замеры и исключённые
-  причины — в докстринге `browser.py::browser_kind` и `PROJECT_NOTES.md`.
+  причины — в докстринге `browser.py::browser_kind` и в архиве журнала
+  `docs/archive/PROJECT_NOTES_2026-10-06.md`.
   Firefox-ветка (`cdp.py::_connect_firefox`, `ffsel.py`) — только отладка профилей.
 - Chromium запускается скриптом с CDP-портом 9222 и отдельным профилем
   (`%LOCALAPPDATA%\opencode\ozon-profile`): там куки и однажды

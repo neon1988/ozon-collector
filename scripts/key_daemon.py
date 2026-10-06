@@ -640,10 +640,45 @@ def summarize(progress: dict) -> dict:
         "discovered": len(set(progress.get("discovered_pids", []))),
         "failed": len(set(progress.get("failed_pids", []))),
         "permanently_failed": len(set(progress.get("permanently_failed_pids", []))),
+        "pending": len(pending_pids(progress)),
         "runs": len(progress.get("runs", [])),
         "final_state": progress.get("final_state"),
         "final_reason": progress.get("final_reason"),
     }
+
+
+def split_done_pending(progress: dict,
+                       data_dir: str | None = None) -> tuple[set, list]:
+    """Разделить пиды выдачи на «обработанные» и «без результата».
+
+    `done` — по ним есть результат: вердикт (valid / FAIL / permanently_failed)
+    либо canonical raw на диске. `pending` — найдены в выдаче, но результата
+    нет: их обязано вернуть в очередку следующего прогона.
+
+    Почему это отдельная функция (регрессия 2026-10-06, жалоба пользователя
+    «прошёл, а собрал мало»): `discovered_pids` пополняется сразу после
+    докрутки выдачи, ДО сбора. Раньше весь discovered попадал в skip_pids, и
+    товары, до которых воркеры не дошли (SESSION_EXHAUSTED / BROWSER_DEAD /
+    конец прогона), выкидались из очереди навсегда: в логе было «пропущено 336
+    уже обработанных (осталось 0)», пока на диске лежало 66 raw.json.
+    """
+    d = data_dir or str(DATA_DIR)
+    discovered = set(progress.get("discovered_pids") or [])
+    # done шире discovered: valid/FAIL/permanently_failed могут быть в состоянии
+    # от прошлых прогонов, их тоже нельзя пересобирать.
+    done = set(progress.get("valid_pids", [])) \
+        | set(progress.get("failed_pids", [])) \
+        | set(progress.get("permanently_failed_pids", []))
+    done |= {p for p in discovered if has_raw(d, str(p))}
+    return done, sorted(discovered - done)
+
+
+def pending_pids(progress: dict, data_dir: str | None = None) -> list[str]:
+    """Товары из выдачи, по которым НЕТ результата (ни raw, ни вердикта).
+
+    Их число показывает, что прогон «нормально завершился», а собрал не всё.
+    """
+    return split_done_pending(progress, data_dir)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -1310,14 +1345,19 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
                       f"{e}. Перезадай --url или удали "
                       f"data/campaigns/{progress.get('campaign', '?')}/state.json")
             raise SystemExit(2)
-        # Пропускать ВСЕ уже известные пиды (valid + FAIL + permanently_failed),
-        # а не только valid: иначе мёртвые товары пересобираются в каждом раунде
-        # (пустая работа, капчи), а выдача "ходит по кругу" без прогресса.
-        _known = set(progress.get("discovered_pids", [])) \
-            | set(progress.get("valid_pids", [])) \
-            | set(progress.get("failed_pids", [])) \
-            | set(progress.get("permanently_failed_pids", []))
-        skip_pids = sorted(_known) or None
+        # Пропускать ТОЛЬКО реально обработанные пиды, а не весь discovered.
+        # Регрессия 2026-10-06 (жалоба пользователя «прошёл, а собрал мало»):
+        # discovered пополняется до сбора, и товары, до которых воркеры не
+        # дошли (SESSION_EXHAUSTED / BROWSER_DEAD / конец прогона), выкидались
+        # из очереди навсегда — в логе «пропущено 336 уже обработанных (осталось
+        # 0)» при 66 raw.json на диске. Разбор — в split_done_pending.
+        _done, _retry = split_done_pending(progress)
+        skip_pids = sorted(_done) or None
+        if _retry:
+            log.info(f"[key_daemon] в очередь возвращено {len(_retry)} пидов из "
+                     f"выдачи без результата (были пропущены как "
+                     f"'обработанные'): {', '.join(_retry[:12])}"
+                     f"{'...' if len(_retry) > 12 else ''}")
         # полный прогон собирает с запасом target + reserve_count (как в прежнем CLI)
         discovery = progress["target_count"] + int(cfg.get("reserve_count") or 0)
         limit = discovery
@@ -1982,10 +2022,18 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 stall["crash_runs"] = stall.get("crash_runs", 0) + 1
             progress["stall"] = stall
 
+            # Честный итог: NORMAL_DONE означает «воркеры отработали», а не
+            # «собрано всё». Показываем, сколько товаров из выдачи осталось
+            # без результата — иначе «нормально завершил» выглядит как успех
+            # (жалоба 2026-10-06: три запуска подряд 21 → 37 → 58 valid, а демон
+            # рапортовал нормальное завершение).
+            _pending = pending_pids(progress)
             log.info(f"[{run_id}] status={status}: discovered "
                 f"{len(progress.get('discovered_pids', []))} "
                 f"valid {len(progress.get('valid_pids', []))} "
-                f"(new_disc={len(new_disc)}, new_valid={len(new_valid)})")
+                f"(new_disc={len(new_disc)}, new_valid={len(new_valid)})"
+                + (f" БЕЗ РЕЗУЛЬТАТА: {len(_pending)} — вернутся в очередь"
+                   if _pending else " без результата: 0"))
 
             # ---- реакция по статусу ----
             if status == "CHALLENGE_STORM":
@@ -2394,6 +2442,17 @@ def finalize_campaign(progress: dict, progress_path: Path,
         else:
             progress["final_note"] = (
                 f"valid={valid} < min_valid={min_valid}, цель недостижима")
+    # Мягкая остановка не значит «выдача выбрана целиком»: если часть товаров
+    # из выдачи так и не получила результата, это входит в итог (жалоба
+    # 2026-10-06: кампания отчиталась о нормальном завершении, не собрав даже
+    # пятой части товаров).
+    _pending_final = pending_pids(progress)
+    if _pending_final:
+        _note = progress.get("final_note") or ""
+        _extra = (f"без результата {len(_pending_final)} товаров из выдачи "
+                  f"(вернутся в очередь при новом запуске)")
+        progress["final_note"] = f"{_note}; {_extra}" if _note else _extra
+        log.warning(f"итог: {_extra}")
     save_json(progress_path, progress)
 
 
