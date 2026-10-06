@@ -255,6 +255,57 @@ class TestSessionAutoLaunch:
         assert s._browser is not None
         assert launches["n"] == 1
 
+    def test_connects_to_shifted_port_not_dead_one(self, monkeypatch):
+        """База сдвинулась (9222 забрала Windows) — connect идёт на живой порт.
+
+        Живой замер 2026-10-03: браузер поднялся на 9444, но Session._connect
+        уходил в connect_over_cdp на исходный 9222 → ECONNREFUSED, хотя
+        браузер был жив. Порт обязан разрешаться ДО подключения.
+        """
+        seen = {}
+        launches = self._install(monkeypatch, lambda: False)
+        monkeypatch.setattr(cdp, "browser_alive",
+                            lambda url: url.endswith(":9444"))
+        monkeypatch.setattr(cdp.P, "profile_debug_ports",
+                            lambda token=None: {9444: [35968]})
+        real_connect = None
+
+        class FakeBrowser:
+            contexts = [type("FakeCtx", (), {"pages": [object()],
+                                             "new_page": lambda self=0: object()})()]
+
+        class FakeChromium:
+            def connect_over_cdp(self, url):
+                seen["url"] = url
+                return FakeBrowser()
+
+        class FakePW:
+            chromium = FakeChromium()
+
+            def start(self):
+                return self
+
+        monkeypatch.setattr(cdp, "sync_playwright", lambda: FakePW())
+        s = cdp.Session("http://127.0.0.1:9222")
+        assert real_connect is None
+        assert seen["url"] == "http://127.0.0.1:9444", \
+            f"подключились к {seen['url']}, а жив наш браузер на 9444"
+        assert s.cdp_url == "http://127.0.0.1:9444", \
+            "Session.cdp_url остался на мёртвом порту — воркеры возьмут его"
+
+    def test_effective_cdp_url_prefers_alive_given_url(self, monkeypatch):
+        monkeypatch.setattr(cdp, "browser_alive", lambda url: True)
+        assert cdp.effective_cdp_url("http://127.0.0.1:9222") == \
+            "http://127.0.0.1:9222"
+
+    def test_effective_cdp_url_falls_back_to_free_base(self, monkeypatch):
+        monkeypatch.setattr(cdp, "browser_alive", lambda url: False)
+        monkeypatch.setattr(cdp.P, "profile_debug_ports",
+                            lambda token=None: {})
+        monkeypatch.setattr(cdp.P, "cdp_port_base", lambda: (9447, "свободен"))
+        assert cdp.effective_cdp_url("http://127.0.0.1:9222") == \
+            "http://127.0.0.1:9447"
+
     def test_no_launch_when_alive(self, monkeypatch):
         seq = iter([True])
         launches = self._install(monkeypatch, lambda: next(seq))

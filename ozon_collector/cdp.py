@@ -391,6 +391,43 @@ def _free_stale_profile(cdp_url: str, profile_token: str) -> list[int]:
     return freed
 
 
+def profile_browser_alive(profile_token: str = P.PROFILE_TOKEN) -> bool:
+    """Жив ли НАШ браузер на этом профиле — на любом порту.
+
+    Проверять живость по номеру порта нельзя: база выбирается динамически, и
+    когда наш браузер уже занял 9444, «свободная база» уезжает на 9445, а
+    проверка на жёстком 9222 всегда False. Живой замер 2026-10-03: демон счёл
+    main остановленным, скопировал куки из профиля, который держал живой
+    Chromium, и упал на shutil.copy2 с [WinError 32].
+    """
+    return any(browser_alive(f"http://127.0.0.1:{p}")
+               for p in P.profile_debug_ports(profile_token))
+
+
+def effective_cdp_url(cdp_url: str,
+                       profile_token: str | None = None) -> str:
+    """Фактический CDP-URL, по которому надо подключаться.
+
+    Зачем: launch_and_wait возвращает только bool, поэтому сдвинутая база
+    (Windows забрала 9222 в исключения) терялась, и Session._connect уходил в
+    connect_over_cdp на мёртвый 9222 — ECONNREFUSED при живом браузере на 9444
+    (живой замер 2026-10-03). Здесь сдвиг разрешается ОДИН раз и попадает в
+    Session.cdp_url, оттуда же берут порт воркеры и BrowserProcessManager.
+    """
+    if browser_alive(cdp_url):
+        return cdp_url
+    _token = profile_token or P.PROFILE_TOKEN
+    live = sorted(p for p in P.profile_debug_ports(_token)
+                  if browser_alive(f"http://127.0.0.1:{p}"))
+    if live:
+        if P.cdp_port(cdp_url) != live[0]:
+            log.warning(f"[cdp] подключаюсь к нашему браузеру на порту "
+                        f"{live[0]}, а cdp_url={cdp_url} — база сдвинулась")
+        return f"http://127.0.0.1:{live[0]}"
+    _base, _why = P.cdp_port_base()
+    return f"http://127.0.0.1:{_base}"
+
+
 def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
                     wait_s: float = 30.0,
                     profile_token: str | None = None) -> bool:
@@ -416,12 +453,67 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
     _want_port = P.cdp_port(cdp_url)
     _bindable, _why = P.port_bindable(_want_port)
     if not _bindable:
-        _base, _base_why = P.cdp_port_base()
-        cdp_url = f"http://127.0.0.1:{_base}"
-        log.error(f"[cdp] ПОРТ {_want_port} НЕПРИГОДЕН ({_why}); переключаюсь "
-                  f"на {_base} — {_base_why}. Если 9222 нужен именно, освободи "
-                  f"диапазон: netsh int ipv4 show excludedportrange "
-                  f"protocol=tcp")
+        # Порт занят — но кем? Различаем принципиально:
+        #   * держит НАШ браузер (поднимается/перезапускается) → ЖДЁМ его, а не
+        #     начинаем второй: второй Chrome с тем же профилем умирает
+        #     («profile captured by a live instance»);
+        #   * никого нашего нет → порт забрала ОС (WSAEACCES) → переключаемся.
+        # Живой замер 2026-10-03: Session._connect вызывает launch_and_wait
+        # повторно, когда connect_over_cdp не удался; порт был занят нашим же
+        # только что поднятым Chrome, код уезжал на 9445 и стартовал второй
+        # браузер с тем же профилем — тот EXITED, и так четыре раунда подряд.
+        _token = profile_token or P.PROFILE_TOKEN
+        _held = P.browser_processes(cdp_url, _token)
+        if not _held:
+            # Слепая зона browser_processes: он матчит (порт + профиль), а
+            # повторный вызов приходит со СТАРЫМ cdp_url, когда наш браузер уже
+            # поднят на новой базе. Ищем по профилю на любом порту.
+            _ports = {p: pids for p, pids in P.profile_debug_ports(
+                _token).items() if p != _want_port}
+            if _ports:
+                _live = sorted(p for p in _ports if browser_alive(
+                    f"http://127.0.0.1:{p}"))
+                log.warning(f"[cdp] наш браузер жив на другом порту "
+                            f"{sorted(_ports)} (профиль {_token}), а вызов пришёл "
+                            f"с {_want_port}: второй Chromium с тем же профилем "
+                            f"умер бы EXITED — беру живой порт")
+                if _live:
+                    cdp_url = f"http://127.0.0.1:{_live[0]}"
+                    return True
+                _dl = time.monotonic() + wait_s
+                while time.monotonic() < _dl:
+                    _live = sorted(p for p in _ports if browser_alive(
+                        f"http://127.0.0.1:{p}"))
+                    if _live:
+                        cdp_url = f"http://127.0.0.1:{_live[0]}"
+                        return True
+                    time.sleep(0.5)
+                log.warning(f"[cdp] наш браузер на {sorted(_ports)} не ожил за "
+                            f"{wait_s:.0f}с — освобождаю профиль и запускаю "
+                            f"заново")
+                _free_stale_profile(cdp_url, _token)
+                _ports = {}
+        if _held:
+            log.warning(f"[cdp] порт {_want_port} занят НАШИМ браузером "
+                        f"(pid={[h.pid for h in _held]}): {_why} — жду его "
+                        f"подъёма, второй браузер не запускаю")
+            _dl = time.monotonic() + wait_s
+            while time.monotonic() < _dl:
+                if browser_alive(cdp_url):
+                    log.info(f"[cdp] наш браузер на {_want_port} ожил — "
+                             f"продолжаю")
+                    return True
+                time.sleep(0.5)
+            log.warning(f"[cdp] наш браузер на {_want_port} не ожил за "
+                        f"{wait_s:.0f}с — освобождаю профиль и запускаю заново")
+            _free_stale_profile(cdp_url, _token)
+        if not _held and not _ports:
+            _base, _base_why = P.cdp_port_base()
+            cdp_url = f"http://127.0.0.1:{_base}"
+            log.error(f"[cdp] ПОРТ {_want_port} НЕПРИГОДЕН ({_why}); "
+                      f"переключаюсь на {_base} — {_base_why}. Если 9222 "
+                      f"нужен именно, освободи диапазон: netsh int ipv4 show "
+                      f"excludedportrange protocol=tcp")
 
     log.warning(f"[cdp] браузер не запущен на {cdp_url}, запускаю…",
                 extra={"cdp_url": cdp_url})
@@ -530,6 +622,10 @@ class Session:
         was_alive = browser_alive(self.cdp_url)
         if self.auto_launch and not was_alive:
             launch_and_wait(self.cdp_url, profile_token=self.profile_token)
+            # База могла сдвинуться (9222 забрала Windows) — подключаться
+            # надо к фактическому порту, иначе ECONNREFUSED при живом браузере.
+            self.cdp_url = effective_cdp_url(self.cdp_url,
+                                             self.profile_token)
             self.browser_owner = "collector"
         else:
             # Браузер уже жив. Если профиль помечен нашим launch_chrome

@@ -1525,16 +1525,25 @@ def _stop_main_browser():
             log.warning(f"stop main Firefox: {type(e).__name__}: {e}")
         return
 
-    _base, _base_why = P.cdp_port_base()
-    cdp_url = f"http://127.0.0.1:{_base}"
-    records = [P.ProcessRecord("main-stop", ident)
-               for ident in P.browser_processes(cdp_url)]
+    # Ищем НАШ main по профилю на всех портах, а не по «свободной базе».
+    # Живой замер 2026-10-03: база сдвинулась на 9444, наш Chromium занял её,
+    # и cdp_port_base() отдал 9445 — browser_processes(9445) пуст, main не
+    # остановился, профиль остался занятым, и bootstrap упал на копировании
+    # кук: [WinError 32] «файл занят другим процессом».
+    records = []
+    _by_port = P.profile_debug_ports(P.PROFILE_TOKEN)
+    _ports = sorted(_by_port)
+    for _port in _ports:
+        for _pid in _by_port[_port]:
+            _ident = P.process_identity(_pid)
+            if _ident is not None:
+                records.append(P.ProcessRecord(f"main-stop-{_port}", _ident))
     if not records:
         return
     try:
-        manager = BrowserProcessManager(cdp_url=cdp_url)
-        manager.force_stop(records)
-        log.info(f"main Chromium stopped ({len(records)} процесс(ов))")
+        killed = P.kill_records(records, wait_s=5.0)
+        log.info(f"main Chromium stopped ({len(killed)} процесс(ов), "
+                 f"порты {_ports})")
     except Exception as e:
         log.warning(f"stop main Chromium: {type(e).__name__}: {e}")
 

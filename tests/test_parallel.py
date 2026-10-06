@@ -992,6 +992,53 @@ def test_stop_main_browser_kills_firefox_by_token(monkeypatch):
     assert killed[0].identity is ident
 
 
+def test_stop_main_browser_finds_our_main_on_shifted_port(monkeypatch):
+    """main ищется по ПРОФИЛЮ на любом порту, а не по «свободной базе».
+
+    Живой замер 2026-10-03: наш Chromium занял 9444, поэтому cdp_port_base()
+    отдал 9445, browser_processes(9445) пуст → main не остановлен → профиль
+    занят → bootstrap упал на shutil.copy2 с [WinError 32].
+    """
+    ident = P.ProcessIdentity(13672, "k1")
+    killed = []
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "chrome")
+    monkeypatch.setattr(P, "profile_debug_ports",
+                        lambda token: {9444: [13672]})
+    monkeypatch.setattr(P, "process_identity", lambda pid: ident)
+    monkeypatch.setattr(P, "browser_processes",
+                        lambda url, token=None: [])
+    monkeypatch.setattr(P, "kill_records",
+                        lambda records, wait_s=3.0: killed.extend(records)
+                        or records)
+    PL._stop_main_browser()
+    assert len(killed) == 1, "main не остановлен: профиль останется занятым"
+    assert killed[0].identity is ident
+
+
+def test_bootstrap_default_skips_when_our_main_alive_on_shifted_port(
+        profile_base, monkeypatch):
+    """Дефолтная проверка живости main — по профилю, не по жёсткому 9222.
+
+    Живой замер 2026-10-03: main жил на 9444, дефолт смотрел на 9222 (мёртвый,
+    зарезервирован ОС) и говорил «остановлен» → копирование Cookies из
+    профиля, который держал живой Chromium → PermissionError [WinError 32].
+    Здесь аргументы main_alive_check НЕ передаются — проверяется дефолт.
+    """
+    import ozon_collector.cdp as cdp
+    main = _mk_main_profile(profile_base)
+    monkeypatch.setattr(cdp, "browser_alive",
+                        lambda url: url.endswith(":9444"))
+    monkeypatch.setattr(P, "profile_debug_ports",
+                        lambda token: ({9444: [13672]}
+                                       if token == P.PROFILE_TOKEN else {}))
+    bs = P.bootstrap_worker_profiles(
+        [1], main_profile=str(main),
+        worker_alive_check=lambda k: False)
+    assert bs[1] == "skipped:main_browser_running", \
+        "main жив на 9444, но дефолтная проверка решила, что он остановлен"
+    assert not os.path.exists(P.worker_profile_path(1))
+
+
 def test_stop_main_browser_noop_without_processes(monkeypatch):
     monkeypatch.setattr(P, "firefox_browser_processes", lambda token: [])
     monkeypatch.setattr(PL.B, "browser_kind", lambda: "firefox")

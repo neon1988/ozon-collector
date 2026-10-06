@@ -26,6 +26,21 @@ def _fake_launcher(tmp_path, text: str, name: str = "ozon_launch_test.log"):
     return str(p)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_chromium(monkeypatch):
+    """Отвязать тесты от процессов и портов РЕАЛЬНОЙ машины.
+
+    Живой замер 2026-10-03: тесты висели по 600 с, потому что на машине был
+    наш живой Chromium, а тест считал реальные процессы и порты. По умолчанию
+    на машине ничего нет; тестам, которым нужен процесс, подменяют сами.
+    """
+    monkeypatch.setattr(cdp.P, "profile_debug_ports", lambda token=None: {})
+    monkeypatch.setattr(cdp.P, "browser_processes",
+                        lambda url, token=None: [])
+    monkeypatch.setattr(cdp.P, "profile_processes",
+                        lambda token=None: [])
+
+
 class _AliveProc:
     """Заглушка Popen: лаунчер ещё работает (poll() -> None)."""
 
@@ -310,6 +325,96 @@ def test_launch_and_wait_switches_port_before_starting(monkeypatch):
     assert used.get("url"), "Chromium не запускался"
     assert used["url"] == f"http://127.0.0.1:{real_base}", \
         f"запуск пошёл на негодный порт: {used['url']}"
+
+
+def test_launch_and_wait_waits_for_our_own_browser_instead_of_second_launch(
+        tmp_path, monkeypatch):
+    """Порт занят НАШИМ браузером → ждём его, а НЕ стартуем второй.
+
+    Живой замер 2026-10-03: Session._connect вызывает launch_and_wait повторно,
+    когда connect_over_cdp не удался. Порт при этом занят нашим же только что
+    поднятым Chrome, код считал это «порт непригоден», уезжал на следующий и
+    запускал ВТОРОЙ браузер с тем же профилем — тот умирал EXITED, и так четыре
+    раунда подряд при живом первом браузере.
+    """
+    log = _write_launch_log("")
+    launched = []
+    monkeypatch.setattr(cdp, "_launch_browser",
+                        lambda url, **kw: launched.append(url) or
+                        cdp.LaunchRun(log, _AliveProc()))
+    monkeypatch.setattr(cdp.P, "port_bindable",
+                        lambda p: (False, "порт занят"))
+
+    def _no_switch(*_a, **_k):
+        raise AssertionError("переключать порт при живом нашем браузере нельзя")
+
+    monkeypatch.setattr(cdp.P, "cdp_port_base", _no_switch)
+    monkeypatch.setattr(cdp.P, "browser_processes",
+                        lambda url, token=None: [cdp.P.ProcessIdentity(
+                            pid=555, start_key="k")])
+    # CDP сначала молчит (браузер ещё поднимается), затем отвечает.
+    _calls = {"n": 0}
+
+    def _alive_later(url):
+        _calls["n"] += 1
+        return _calls["n"] > 2
+
+    monkeypatch.setattr(cdp, "browser_alive", _alive_later)
+    assert cdp.launch_and_wait("http://127.0.0.1:9444", wait_s=5.0) is True
+    assert not launched, \
+        f"второй браузер запущен поверх нашего же: {launched}"
+
+
+def test_launch_and_wait_reuses_our_browser_on_shifted_base(tmp_path,
+                                                            monkeypatch):
+    """Вызов со старым cdp_url переиспользует наш браузер с новой базы.
+
+    Живой замер 2026-10-03: launch_and_wait поднял Chrome на 9444, затем
+    Session._connect повторил вызов с исходным 9222. browser_processes(9222)
+    не видел нашего Chrome на 9444, код счёл порт свободным, ушёл на 9445 и
+    запустил ВТОРОЙ Chromium с тем же --user-data-dir — тот умер EXITED, и так
+    четыре раунда подряд. Здесь повторный вызов обязан вернуть True, не
+    запустив второй браузер.
+    """
+    log = _write_launch_log("")
+    launched = []
+    monkeypatch.setattr(cdp, "_launch_browser",
+                        lambda url, **kw: launched.append(url) or
+                        cdp.LaunchRun(log, _AliveProc()))
+    monkeypatch.setattr(cdp.P, "port_bindable",
+                        lambda p: (False, "порт 9222 ЗАРЕЗЕРВИРОВАН Windows"))
+    monkeypatch.setattr(cdp.P, "browser_processes", lambda url, token=None: [])
+    monkeypatch.setattr(cdp.P, "profile_debug_ports",
+                        lambda token=None: {9444: [35968]})
+    monkeypatch.setattr(cdp, "browser_alive",
+                        lambda url: url.endswith(":9444"))
+    assert cdp.launch_and_wait("http://127.0.0.1:9222", wait_s=2.0) is True
+    assert not launched, \
+        f"запущен второй браузер с тем же профилем: {launched}"
+
+
+def test_launch_and_wait_cleans_profile_when_shifted_browser_never_comes_up(
+        tmp_path, monkeypatch):
+    """Наш браузер на сдвинутой базе не ожил → профиль освобождаем, заново."""
+    log = _write_launch_log("")
+    launched = []
+    freed = []
+    monkeypatch.setattr(cdp, "_launch_browser",
+                        lambda url, **kw: launched.append(url) or
+                        cdp.LaunchRun(log, _AliveProc()))
+    monkeypatch.setattr(cdp.P, "port_bindable",
+                        lambda p: (False, "порт 9222 ЗАРЕЗЕРВИРОВАН Windows"))
+    monkeypatch.setattr(cdp.P, "browser_processes", lambda url, token=None: [])
+    monkeypatch.setattr(cdp.P, "profile_debug_ports",
+                        lambda token=None: {9444: [35968]})
+    monkeypatch.setattr(cdp, "browser_alive", lambda url: False)
+    monkeypatch.setattr(cdp, "_await_browser", lambda *a, **k: True)
+    monkeypatch.setattr(cdp.P, "cdp_port_base", lambda: (9444, "свободен"))
+    monkeypatch.setattr(cdp, "_free_stale_profile",
+                        lambda url, token=None: freed.append((url, token)))
+    assert cdp.launch_and_wait("http://127.0.0.1:9222", wait_s=0.2) is True
+    assert freed, "профиль не освобождён — следующий запуск умер бы EXITED"
+    assert len(launched) == 1, f"ожидался ровно один запуск, было {launched}"
 
 
 def test_launch_and_wait_keeps_port_when_bindable(monkeypatch):

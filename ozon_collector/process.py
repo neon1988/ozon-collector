@@ -317,7 +317,13 @@ def bootstrap_worker_profiles(worker_ids, main_profile: str | None = None,
     if main_profile is None:
         main_profile = profile_path(PROFILE_TOKEN)
     if main_alive_check is None:
-        main_alive_check = lambda: _ba(f"http://127.0.0.1:{MAIN_CDP_PORT}")
+        # Проверять по номеру порта нельзя: база динамическая, и когда наш
+        # браузер уже занял 9444, cdp_port_base() отдаёт 9445, а жёсткий
+        # MAIN_CDP_PORT=9222 мёртв всегда. Ложное «main остановлен» ведёт к
+        # копированию кук из профиля, который держит живой Chromium, —
+        # shutil.copy2 падает с [WinError 32] (живой замер 2026-10-03).
+        from .cdp import profile_browser_alive as _pba
+        main_alive_check = lambda: _pba(PROFILE_TOKEN)
     if worker_alive_check is None:
         def _w(k):
             return bool(browser_processes(worker_cdp_url(k),
@@ -890,6 +896,44 @@ def _matches_firefox_profile(args: list[str], profile_path: str) -> bool:
         if cand == needle:
             return True
     return False
+
+
+def profile_debug_ports(profile_token: str = PROFILE_TOKEN
+                        ) -> dict[int, list[int]]:
+    """remote-debugging-порты наших Chromium на этом профиле: {порт: [pid]}.
+
+    Зачем шире browser_processes: тот ищет по (порт + профиль) и потому слеп,
+    когда вызов пришёл со СТАРЫМ cdp_url, а база уже сдвинулась. Живой замер
+    2026-10-03: launch_and_wait звал браузер на 9444, потом Session._connect
+    повторил вызов с исходным 9222; browser_processes(9222) не нашёл наш живой
+    Chrome на 9444, код счёл порт «никем не занятым», переключился на 9445 и
+    запустил ВТОРОЙ Chromium с тем же --user-data-dir — тот умер EXITED
+    («profile captured by a live instance»), четыре раунда подряд.
+
+    Учитываются только главные процессы (без --type=) с нашим профилем и
+    маркером запуска, поэтому чужое окно пользователя не видно.
+    """
+    out: dict[int, list[int]] = {}
+    for pid, argv, _ppid in _iter_chromium_processes():
+        udd = None
+        port = None
+        has_type = False
+        for a in argv:
+            if a.startswith("--user-data-dir="):
+                udd = a.split("=", 1)[1].strip("\"'")
+            elif a.startswith("--remote-debugging-port="):
+                try:
+                    port = int(a.split("=", 1)[1])
+                except ValueError:
+                    port = None
+            elif a.startswith("--type="):
+                has_type = True
+        if has_type or not udd or port is None:
+            continue
+        if os.path.basename(udd.rstrip("/\\")) != profile_token:
+            continue
+        out.setdefault(port, []).append(pid)
+    return out
 
 
 def _linux_iter_firefox_processes():
