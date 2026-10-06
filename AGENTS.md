@@ -35,10 +35,19 @@
 
 ## Проверка
 
-- Тесты: `python scripts/run_tests_guarded.py --timeout 900`
-  (дефолт 300 с **не проходит** весь набор: 1438 тестов ≈ 8 мин).
-- QA одного товара: `python scripts/qa_raw.py --pids <pid>`
-- Единой команды `scripts/verify` в проекте **нет** — прогоняй те явно.
+Единая точка проверки:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1 -Quick
+```
+
+Порядок: синтаксис → CLI → тесты. Полный прогон идёт через
+`scripts/run_tests_guarded.py --timeout 900`: дефолтный таймаут pytest в 300 с
+**не проходит** весь набор (1438 тестов ≈ 8 мин), а reaper в этом скрипте снимает
+потомков и сирот прошлых прогонов — иначе браузеры держат каталог профиля.
+QA одного товара — `python scripts/qa_raw.py --pids <pid>`, это уже не проверка
+кода, а проверка данных.
 
 ## Гигиена: не оставлять мусор (просил пользователь 2026-10-02)
 
