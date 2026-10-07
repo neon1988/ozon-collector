@@ -45,11 +45,15 @@ WORKER_LOG_DIR = "logs"
 # перезапуском. Единый контроль воркеров в оркестраторе и для parallel=1.
 WORKER_STALL_S = 300           # 5 мин без heartbeat = зависание (в т.ч. параллель=1)
 
-# Размер пачки динамической раздачи (единиц товаров за один task_request).
-# Компромисс между балансировкой и overhead handshake (сбор товара 5-180 с ⇒
-# пачка 5 даёт почти нулевой отрицательный эффект). Настраивается через
-# gather_cfg["batch_size"] для эмпирического тюнинга.
-DEFAULT_BATCH_SIZE = 5
+# Размер выдачи динамической раздачи (единиц товаров за один task_request).
+# По умолчанию ОДИН товар: модель «грузчик берёт один ящик из стопки, относит,
+# возвращается, берёт следующий» (решение владельца). Раздача пачками держалась
+# на DEFAULT_BATCH_SIZE=5 только ради экономии handshake'ов, а handshake на фоне
+# сбора товара (5-180 с) не вносит ничего: лишняя задержка ≤ poll (0.3 с) на
+# товар — доли процента прогона, зато падение воркера теряет 1 товар, а не 5, и
+# хвост раздачи выравнивается по фактической скорости каждого воркера.
+# Явно переопределяется gather_cfg["batch_size"] (демон — run_cfg.batch_size).
+DEFAULT_BATCH_SIZE = 1
 
 # Старт воркеров не синхронный: N браузеров, открывших первые страницы в один
 # миллисекунд, — сам по себе паттерн (п.6 ревью 2026-09-25). Разброс
@@ -294,11 +298,17 @@ class WorkerContext:
         # {t:"done_batch"}). Модифицируется ТОЛЬКО reader-потоком; читается
         # (и сбрасывается) главным циклом _await_workers при раздаче.
         self.waiting_for_batch: bool = False
-        # Индексы завершённой пачки воркера (из done_batch processed+failed),
+        # Индексы завершённой выдачи воркера (из done_batch processed+failed),
         # накопленные reader-потоком; главный цикл переводит их в
         # completed_indexes. Отдельная очередь — чтобы не было гонки reader
         # thread ↔ основной цикл по модификации общих completed_indexes.
         self.batch_completed: list[int] = []
+        # ВСЕ products, пришедшие от воркера (progress + done_batch), без дублей
+        # по индексу. Нужно потому, что done_batch несёт products ТОЛЬКО за
+        # текущую выдачу, а wctx.payload перезаписывается каждым сообщением:
+        # при terminate/respawn без накопления в merge уезжал бы последний
+        # товар вместо всех собранных (аудит 2026-10-06, находка 4).
+        self.acc_products: list[dict] = []
         # Ленивый запуск браузера (контракт «не поднимать окно раньше, чем
         # понадобятся данные со страницы»): счётчик warmup-событий воркера.
         # 0 = браузер не поднимался (все пачки из кэша), 1 = поднят один раз
@@ -328,6 +338,7 @@ def _reader_loop(wctx: WorkerContext, on_event=None):
                 wctx.recovery_events.append(msg)
             elif t == "progress":
                 wctx.payload = msg.get("payload") or {}
+                _absorb_products(wctx, wctx.payload)
                 _update_pending(wctx)
             elif t == "task_request":
                 wctx.waiting_for_batch = True
@@ -338,6 +349,7 @@ def _reader_loop(wctx: WorkerContext, on_event=None):
             elif t == "done_batch":
                 pl = msg.get("payload") or {}
                 wctx.payload = pl
+                _absorb_products(wctx, pl)
                 _update_pending(wctx)
                 wctx.batch_completed.extend(
                     list(pl.get("processed_indexes") or [])
@@ -349,6 +361,7 @@ def _reader_loop(wctx: WorkerContext, on_event=None):
                 pass  # heartbeat: last_activity уже обновлён выше
             elif t == "done":
                 wctx.payload = msg.get("payload") or {}
+                _absorb_products(wctx, wctx.payload)
                 wctx.done = True
                 _update_pending(wctx)
                 if on_event is not None:
@@ -381,6 +394,50 @@ def _update_pending(wctx: WorkerContext):
     processed = set(pl.get("processed_indexes") or [])
     wctx.pending_indexes = [
         idx for idx in wctx.shard_indexes if idx not in processed]
+
+
+def _absorb_products(wctx: WorkerContext, payload: dict) -> None:
+    """Дописать products из сообщения в накопитель wctx.acc_products.
+
+    Зачем накопитель: done_batch несёт products ТОЛЬКО за текущую выдачу (при
+    batch_size=1 — за один товар), а wctx.payload перезаписывается каждым
+    сообщением. При terminate/respawn payload брался бы последним товаром, и
+    merge_shard_results пометил бы все остальные собранные товары как
+    terminated/failed (аудит 2026-10-06, находка 4). Ключ уникальности — индекс
+    товара (контракт merge_shard_results), поэтому повторы и кумулятивные
+    payload'ы дублей не добавляют.
+    """
+    entries = payload.get("products") or []
+    if not entries:
+        return
+    have = {int(e["index"]) for e in wctx.acc_products}
+    for entry in entries:
+        idx = int(entry["index"])
+        if idx in have:
+            continue
+        have.add(idx)
+        wctx.acc_products.append(entry)
+
+
+def _with_acc_products(pl: dict, wctx: WorkerContext) -> dict:
+    """payload воркера + накопленные products (для merge и carried_payload).
+
+    Порядок — по порядку прихода выдач (накопитель), дополнительные записи из
+    payload (их там быть не должно) дописываются в конец: merge_shard_results
+    раскладывает всё по index, поэтому порядок на корректность не влияет.
+    """
+    if not wctx.acc_products:
+        return pl
+    products = list(wctx.acc_products)
+    have = {int(e["index"]) for e in products}
+    for entry in pl.get("products") or []:
+        idx = int(entry["index"])
+        if idx not in have:
+            have.add(idx)
+            products.append(entry)
+    pl = dict(pl)
+    pl["products"] = products
+    return pl
 
 
 def _spawn_ctx(spec: dict, task: dict, on_event=None) -> WorkerContext:
@@ -857,22 +914,31 @@ def merge_shard_results(payloads: list[dict], shards: list[list[tuple]]) -> list
 
     Товар без результата → ok=False, error="worker{k} terminated/failed".
     Результат run_gather вставляется как есть (тот же формат, что в collect_search).
+
+    pid у потерянного товара НЕ теряется: он уже известен merge'у из шарда
+    ((idx,pid,url), см. _rebuild_shards), поэтому подставляется настоящий pid,
+    а утрата помечается lost=True. Раньше тут был pid=None, и товар выпадал
+    из discovered_pids в key_daemon.extract_discovered_pids → не попадал ни в
+    done, ни в pending (split_done_pending) → исчезал из системы навсегда.
+    ok остаётся False, поэтому в ok_pids/valid такие записи не проходят.
     """
     by_index = {}
     for pl in payloads:
         for entry in pl.get("products", []) or []:
             by_index[int(entry["index"])] = entry["result"]
     owner = {}
+    pid_by_idx = {}
     for k, shard in enumerate(shards, 1):
-        for idx, _p, _u in shard:
+        for idx, pid, _u in shard:
             owner[int(idx)] = k
+            pid_by_idx[int(idx)] = pid
     total = sum(len(s) for s in shards)
     out = []
     for i in range(total):
         if i in by_index:
             out.append(by_index[i])
         else:
-            out.append({"pid": None, "ok": False,
+            out.append({"pid": pid_by_idx.get(i), "ok": False, "lost": True,
                         "error": f"worker{owner.get(i, '?')} terminated/failed"})
     return out
 
@@ -1167,6 +1233,13 @@ def _process_batch(spec, items, gather_cfg, sess, manager, *,
 
     results идут строго в порядке items, независимо от того, где разрезалась
     пачка: без этого merge_shard_results/QA получают неверные индексы.
+
+    При batch_size=1 отчёт _progress не срабатывает ВСЕГДА (n=1 < PROGRESS_EVERY)
+    — и это нормально, а не регресс наблюдаемости: отчёт нужен для частичного
+    снимка ВНУТРИ выдачи, а при выдаче в один товар частичного состояния нет.
+    Per-item payload идёт через done_batch после каждого товара (reader кладёт
+    его в wctx.payload/acc_products), поэтому демон по-прежнему видит живой
+    сбор, а потеря при terminate ограничена одним товаром.
     """
     head = (0 if sess is not None
             else _first_browser_index(items, gather_cfg))
@@ -1203,6 +1276,29 @@ def _process_batch(spec, items, gather_cfg, sess, manager, *,
     return results, sess, manager
 
 
+def _resolve_batch_size(gather_cfg: dict) -> int:
+    """Размер выдачи из gather_cfg["batch_size"], с защитой от вырожденных значений.
+
+    Кламп вниз единицей — НЕ косметика: при size<=0 _take_batch не набирает ни
+    одного товара даже при непустой очереди, оркестратор шлёт воркеру
+    {"t": "none"}, воркер тихо выходит, и весь прогон уходит в «0 собрано»
+    без единой ошибки. Мусор в значении (строка/None) — тоже дефолт, а не
+    ValueError посреди прогона.
+    """
+    raw = (gather_cfg or {}).get("batch_size", DEFAULT_BATCH_SIZE)
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        log.warning(f"[parallel] batch_size={raw!r} не число → "
+                    f"{DEFAULT_BATCH_SIZE}")
+        return DEFAULT_BATCH_SIZE
+    if size < 1:
+        log.warning(f"[parallel] batch_size={size} < 1 → 1 (иначе воркеры "
+                    f"получат 'none' при непустой очереди и прогон соберёт 0)")
+        return 1
+    return size
+
+
 def _take_batch(queue, size: int, prefer_miss: bool, gather_cfg: dict,
                 worker_idx: int, owner: dict, verdicts: dict) -> list:
     """Достать из очереди пачку, отдавая приоритет нужному типу товаров.
@@ -1215,12 +1311,16 @@ def _take_batch(queue, size: int, prefer_miss: bool, gather_cfg: dict,
     приоритетного типа не осталось — отдаём что есть, воркер не должен
     простаивать вхолостую.
 
-    Недобор НЕ добираем товарами другого типа: короткая пачка дешевле, чем
+    Недобор НЕ добираем товарами другого типа: короткая выдача дешевле, чем
     гонять воркер с браузером по кэшу (лишний round-trip и потеря ленивости —
     hit'ы предназначены воркерам без Chromium).
 
+    size=1 (дефолт) — та же логика без веток: в picked попадает ПЕРВЫЙ товар
+    приоритетного типа, порядок rest сохраняется, fallback срабатывает только
+    когда товаров приоритетного типа в очереди не осталось вовсе.
+
     verdicts — кэш «нужен ли браузер» по pid на прогон: cache_check читает
-    JSON с диска, а раздач на прогон столько же, сколько пачек.
+    JSON с диска, а раздач на прогон столько же, сколько выдач.
     """
     def _needs(item) -> bool:
         pid = item[1]
@@ -1289,6 +1389,12 @@ def _await_workers(wctxs: list, deadline: float,
     # Кэш вердиктов «нужен ли браузер» по pid на прогон (см. _take_batch).
     verdicts: dict = {}
 
+    # Все воркеры, которых оркестратор видел за прогон, включая респавны:
+    # _drain_completed обязан обходить их, а не только исходный список — иначе
+    # индексы, завершённые воркером-ЗАМЕНОЙ, не попадают в completed_indexes и
+    # товар выдаётся повторно (тот же товар собирается дважды).
+    all_wctxs: list = list(wctxs)
+
     def _send_to_worker(wctx, msg: dict) -> bool:
         """Отправить пачку/команду воркеру через parent→worker pipe.
 
@@ -1324,7 +1430,12 @@ def _await_workers(wctxs: list, deadline: float,
         if batch:
             wctx.waiting_for_batch = False
             if not _send_to_worker(wctx, {"t": "next", "batch": batch}):
-                # воркер умер до получения пачки → вернуть пачку в очередь
+                # Воркер умер до получения выдачи → вернуть её в очередь.
+                # owner тоже чистим: индексы уже не в руках этого воркера, и
+                # _requeue_unfinished вернул бы их ВТОРЫМ разом — товар оказался
+                # бы в очереди дважды и собрался бы дважды.
+                for item in batch:
+                    owner.pop(int(item[0]), None)
                 shared_items.extendleft(reversed(batch))
                 requeue_metrics["p2w_broken"] = (
                     requeue_metrics.get("p2w_broken", 0) + 1)
@@ -1336,7 +1447,7 @@ def _await_workers(wctxs: list, deadline: float,
         """Перелить подтверждённые done_batch индексы в completed_indexes."""
         if not dynamic:
             return
-        for wctx in wctxs:
+        for wctx in all_wctxs:
             if wctx.batch_completed:
                 completed_indexes.update(wctx.batch_completed)
                 wctx.batch_completed = []
@@ -1488,7 +1599,10 @@ def _await_workers(wctxs: list, deadline: float,
                     canary_url=canary_url)
             # Перенести уже собранные товары упавшего воркера в замену: иначе
             # merge широко пометит их как "terminated/failed" (потеря данных).
-            old_pl = wctx.payload or {}
+            # products берём из накопителя acc_products: payload упавшего
+            # воркера — это последний присланный снимок (при batch_size=1 —
+            # один товар), а не всё, что он собрал.
+            old_pl = _with_acc_products(wctx.payload or {}, wctx)
             old_products = old_pl.get("products") or []
             if old_products:
                 new.carried_payload = {
@@ -1498,6 +1612,7 @@ def _await_workers(wctxs: list, deadline: float,
                     "failed_indexes": list(old_pl.get("failed_indexes") or []),
                 }
             active.append(new)
+            all_wctxs.append(new)
             finalized.remove(wctx)
         time.sleep(poll)
     _attach_scheduler_metrics(wctxs, requeue_metrics)
@@ -1561,7 +1676,8 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      worker_log: str | None = None,
                      stop_event=None,
                      force_event=None,
-                     canary_url: str | None = None) -> dict:
+                     canary_url: str | None = None,
+                     skip_no_reviews: bool = True) -> dict:
     """Parallel-search: links в main-сессии → шарды → воркеры → merge.
 
     pids — явный список артикулов вместо докрутки выдачи: main-сессия не
@@ -1592,6 +1708,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     """
     B.resolve_browser_for_parallel()  # дефолт движка для воркеров (firefox; переопределяется env/флагом)
     parallel = int(parallel)
+    skipped_no_reviews = []
     if pids:
         links = S._links_from_pids(pids)
         recovery_main = {"recycles": 0, "events": []}
@@ -1602,9 +1719,10 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         recovery_main = {"recycles": 0, "events": []}
         try:
             manager_main = BrowserProcessManager(cdp_url=sess.cdp_url)
-            links = S._collect_links_with_recovery(
+            links, skipped_no_reviews = S._collect_links_with_recovery(
                 sess, manager_main, url, limit, max_recycles, recovery_main,
-                stop_event=stop_event, force_event=force_event)
+                stop_event=stop_event, force_event=force_event,
+                skip_no_reviews=skip_no_reviews)
         except S.CollectionInterrupted as exc:
             # finally ниже всё равно гасит main-браузер и сессию; здесь только
             # решаем: graceful (вернуть partial) или force (пробросить).
@@ -1689,7 +1807,9 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     owner: dict[int, int] = {}
     pid_by_idx = {idx: pid for idx, pid, _url in items}
     url_by_idx = {idx: url for idx, _pid, url in items}
-    batch_size = int(gather_cfg.get("batch_size", DEFAULT_BATCH_SIZE))
+    batch_size = _resolve_batch_size(gather_cfg)
+    log.info(f"[parallel] выдача: по {batch_size} товар(а) за раз "
+             f"({total} товаров, {parallel} воркер(ов))")
 
     deadline = time.monotonic() + join_timeout_s
     wctxs = _await_workers(
@@ -1714,7 +1834,10 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
 
     payloads = []
     for wctx in wctxs:
-        pl = wctx.payload or _empty_payload(wctx.worker_idx)
+        # Накопитель products обязателен и для штатно завершившегося воркера:
+        # без него merge видел бы только последний снимок payload.
+        pl = _with_acc_products(
+            wctx.payload or _empty_payload(wctx.worker_idx), wctx)
         pl = _merge_carried(pl, wctx)
         if wctx.exitcode is None:
             try:
@@ -1755,6 +1878,12 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     mr = gather_cfg.get("min_rating")
     if mr is not None:
         combined["min_rating"] = mr
+    # Товары без отзывов, отброшенные по плитке выдачи (решение владельца
+    # 2026-10-07): страницы не открывались, в combined идут ОТДЕЛЬНО от недобора.
+    if skipped_no_reviews:
+        combined["skipped_no_reviews"] = len(skipped_no_reviews)
+        combined["skipped_no_reviews_pids"] = [it["pid"]
+                                               for it in skipped_no_reviews]
     combined["kpi"] = _kpi_summary(payloads, len(products))
     storm = _storm_summary(wctxs, payloads, parallel)
     if storm:

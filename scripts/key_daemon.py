@@ -121,6 +121,13 @@ DAEMON_STATES = {
 # QA (новый FAIL/WARN) инвалидирует старые вердикты даже если raw не менялся.
 QA_VERSION = "1.7"
 
+# Сколько раз товар из выдачи может вернуться в очередь без результата, прежде
+# чем признаётся безнадёжным. Обратная сторона починки «discovered ≠ собранные»:
+# без счётчика не собираемый товар пересобирался бы каждый прогон (ревью
+# 2026-10-06). Три попытки — потому что сбои бывают разовыми: SESSION_EXHAUSTED,
+# BROWSER_DEAD, конец прогона.
+PENDING_ATTEMPT_LIMIT = 3
+
 
 def _sha256_text(s: str) -> str:
     try:
@@ -238,6 +245,13 @@ def extract_discovered_pids(combined: Optional[dict]) -> list[str]:
     сравнения/словари были консистентны независимо от формата записи.
     Также сливает combined.discovered_pids (заполняется при graceful-стопе
     докрутки ссылок в collect_parallel: products пуст, но ссылки найдены).
+
+    Берём ВСЮ запись, у которой опознан pid, независимо от ok/lost/excluded:
+    товар без результата (lost=True из merge_shard_results) обязан попасть в
+    discovered_pids, иначе split_done_pending не вернёт его в очередь и он
+    исчезнет из кампании навсегда. «pid is not None» здесь — условие
+    ОПОЗНАНИЯ записи, а не признак успеха; успех живёт только в
+    extract_ok_pids.
     """
     if not combined:
         return []
@@ -248,11 +262,17 @@ def extract_discovered_pids(combined: Optional[dict]) -> list[str]:
 
 
 def extract_ok_pids(combined: Optional[dict]) -> list[str]:
-    """PID, реально собранные без исключения (потенциально валидные)."""
+    """PID, реально собранные без исключения (потенциально валидные).
+
+    lost-записи (потерянный товар без результата) сюда НЕ попадают никогда:
+    у них ok=False (и вдобавок про явный запрет по lost) — иначе товар без
+    собранных отзывов уехал бы в valid_pids, что ломает инвариант I1/I5.
+    """
     if not combined:
         return []
     return normalize_pids(p["pid"] for p in (combined.get("products") or [])
-                          if p.get("ok") and not p.get("excluded"))
+                          if p.get("ok") and not p.get("excluded")
+                          and not p.get("lost"))
 
 
 def normalize_pids(seq: Iterable[str]) -> list[str]:
@@ -1276,6 +1296,11 @@ def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
 
     Демон запускал CLI без большинства опций → действовали дефолты CLI
     search-парсера; те же значения задаём здесь явно, чтобы не разъехаться.
+
+    batch_size — размер выдачи воркеру (1 = «грузчик берёт один товар»,
+    решение владельца). Берётся ИЗ run_cfg манифеста: при resume конфиг — это
+    манифест, а не аргументы текущего запуска (инвариант 4). Поле в кампаниях,
+    созданных до появления ключа, отсутствует → дефолт 1.
     """
     return {
         "variant": "",
@@ -1288,6 +1313,10 @@ def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
         "max_age_s": max_age_s,
         "no_ocr": True,          # --ocr не передаётся демоном
         "skip_reviews": cfg.get("skip_reviews", False),
+        # Размер выдачи воркеру. Кламп вниз единицей: batch_size<=0 в
+        # parallel._take_batch даёт пустую выдачу при непустой очереди →
+        # воркер получает 'none' и прогон тихо собирает 0 товаров.
+        "batch_size": max(1, int(cfg.get("batch_size") or 1)),
         # Быстрый API-предсрез отзывов (ревизия 2.8): выключен по умолчанию,
         # DOM остаётся источником истины. None → env OZON_REVIEWS_API.
         "reviews_api": cfg.get("reviews_api"),
@@ -1353,6 +1382,30 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
         # 0)» при 66 raw.json на диске. Разбор — в split_done_pending.
         _done, _retry = split_done_pending(progress)
         skip_pids = sorted(_done) or None
+        # Счётчик попыток для товаров без результата. Без него починка
+        # «discovered ≠ собранные» превратилась бы в свой антипаттерн: товар,
+        # который невозможно собрать (удалённая карточка, вечная капча на этом
+        # PID), брался бы в работу на каждом прогоне, пока хватает лимита
+        # no_progress. После N попыток — в permanently_failed_pids (ревью
+        # 2026-10-06). Счётчик сам сбрасывается: остаются только те, у кого
+        # результата так и нет.
+        _attempts = dict(progress.get("pending_attempts") or {})
+        for _p in _retry:
+            _attempts[_p] = _attempts.get(_p, 0) + 1
+        _give_up = {p for p, n in _attempts.items()
+                    if n >= PENDING_ATTEMPT_LIMIT}
+        if _give_up:
+            progress["permanently_failed_pids"] = normalize_pids(
+                set(progress.get("permanently_failed_pids", [])) | _give_up)
+            log.warning(
+                f"[key_daemon] {len(_give_up)} товаров без результата после "
+                f"{PENDING_ATTEMPT_LIMIT} попыток — в безнадёжные: "
+                f"{', '.join(sorted(_give_up)[:12])}"
+                f"{'...' if len(_give_up) > 12 else ''}")
+        progress["pending_attempts"] = {
+            p: n for p, n in _attempts.items() if p not in _give_up}
+        skip_pids = sorted(set(skip_pids or ()) | _give_up) or None
+        _retry = [p for p in _retry if p not in _give_up]
         if _retry:
             log.info(f"[key_daemon] в очередь возвращено {len(_retry)} пидов из "
                      f"выдачи без результата (были пропущены как "
@@ -1394,7 +1447,8 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
         session_budget=session_budget, on_event=_on_event,
         max_worker_restarts=max_restarts, worker_log=worker_log,
         stop_event=_STOP_EVENT, force_event=_FORCE_EXIT,
-        canary_url=cfg.get("canary_url") or None)
+        canary_url=cfg.get("canary_url") or None,
+        skip_no_reviews=cfg.get("skip_no_reviews", True))
 
     combined_file = CAMPAIGNS_DIR / camp / f"combined_{run_id}.json"
     combined_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1532,8 +1586,10 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  write_digest: bool = True,
                  compact: bool = False,
                  skip_reviews: bool = False,
+                 include_no_reviews: bool = False,
                  canary_url: Optional[str] = None,
                  reviews_api: bool = False,
+                 batch_size: Optional[int] = None,
                  name_source: str = "explicit",
                  name_source_value: Optional[str] = None,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
@@ -1578,6 +1634,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         session_budget_wall_clock=session_budget_wall_clock,
         window_mode=window_mode,
         skip_reviews=skip_reviews,
+        include_no_reviews=include_no_reviews,
         canary_url=canary_url,
         reviews_api=reviews_api,
         name_source=name_source,
@@ -1649,6 +1706,34 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
     else:
         skip_reviews = bool(progress.get("run_cfg", {}).get(
             "skip_reviews", skip_reviews))
+
+    # Пропуск товаров без отзывов (решение владельца 2026-10-07): видно по
+    # плитке выдачи, страницу не открываем. По умолчанию ВКЛ — по решению
+    # владельца; отключается --include-no-reviews. Так же, как skip_reviews,
+    # при resume берётся из манифеста (источник истины).
+    if fresh:
+        progress.setdefault("run_cfg", {})["skip_no_reviews"] = (
+            not include_no_reviews)
+        skip_no_reviews = not include_no_reviews
+    else:
+        skip_no_reviews = bool(progress.get("run_cfg", {}).get(
+            "skip_no_reviews", not include_no_reviews))
+    if not skip_no_reviews:
+        log.info("[key_daemon] ВНИМАНИЕ: собираю и товары без отзывов "
+                 "(include_no_reviews)")
+
+    # Размер выдачи воркеру (--batch-size, по умолчанию 1 товар за раз —
+    # решение владельца). Фиксируется в run_cfg при создании кампании; при
+    # resume берётся ИЗ МАНИФЕСТА (источник истины, инвариант 4). Явно
+    # переданный --batch-size синхронизируется в run_cfg, как window_mode и
+    # session_budget_wall_clock: это разовый параметр планировщика, а не
+    # идентичность кампании, и без записи он терялся бы при следующем запуске.
+    if fresh:
+        progress.setdefault("run_cfg", {})["batch_size"] = max(1, int(
+            batch_size or 1))
+    elif batch_size is not None:
+        rcfg = progress.setdefault("run_cfg", {})
+        rcfg["batch_size"] = max(1, int(batch_size))
 
     try:
         # При resume конфиг берём из манифеста (источник истины), а не из текущих
@@ -2605,6 +2690,21 @@ def parse_args(argv=None):
                          "фиксируется при создании кампании в манифесте "
                          "(run_cfg.skip_reviews); при resume взётся только из "
                          "манифеста, смена режима — через --reset.")
+    ap.add_argument("--include-no-reviews", action="store_true",
+                    help="собирать и товары БЕЗ отзывов/оценки. По умолчанию "
+                         "такие товары отбрасываются по плитке выдачи, без "
+                         "захода на страницу (заход стоит минуты, а отзывов "
+                         "всё равно нет) — решение владельца 2026-10-07. "
+                         "Флаг фиксируется при создании кампании "
+                         "(run_cfg.skip_no_reviews); при resume берётся из "
+                         "манифеста, смена режима — через --reset.")
+    ap.add_argument("--batch-size", type=int, default=None, metavar="N",
+                    help="сколько товаров воркер берёт за одну раздачу "
+                         "(дефолт 1 — «грузчик берёт один товар»). Значение "
+                         "фиксируется в run_cfg.batch_size при создании "
+                         "кампании; при resume без флага берётся из манифеста, "
+                         "с флагом — синхронизируется в манифест (как "
+                         "--window-mode).")
     ap.add_argument("--canary-url", default=None, metavar="URL",
                     help="цель canary-пробы после access-recovery. По умолчанию "
                          "берётся URL текущей кампании (та же сущность, на "
@@ -2720,6 +2820,7 @@ def main(argv=None):
         skip_reviews=args.no_reviews,
         canary_url=args.canary_url,
         reviews_api=args.reviews_api,
+        batch_size=args.batch_size,
         name_source=name_source,
         name_source_value=name_source_value)
     print(json.dumps(summarize(progress), ensure_ascii=False, indent=2))
