@@ -20,11 +20,74 @@ ease-in-out + симметричный белый шум, потому что т
 - overshoot & correction: цель пролетается на few px дальше, микропауза,
   возврат назад — живой человек доигрывает позицию рукой, а не идеально
   останавливается ровно на пикселе.
+
+Ревизия 3.0 (бюджет решения, 2026-10-07): длина пачки больше не задаётся
+только случайностью. В подвиревшей вкладке `page.mouse.move` стоит ~0.7 с
+на точку (живой лог: зонд 17 точек = 12.34 с), и фиксированные 22-24 точки
+съедали весь `PUZZLE_BUDGET_S` до начала доводки. Теперь число точек
+подбирается под остаток бюджета (move_cost() — скользящая оценка стоимости
+точки), а обрезанная по дедлайну траектория всё равно доставляет конечную
+координату отдельной командой: иначе кусок остался бы там, где его оставил
+последний промежуточный move, и доводка считала бы неверную позицию.
 """
 
 import math
 import random
 import time
+
+# Оценка стоимости одной точки траектории (секунд на page.mouse.move) —
+# скользящее среднее по последним пачкам. На здоровой вкладке точка стоит
+# 0.008-0.02 с, на подвисшей CDP-раундтрип раздувается до 0.5-0.8 с (живой
+# лог 2026-10-07: зонд 17 точек = 12.34 с, большой ход 24 точки = 10.86 с).
+# Траектория фиксированной длины в такой вкладке САМА съедает бюджет
+# решения: доезд просто не начинается (stop=deadline_micro при iters=2).
+# Поэтому длина пачки подбирается под остаток бюджета.
+_MOVE_COST_S: list = [0.0]
+
+# Границы числа точек траектории. Снизу 3: одна команда нужна ВСЕГДА, иначе
+# конечная координата просто не будет доставлена (см. _human_move).
+PATH_MIN_POINTS = 3
+PATH_MAX_POINTS = 34
+PATH_NOMINAL_POINTS = 22
+# Доля остатка бюджета, которую можно потратить на одну траекторию: остальное
+# нужно на замер позиции и на вердикт после дропа.
+PATH_BUDGET_SHARE = 0.35
+# Одна точка на 4 px хода: на коротком смещении 30 точек смысла нет, лишние
+# события — тоже палево.
+PATH_PX_PER_POINT = 4.0
+# Нижняя оценка стоимости точки для расчёта (сек): быстрее CDP не отвечает.
+_PATH_COST_FLOOR_S = 0.005
+
+
+def move_cost() -> float:
+    """Текущая оценка секунд на одну точку траектории."""
+    return _MOVE_COST_S[0]
+
+
+def _note_move_cost(points: int, seconds: float) -> float:
+    """Обновить оценку стоимости точки по факту пачки (0 = неизвестно)."""
+    if points > 0 and seconds > 0.0:
+        per = seconds / float(points)
+        prev = _MOVE_COST_S[0]
+        _MOVE_COST_S[0] = per if prev <= 0.0 else 0.5 * (prev + per)
+    return _MOVE_COST_S[0]
+
+
+def _fit_points(left_s: float, dist: float, want: int = PATH_NOMINAL_POINTS) -> int:
+    """Сколько точек траектории влезает в остаток бюджета (чистая функция).
+
+    left_s <= 0 — бюджета нет (точечный свип, юнит-тест): возвращаем `want`,
+    форма остаётся случайной как раньше. Иначе не больше, чем влезает по
+    времени (остаток × PATH_BUDGET_SHARE / стоимость точки), не больше
+    PATH_MAX_POINTS и не больше одной точки на PATH_PX_PER_POINT пикселей хода.
+    """
+    if left_s <= 0.0:
+        return max(PATH_MIN_POINTS, int(want))
+    cost = max(move_cost(), _PATH_COST_FLOOR_S)
+    by_time = int(left_s * PATH_BUDGET_SHARE / cost)
+    by_dist = int(max(PATH_MIN_POINTS, dist / PATH_PX_PER_POINT))
+    return max(PATH_MIN_POINTS,
+               min(int(want), PATH_MAX_POINTS, by_dist, by_time))
 
 
 def _human_path(x0: float, y0: float, x1: float, y1: float,
@@ -84,19 +147,23 @@ def _drift(rng, n: int) -> list:
 
 def _human_drag_path(x0: float, y0: float, x1: float, y1: float,
                      rng: random.Random | None = None,
-                     bound: float | None = None) -> tuple:
+                     bound: float | None = None,
+                     n: int | None = None) -> tuple:
     """Траектория драга с overshoot & correction (ревизия 2.9).
 
-    Возвращает (points, shape) — shape попадает в лог/телеметрию, чтобы в
-    данных было видно разнообразие параметров, а не одну и ту же кривую.
+    Возвращает (points, shape) — shape попадает в лог/телеметрию, чтобы
+    в данных было видно разнообразие параметров, а не одну и ту же кривую.
     Конечная точка — ровно (x1, y1): overshoot отыгрывается назад, поэтому
     последующая сверка позиции (см. puzzle_drag) работает как раньше.
 
     bound — правая граница дорожки (max_hx). Если до неё меньше 2px, overshoot
     отменяется: пролететь дальше конца дорожки нельзя.
+
+    n — число точек; None = случайное 14..34. Передаётся явно, когда длина
+    подобрана под остаток бюджета (_fit_points).
     """
     rng = rng or random
-    n = rng.randint(14, 34)
+    n = int(n) if n else rng.randint(14, PATH_MAX_POINTS)
     arc = rng.uniform(2.0, 7.0)
     ease_k = rng.uniform(1.5, 2.8)
     tremor = rng.uniform(0.3, 1.0)
@@ -146,37 +213,79 @@ def _human_drag_path(x0: float, y0: float, x1: float, y1: float,
     return pts, shape
 
 
-def _human_move(page, pts, delay=(0.008, 0.02), hold_ranges=()):
+def _human_move(page, pts, delay=(0.008, 0.02), hold_ranges=(),
+                deadline: float = 0.0) -> int:
     """Эмитировать траекторию реальными событиями мыши.
 
     Каждая точка — отдельный mouse.move (КДП-событие), между точками
     случайная пауза (дрожание руки). hold_ranges: индексы точек с длинной
-    паузой (dwell, человеческая «поправка курсора»). Последняя точка
+    паузой (dwell, человеческая «правка курсора»). Последняя точка
     фиксируется без паузы после неё (потом down/up мгновенно от цели).
+
+    deadline (абсолютный time.monotonic) — ВАЖНО, иначе одна пачка съедает
+    бюджет решения: в подвиревшей вкладке точка стоит 0.7 с, и 24-точечный
+    ход = 10.9 с. По дедлайну промежуточные точки прекращаются, но конечная
+    координата ДОСТАВЛЯЕТСЯ отдельной командой. Без этого обрезанная
+    траектория оставляла бы кусок там, где его оставил последний
+    промежуточный move, и доводка считала бы неверную позицию.
+
+    Возвращает число отправленных mouse.move (для телеметрии).
     """
     holds = set(hold_ranges or ())
+    if not pts:
+        return 0
     last = len(pts) - 1
+    t0 = time.monotonic()
+    sent = 0
+    reached_last = False
     for i, (px, py) in enumerate(pts):
+        if i == last:
+            reached_last = True
+        elif deadline and time.monotonic() > deadline:
+            break
         page.mouse.move(px, py)
+        sent += 1
         if i != last:
             time.sleep(random.uniform(0.045, 0.11) if i in holds
                        else random.uniform(*delay))
+    if not reached_last:
+        page.mouse.move(pts[last][0], pts[last][1])
+        sent += 1
+    _note_move_cost(sent, time.monotonic() - t0)
+    return sent
 
 
 def _human_drag(page, x0: float, y0: float, x1: float, y1: float,
-                rng: random.Random | None = None, bound: float | None = None):
-    """Драг кусочка «человеком»: путь + события + паузы; вернёт shape."""
-    pts, shape = _human_drag_path(x0, y0, x1, y1, rng=rng, bound=bound)
-    _human_move(page, pts, hold_ranges=shape.get("holds", ()))
+                rng: random.Random | None = None, bound: float | None = None,
+                deadline: float = 0.0):
+    """Драг кусочка «человеком»: путь + события + паузы; вернёт shape.
+
+    Число точек подбирается под остаток бюджета (deadline), а не только под
+    случайность: подвиревшая вкладка не даёт доводке начаться. shape["n_sent"]
+    — сколько команд реально ушло, чтобы по паспорту было видно обрезку.
+    """
+    rng = rng or random
+    left = (deadline - time.monotonic()) if deadline else 0.0
+    n = _fit_points(left, math.hypot(x1 - x0, y1 - y0),
+                    rng.randint(14, PATH_MAX_POINTS))
+    pts, shape = _human_drag_path(x0, y0, x1, y1, rng=rng, bound=bound, n=n)
+    shape["n_sent"] = _human_move(page, pts, hold_ranges=shape.get("holds", ()),
+                                  deadline=deadline)
     return shape
 
 
-def _human_click(page, x: float, y: float, hold: float = 0.0):
-    """Клик/нажим в точке с пред-подводом мыши (не телепорт в целевую)."""
+def _human_click(page, x: float, y: float, hold: float = 0.0,
+                 deadline: float = 0.0):
+    """Клик/нажим в точке с пред-подводом мыши (не телепорт в целевую).
+
+    deadline передаётся в _human_move: подвод = 14 команд, и в подвиревшей
+    вкладке он один стоит больше, чем весь калибровочный зонд.
+    """
     px0, py0 = x - random.uniform(25, 55), y + random.uniform(-18, 18)
     page.mouse.move(px0, py0)
     time.sleep(random.uniform(0.05, 0.14))
-    _human_move(page, _human_path(px0, py0, x, y, n=12, arc=2.0))
+    _human_move(page, _human_path(px0, py0, x, y, n=12, arc=2.0),
+                deadline=deadline)
     time.sleep(random.uniform(0.03, 0.08))
     page.mouse.down()
     if hold > 0:

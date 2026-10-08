@@ -1407,17 +1407,33 @@ class Session:
             ctx = (self._browser.contexts[0]
                    if self._browser and self._browser.contexts else None)
             if ctx:
-                pages = ctx.pages
-                for p in pages[1:]:
+                # Закрываем ТОЛЬКО те вкладки, которые открыл коллектор.
+                # Раньше закрывался `ctx.pages[1:]`, а `pages[0]` уводилась на
+                # about:blank — для внешнего браузера (browser_owner ==
+                # "external", то есть чужой Chrome оператора) это закрывало его
+                # вкладки и теряло несохранённый ввод (ревью 2026-10-06).
+                managed = list(getattr(self, "_managed_pages", None) or [])
+                for p in managed:
                     try:
+                        if p.is_closed() or p is self.page:
+                            continue      # рабочую вкладку не закрываем
                         p.close()
                     except Exception:
                         pass
-                if pages:
+                self._managed_pages = ([self.page]
+                                      if self.page is not None else [])
+                # Вкладку, на которой мы работаем, оставляем открытой: если она
+                # наша (owner=collector) — её можно увести на about:blank, если
+                # чужая — нельзя.
+                if self.browser_owner == "collector" and self.page is not None:
                     try:
-                        pages[0].goto("about:blank", timeout=5000)
+                        if not self.page.is_closed():
+                            self.page.goto("about:blank", timeout=5000)
                     except Exception:
                         pass
+                else:
+                    log.debug("сессия закрыта: вкладки коллектора закрыты, "
+                              "чужие не тронуты")
         except Exception:
             pass
         try:

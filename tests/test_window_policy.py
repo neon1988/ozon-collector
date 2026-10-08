@@ -402,7 +402,16 @@ def _fake_session(keep_window=False, owner="collector", kind="chrome", pid=777):
 
 
 def _guard_with(monkeypatch, g=None):
+    """Подменённый гвард БЕЗ фонового потока.
+
+    Поток нужен для проверки `tick` вживую, но в тестах реестра он мешает:
+    `_drop_dead_browsers` выкидывает несуществующий pid (777/500) и к моменту
+    проверки реестр оказывался пустым — тест падал в полном прогоне и проходил
+    изолированно (гонка). Поток проверяется отдельно в
+    `test_guard_thread_starts_once_and_stops`.
+    """
     g = g or wp.WindowGuard()
+    monkeypatch.setattr(g, "start", lambda: None)
     monkeypatch.setattr(wp, "guard", lambda: g)
     return g
 

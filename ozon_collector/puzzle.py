@@ -30,6 +30,7 @@ import json
 import os
 import tempfile
 import time
+from typing import Optional
 
 import numpy as np
 
@@ -71,17 +72,26 @@ from .puzzle_dom import (  # noqa: F401
     is_puzzle,
     looks_like_puzzle,
 )
-from .puzzle_input import (_human_click, _human_drag, _human_move,  # noqa: F401
-                           _human_path)
-
 from .puzzle_drag import (  # noqa: F401  (реэкспорт: puzzle.X работает)
+    ACC,
     _drag_to,
+    _dsl,
+    _gain_update,
+    _k_from_probe,
+    _k_usable,
     _last_move,
+    _left,
+    _mouse_up,
     _piece_grip_offset,
+    _read_settled,
     _read_sl_piece,
+    _settle,
+    _step_mouse,
     _wait_piece,
     last_drag_diag,
 )
+from .puzzle_input import (_fit_points, _human_click, _human_drag,  # noqa: F401
+                           _human_move, _human_path, move_cost)
 from .puzzle_state import (  # noqa: F401
     PUZZLE_BUDGET_S,
     PUZZLE_MAX_ATTEMPTS,
@@ -368,7 +378,7 @@ def _verdict(page) -> str:
 
 
 def _await_verdict(page, seconds: float = _SOLVED_GRACE_S,
-                   reject_after: float = _REJECT_FAST_S) -> str:
+                   reject_after: float = _REJECT_FAST_S, left: float = 0.0) -> str:
     """Поллить вердикт снятия, различая «отвергнуто» и «ждём рендер».
 
     Полный grace нужен только когда челлендж ИСЧЕЗ: дроп мог быть верным, и мы
@@ -379,7 +389,13 @@ def _await_verdict(page, seconds: float = _SOLVED_GRACE_S,
     Без этого разделения каждый отвергнутый выстрел стоил полные 12s, семь
     выстрелов = 84s, и solve упирался в таймаут хантера (90s): live7 дал два
     провала по 96-97s с reason=timeout вместо нормального отказа по кандидатам.
+
+    left — остаток бюджета решения: подрезаем оба ожидания, иначе вердикт
+    дописывает к израсходованному бюджету ещё 12 с.
     """
+    if left > 0.0:
+        seconds = max(0.0, min(seconds, left))
+        reject_after = max(0.0, min(reject_after, left))
     t0 = time.monotonic()
     while True:
         st = _verdict(page)
@@ -523,6 +539,39 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
     def _expired() -> bool:
         return bool(timeout_s > 0 and time.monotonic() - _t0 > timeout_s)
 
+    def _left() -> float:
+        """Остаток бюджета решения (0.0 — бюджет выключен/исчерпан)."""
+        return (timeout_s - (time.monotonic() - _t0)) if timeout_s > 0 else 0.0
+
+    def _fail(reason: str, **kw) -> bool:
+        """ЕДИНСТВЕННАЯ точка «попытка не удалась»: паспорт + счётчик + False.
+
+        Инвариант KPI attempts() == failures() + solved() держится только если
+        каждый выход из solve_puzzle после _note_attempt() помечен РОВНО
+        одним исходом. Выходов было девять, и четыре из них возвращали False
+        без failures += 1: таймаут внутри цикла ожидания src, on_event=empty,
+        «timeout» от _drag_bx и исчерпание бюджета дропов. Счётчик попыток
+        рос, доля успеха считалась от несогласованных чисел — в живом логе это
+        читалось как «пазл не решён за 0 попыток».
+        """
+        _attempt("solve", ok=False, reason=reason, **kw)
+        _PUZZLE_FAILURES[0] += 1
+        return False
+
+    def _ok(verdict: str, **kw) -> bool:
+        """ЕДИНСТВЕННАЯ точка «попытка удалась»: паспорт + счётчик + True."""
+        _attempt("solve", ok=True, via=verdict, **kw)
+        note_solved()
+        return True
+
+    # Неудачные ДРОПЫ за ОДИН solve_puzzle. Прежде бюджет дропов сравнивался с
+    # глобальным _PUZZLE_FAILURES, который (а) не инкрементится на возвратах
+    # "reject" из _drag_bx — то есть на провале дропа, и (б) копится за всю
+    # сессию, поэтому после 4 провалов подряд любой следующий пазл отказывался
+    # двигать кусок вообще, даже имея полный бюджет времени. Теперь счётчик
+    # локальный, а в паспорт попытки идёт `drops`.
+    drops = 0
+
     # Геометрический инвариант: физическое OS-окно должно совпадать с
     # CDP-моделью, иначе композитор рисует контент смещённо относительно
     # координат мыши и решать пазл в сломанной геометрии бессмысленно
@@ -544,20 +593,17 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                         f"{g_metrics.get('cdp_bounds')}) — не решаю в сломанной "
                         f"геометрии")
             _note_attempt()
-            _PUZZLE_FAILURES[0] += 1
-            return False
+            return _fail("geom_mismatch", **g_metrics)
 
     for _ in range(max(1, int(attempts))):
         _note_attempt()
         if _expired():
-            _PUZZLE_FAILURES[0] += 1
-            _attempt("solve", ok=False, reason="timeout")
             note_timeout()
             log.warning(f"solve: бюджет времени ({timeout_s:.0f}с) исчерпан "
                         f"до захвата кадра — вкладка, вероятно, зависла; "
                         f"отдаём в лестницу восстановления "
                         f"(FAB-reload → new_tab → recycle)")
-            return False
+            return _fail("timeout")
         try:
             info = _capture_info(page)
         except Exception:
@@ -572,7 +618,8 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                     and (info["puzzle"].get("src") or "").strip()):
                 break
             if _expired():
-                return False
+                note_timeout()
+                return _fail("timeout_wait_src")
             time.sleep(0.5)
             try:
                 info = _capture_info(page)
@@ -595,7 +642,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 if _reason:
                     on_event({"kind": "empty", "reason": _reason,
                               "seconds_s": round(time.monotonic() - _t0, 1)})
-                    return False
+                    return _fail(_reason)
         if not info or not info.get("bg") or not info.get("puzzle"):
             # пазл уже снят (переход на url captchaDone=true) — успех; иначе
             # просто нет пазла на странице — неудачная попытка (счётчик
@@ -604,14 +651,11 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 on_event({"kind": "empty",
                           "seconds_s": round(time.monotonic() - _t0, 1)})
             done = _captcha_done(page)
-            if not done:
-                _PUZZLE_FAILURES[0] += 1
-            return done
+            return _ok("url_marker") if done else _fail("no_puzzle")
         try:
             psrc = (info["puzzle"] or {}).get("src")
             if not psrc:
-                _PUZZLE_FAILURES[0] += 1
-                return False
+                return _fail("no_puzzle_src")
             # Сессия уже сожжена: заглушка «Похоже, нет соединения» стоит в DOM
             # ОДНОВРЕМЕННО с пазлом (живой замер 2026-10-01: 6 из 8 дропов
             # дали st_h1='Похоже, нет соединения', st_blen=95 при живом пазле).
@@ -626,9 +670,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                               "seconds_s": round(time.monotonic() - _t0, 1)})
                 _solve_diag(page, info, "session_blocked",
                             detail="stub present while puzzle alive")
-                _attempt("solve", ok=False, reason="session_blocked")
-                _PUZZLE_FAILURES[0] += 1
-                return False
+                return _fail("session_blocked")
             cdn = _bg_from_cdn(info)
             shot = None
             grip = None
@@ -651,16 +693,6 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 yrow = int(round(p_r[1] - b_r[1]))
                 _PBG_STATS[0] = (float(bg_l.mean()), float(bg_l.std()),
                                  float(bg_l.max()), float(bg_l.min()))
-                shot = _shot_bg_clean(page, info)
-                diff_cands = []
-                diff_mode = "none"
-                if shot is not None and shot["bg_l"].shape == bg_l.shape:
-                    diff_cands, diff_mode = _detect_slot_diff(
-                        shot["bg_l"], bg_l, mask, yrow, k=3)
-                edge_cands = []
-                if shot is not None and shot["bg_l"].shape == bg_l.shape:
-                    edge_cands = _detect_slot_edges(shot["bg_l"], bg_l,
-                                                    mask, yrow, k=3)
                 va_cands = _detect_slot_topk(bg_l, mask, yrow, k=3)
                 # ОСНОВНОЙ ДЕТЕКТОР: локализация лунки по форме силуэта куска
                 # (2026-10-01, замер 87% top-1 против 20-27% у колоночных).
@@ -668,20 +700,51 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 # передача 0 означала бы верх картинки. Замер: с yrow из
                 # кадра 13/15 = 87%, с yrow=0 — 4/15 = 27%.
                 shape_cands = _detect_slot_shape(bg_l, mask, yrow, k=3)
-                # Диагноз 2026-09-20: edges возвращает левую ГРАНЬ лунки в фоне,
-                # а цель драга — левый край img куска. У куска слева прозрачная
-                # маржа silL (6-21px), поэтому img.left должен быть на silL
-                # меньше грани лунки. Валидация на 18 diag-кадрах: edges-silL
-                # попадает в нужную лунку 14/17 (±1px), diff из-за присутствия
-                # самого куска в живом кадре ошибается чаще (4/18) — приоритет
-                # скорректированным edges.
+                # ЖИВОЙ КАДР ФОНА — ТОЛЬКО ЕСЛИ ОН МОЖЕТ ИЗМЕНИТЬ РЕШЕНИЕ.
+                #
+                # Порядок детекторов в _solve_cands: shape идут первыми со
+                # сдвигом +_SHAPE_SCORE_BIAS (1e6), а шкалы колоночных
+                # детекторов — суммы энергий/доли пика, то есть ≤ ~510 при
+                # байтовых значениях diff. Следовательно, когда shape_cands
+                # непуст, cands[0] = shape_cands[0] НЕЗАВИСИМО от результатов
+                # diff/edges, а _shot_order стреляет только в cands[0] и его
+                # ±3. Живой кадр и silR в этом случае не могут изменить ни
+                # одного выстрела.
+                #
+                # А стоят они 8 скриншотов (5 с таймаут каждый) плюс ~40
+                # evaluate — на подвиревшей вкладке это треть-половина
+                # PUZZLE_BUDGET_S до того, как начался хоть один drag. В живом
+                # логе 2026-10-07 отведённый на ожидания остаток бюджета и
+                # кончился на stop=deadline_micro при iters=2. Поэтому кадр
+                # снимается лениво: если shape нашёл лунку, дифф-детекторы и
+                # рендерная маржа не платят за съёмку; если не нашёл — платят,
+                # и решение остаётся прежним.
+                shot = None
+                diff_cands = []
+                edge_cands = []
+                diff_mode = "skipped_shape"
                 silL = _sil_left(mask)
                 silR = None
-                try:
-                    silR = _shot_piece_margin(page, info)
-                except Exception as e:
-                    log.warning(f"solve silR failed, fallback silL: {e}")
-                sil_use = silR if silR is not None else silL
+                sil_use = silL
+                if not shape_cands:
+                    shot = _shot_bg_clean(page, info)
+                    diff_mode = "none"
+                    if shot is not None and shot["bg_l"].shape == bg_l.shape:
+                        diff_cands, diff_mode = _detect_slot_diff(
+                            shot["bg_l"], bg_l, mask, yrow, k=3)
+                        edge_cands = _detect_slot_edges(shot["bg_l"], bg_l,
+                                                        mask, yrow, k=3)
+                    # Диагноз 2026-09-20: edges возвращает левую ГРАНЬ лунки в
+                    # фоне, а цель драга — левый край img куска. У куска слева
+                    # прозрачная маржа silL (6-21px), поэтому img.left должен
+                    # быть на silL меньше грани лунки. Валидация на 18
+                    # diag-кадрах: edges-silL попадает в нужную лунку 14/17
+                    # (±1px) — приоритет скорректированным edges.
+                    try:
+                        silR = _shot_piece_margin(page, info)
+                    except Exception as e:
+                        log.warning(f"solve silR failed, fallback silL: {e}")
+                    sil_use = silR if silR is not None else silL
                 cands = _solve_cands(mask, edge_cands, diff_cands,
                                      va_cands, sil_use,
                                      shape_cands=shape_cands)
@@ -691,7 +754,8 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                           f"yrow={yrow} edges={[x for x, _ in edge_cands]} "
                           f"diff={[x for x, _ in diff_cands]} "
                           f"va={[x for x, _ in va_cands]} cands={cands} "
-                          f"shot_reason={_shot_bg_reason()} "
+                          f"diff_mode={diff_mode} "
+                          f"shot_reason={_shot_bg_reason() or 'not_shot'} "
                           f"silL={silL} silR={silR}")
                 _attempt("det", diff=[x for x, _ in diff_cands],
                          va=[x for x, _ in va_cands],
@@ -727,14 +791,12 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                     # на f-string ниже (bg_l/mask/yrow не присвоены).
                     _solve_diag(page, info, "no_bg_shot",
                                 detail=f"reason={_shot_bg_reason()}")
-                    _PUZZLE_FAILURES[0] += 1
-                    return False
+                    return _fail("no_bg_shot")
                 bg_l = shot["bg_l"]
                 b_r = shot["b_r"]
                 p_r = shot["pz_r"]
                 if len(p_r) != 4 or len(b_r) != 4:
-                    _PUZZLE_FAILURES[0] += 1
-                    return False
+                    return _fail("bad_rects")
                 mask = _silhouette(_fetch(psrc).read(), p_r[2], p_r[3])
                 yrow = int(round(p_r[1] - b_r[1]))
                 cands = _detect_slot_topk(bg_l, mask, yrow, k=3)
@@ -753,8 +815,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                             bg_stats=_PBG_STATS[0], bg=bg_l,
                             shot=shot.get("orig") if shot else None,
                             fullshot=fullshot)
-                _PUZZLE_FAILURES[0] += 1
-                return False
+                return _fail("no_slot")
             tried = set()
 
             def _drag_bx(x: int, score0: float):
@@ -784,7 +845,6 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                            deadline=(_t0 + timeout_s) if timeout_s > 0 else 0.0)
                 still = _still_challenge(page)
                 if _expired():
-                    _attempt("solve", ok=False, reason="timeout")
                     return "timeout"
                 # Двигался ли кусок вообще — отдельный вопрос от «попала ли
                 # лунка». no_move означает поломку захвата (мышь не зацепила),
@@ -792,7 +852,6 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 # причины выглядят одинаково и в логе, и на экране.
                 _moved = _last_move()
                 if _expired():
-                    _attempt("solve", ok=False, reason="timeout")
                     return "timeout"
                 # Вердикт снятия — по ЛЮБОМУ из двух признаков. Прежний ждал
                 # только captchaDone=true в URL, чего текущее поколение капчи
@@ -801,7 +860,11 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 # на месте. Живой лог 2026-09-29: 64 дропа легли в лунку
                 # (|err|≤1px), успехом засчитаны 3 — 61 верное попадание
                 # выброшено, плюс 24s мёртвого ожидания URL на кандидата.
-                verdict = _await_verdict(page, _SOLVED_GRACE_S)
+                # Оба ожидания подрезаются остатком бюджета решения: ещё 12с
+                # после израсходованных 55с — это ровно тот разрыв между
+                # «бюджет 60с» в настройке и 178с в логе.
+                verdict = _await_verdict(page, _SOLVED_GRACE_S,
+                                         left=_left())
                 _d = _drag_diag()
                 # Паспорт захода идёт и в машиночитаемый JSONL (_attempt), иначе
                 # разбор требует парсинга текстового лога.
@@ -819,6 +882,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 _why = _verdict_reason(okc, still, verdict)
                 _tail = (f"bx={x} score={score0:.3g} target={target_vx:.0f} "
                          f"err={_d.get('final_err')} k={_d.get('k')} "
+                         f"k_rem={_d.get('k_rem')} "
                          f"moved={_d.get('moved_px')}/{_moved} "
                          f"шагов={_d.get('iters')} stop={_d.get('stop')} "
                          f"settled={_d.get('settled')} "
@@ -832,8 +896,6 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 else:
                     log.warning(f"solve: НЕ РЕШЁН — {_why}; {_tail}")
                 if verdict in ("done", "unblocked"):
-                    _attempt("solve", ok=True, via=verdict, bx=x)
-                    note_solved()
                     return "solved"
                 # Не снят. Челлендж исчез, но контента нет: это либо подмена
                 # заглушкой, либо капча успела перерисоваться. Различаем
@@ -891,9 +953,13 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
             for bx, sc in shots:
                 r = _drag_bx(bx, sc)
                 if r == "solved":
+                    # Через _ok, а не голый True: иначе note_solved() не
+                    # вызывается, и метрика solve-rate в отчёте и в
+                    # recovery_telemetry демона всегда 0 (падал инвариант
+                    # attempts == failures + solved).
                     log.info(f"solve: ИТОГ — пазл снят за {_note_seen()} "
                              f"попытки; {puzzle_summary()}")
-                    return True
+                    return _ok("solved", bx=bx, drops=drops)
                 if r == "timeout":
                     # Бюджет времени исчерпан: значит вкладка зависла (медленный
                     # CDP), а не капча сложная. Логируем явно — иначе «не решён»
@@ -906,40 +972,67 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                                 f"зависла; отдаём в лестницу восстановления "
                                 f"(FAB-reload → new_tab → recycle); "
                                 f"{puzzle_summary()}")
-                    return False
+                    return _fail("timeout", drops=drops)
+                # «reject» и «reroll» — оба означают, что дроп состоялся и
+                # не засчитан. Считаем их в бюджет дропов: прежний код смотрел
+                # в глобальный _PUZZLE_FAILURES, который на них НЕ растёт, то
+                # есть бюджет дропов на провале не срабатывал никогда, а на
+                # СЛЕДУЮЩЕМ пазле блокировал движение куска при полном бюджете
+                # времени (живой лог 2026-10-07: «пазл не решён за 0 попыток»).
+                if r in ("reject", "reroll"):
+                    drops += 1
+                    if drops >= DROP_BUDGET:
+                        log.warning(f"solve: исчерпан бюджет дропов "
+                                    f"({DROP_BUDGET}) на этот пазл — стоп, "
+                                    f"сессия сгорит")
+                        if on_event is not None:
+                            on_event({"kind": "budget", "drops": drops})
+                        return _fail("drop_budget", drops=drops)
                 if r == "reroll":
                     break
-                if _PUZZLE_FAILURES[0] >= DROP_BUDGET:
-                    log.warning(f"solve: исчерпан бюджет дропов ({DROP_BUDGET}) "
-                                f"за сессию - стоп, сессия сгорит")
-                    if on_event is not None:
-                        on_event({"kind": "budget", "drops": _PUZZLE_FAILURES[0]})
-                    return False
             _solve_diag(page, info, "all_cands_failed",
                         detail=f"cands={cands} shots={shots}")
             _attempt("solve", ok=False, cands=[c[0] for c in cands],
-                     shots=[b for b, _ in shots])
+                     shots=[b for b, _ in shots], drops=drops)
+            # Исход ЭТОГО круга пишется здесь, на continue: попытка с
+            # исчерпанными кандидатами завершена и измерима, а следующий круг
+            # начинает новую с новым захватом кадра. Без этой пары «попытка +
+            # провал» итерация уходила без исхода, а следующая записывала
+            # провал уже на себя — и attempts != failures + solved на каждом
+            # цикле с рероллом капты.
+            _PUZZLE_FAILURES[0] += 1
             continue
         except Exception as exc:
             _solve_diag(page, info, "exception",
                         detail=f"{type(exc).__name__}: {exc}")
-            _PUZZLE_FAILURES[0] += 1
-            return False
-        # Сюда падаем только если ПОСЛЕДНИЙ цикл закончился на `continue`:
-        # без этого хвоста solve_puzzle возвращал None (falsy без ошибки), и
-        # счётчик failures не рос — ломался инвариант KPI attempts ==
-        # failures + solved. Прежний `_grace_resolve(page, 18.0)` здесь ждал
-        # URL-маркер, которого текущее поколение капчи не ставит: 18s
-        # пустоты на каждый проваленный инцидент (наблюдение с экрана
-        # 2026-09-30: «пазл стоит, 20-30s ничего, потом перезагрузка»).
-        # Вердикт снятия теперь полностью живёт в _drag_bx (_await_verdict).
-        if _captcha_done(page):
-            _attempt("solve", ok=True, note="late_url")
-            note_solved()
-            log.info(f"solve: ИТОГ — капча снята поздно (URL-маркер); "
-                     f"{puzzle_summary()}")
-            return True
-        _PUZZLE_FAILURES[0] += 1
-        log.warning(f"solve: ИТОГ — НЕ решён за {_note_seen()} попытки "
-                    f"(капча ушла, но доступа нет); {puzzle_summary()}")
-        return False
+            return _fail("exception", drops=drops,
+                         error=f"{type(exc).__name__}: {exc}")
+
+    # ХВОСТ ВНЕ ЦИКЛА ПОПЫТОК — это была настоящая ошибка отступов: хвост стоял
+    # на уровне тела цикла, а последний оператор в нём (`continue`) его
+    # перепрыгивал. То есть на пути «все круги ушли на continue» функция
+    # просто падала с конца и возвращала None — falsy, но не False, без
+    # failures += 1. В логе это и читалось как «пазл не решён за 0 попыток».
+    #
+    # Дальше: без этого хвоста solve_puzzle тоже возвращал None (falsy без
+    # ошибки) — счётчик failures не рос и инвариант KPI attempts ==
+    # failures + solved не сходился. Прежний `_grace_resolve(page, 18.0)` ждал
+    # URL-маркер, которого текущее поколение капчи не ставит: 18s пустоты на
+    # каждый проваленный инцидент (наблюдение с экрана 2026-09-30: «пазл
+    # стоит, 20-30с ничего, потом перезагрузка»). Вердикт снятия теперь
+    # полностью живёт в _drag_bx (_await_verdict).
+    #
+    # Счётчики здесь НЕ трогаем: каждый круг цикла уже записал свою пару
+    # «попытка + провал» на continue выше, и повторная запись разъехала бы
+    # инвариант. Единственное исключение — капта снялась ПОСЛЕ последнего
+    # круга: тогда её провал честно отменяется, иначе в KPI будет провал
+    # при фактически снятой капче.
+    if _captcha_done(page):
+        _PUZZLE_FAILURES[0] -= 1
+        log.info(f"solve: ИТОГ — капча снята поздно (URL-маркер); "
+                 f"{puzzle_summary()}")
+        return _ok("late_url", drops=drops)
+    log.warning(f"solve: ИТОГ — НЕ решён за {_note_seen()} попытки "
+                f"(капча ушла, но доступа нет), дропов={drops}; "
+                f"{puzzle_summary()}")
+    return False

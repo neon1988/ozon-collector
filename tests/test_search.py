@@ -1168,12 +1168,13 @@ def test_collect_search_links_recovery(monkeypatch):
     def fake_collect_links(sess, limit, scan_limit=None, max_scrolls=40,
                            scroll_by=1500, wait_ms=1000, quiet_after=3,
                            quiet_wait_ms=2500,
-                           stop_event=None, force_event=None):
+                           stop_event=None, force_event=None,
+                           skip_no_reviews=True):
         calls["n"] += 1
         if calls["n"] == 1:
             from playwright.sync_api import TimeoutError
             raise TimeoutError("Timeout 15000ms exceeded")
-        return links
+        return links, []      # (links, skipped_no_reviews) с 07.10
 
     def fake_recycle(sess, manager, launch_id):
         recycled.append(launch_id)
@@ -1493,8 +1494,10 @@ def test_collect_links_survives_two_quiet_iterations():
         ["5"],                         # iter 4: рост возобновился
         ["5", "6"],                    # iter 5: 6
     ])
-    got = _collect_links(sess, limit=100, scan_limit=100, max_scrolls=10)
+    got, _skipped = _collect_links(sess, limit=100, scan_limit=100,
+                                  max_scrolls=10)
     assert [g["pid"] for g in got] == ["1", "2", "3", "4", "5", "6"]
+    assert _skipped == []
 
 
 def test_collect_links_first_quiet_iteration_waits_longer():
@@ -1510,7 +1513,8 @@ def test_collect_links_stops_after_three_quiet_iterations():
     """Три тихие подряд — правда конец: выход, товары не теряются."""
     sess = _ScriptedSess([["1"], ["1"], ["1"], ["1"], ["1"], ["1"], ["1"],
                          ["1"]])
-    got = _collect_links(sess, limit=100, scan_limit=100, max_scrolls=10)
+    got, _skipped = _collect_links(sess, limit=100, scan_limit=100,
+                                  max_scrolls=10)
     assert [g["pid"] for g in got] == ["1"]
 
 
@@ -1592,8 +1596,8 @@ def test_collect_search_repairs_markdown_url(monkeypatch):
     monkeypatch.setattr(_S, "_warmup_to_category",
                         lambda s, u, recovery=None: got.setdefault("url", u))
     monkeypatch.setattr(_S, "_collect_links_with_recovery",
-                        lambda s, m, u, lim, mr, rec: (got.update(links=u)
-                                                       or []))
+                        lambda s, m, u, lim, mr, rec, **kw: (
+                            got.update(links=u) or ([], [])))
     sess = _FakeSess([{"pid": "1", "url": "u1"}])
     c = collect_search(sess,
                        "[кат](https://www.ozon.ru/category/j-10/?x=1)",

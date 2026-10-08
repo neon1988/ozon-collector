@@ -41,11 +41,27 @@ def test_k_from_probe_piece_mode_one_to_one():
                                      8.0, "piece") == pytest.approx(0.5)
 
 
-def test_k_from_probe_slider_uses_slider_travel():
-    """slider: делим на ход слайдера, а не на calib (у страйдера свой лаг)."""
+def test_k_from_probe_slider_divides_by_MOUSE_travel():
+    """slider: знаменатель — ИЗВЕСТНЫЙ сдвиг МЫШИ, а не ход слайдера.
+
+    Разбор прогона 2026-10-07 (слайдер перестал доезжать). Доводка управляет
+    МЫШЬЮ: dest в _drag_to — координата мыши. Значит коэффициент, который
+    гасит ошибку куска, обязан быть полным «мышь→кусок». Прежняя схема
+    считала k = «кусок/слайдер» и подставляла его в координату мыши, то есть
+    домножала ещё на связку мышь→слайдер, которая в живой капче плавает.
+
+    Числа из живого лога: 40px мыши → слайдер +40, кусок +23.86. Старая схема
+    дала бы 23.86/40 = 0.596 здесь случайно (dsl==calib), но на большом ходе
+    156px слайдера кусок ушёл на 58.4 → 0.373, и доводка с замороженным 0.596
+    считала шаг 55.9px, обрезала до 12 и получала 4.5px хода куска.
+    """
     r0 = {"px": 10.0, "s": 100.0}
     r1 = {"px": 20.0, "s": 125.0}
-    assert puzzle_drag._k_from_probe(r0, r1, 40.0, "slider") == pytest.approx(0.4)
+    assert puzzle_drag._k_from_probe(r0, r1, 40.0, "slider") == pytest.approx(0.25)
+    # мышь и слайдер разошлись (dsl=25 при ходе мыши 40) — коэффициент
+    # обязан считаться по мыши, иначе ошибка масштаба теряется
+    r1b = {"px": 20.0, "s": 125.0}
+    assert puzzle_drag._k_from_probe(r0, r1b, 20.0, "slider") == pytest.approx(0.5)
 
 
 def test_k_from_probe_grip_fail_returns_none():
@@ -59,22 +75,23 @@ def test_k_from_probe_grip_fail_returns_none():
 
 
 def test_k_from_probe_slider_without_travel_warns(caplog, monkeypatch):
-    """Слайдер не поехал, кусок сдвинулся: k=1.0 НЕ молча.
+    """Полоса слайдера не поехала — коэффициент ВСЁ РАВНО полный, но молчать нельзя.
 
-    Почему не None: если у этой генерации капчи координата `s` не находится
-    ВООБЩЕ, то возврат None увёл бы в бесконечный повторный хват и солвер встал
-    бы целиком. Поэтому оставляем рабочее значение, но предупреждаем в лог —
-    иначе доводка едет по неверному масштабу молча.
+    Почему не None и не 1.0: `s` больше не входит в формулу коэффициента
+    (см. test_k_from_probe_slider_divides_by_MOUSE_travel), возвращать None
+    означало бы объявить поломкой захвата связку, которая жива. Расхождение
+    «мышь едет, полоса не читается» остаётся аномалией, о ней нужен голос в
+    логе — иначе рассинхрон масштабов снова придётся выводить из разбора.
     """
     import ozon_collector.log as _log
     lines = []
     monkeypatch.setattr(_log, "warning",
                         lambda m, extra=None: lines.append(str(m)))
     r0 = {"px": 10.0, "s": 100.0}
-    r1 = {"px": 30.0, "s": 100.0}      # кусок +20, слайдер 0
+    r1 = {"px": 30.0, "s": 100.0}      # кусок +20, полоса 0
     k = puzzle_drag._k_from_probe(r0, r1, 40.0, "slider")
-    assert k == 1.0, k
-    assert any("калибровка ненадёжна" in m for m in lines), lines
+    assert k == pytest.approx(0.5), k
+    assert any("полоса слайдера не читается" in m for m in lines), lines
 
 
 def test_k_from_probe_slider_missing_s_coord_is_loud():
@@ -86,10 +103,11 @@ def test_k_from_probe_slider_missing_s_coord_is_loud():
     try:
         r0 = {"px": 10.0, "s": None}
         r1 = {"px": 30.0, "s": None}
-        assert puzzle_drag._k_from_probe(r0, r1, 40.0, "slider") == 1.0
+        assert puzzle_drag._k_from_probe(r0, r1, 40.0, "slider") == \
+            pytest.approx(0.5)
     finally:
         _log.warning = orig
-    assert any("калибровка ненадёжна" in m for m in lines), lines
+    assert any("полоса слайдера не читается" in m for m in lines), lines
 
 
 def _recording_drag(target_vx, px_seq):

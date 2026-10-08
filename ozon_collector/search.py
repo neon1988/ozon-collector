@@ -30,8 +30,64 @@ from .cdp import browser_alive, browser_tabs_count
 from .gather import run_gather
 from .report import digest_rating, sort_digest_products
 
+# Признак «у товара нет отзывов» из самой ПЛИТКИ выдачи — до захода на страницу.
+#
+# Зачем (решение владельца 2026-10-07): заход на карточку без отзывов и оценки
+# тратит минуты (открытие, прогрев, пагинация пустого блока), а данных в ней
+# всё равно нет. Пока такие товары пропускаются; если понадобится их собирать —
+# флаг skip_no_reviews, без изменения логики выдачи.
+#
+# Что ищем в плитке (шаблон tileGridDesktop):
+#   - state-JSON виджета рейтинга: reviewsCount/totalScore == 0 → отзывов нет;
+#   - подпись «Нет отзывов» / «Нет оценок» → отзывов нет;
+#   - подпись с числом отзывов («1 234 отзыва») → отзывы есть.
+# Три состояния, а не два: «нет» отбрасываем, «есть» оставляем, НЕИЗВЕСТНО
+# (ни одного признака — вёрстка изменилась или виджет не отрендерился)
+# ОСТАВЛЯЕМ. Иначе новая разметка Ozon молча вычеркнула бы весь каталог.
 SEARCH_JS = r"""
 () => {
+  // Три состояния: true (есть отзывы) / false (нет отзывов) / null (неизвестно).
+  // Неизвестно НЕ отбрасывается намеренно: неизвестно ≠ «отзывов нет».
+  const fromState = (card) => {
+    for (const s of card.querySelectorAll(
+        '[id^="state-webReviewProductScore"],[id^="state-webProductScore"],'
+        + '[id^="state-webSingleProductScore"]')) {
+      try {
+        const st = JSON.parse(s.getAttribute('data-state') || '{}');
+        const rc = st.reviewsCount ?? st.totalScore;
+        if (typeof rc === 'number') return rc > 0;
+      } catch (e) {}
+    }
+    return null;
+  };
+  const fromText = (txt) => {
+    if (/(нет|без)\s+отзыв/i.test(txt)) return false;
+    if (/(нет|без)\s+оцен/i.test(txt)) return false;
+    if (/\d[\d\s\u00a0]*(отзыв|оценк)/i.test(txt)) return true;
+    return null;
+  };
+  const cardOf = (a) => {
+    let el = a;
+    for (let i = 0; i < 6 && el; i++) {
+      if (el.querySelector
+          && el.querySelector('[data-widget*="Score"],[data-widget*="Review"]')) {
+        break;
+      }
+      el = el.parentElement;
+    }
+    return el || a.parentElement || a;
+  };
+  const counts = {yes: 0, no: 0, unknown: 0};
+  const signal = (a) => {
+    const card = cardOf(a);
+    const st = fromState(card);
+    // state-JSON авторитетен: «5 оценок» в тексте может относиться к оценке
+    // товара, а не к отзывам. При расхождении верим state-JSON.
+    const sig = st !== null ? st : fromText(String(card.innerText || ''));
+    counts[sig === true ? 'yes' : (sig === false ? 'no' : 'unknown')] += 1;
+    return sig;
+  };
+
   const out = [];
   const seen = new Set();
   for (const g of document.querySelectorAll('[data-widget="tileGridDesktop"]')) {
@@ -46,9 +102,11 @@ SEARCH_JS = r"""
       const pid = m[1] || m[2];
       if (!pid || pid.length < 5 || seen.has(pid)) continue;
       seen.add(pid);
-      out.push({ pid, url: 'https://www.ozon.ru/product/' + pid });
+      out.push({ pid, url: 'https://www.ozon.ru/product/' + pid,
+                 tile_no_reviews: signal(a) === false });
     }
   }
+  out.tile_counts = counts;
   return out;
 }
 """
@@ -109,7 +167,8 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
                    max_scrolls: int = 40, scroll_by: int = 1500,
                    wait_ms: int = 1000, quiet_after: int = 3,
                    quiet_wait_ms: int = 2500,
-                   stop_event=None, force_event=None) -> list[dict]:
+                   stop_event=None, force_event=None,
+                   skip_no_reviews: bool = True) -> tuple:
     """Докручивает выдачу (tileGridDesktop), пока прибавляются товары.
 
     Возвращает ВСЕ найденные уникальные товары (found) — НЕ ограничиваясь
@@ -150,10 +209,20 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
       force_event → CollectionInterrupted(links, forced=True) — emergency.
     Уже идущий блокирующий CDP-вызов (scroll/eval) не прерывается polling-флагом,
     но задержка ограничена одной итерацией / таймаутом сессии.
+
+    skip_no_reviews (решение владельца 2026-10-07) — товары, у которых в ПЛИТКЕ
+    выдачи видно «нет отзывов / нет оценки», не отдаются в сбор: заход на такую
+    карточку стоит минуты, а данных в ней нет. Отфильтрованные пиды возвращаются
+    вторым элементом кортежа, чтобы демон их посчитал и показал в отчёте — иначе
+    «в выдаче было 300, собрали 40» неотличимо от недобора.
+    Признак «неизвестно» (нет ни одного маркера) НЕ отбрасывается, см. SEARCH_JS.
+
+    Возвращает (links, skipped_no_reviews).
     """
     if scan_limit is None:
         scan_limit = max(limit, 50)
     seen = {}
+    no_reviews = {}
     stagnant = 0
     prev = 0
     why = "max_scrolls"
@@ -167,8 +236,13 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
             raise CollectionInterrupted(
                 [{"pid": p, "url": u} for p, u in seen.items()], forced=False)
         for item in sess.eval(SEARCH_JS):
+            if skip_no_reviews and item.get("tile_no_reviews"):
+                # Видно в плитке, что отзывов нет: заход не тратим.
+                no_reviews.setdefault(item["pid"], item["url"])
+                continue
             seen.setdefault(item["pid"], item["url"])
-        log.debug(f"links iter {i}: seen={len(seen)} stagnant={stagnant}")
+        log.debug(f"links iter {i}: seen={len(seen)} "
+                  f"no_reviews={len(no_reviews)} stagnant={stagnant}")
         if len(seen) >= scan_limit:
             why = f"scan_limit({scan_limit})"
             break
@@ -189,7 +263,13 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
     log.info(f"links: собрано {len(seen)}, причина выхода: {why}, "
              f"итераций: {i + 1}/{max_scrolls + 1}, "
              f"тихих подряд: {stagnant}/{quiet_after}")
-    return [{"pid": p, "url": u} for p, u in seen.items()]
+    if skip_no_reviews and no_reviews:
+        log.info(f"links: пропущено {len(no_reviews)} товаров без отзывов "
+                 f"(видно в плитке выдачи, страницы не открывались): "
+                 f"{', '.join(list(no_reviews)[:10])}"
+                 f"{'...' if len(no_reviews) > 10 else ''}")
+    return ([{"pid": p, "url": u} for p, u in seen.items()],
+            [{"pid": p, "url": u} for p, u in no_reviews.items()])
 
 
 def _cdp_dead(sess, kind: str) -> bool:
@@ -501,7 +581,8 @@ def _recovery_meta(sess, ev: dict, duration: float | None = None,
 
 def _collect_links_with_recovery(sess, manager, url: str, limit: int,
                                  max_recycles: int, recovery: dict,
-                                 stop_event=None, force_event=None):
+                                 stop_event=None, force_event=None,
+                                 skip_no_reviews: bool = True):
     """Докрутка выдачи с recovery по FSM-лестнице (ADR §14.2).
 
     Единый контур с _collect_shard: access_challenge → new_tab×1 → recycle×1 →
@@ -550,9 +631,10 @@ def _collect_links_with_recovery(sess, manager, url: str, limit: int,
                 # пуста. Раньше это выглядело как NORMAL_DONE discovered=0 —
                 # «здоровый» прогон без единого товара (см. ревизия 2.9).
                 recovery["search_grid_empty"] = True
-                return []
+                return [], []
             return _collect_links(sess, limit, stop_event=stop_event,
-                                  force_event=force_event)
+                                  force_event=force_event,
+                                  skip_no_reviews=skip_no_reviews)
         except Exception as e:
             if isinstance(e, CollectionInterrupted):
                 raise
@@ -1243,7 +1325,8 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
                    pids: Optional[list] = None,
                    skip_pids: Optional[list] = None,
                    session_budget: Optional[dict] = None,
-                   canary_url: Optional[str] = None) -> dict:
+                   canary_url: Optional[str] = None,
+                   skip_no_reviews: bool = True) -> dict:
     """Собирает до limit товаров из выдачи url в одной CDP-сессии.
 
     gather_cfg — базовый конфиг для run_gather (pid/url подставляются на
@@ -1259,6 +1342,13 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
 
     canary_url — цель canary-пробы после access-recovery: по умолчанию URL самой
     кампании (сущность того же класса). Переопределяется OZON_CANARY_URL.
+
+    skip_no_reviews (решение владельца 2026-10-07, по умолчанию True) — товары,
+    у которых в плитке выдачи видно «нет отзывов / нет оценки», не открываются:
+    заход стоит минуты, а данных в карточке всё равно нет. Они попадают в
+    combined["skipped_no_reviews_pids"], чтобы отчёт показывал их ОТДЕЛЬНО от
+    недобора (иначе «найдено 300, собрано 40» неотличимо от потери).
+    False — собирать и такие тоже.
 
     Recovery (ADR §14.2): access_challenge → FSM «один инцидент»: reload×3
     (внутри check_challenge) → new_tab×1 → recycle×1 → SESSION_BLOCKED (abort
@@ -1287,12 +1377,14 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
                     getattr(sess, "cdp_url", "http://127.0.0.1:9222"))}
     manager = B.BrowserProcessManager(
         cdp_url=getattr(sess, "cdp_url", "http://127.0.0.1:9222"))
+    skipped_no_reviews = []
     if pids:
         links = _links_from_pids(pids)
     else:
         _warmup_to_category(sess, url, recovery=recovery)
-        links = _collect_links_with_recovery(
-            sess, manager, url, limit, max_recycles, recovery)
+        links, skipped_no_reviews = _collect_links_with_recovery(
+            sess, manager, url, limit, max_recycles, recovery,
+            skip_no_reviews=skip_no_reviews)
 
     found = len(links)
     # skip_pids: уже обработанные артикулы пропускаем (не пересобираем заново).
@@ -1323,6 +1415,15 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
         "recovery": recovery,
         "products": products,
     }
+    # Товары без отзывов: видно в плитке выдачи, страницы не открывались.
+    # В отчёте обязаны быть видны отдельно, иначе «найдено 300, собрано 40»
+    # читается как недобор, хотя 200+ были отброшены осознанно.
+    if skipped_no_reviews:
+        combined["skipped_no_reviews"] = len(skipped_no_reviews)
+        combined["skipped_no_reviews_pids"] = [it["pid"]
+                                               for it in skipped_no_reviews]
+        log.info(f"[search] без отзывов (по плитке): {len(skipped_no_reviews)} "
+                 f"товаров не открывались — всего в выдаче {found + len(skipped_no_reviews)}")
     mr = gather_cfg.get("min_rating")
     if mr is not None:
         combined["min_rating"] = mr

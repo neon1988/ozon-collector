@@ -180,7 +180,7 @@ class TestCampaignFallbackPriority:
             with patch.object(S, "_collect_shard", _fake_shard), \
                  patch.object(S, "_warmup_to_category", lambda *a, **kw: None), \
                  patch.object(S, "_collect_links_with_recovery",
-                              lambda *a, **kw: []):
+                              lambda *a, **kw: ([], [])):
                 S.collect_search(
                     sess=None, url="https://www.ozon.ru/search/?text=iphone",
                     limit=1, gather_cfg={})
@@ -199,7 +199,7 @@ class TestCampaignFallbackPriority:
             with patch.object(S, "_collect_shard", _fake_shard), \
                  patch.object(S, "_warmup_to_category", lambda *a, **kw: None), \
                  patch.object(S, "_collect_links_with_recovery",
-                              lambda *a, **kw: []):
+                              lambda *a, **kw: ([], [])):
                 S.collect_search(
                     sess=None, url=campaign, limit=1, gather_cfg={})
         assert seen["recovery"]["canary_url"] == campaign

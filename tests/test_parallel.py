@@ -282,9 +282,47 @@ def test_orphaned_worker_browser_detects_dead_parent(monkeypatch):
     # 555 мёртв, 666 живой
     monkeypatch.setattr(P, "_parent_owner_alive",
                         lambda ppid: ppid == 666)
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: False)
     ids = P.orphaned_worker_browser_processes(
         "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1")
     assert [i.pid for i in ids] == [111]
+
+
+def test_live_cdp_browser_is_never_treated_as_orphan(monkeypatch):
+    """ЖИВОЙ браузер не бывает осиротевшим, даже если родитель «мёртв».
+
+    Регрессия 2026-10-06: PPID нашего chrome — это powershell-лаунчер, а
+    `_parent_owner_alive` требует имя «python», поэтому проверка всегда давала
+    «родитель мёртв». Второй параллельный запуск в preflight убивал браузеры
+    РАБОТАЮЩЕГО демона. Ответ CDP — единственный честный признак жизни.
+    """
+    base = P.profile_base_dir()
+    argv = [
+        "C:/Program Files/Chrome/chrome.exe",
+        f"--user-data-dir={base}\\ozon-profile-worker-1",
+        "--remote-debugging-port=9223",
+    ]
+    monkeypatch.setattr(P, "_iter_chromium_processes",
+                        lambda: iter([(111, argv, 555)]))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid, f"k{pid}"))
+    monkeypatch.setattr(P, "_parent_owner_alive", lambda ppid: False)
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: True)
+    assert P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
+
+
+def test_orphan_scan_does_not_touch_processes_when_cdp_answers(monkeypatch):
+    """При живом CDP перечисление процессов даже не выполняется.
+
+    Стоит дорого (WMI на каждый процесс) и бессмысленно: браузер жив.
+    """
+    def _boom():
+        raise AssertionError("процессы не должны перечисляться при живом CDP")
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: True)
+    monkeypatch.setattr(P, "_iter_chromium_processes", _boom)
+    assert P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
 
 
 # ---- preflight -----------------------------------------------------------------
@@ -1234,7 +1272,7 @@ def test_collect_parallel_graceful_link_stop_returns_partial(monkeypatch):
                         lambda *a, **k: _FakeManager())
 
     def _fake_links(sess, manager, url, limit, max_recycles, recovery,
-                    stop_event=None, force_event=None):
+                    stop_event=None, force_event=None, skip_no_reviews=True):
         raise CollectionInterrupted(
             [{"pid": "111", "url": "u111"},
              {"pid": "222", "url": "u222"}], forced=False)
@@ -1271,7 +1309,7 @@ def test_collect_parallel_force_link_stop_propagates(monkeypatch):
     monkeypatch.setattr(PL, "BrowserProcessManager", lambda *a, **k: object())
 
     def _fake_links(sess, manager, url, limit, max_recycles, recovery,
-                    stop_event=None, force_event=None):
+                    stop_event=None, force_event=None, skip_no_reviews=True):
         raise CollectionInterrupted([], forced=True)
 
     monkeypatch.setattr(PL.S, "_collect_links_with_recovery", _fake_links)

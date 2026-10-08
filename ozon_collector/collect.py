@@ -760,9 +760,16 @@ SCROLL_TO_LAST_REVIEW_JS = r"""
 """
 
 
+# ВАЖНО: маркер `step-up`/`step-down` живёт ВНУТРИ тела функции, а не перед
+# ней. ffsel_js.js_is_function определяет функцию по началу строки, и ведущий
+# `/*step-up*/` ломал определение: строка уходила в execute_script как
+# выражение, возвращала объект-функцию и НЕ скроллила — top-up на Firefox
+# («FakePage») не добирал отзывы молча. Маркер при этом остаётся в строке
+# (docs/architecture/architecture.md, FakePage-подмены и тесты ищут его
+# подстрокой), так что идентификация не пострадала.
 SCROLL_STEP_UP_JS = r"""
-/*step-up*/
 () => {
+  /*step-up*/
   const before = window.scrollY;
   window.scrollBy({ top: -Math.round(window.innerHeight * 2.2), behavior: 'instant' });
   return window.scrollY <= 0 || window.scrollY === before;
@@ -771,8 +778,8 @@ SCROLL_STEP_UP_JS = r"""
 
 
 SCROLL_STEP_DOWN_JS = r"""
-/*step-down*/
 () => {
+  /*step-down*/
   const before = window.scrollY;
   window.scrollBy({ top: Math.round(window.innerHeight * 2.2), behavior: 'instant' });
   return window.scrollY === before

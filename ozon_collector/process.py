@@ -1124,6 +1124,24 @@ def _matches_profile_token(args, profile_token: str) -> bool:
     return name == profile_token
 
 
+def cdp_responds(cdp_url: str, timeout_s: float = 1.5) -> bool:
+    """Отвечает ли CDP по этому URL (живой браузер).
+
+    Живость проверяется ДО того, как процесс признаётся осиротевшим: если CDP
+    отвечает, браузер жив и им кто-то пользуется — убивать его нельзя даже при
+    «мёртвом» родителе. Раньше такой защиты не было, и PPID-проверка всегда
+    давала «родитель мёртв» (родитель нашего chrome — это powershell-лаунчер,
+    а не python-воркер), из-за чего ВТОРОЙ параллельный запуск в preflight
+    убивал браузеры РАБОТАЮЩЕГО демона (ревизия 2026-10-06, находка ревью).
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{cdp_url}/json/version", timeout=timeout_s):
+            return True
+    except Exception:
+        return False
+
+
 def orphaned_worker_browser_processes(
         cdp_url: str, profile_token: str) -> list[ProcessIdentity]:
     """Все Chromium-процессы воркера на профиле, чей владелец мёртв.
@@ -1132,7 +1150,17 @@ def orphaned_worker_browser_processes(
     принудительно (kill/Ctrl+C/таймаут), его `finally` не выполняется и
     браузер остаётся жить — это осиротевший зомби. Здесь такой Chromium
     идентифицируется по родителю: родитель main chrome-процесса обязан быть
-    python-процессом воркера. Родитель мёртв/не python → осиротевший.
+    python-процессом воркера. Родитель мёртв/не python → кандидат в осиротевшие.
+
+    ДВЕ защиты, обе обязательны (правило «чужой процесс не трогать»):
+
+    1. **FailSafe в сторону «не трогать».** PPID у нашего chrome — это
+       powershell-лаунчер (`launch_chrome.ps1` делает CreateProcess), а не
+       python-воркер, поэтому проверка «родитель = python» почти всегда ложна.
+       Поэтому кандидатом считается процесс, у которого родитель И НЕ наш
+       владелец; решить окончательно можно только по ответам CDP.
+    2. **CDP отвечает → браузер жив, не трогаем.** Живой браузер не бывает
+       осиротевшим по определению: им пользуется воркер (или оператор вручную).
 
     Если main-браузер на (порт, профиль) осиротел — возвращаем ВСЕ
     chromium-процессы этого профиля (main + дочерние renderer/gpu/utility).
@@ -1140,6 +1168,9 @@ def orphaned_worker_browser_processes(
     main. Вернувшийся список можно force_stop (это не чужие процессы —
     профиль наш, а владельца-воркера больше нет).
     """
+    if cdp_responds(cdp_url):
+        # браузер жив — его не трогаем, даже если родитель «мёртв»
+        return []
     port = cdp_port(cdp_url)
     orphans: list[ProcessIdentity] = []
     for pid, argv, ppid in _iter_chromium_processes():

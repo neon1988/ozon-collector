@@ -4250,6 +4250,35 @@ def test_split_done_pending_keeps_failed_out_of_queue(tmp_path):
     assert retry == ["4"], "только 4 (без результата) возвращается в очередь"
 
 
+def test_pending_attempts_give_up_after_limit(tmp_path):
+    """Товар без результата уходит в безнадёжные после N попыток.
+
+    Обратная сторона починки очереди: без счётчика не собираемый товар
+    пересобирался бы каждый прогон (ревью 2026-10-06).
+    """
+    prog = {"discovered_pids": ["1", "2"], "valid_pids": [],
+            "failed_pids": [], "permanently_failed_pids": [],
+            "pending_attempts": {"1": k.PENDING_ATTEMPT_LIMIT - 1}}
+    attempts = dict(prog["pending_attempts"])
+    for p in ["1", "2"]:
+        attempts[p] = attempts.get(p, 0) + 1
+    give_up = {p for p, n in attempts.items()
+               if n >= k.PENDING_ATTEMPT_LIMIT}
+    assert give_up == {"1"}, "товар на пределе попыток уходит в безнадёжные"
+    assert "2" not in give_up, "у 2 только первая попытка — он ещё в работе"
+
+
+def test_pending_attempts_reset_when_result_appears(tmp_path):
+    """Появился raw → пид больше не «без результата», счётчик обнуляется."""
+    (tmp_path / "1_raw.json").write_text("{}", encoding="utf-8")
+    prog = {"discovered_pids": ["1", "2"], "valid_pids": [],
+            "failed_pids": [], "permanently_failed_pids": [],
+            "pending_attempts": {"1": 2, "2": 1}}
+    _done, retry = k.split_done_pending(prog, str(tmp_path))
+    kept = {p: n for p, n in prog["pending_attempts"].items() if p in retry}
+    assert kept == {"2": 1}, "у пида с результатом счётчик сбрасывается"
+
+
 def test_checkpoint_thread_writes_inflight_and_stop_is_clean(tmp_path):
     camp = tmp_path / "camp"
     camp.mkdir()
@@ -4376,3 +4405,34 @@ def test_checkpoint_never_writes_progress_manifest(tmp_path):
         k.stop_checkpoint(h)
     assert on_disk["discovered_pids"] == ["999"]
     assert h["pids"] == ["101"]
+
+
+# --- batch_size: размер выдачи воркеру (режим «по одному товару») -------------
+
+def test_inproc_gather_cfg_batch_size_default_one():
+    """Без ключа в run_cfg демон выдаёт воркеру по одному товару."""
+    cfg = k._inproc_gather_cfg({}, 3600)
+    assert cfg["batch_size"] == 1
+
+
+def test_inproc_gather_cfg_batch_size_from_manifest():
+    """При resume значение берётся ИЗ run_cfg (манифест — источник истины)."""
+    cfg = k._inproc_gather_cfg({"batch_size": 5}, 3600)
+    assert cfg["batch_size"] == 5
+
+
+def test_inproc_gather_cfg_batch_size_never_degenerate():
+    """batch_size<=0 в манифесте дал бы тихий ноль: воркеры получат 'none'."""
+    assert k._inproc_gather_cfg({"batch_size": 0}, 3600)["batch_size"] == 1
+    assert k._inproc_gather_cfg({"batch_size": -2}, 3600)["batch_size"] == 1
+    assert k._inproc_gather_cfg({"batch_size": None}, 3600)["batch_size"] == 1
+
+
+def test_batch_size_cli_default_is_absent():
+    """Без флага демон не переписывает манифест (значение — из run_cfg)."""
+    assert k.parse_args(["--url", "u", "--campaign", "c"]).batch_size is None
+
+
+def test_batch_size_cli_explicit_value():
+    assert k.parse_args(["--url", "u", "--campaign", "c",
+                         "--batch-size", "5"]).batch_size == 5

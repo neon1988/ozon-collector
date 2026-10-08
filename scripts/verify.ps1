@@ -32,8 +32,20 @@ function Invoke-Step {
     param([string]$Name, [scriptblock]$Action)
     Write-Host ''
     Write-Host "==> $Name" -ForegroundColor Cyan
+    # LASTEXITCODE can be stale: if the native command never started (missing
+    # python, missing file), PowerShell writes to the error stream and
+    # $LASTEXITCODE keeps the value of the PREVIOUS step, so the failed step
+    # would be reported as OK. Clearing it before the call makes that visible.
+    $global:LASTEXITCODE = $null
     & $Action
     $code = $LASTEXITCODE
+    if ($null -eq $code) {
+        # native command did not start (not found / threw before exit)
+        $ErrorActionPreference = 'Continue'
+        Write-Host "    FAIL  $Name (native command did not start)" -ForegroundColor Red
+        $script:failures += $Name
+        return
+    }
     if ($code -eq 0) {
         Write-Host "    OK    $Name" -ForegroundColor Green
     } else {
@@ -53,7 +65,14 @@ Invoke-Step 'cli --help' {
 if ($Quick) {
     Pop-Location
     Write-Host ''
-    Write-Host 'QUICK GREEN' -ForegroundColor Green
+    # -Quick never runs tests, so it may NOT claim the suite is green. It did
+    # (2026-10-06), and docs/tasks/current.md recorded that wording as proof of
+    # a completed check.
+    if ($script:failures.Count -gt 0) {
+        Write-Host "QUICK FAIL: $($script:failures -join ', ')" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host 'QUICK OK (syntax + cli only; TESTS WERE NOT RUN)' -ForegroundColor Yellow
     exit 0
 }
 
@@ -68,5 +87,5 @@ if ($script:failures.Count -gt 0) {
     Write-Host "FAILED: $($script:failures -join ', ')" -ForegroundColor Red
     exit 1
 }
-Write-Host 'ALL GREEN' -ForegroundColor Green
+Write-Host 'ALL GREEN (syntax + cli + tests)' -ForegroundColor Green
 exit 0

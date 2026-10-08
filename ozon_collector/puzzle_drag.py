@@ -8,11 +8,36 @@ _drag_to — один «заход»: снять актуальную позиц
 
 Перенесено из puzzle.py без изменения кода (механический сплит).
 
-Примечание по сложности: _drag_to — живой FSM драга (234 строки, cn выше
-ориентира 15) и НЕ расчленён дальше намеренно: у нас нет live-корпуса капч,
-а механическое дробление обратной связи «замер → шаг → доводка» без прогонов
-реально повышает риск антибот-регрессии. Вынесенные чистые функции
-_calib_step/_k_from_probe покрыты юнит-тестами (tests/test_puzzle_drag.py).
+Разбор прогона 2026-10-07 (ползунок перестал доезжать: moved_px=23.86 при
+calib=40, k=0.596, stop=deadline_micro при iters=2, бюджет 60с) дал три
+причины, и все три — здесь:
+
+1. ЗАМЕР ИДЁТ ПО НЕОТРИСОВАННОМУ КАДРУ. page.mouse.move в подвиревшей
+   вкладке стоит ~0.7с на точку (зонд 17 точек = 12.34с), а page.evaluate
+   отвечает за ~0.00с, поэтому между последним move и чтением
+   getBoundingClientRect нет ни одного кадра композитора. Три замера одного
+   и того же зонда в 40px дали 23.86 / 48.34 / -0.88 — кусок «поехал назад»
+   при команде вперёд. Лечится _read_settled (кадр перед чтением).
+2. КОЭФФИЦИЕНТ ЗАМОРАЖИВАЛСЯ ПОСЛЕ ЗОНДА. Зонд дал 0.596, большой ход на
+   той же вкладке — 0.373. Доводка с 0.596 считала шаг 55.9px, обрезала до
+   12px и получала 4.5px хода куска: 8 итераций нужно, а бюджет кончался на
+   второй. Лечится _gain_update (перемер по каждой наблюдённой паре) и
+   _step_mouse с потолком, достаточным для реального усиления.
+3. ТРАЕКТОРИЯ НЕ ЗНАЛА ПРО БЮДЖЕТ. 24 точки по 0.45с = 10.9с на один ход.
+   Теперь длина пачки подбирается под остаток бюджета (puzzle_input.
+   _fit_points), а обрезанная траектория доставляет конечную координату.
+
+Плюс отступление от кода, замеренное там же: k в ветке slider считался как
+«кусок/слайдер» и применялся к координате МЫШИ — с домноженной связкой
+мышь→слайдер. Теперь k — полный коэффициент мышь→кусок (знаменатель —
+известный сдвиг мыши), а ход слайдера остался только признаком в логе.
+
+Примечание по сложности: _drag_to — живой FSM драга (cn выше ориентира 15) и
+НЕ расчленён дальше намеренно: у нас нет live-корпуса капч, а механическое
+дробление обратной связи «замер → шаг → доводка» без прогонов реально
+повышает риск антибот-регрессии. Вынесенные чистые функции
+_calib_step/_k_from_probe/_gain_update/_step_mouse/_fit покрыты юнит-тестами
+(tests/test_puzzle_drag.py, tests/test_puzzle_regressions.py).
 """
 
 import os
@@ -54,10 +79,155 @@ CALIB_MAX = 40.0   # потолок = прежнее поведение для �
 CALIB_MIN = 6.0    # меньше 6px k не измерить: getBoundingClientRect даёт ~1px
 CALIB_GUARD = 2.0  # не подходить к цели ближе, чем на 2px
 
-# Пауза после отпускания куска до вердикта «снято/не снято». Приёмка приходит
-# быстро (перезапрос выдачи на месте), 2.5s хватает; дальше решает вызывающий
+# Допуск попадания куска в цель (px) и предел микрокоррекций.
+ACC = 0.9
+MICRO_MAX_ITERS = 18
+
+# ---------------------------------------------------------------------------
+# КОЭФФИЦИЕНТ «МЫШЬ → КУСОК»
+# ---------------------------------------------------------------------------
+# Управляет доводка МЫШЬЮ (`dest` в _drag_to — координата мыши, а не ползунка
+# и не куска). Поэтому ошибку куска надо делить на ПОЛНЫЙ коэффициент
+# мышь→кусок, а пользовалась схема «k = кусок/слайдер, применяем к мыши»,
+# то есть с домноженным на связку мышь→слайдер. Номинальная полоса — где
+# связка ведёт себя как задумано; вне неё коэффициент всё ещё пригоден, но
+# это аномалия, о которой надо сказать в логе (живой лог 2026-10-07 давал
+# k=0.596 и 1.208 в соседних прогонах).
+K_NOMINAL = (0.4, 3.0)
+# За этой полосой измерение непригодно (кусок почти не следует за мышью или
+# едет в разы быстрее) — заход считается несостоявшимся и хват берётся заново.
+K_USABLE = (0.05, 8.0)
+# Минимальные величины, при которых пара (Δкусок, Δмышь) вообще что-то меряет:
+# getBoundingClientRect даёт долю пикселя, а прыжок на 0.4px — это шум.
+GAIN_MIN_DPX = 1.0
+GAIN_MIN_DMOUSE = 0.5
+# Потолок одного шага МЫШИ. Прежний был 12px, и при фактическом усилении
+# 0.373 (измерено в том же заходе, где зонд дал 0.596) это означало 4.5px
+# хода куска за итерацию: ошибка 33px требовала 8 итераций по ~11с, а бюджет
+# 60с кончался на второй (stop=deadline_micro, iters=2). Потолок поднят до
+# величины, достаточной для реального усиления; безопасность обеспечивает
+# не потолок, а ЗАМКНУТЫЙ КОНТУР: каждый шаг сверяется с замеренной позицией,
+# поэтому перелёт стоит одной итерации, а не попытки.
+STEP_CAP_MOUSE = 40.0
+# Потолок шага в финальных микро-движениях (доводка «докручиванием»).
+NUDGE_STEP_CAP = 4.0
+
+# ---------------------------------------------------------------------------
+# ИЗМЕРЕНИЕ ПОЗИЦИИ: СТРАНИЦА ДОЛЖНА ОТРИСОВАТЬ КАДР
+# ---------------------------------------------------------------------------
+# Живой лог 2026-10-07: page.mouse.move по подвисшей вкладке идёт ~0.7с на
+# точку (зонд 17 точек = 12.34с, ход 24 точки = 10.86с), а page.evaluate
+# возвращается за ~0.00с. Между последним mouse.move и чтением
+# getBoundingClientRect проходит 0.1-0.3с — меньше кадра композитора, и
+# координата куска читается С ПРОШЛОГО кадра. Признак в том же логе: один и
+# тот же зонд в 40px давал moved_px = 23.86, 48.34 и -0.88, причём последний
+# — кусок «поехал назад» при команде вперёд. Три несовместимых значения.
+# Дальше ошибка замыкается на себя: k считается по недомерянной позиции,
+# шаг получается неверным, доводка едет мимо и упирается в дедлайн.
+#
+# Поэтому перед чтением позиции ждём кадр: двойной requestAnimationFrame
+# (нужно ДВА кадра, иначе анимация не «догнала» команду) под гонкой с
+# setTimeout — если вкладка фоновая и rAF не приходит, страница обязана
+# ответить, иначе evaluate висит вечно (таймаута у page.evaluate нет).
+SETTLE_TIMEOUT_MS = 1200
+SETTLE_MAX_S = 1.5
+_SETTLE_JS = (
+    "() => Promise.race(["
+    " new Promise(r => requestAnimationFrame("
+    "   () => requestAnimationFrame(() => r('raf')))),"
+    " new Promise(r => setTimeout(() => r('timer'), %d))"
+    "]).then(v => v)"
+) % SETTLE_TIMEOUT_MS
+
+
+def _settle(page, budget_s: float = SETTLE_MAX_S) -> str:
+    """Дождаться кадра страницы: 'raf' | 'timer' | 'no_budget' | 'err_*'.
+
+    Молча по всем исходам: это синхронизация измерения, а не проверка, и её
+    неудача не должна ронять заход — читаем позицию как есть.
+    """
+    if budget_s <= 0.0:
+        return "no_budget"
+    try:
+        v = page.evaluate(_SETTLE_JS)
+        return "raf" if v == "raf" else "timer"
+    except Exception as e:
+        return f"err_{type(e).__name__}"
+
+
+def _read_settled(page, deadline: float = 0.0) -> Optional[dict]:
+    """Прочитать позицию куска, дождавшись кадра страницы.
+
+    Всё, что дальше питает замкнутый контур (k, err, шаг), обязано приходить
+    из УСТОЯВШЕЙСЯ позиции, иначе контур замыкается на собственном шуме.
+    Ожидание ограничено остатком бюджета: бюджета нет — читаем как раньше.
+    """
+    left = (deadline - time.monotonic()) if deadline else SETTLE_MAX_S
+    _settle(page, min(SETTLE_MAX_S, left))
+    return _read_sl_piece(page)
+
+
+def _mouse_up(page) -> bool:
+    """Отпустить левую кнопку мыши. Молча при обрыве CDP."""
+    try:
+        page.mouse.up()
+        return True
+    except Exception:
+        return False
+
+
+def _k_usable(k) -> bool:
+    """Годится ли измеренный коэффициент для доводки."""
+    try:
+        return k is not None and K_USABLE[0] <= float(k) <= K_USABLE[1]
+    except (TypeError, ValueError):
+        return False
+
+
+def _dsl(r0: dict, r1) -> float:
+    """Ход полосы/ручки слайдера между замерами (0.0 — не читается)."""
+    a = (r0 or {}).get("s")
+    b = r1.get("s") if isinstance(r1, dict) else None
+    if a is None or b is None:
+        return 0.0
+    return float(b) - float(a)
+
+
+def _gain_update(k_prev, dpx: float, dmouse: float):
+    """Коэффициент мышь→кусок по наблюдённой паре (Δмышь, Δкусок).
+
+    Замеренный один раз зондом коэффициент НЕ переносится на всю доводку.
+    Живой лог 2026-10-07: один заход дал k=0.596 на зонде (40px мыши → 23.86
+    куска) и 0.373 на большом ходе (156px слайдера → 58.4 куска). Доводка с
+    замороженным 0.596 считала шаг 33.3/0.596 = 55.9px, обрезала до 12px и
+    получала 4.5px фактического хода куска — 8 итераций нужно, а бюджет 60с
+    кончался на второй (stop=deadline_micro, iters=2). Теперь каждая
+    итерация даёт свежую пару, и коэффициент следует за фактом.
+
+    Возвращает (k, обновился_ли). Пара не годится (ходы слишком мелкие) —
+    оставляем прошлый коэффициент, а не 1.0.
+    """
+    if abs(dmouse) < GAIN_MIN_DMOUSE or abs(dpx) < GAIN_MIN_DPX:
+        return k_prev, False
+    return dpx / dmouse, True
+
+
+def _step_mouse(err: float, k, step_cap: float = STEP_CAP_MOUSE) -> float:
+    """Сдвиг МЫШИ, компенсирующий ошибку куска (чистая функция).
+
+    err = px - target_vx, поэтому при err < 0 (кусок левее цели) нужно
+    двигаться ВПЕРЁД (шаг положительный). 0.0 — доводка в допуске или
+    коэффициент непригоден.
+    """
+    if not _k_usable(k) or abs(err) <= ACC:
+        return 0.0
+    return max(-step_cap, min(step_cap, -err / float(k)))
+
+
+# Пауза после отпускания кучка до вердикта «снято/не снято». Приёмка приходит
+# быстро (перезапрос выдачи на месте), 2.5 с хватает; дальше решает вызывающий
 # (solve_puzzle ждёт ещё _SOLVED_GRACE_S). Прежний _confirm_solved ждал
-# 6x1s ТОЛЬКО URL-маркер captchaDone=true, которого текущее поколение капчи
+# 6x1 с ТОЛЬКО URL-маркер captchaDone=true, которого текущее поколение капчи
 # не ставит, — верные дропы возвращали okc=False и жегли время.
 DROP_VERDICT_S = 2.5
 
@@ -93,12 +263,19 @@ def _verdict(page) -> str:
 
 
 def _await_verdict(page, seconds: float = DROP_VERDICT_S,
-                   reject_after: float = 1.2) -> str:
+                   reject_after: float = 1.2, left: float = 0.0) -> str:
     """Вердикт после отпускания: полный grace только если челлендж исчез.
 
     Если челлендж жив — дроп отвергнут, хватит reject_after (иначе каждый
     выстрел стоит полные секунды и свип не укладывается в таймаут solve).
+
+    left — остаток бюджета решения. Оба ожидания подрезаются по нему: раньше
+    вердикт мог съесть 12 с поверх уже израсходованного бюджета, и «бюджет
+    60 с» держался только на честности вызывающего.
     """
+    if left > 0.0:
+        seconds = max(0.0, min(seconds, left))
+        reject_after = max(0.0, min(reject_after, left))
     t0 = time.monotonic()
     while True:
         st = _verdict(page)
@@ -110,6 +287,11 @@ def _await_verdict(page, seconds: float = DROP_VERDICT_S,
         elif time.monotonic() - t0 >= seconds:
             return "no"
         time.sleep(0.3)
+
+
+def _left(deadline: float) -> float:
+    """Остаток до дедлайна в секундах (0.0 — дедлайна нет/он прошёл)."""
+    return (deadline - time.monotonic()) if deadline else 0.0
 
 
 def _calib_step(dist: float) -> float:
@@ -125,11 +307,24 @@ def _calib_step(dist: float) -> float:
 
 
 def _k_from_probe(r0: dict, r1, calib: float, grip_mode: str) -> Optional[float]:
-    """k = сдвиг куска / сдвиг мыши по двум замерам (чистая функция).
+    """k = сдвиг КУСКА / сдвиг МЫШИ по двум замерам (чистая функция).
+
+    Знаменатель — ИЗВЕСТНЫЙ сдвиг мыши (calib), а не отдельно замеренный ход
+    слайдера `s`. Доводка управляет мышью (`dest` в _drag_to — координата
+    мыши), поэтому коэффициент должен быть полным «мышь→кусок». Схема
+    «k = кусок/слайдер, применить к мыши» домножена ещё на связку
+    мышь→слайдер, а та в живой капче плавает: в логе 2026-10-07 на 40px мыши
+    слайдер поехал на 40px, а кусок — на 23.86, и на следующем ходе в 156px
+    кусок поехал всего на 58.4. Замеренный по слайдеру коэффициент поэтому
+    нельзя переносить ни на большой ход, ни на микрокоррекцию — он
+    перемеряется на каждом шаге (_gain_update).
+
+    `s` остаётся в замере как признак «полоса/ручка едет за мышью»: если он
+    не читается или не двигается, об этом всё равно нужно сказать в лог —
+    иначе рассинхрон масштабов не виден.
 
     None → кусочек не поехал (хват не удался), вызывающий берёт новую точку
-    хвата. slider: делим на фактический ход слайдера (там k<1 из-за лага
-    отрисовки), piece: мышь тянет кусок 1:1, делим на calib.
+    хвата.
     """
     if not r1 or r1.get("px") is None:
         return None
@@ -137,19 +332,12 @@ def _k_from_probe(r0: dict, r1, calib: float, grip_mode: str) -> Optional[float]
     if abs(dpx) <= 1.0:
         return None
     if grip_mode == "slider":
-        dsl = (r1.get("s") or 0) - (r0.get("s") or 0)
+        dsl = _dsl(r0, r1)
         if dsl <= 0.01:
-            # Слайдер по факту не поехал, а кусок сдвинулся — измерение ненадёжно
-            # (обычно это значит, что координата `s` перестала читаться). k=1.0
-            # оставляем намеренно: возврат None увёл бы в повторный хват, а если
-            # `s` не находится у этой генерации капчи ВСЕГДА, солвер встал бы
-            # целиком. Поэтому не молчим — предупреждение в лог, чтобы по паспорту
-            # было видно, когда доводка пошла по неверному масштабу.
-            log.warning(f"drag: калибровка ненадёжна — слайдер не сдвинулся "
-                        f"(dsl={dsl:.2f}), беру k=1.0; если такие случаи "
-                        f"постоянны, солвер едет по неверному масштабу")
-            return 1.0
-        return dpx / dsl
+            log.warning(f"drag: полоса слайдера не читается или не поехала "
+                        f"(dsl={dsl:.2f}) — веду по полному коэффициенту "
+                        f"мышь→кусок; если такие случаи постоянны, сверь "
+                        f"масштаб по паспорту (k в _attempt)")
     return dpx / calib
 
 
@@ -227,9 +415,37 @@ def _drag_to(page, target_vx: float, info, bx, score,
     в прозрачной зоне бочонка «не везёт» кусок. Вертикаль держим исходную.
     Все перемещения мыши — человеческие траектории (_human_path/_human_move),
     анти-бот палит равномерные линейные move (телепорт + идеальная прямая).
+
+    Что чинилось 2026-10-07 (живой лог: ползунок не доезжает, `moved_px` =
+    23.86 при калибровке 40, k = 0.596, stop=deadline_micro при iters=2):
+      * позиция читается ТОЛЬКО после кадра стра (_read_settled) — до этого
+        k/err/шаг считались по кадру, предшествующему последнему mouse.move;
+      * коэффициент мышь→кусок перемеряется на каждом шаге (_gain_update), а
+        не замораживается после зонда;
+      * длина траектории подбирается под остаток бюджета, а обрезанная
+        траектория всё равно доставляет конечную координату;
+      * кнопка отпускается на ЛЮБОМ выходе из захода (_finish) — иначе
+        следующий заход стартует поверх mousePressed.
     """
-    ACC = 0.9
     _LAST_MOVE[0] = None
+    # Состояние кнопки: нужно, чтобы отпускание было идемпотентным. Второй
+    # mouse.up() после успешного дропа — это лишнее событие для страницы, а
+    # после неудачного дропа она на него реагирует.
+    _pressed: dict = {"v": False}
+
+    def _release() -> bool:
+        """Отпустить кнопку, если она нажата (идемпотентно)."""
+        if not _pressed["v"]:
+            return False
+        _pressed["v"] = False
+        return _mouse_up(page)
+
+    def _grip(x: float, y: float, ox: float) -> None:
+        """Подвести мышь и нажать (с учётом состояния кнопки)."""
+        _human_click(page, x + ox, y, hold=random.uniform(0.06, 0.16),
+                     deadline=deadline)
+        _pressed["v"] = True
+
     if deadline and time.monotonic() > deadline:
         return False
     try:
@@ -282,14 +498,25 @@ def _drag_to(page, target_vx: float, info, bx, score,
     _t_drag = time.monotonic()
     _diag = {"t_read_s": 0.0, "t_move_s": 0.0, "probe_reads": 0,
              "iters": 0, "final_err": None, "settled": False,
-             "stop": None, "k": None, "moved_px": None, "grip": grip_mode,
-             "target_vx": round(target_vx, 1), "bx": bx,
+             "stop": None, "k": None, "k_rem": 0, "moved_px": None,
+             "grip": grip_mode, "target_vx": round(target_vx, 1), "bx": bx,
              "simple": bool(_SIMPLE_DRAG)}
     _LAST_DRAG_DIAG.clear()
     _LAST_DRAG_DIAG.update(_diag)
 
     def _finish(**kw) -> bool:
-        """Закрыть заход: дописать факты в паспорт и отдать результат провала."""
+        """Закрыть заход: ОТПУСТИТЬ кнопку, дописать факты, отдать провал.
+
+        Отпускание здесь — часть контракта, а не страховка. _finish зовётся на
+        deadline_before_pick / deadline_micro / deadline_nudge /
+        grip_exhausted, и три из них срабатывают С ЗАЖАТОЙ кнопкой. Без
+        mouse.up() следующий заход стартует поверх mousePressed: страница
+        получает mousedown без mouseup, и кусок либо не едет вовсе, либо едет
+        рывком от старой точки (дефект из живого лога 2026-10-07: прогоны
+        шли подряд, stop=deadline_micro, а `moved_px` второго был -0.88 — кусок
+        «поехал назад», потому что кнопка осталась зажатой с прошлого захода).
+        """
+        _release()
         _diag.update(kw)
         _diag["t_total_s"] = round(time.monotonic() - _t_drag, 2)
         for _n in ("t_read_s", "t_move_s"):
@@ -308,13 +535,13 @@ def _drag_to(page, target_vx: float, info, bx, score,
         # контенте на странице (текущее поколение v10 — перезапрос выдачи на
         # месте). Прежние 6x1s ждали только URL-маркер и почти всегда истекали
         # впустую: заменены на _await_verdict с тем же вердиктом.
-        return _await_verdict(page) != "no"
+        return _await_verdict(page, left=_left(deadline)) != "no"
 
-    def _drop_and_confirm(cur0: float) -> bool:
+    def _drop_and_confirm() -> bool:
         # Кнопка ещё зажата на куске, доведённом к цели. Отпускаем и сразу
         # спрашиваем вердикт у обоих признаков снятия.
-        page.mouse.up()
-        return _await_verdict(page) != "no"
+        _release()
+        return _await_verdict(page, left=_left(deadline)) != "no"
 
     def _simple_drag_once() -> bool:
         """ОДИН непрерывный человеческий драг: без зонда и без до-крутки.
@@ -337,15 +564,16 @@ def _drag_to(page, target_vx: float, info, bx, score,
         if not r or r.get("px") is None:
             _attempt("drag", note="simple_no_piece", bx=bx, score=score,
                      target_vx=round(target_vx, 1))
-            return _await_verdict(page) != "no"
+            return _await_verdict(page, left=_left(deadline)) != "no"
         px0 = r["px"]
         _LAST_MOVE[0] = None
-        _human_click(page, gx + rng_x, gy, hold=random.uniform(0.08, 0.18))
+        _grip(gx, gy, rng_x)
         time.sleep(random.uniform(0.05, 0.12))
         dest = max(track[0] + 1, min(max_hx, gx + (target_vx - px0)))
-        _shape = _human_drag(page, gx + rng_x, gy, dest, gy, bound=max_hx)
+        _shape = _human_drag(page, gx + rng_x, gy, dest, gy, bound=max_hx,
+                             deadline=deadline)
         time.sleep(random.uniform(0.2, 0.45))
-        r2 = _read_sl_piece(page)
+        r2 = _read_settled(page, deadline)
         if r2 and r2.get("px") is not None:
             _LAST_MOVE[0] = round(r2["px"] - px0, 2)
         err = round((r2.get("px") if r2 and r2.get("px") is not None
@@ -355,7 +583,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
                  moved_px=_LAST_MOVE[0], grip=grip_mode, k=1.0)
         log.debug(f"drag simple px0={px0} dest={dest:.1f} err={err} "
                   f"moved={_LAST_MOVE[0]}")
-        return _drop_and_confirm(dest)
+        return _drop_and_confirm()
 
     last = {}
     for _try in range(3):
@@ -369,7 +597,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
                   f"t_read={time.monotonic() - _t0_read:.2f}s")
         if not r0 or r0.get("px") is None:
             # Кусок мог исчезнуть на пересборке капчи после неудачного дропа:
-            # img#puzzle грузится заново через 0.3-2s. Поллинг; если не
+            # img#puzzle грузируется заново через 0.3-2s. Поллинг; если не
             # появился — это НЕ «пазл снят», а только реальное снятие
             # челленджа даёт True (2026-09-22: ложные okc=True из no_piece
             # раздували успехи и жечь свип по устаревшим кандидатам).
@@ -377,7 +605,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
             if r0 is None:
                 _attempt("drag", note="no_piece", bx=bx, score=score,
                          target_vx=round(target_vx, 1))
-                return _await_verdict(page) != "no"
+                return _await_verdict(page, left=_left(deadline)) != "no"
         if _SIMPLE_DRAG:
             # Один непрерывный драг: гипотеза, что возвратно-точный FSM
             # (зонд вперёд + до 18 микрокоррекций) Ozon читает как
@@ -387,27 +615,33 @@ def _drag_to(page, target_vx: float, info, bx, score,
             _solved = _simple_drag_once()
             if _solved:
                 return True
-            page.mouse.up()
+            _release()
             return False
         # подвод мыши к точке хвата (визуально-естественно) затем нажим
-        _human_click(page, gx + rng_x, gy, hold=random.uniform(0.06, 0.16))
+        _grip(gx, gy, rng_x)
         time.sleep(random.uniform(0.05, 0.12))
         # Калибровочный зонд по расстоянию до цели (НЕ фиксированные 40px):
         # близкая лунка раньше перешагивалась зондом. Длина здесь не влияет на
-        # точность big-move: d_sl считается от ФАКТИЧЕСКОГО px после зонда,
-        # т.е. dest = gx + calib + (target - px_now)/k — probe-agnostic.
+        # точность big-move: шаг считается от ФАКТИЧЕСКОГО px после зонда,
+        # т.е. dest = mouse + (target - px_now)/k — probe-agnostic.
         calib = _calib_step(abs(target_vx - (r0.get("px") or 0)))
         k = 1.0
         r1 = r0
         if calib > 0.0:
-            # калибровочный сдвиг человеческой траекторией
+            # калибровочный сдвиг человеческой траекторией. Дедлайн можно
+            # передавать: конечная координата зонда всё равно доставляется
+            # (см. _human_move), а измерение Δкусок/Δмышь от обрезки не
+            # зависит — оно и есть смысл зонда.
             _t_probe = time.monotonic()
             _human_move(page, _human_path(gx + rng_x, gy, gx + calib + rng_x, gy,
-                                          n=16, arc=3.0))
+                                          n=16, arc=3.0),
+                        deadline=deadline)
             time.sleep(random.uniform(0.1, 0.22))
             _t_probe = time.monotonic() - _t_probe
             _t_r1 = time.monotonic()
-            r1 = _read_sl_piece(page)
+            # Замер после кадра страницы: без этого k считается по позиции
+            # с ПРОШЛОГО кадра (см. SETTLE_*).
+            r1 = _read_settled(page, deadline)
             _t_r1 = time.monotonic() - _t_r1
             _diag["t_move_s"] += _t_probe
             _diag["t_read_s"] += _t_r1
@@ -434,22 +668,24 @@ def _drag_to(page, target_vx: float, info, bx, score,
         _LAST_MOVE[0] = _moved
         _diag["moved_px"] = _moved
         log.debug(f"drag r1={r1} calib={calib} moved_px={_moved} k={k}")
-        if k is None or not (0.4 <= k <= 3.0):
-            page.mouse.up()
+        if k is None:
+            # ХВАТ НЕ УДАЛСЯ (кусок не поехал). Отделено от «коэффициент вне
+            # номинала»: полоса 0.4..3.0 раньше была общей для обоих случаев,
+            # и настоящий малый коэффициент (0.373 в замере 2026-10-07)
+            # объявлялся поломкой захвата — три полных зонда впустую.
+            _release()
             time.sleep(random.uniform(0.3, 0.5))
-            _no_move = _moved is None or abs(_moved) <= 1.0
-            if _no_move:
-                log.warning(f"drag: КУСОК НЕ ДВИНУЛСЯ (moved_px={_moved}, "
-                            f"calib={calib:.1f}, grip={grip_mode} @"
-                            f"({gx:.0f},{gy:.0f}) bx={bx}) — мышь не зацепила "
-                            f"цель, доводка невозможна")
-                _attempt("drag", note="no_move", bx=bx, score=score,
-                         target_vx=round(target_vx, 1), calib=round(calib, 1),
-                         moved_px=_moved, gx=round(gx, 1), gy=round(gy, 1),
-                         grip=grip_mode)
+            log.warning(f"drag: КУСОК НЕ ДВИНУЛСЯ (moved_px={_moved}, "
+                        f"calib={calib:.1f}, grip={grip_mode} @"
+                        f"({gx:.0f},{gy:.0f}) bx={bx}) — мышь не зацепила "
+                        f"цель, доводка невозможна")
+            _attempt("drag", note="no_move", bx=bx, score=score,
+                     target_vx=round(target_vx, 1), calib=round(calib, 1),
+                     moved_px=_moved, gx=round(gx, 1), gy=round(gy, 1),
+                     grip=grip_mode)
             _attempt("drag", note="grip_fail", bx=bx, score=score,
                      target_vx=round(target_vx, 1), k=k, grip=grip_mode,
-                     moved_px=_moved, no_move=_no_move)
+                     moved_px=_moved, no_move=True)
             rng_x = random.uniform(-9, 9)
             if grip_mode == "piece":
                 # При повторном хвате НЕ рандом: читаем живую непрозрачную точку
@@ -465,28 +701,59 @@ def _drag_to(page, target_vx: float, info, bx, score,
                     gx = min(pz_r[0] + pz_r[2], max(pz_r[0], gx + random.uniform(-12, 12)))
                     gy = min(pz_r[1] + pz_r[3], max(pz_r[1], gy + random.uniform(-8, 8)))
             continue  # хват не удался — пробуем другую точку
+        if not _k_usable(k):
+            _release()
+            time.sleep(random.uniform(0.3, 0.5))
+            log.warning(f"drag: коэффициент мышь→кусок k={k} вне пригодной "
+                        f"полосы {K_USABLE} при живом куске (moved_px={_moved}) — "
+                        f"хват считаем несостоявшимся")
+            _attempt("drag", note="grip_fail", bx=bx, score=score,
+                     target_vx=round(target_vx, 1), k=k, grip=grip_mode,
+                     moved_px=_moved, no_move=False)
+            rng_x = random.uniform(-9, 9)
+            continue
+        if not (K_NOMINAL[0] <= k <= K_NOMINAL[1]):
+            # Кусок едет, но связка аномальна. Это НЕ поломка: доводим по
+            # измеренному коэффициенту и говорим об аномалии голосом, иначе
+            # «солвер едет по неверному масштабу» снова придётся выводить из
+            # разбора лога.
+            log.warning(f"drag: коэффициент мышь→кусок k={k:.3f} вне номинальной "
+                        f"полосы {K_NOMINAL} — довожу по измеренному и перемеряю "
+                        f"каждый шаг")
+            _attempt("drag", note="gain_offnominal", bx=bx, score=score,
+                     target_vx=round(target_vx, 1), k=round(k, 3),
+                     grip=grip_mode, moved_px=_moved)
         px_now = r1.get("px") or r0.get("px")
         err = px_now - target_vx
         if abs(err) <= ACC:
             time.sleep(random.uniform(0.15, 0.3))
-            _solved = _drop_and_confirm(gx + calib + rng_x)
+            _solved = _drop_and_confirm()
             _attempt("drag", note="acc_ok", bx=bx, score=score,
                      target_vx=round(target_vx, 1), k=k, calib=calib,
                      settled=True, solved=_solved, grip=grip_mode)
             return _solved
-        # большой сдвиг в ожидаемую позицию (остаточная ошибка докручивается)
-        d_sl = -err / k
-        dest = max(track[0] + 1, min(max_hx, gx + calib + d_sl + move_noise))
-        log.debug(f"drag to dest={dest:.1f} (err={err:.1f} d_sl={d_sl:.1f} "
-                  f"calib={calib})")
-        _shape = _human_drag(page, gx + calib + rng_x, gy, dest, gy,
-                             bound=max_hx)
+        # большой сдвиг в ожидаемую позицию (остаточная ошибка докручивается).
+        # d_mouse — сдвиг МЫШИ, а не слайдера: k теперь полный коэффициент
+        # мышь→кусок, и подставлять его в координату мыши можно без домножения
+        # на связку мышь→слайдер.
+        d_mouse = _step_mouse(err, k)
+        if d_mouse == 0.0:
+            return _finish(stop="k_unusable", final_err=round(err, 2))
+        prev_px = px_now
+        prev_mouse = gx + calib + rng_x
+        dest = max(track[0] + 1,
+                   min(max_hx, prev_mouse + d_mouse + move_noise))
+        log.debug(f"drag to dest={dest:.1f} (err={err:.1f} d_mouse={d_mouse:.1f} "
+                  f"k={k:.3f} calib={calib})")
+        _shape = _human_drag(page, prev_mouse, gy, dest, gy, bound=max_hx,
+                             deadline=deadline)
         log.debug(f"drag shape={_shape}")
         time.sleep(random.uniform(0.15, 0.3))
         cur = dest
         settled = False
+        stuck = 0
         iters = 0
-        for _i in range(18):
+        for _i in range(MICRO_MAX_ITERS):
             iters = _i + 1
             _diag["iters"] = iters
             if deadline and time.monotonic() > deadline:
@@ -494,7 +761,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
                                final_err=round(err, 2) if last.get("px")
                                is not None else None)
             _t_read = time.monotonic()
-            rr = _read_sl_piece(page)
+            rr = _read_settled(page, deadline)
             _t_read = time.monotonic() - _t_read
             _diag["t_read_s"] += _t_read
             _diag["probe_reads"] += 1
@@ -506,20 +773,43 @@ def _drag_to(page, target_vx: float, info, bx, score,
             last = rr
             err = (rr.get("px") or 0) - target_vx
             _diag["final_err"] = round(err, 2)
+            # ПЕРЕМЕР коэффициента по факту: пара (Δмышь, Δкусок) прошлого
+            # шага — это единственное честное измерение в подвиревшей вкладке.
+            # Без этого доводка едет по модели, замеренной до первого же хода
+            # (см. _gain_update и разбор прогона 2026-10-07).
+            k_new, _k_ok = _gain_update(k, rr["px"] - prev_px,
+                                        cur - prev_mouse)
+            if _k_ok:
+                k = k_new
+                _diag["k_rem"] = _diag.get("k_rem", 0) + 1
+            _diag["k"] = round(float(k), 3)
             log.debug(f"drag i={_i} px={rr.get('px')} s={rr.get('s')} "
-                      f"err={err:+.2f} t_read={_t_read:.2f}s")
+                      f"err={err:+.2f} k={k:.3f} t_read={_t_read:.2f}s")
             if abs(err) <= ACC:
                 settled = True
                 _diag["stop"] = "acc_ok"
                 break
-            step_px = -err / k if k else -err
-            step_px = max(-12.0, min(12.0, step_px))
+            step_px = _step_mouse(err, k)
+            if step_px == 0.0:
+                _diag["stop"] = _diag.get("stop") or "k_unusable"
+                break
+            prev_px, prev_mouse = rr["px"], cur
             _dest = max(track[0] + 1, min(max_hx, cur + step_px))
             if abs(_dest - cur) < 0.3:
-                _dest = cur  # больше не двигаем — мертвая зона
+                # Мёртвая зона: шаг по модели не меняет положение мыши. Две
+                # такие итерации подряд — модель не сходится, дальше крутить
+                # бессмысленно: дроп делается с тем, что есть (см. ниже).
+                _dest = cur
+                stuck += 1
+                if stuck >= 2:
+                    _diag["stop"] = _diag.get("stop") or "stuck"
+                    break
+            else:
+                stuck = 0
             _t_move = time.monotonic()
             _human_move(page, _human_path(cur, gy, _dest, gy,
-                                          n=10, arc=1.2))
+                                          n=10, arc=1.2),
+                        deadline=deadline)
             # ТАЙМИНГ (2026-10-02): живой лог показал 11 с между соседними
             # шагами при норме 0.4 с, то есть CDP-вызовы висят в 25 раз
             # дольше. Разделение read/move отвечает на вопрос, что именно
@@ -537,32 +827,45 @@ def _drag_to(page, target_vx: float, info, bx, score,
         cur2 = cur
         if last.get("px") is not None:
             _e = (last.get("px") or 0) - target_vx
+            nudge_prev_px, nudge_prev_mouse = last["px"], cur2
             for _n in range(random.randint(1, 3)):
                 if deadline and time.monotonic() > deadline:
                     return _finish(stop="deadline_nudge",
                                    final_err=round(_e, 2))
                 if abs(_e) <= 0.4:
                     break
-                _sd = (-_e / k) if k else (-_e if abs(_e) < 5 else -4.0)
-                _sd = max(-4.0, min(4.0, _sd))
+                _sd = _step_mouse(_e, k, step_cap=NUDGE_STEP_CAP)
+                if _sd == 0.0:
+                    break
                 _nc = max(track[0] + 1, min(max_hx, cur2 + _sd))
                 _t_move = time.monotonic()
-                _human_move(page, _human_path(cur2, gy, _nc, gy, n=6, arc=0.8))
+                _human_move(page, _human_path(cur2, gy, _nc, gy, n=6, arc=0.8),
+                            deadline=deadline)
                 _diag["t_move_s"] += time.monotonic() - _t_move
                 time.sleep(random.uniform(0.18, 0.45))
+                nudge_prev_mouse = cur2
                 cur2 = _nc
                 _t_read = time.monotonic()
-                rr2 = _read_sl_piece(page)
+                rr2 = _read_settled(page, deadline)
                 _diag["t_read_s"] += time.monotonic() - _t_read
                 _diag["probe_reads"] += 1
                 if not rr2 or rr2.get("px") is None:
                     break
+                k_new, _k_ok = _gain_update(k, rr2["px"] - nudge_prev_px,
+                                            cur2 - nudge_prev_mouse)
+                if _k_ok:
+                    k = k_new
+                    _diag["k_rem"] = _diag.get("k_rem", 0) + 1
+                    _diag["k"] = round(float(k), 3)
+                nudge_prev_px = rr2["px"]
                 _e = (rr2.get("px") or 0) - target_vx
                 _diag["final_err"] = round(_e, 2)
                 last = rr2
-                settled = True
+                # settled означает «ошибка в допуске», а не «прочитали позицию»:
+                # прежняя строка ставила True безусловно, и паспорт врал.
+                settled = abs(_e) <= ACC
         time.sleep(random.uniform(0.25, 0.4))
-        _solved = _drop_and_confirm(cur2)
+        _solved = _drop_and_confirm()
         _err_last = None
         if last.get("px") is not None:
             _err_last = round((last.get("px") or 0) - target_vx, 1)
@@ -575,7 +878,8 @@ def _drag_to(page, target_vx: float, info, bx, score,
                  target_vx=round(target_vx, 1), k=k, calib=calib,
                  settled=settled,
                  solved=_solved, err=_err_last, cur=round(cur, 1),
-                 iters=iters, px=last.get("px"), s=last.get("s"),
+                 iters=iters, k_rem=_diag.get("k_rem", 0),
+                 px=last.get("px"), s=last.get("s"),
                  ps=last.get("ps"), ss=last.get("ss"), grip=grip_mode)
         if _solved:
             _diag["t_total_s"] = round(time.monotonic() - _t_drag, 2)
@@ -586,10 +890,7 @@ def _drag_to(page, target_vx: float, info, bx, score,
         else:
             _finish()
         return _solved
-    try:
-        page.mouse.up()
-    except Exception:
-        pass
+    _release()
     _attempt("drag", note="grip_exhausted", bx=bx, score=score,
              target_vx=round(target_vx, 1))
     return _finish(stop="grip_exhausted")
