@@ -44,8 +44,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1 -Quick
 
 Порядок: синтаксис → CLI → тесты. Полный прогон идёт через
 `scripts/run_tests_guarded.py --timeout 900`: дефолтный таймаут pytest в 300 с
-**не проходит** весь набор (1438 тестов ≈ 8 мин), а reaper в этом скрипте снимает
-потомков и сирот прошлых прогонов — иначе браузеры держат каталог профиля.
+**не проходит** весь набор, а reaper в этом скрипте снимает потомков и сирот
+прошлых прогонов — иначе браузеры держат каталог профиля.
+
+**`-Quick` не доказывает, что тесты зелёные** — он их не запускает и печатает
+`QUICK OK (syntax + cli only; TESTS WERE NOT RUN)`. Доказательством проверки
+считается только полный прогон (`ALL GREEN`). На 07.10.2026 `-Quick` печатал
+`QUICK GREEN` и выходил с кодом 0, даже когда шаги провалились, — это ввело в
+заблуждение и попало в `docs/tasks/current.md` как «проверка пройдена».
+
+Пока работает демон, порты 9222-9230 заняты, и два портовых теста падают по
+этой причине; прогон с исключением:
+`python scripts\run_tests_guarded.py --timeout 900 -k "not worker_ports_are_not_reserved_by_windows and not port_bindable_distinguishes_reserved_from_occupied"`.
+
 QA одного товара — `python scripts/qa_raw.py --pids <pid>`, это уже не проверка
 кода, а проверка данных.
 
@@ -89,7 +100,36 @@ QA одного товара — `python scripts/qa_raw.py --pids <pid>`, это
 
 ## Данные и секреты
 
-- В `.gitignore`: `data/`, `logs/`, `docs/qa/`, `docs/digests/`, `.agents/`, `tools/`.
-- Профиль Chromium с куками и подтверждённой 18+ проверкой живёт вне репозитория
-  (`%LOCALAPPDATA%\opencode\ozon-profile`) — не копировать в проект и не коммитить.
+- В `.gitignore`: `data/`, `logs/`, `docs/qa/`, `docs/digests/`, `.agents/`, `tools/`, `.tmp/`.
+- **Профили Chromium — в `.tmp/profiles/`, и это НЕ мусор.** Решение владельца
+  07.10: перенос из `%LOCALAPPDATA%\opencode` (там же лежат профили avito и
+  других проектов). Задаётся `OZON_PROFILE_BASE` на уровне User; при новом
+  запуске без env профили уедут обратно в `LOCALAPPDATA` и потеряют куки.
+  Содержит `ozon-profile` + `ozon-profile-worker-1..8` с пройденной 18+
+  проверкой. Правило «в `.tmp` только временное, убирать в конце задачи» здесь
+  НЕ действует: удаление = заново 18+ и холодная сессия (Ozon подсовывает пазл).
 - `.env`, куки, токены в коммит не попадают: проверяй `git diff --cached` перед коммитом.
+
+## Размер профилей
+
+92% профиля — воспроизводимый кэш Chromium (`Default/Cache` + `Code Cache` +
+BrowserMetrics + component_crx_cache), а не состояние сессии: Cookies/Local
+Storage/Sessions на 9 профилей — 79 МБ. Живой замер 07.10: без потолка 880 МБ на
+воркер, **6.7 ГБ на 9 профилей**; после уборки и с потолком — **268 МБ на все 9**.
+
+- Потолок на браузер: `--disk-cache-size` в `launch_chrome.ps1`/`.sh`,
+  дефолт 100 МБ, переопределяется `OZON_DISK_CACHE_MB`. Флаг не JS-наблюдаемый,
+  отпечаток страницы не меняет. **Режет только `Default/Cache`** — без уборки
+  папка всё равно растёт до ~400 МБ на воркер.
+- Автоуборка: `parallel.preflight_check` → `_gc_profile_caches()` чистит профили
+  воркеров перед стартом, порог `GC_MIN_MB` (200 МБ). Точка вызова выбрана по
+  инварианту, а не по удобству: осиротевшие браузеры к этому моменту уже убиты,
+  новые ещё не подняты. Уборка **не роняет сбор** при ошибке.
+- Ручная: `python scripts\clean_profile_cache.py --apply` (dry-run по умолчанию).
+  Список каталогов живёт в `ozon_collector/profile_gc.py` — он нужен и демону, и
+  скрипту, дублировать его опасно.
+- Профиль с живым Chromium уборка **пропускает** (удаление у живого Chromium
+  ломает профиль); не удалось определить живость — тоже пропуск.
+- `STATE_DIRS` (Cookies/Local Storage/Sessions/IndexedDB/Storage/Preferences/
+  Network/Web Data) в `JUNK_DIRS` не входят; это проверяет тест
+  `test_profile_gc.py::TestWhitelistSafety`.

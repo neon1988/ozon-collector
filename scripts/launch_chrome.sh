@@ -37,6 +37,10 @@ date -Is > "$PROFILE/.ozon_collector_launched"
 # намеренно, см. комментарий к $chromeArgs). Остальные флаги держат
 # .sh и .ps1 синхронными: НЕ добавлять --enable-automation.
 DISPLAY=${DISPLAY:-:0}
+# Потолок дискового кеша Chromium (МБ, флаг принимает килобайты). Живой замер
+# 2026-10-07: профиль раздувался до 880 МБ, 92% — воспроизводимый кеш, а не
+# состояние сессии. Флаг не JS-наблюдаемый, отпечаток страницы не меняет.
+DISK_CACHE_MB="${OZON_DISK_CACHE_MB:-100}"
 PROXY_ARGS=""
 # Per-worker прокси (ревизия 2.9, ADR §18.7): пусто → напрямую. ВНИМАНИЕ:
 # аргумент виден в /proc/<pid>/cmdline — не кладите пароль прокси в общий доступ.
@@ -52,6 +56,7 @@ DISPLAY="$DISPLAY" setsid bash -c "$CHROME --remote-debugging-port=$PORT \
   --user-data-dir=$PROFILE \
   --no-first-run --no-default-browser-check \
   --disable-features=OptimizationHints,MediaRouter \
+  --disk-cache-size=$((DISK_CACHE_MB * 1024)) \
   --window-size=1440,900 --no-sandbox $PROXY_ARGS about:blank" & disown
 
 sleep 2

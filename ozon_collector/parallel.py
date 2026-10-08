@@ -30,6 +30,7 @@ from . import collect as C
 from . import log
 from . import net
 from . import process as P
+from . import profile_gc
 from . import search as S
 from .browser import BrowserProcessManager
 from .gather import run_gather
@@ -254,7 +255,62 @@ def preflight_check(specs: list[dict]) -> list[str]:
                 os.makedirs(pp, exist_ok=True)
             except OSError as e:
                 errs.append(f"worker{w}: не удалось создать профиль {pp}: {e}")
+    _gc_profile_caches(specs)
     return errs
+
+
+#: Порог «профиль грязный», МБ. Живой замер 07.10: сразу после уборки и с
+#: работающим потолком `--disk-cache-size` на 9 профилях осталось 140-199 МБ
+#: воспроизводимого мусора (Code Cache + BrowserMetrics + component_crx_cache).
+#: При 300 МБ потолок не срабатывал бы никогда; при 200 МБ уборка идёт раз в
+#: несколько прогонов, а состояние сессии (6-13 МБ) этот порог не задевает.
+GC_MIN_MB = 200.0
+
+
+def _gc_profile_caches(specs: list[dict]) -> dict:
+    """Убрать кэш профилей воркеров перед стартом (живой замер 2026-10-07).
+
+    Точка вызова выбрана по инварианту, а не по удобству: здесь осиротевшие
+    браузеры воркеров УЖЕ убиты (шаг выше), а новые ещё не подняты, поэтому
+    профили гарантированно не заняты. Без этого уборка в прогоне сдвинула бы
+    момент на «после сбора», где браузеры ещё живы и удалять нельзя.
+
+    Кэш воспроизводим: Cookies/Local Storage/Sessions/IndexedDB/Preferences/
+    Network в белый список не входят (profile_gc.JUNK_DIRS). Ошибка уборки НЕ
+    роняет preflight — сбор важнее чистоты диска.
+    """
+    tokens = [s["profile_token"] for s in specs
+              if s.get("kind") != "firefox" and s.get("profile_token")]
+    if not tokens:
+        return {}
+    freed_total = 0.0
+    touched = {}
+    for token in tokens:
+        path = P.profile_path(token)
+        try:
+            junk = profile_gc.junk_size_mb(path)
+        except OSError as e:
+            log.debug(f"[gc] {token}: не удалось измерить кэш: {e}")
+            continue
+        if junk < GC_MIN_MB:
+            continue
+        try:
+            res = profile_gc.clean_profile(path, apply=True)
+        except Exception as e:
+            log.warning(f"[gc] {token}: уборка не удалась ({type(e).__name__}: "
+                        f"{e}) — продолжаю, на сбор это не влияет")
+            continue
+        if res["skipped"]:
+            log.warning(f"[gc] {token}: живой Chromium на профиле, кэш "
+                        f"({junk:.0f} МБ) оставлен")
+            continue
+        freed_total += res["freed_mb"]
+        touched[token] = res["freed_mb"]
+    if touched:
+        log.info(f"[gc] убрал кэш профилей: " + ", ".join(
+            f"{t} −{v:.0f} МБ" for t, v in sorted(touched.items()))
+            + f" (всего −{freed_total:.0f} МБ, состояние сессии цело)")
+    return touched
 
 
 # ---- WorkerContext и reader ------------------------------------------------

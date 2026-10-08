@@ -80,6 +80,30 @@ def test_ps1_supports_proxy_env():
     assert "proxy=$proxyNote" in diag, "LAUNCHER-DIAG печатает сырой $Proxy"
 
 
+def test_both_cap_disk_cache():
+    """Потолок дискового кеша: профиль озона раздувался до 880 МБ на воркер,
+    92% из этого — воспроизводимый кэш (Default/Cache + Code Cache), а не
+    состояние сессии. --disk-cache-size в килобайтах режет это до ~100 МБ."""
+    for path, t in ((PS1, _text(PS1)), (SH, _text(SH))):
+        name = os.path.basename(path)
+        assert "--disk-cache-size=" in t, f"{name} не ограничивает дисковый кеш"
+        assert "* 1024" in t, f"{name}: флаг ждёт КБ, а не МБ (нет * 1024)"
+
+
+def test_ps1_disk_cache_env_override():
+    """OZON_DISK_CACHE_MB переопределяет дефолт; мусор в переменной → дефолт,
+    а не падение лаунчера (сбой запуска = нет сбора вообще)."""
+    t = _text(PS1)
+    assert "$env:OZON_DISK_CACHE_MB" in t
+    assert "TryParse" in t, "значение из env проверяется как число"
+    warn = [ln for ln in t.splitlines() if "LAUNCHER-WARN" in ln]
+    assert warn, "мусор в OZON_DISK_CACHE_MB молча проглатывается"
+    for ln in warn:
+        assert ln.isascii(), (
+            f"LAUNCHER-WARN содержит не-ASCII: кириллица в перенаправленном "
+            f"выводе PowerShell едет через кодировку консоли и в логе нечитаема")
+
+
 def test_sh_supports_proxy_env():
     t = _text(SH)
     assert "${PROXY:-}" in t or "$PROXY" in t

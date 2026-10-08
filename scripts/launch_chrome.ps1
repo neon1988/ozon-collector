@@ -4,17 +4,35 @@
 # Использование: powershell -ExecutionPolicy Bypass -File scripts/launch_chrome.ps1
 # Переменные: PORT (по умолч. 9222), PROFILE (по умолч. %LOCALAPPDATA%\opencode\ozon-profile),
 #             CHROME (по умолч. ищет ms-playwright chromium → системный Chrome),
-#             PROXY (ревизия 2.9: per-worker прокси; пусто → напрямую).
+#             PROXY (ревизия 2.9: per-worker прокси; пусто → напрямую),
+#             DISK_CACHE_MB (env OZON_DISK_CACHE_MB, по умолч. 100; 0 = выключить).
 # Скрипт запускает браузер и сразу завершается; браузер живёт сам по себе.
 param(
     [string]$Port = $env:PORT,
     [string]$Profile = $env:PROFILE,
     [string]$Chrome = $env:CHROME,
-    [string]$Proxy = $env:PROXY
+    [string]$Proxy = $env:PROXY,
+    [int]$DiskCacheMb = 0
 )
 
 if (-not $Port) { $Port = "9222" }
 if (-not $Profile) { $Profile = Join-Path $env:LOCALAPPDATA "opencode\ozon-profile" }
+
+# Потолок дискового кеша Chromium. Живой замер 2026-10-07: профиль озона
+# раздувался до 880 МБ, из них Default/Cache 448 МБ + Code Cache 138 МБ — 92%
+# мусора, воспроизводимого заново; состояние сессии (Cookies/Local Storage/
+# Sessions) — 79 МБ на 9 профилей. Флаг в килобайтах, 0 = потолка нет.
+# Антибот: флаг не виден странице (не JS-наблюдаемый), влияет только на
+# eviction кеша, поэтому отпечаток страницы не меняется.
+if ($DiskCacheMb -le 0 -and $env:OZON_DISK_CACHE_MB) {
+    [int]$parsed = 0
+    if ([int]::TryParse($env:OZON_DISK_CACHE_MB, [ref]$parsed) -and $parsed -gt 0) {
+        $DiskCacheMb = $parsed
+    } else {
+        Write-Host "LAUNCHER-WARN: OZON_DISK_CACHE_MB is not a positive number - disk cache cap not set" -ForegroundColor Yellow
+    }
+}
+if ($DiskCacheMb -le 0) { $DiskCacheMb = 100 }
 
 function Find-Chrome {
     # 1) Системный Chrome (реальный отпечаток браузера) — Ozon не блочит.
@@ -78,6 +96,10 @@ $chromeArgs = @(
     # НЕ ставим --no-sandbox (сильный сигнал automation; системному Chrome не нужен).
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
+    # Потолок дискового кеша (МБ → килобайты для Chromium): 8 воркеров × 100 МБ
+    # вместо × 700 МБ. Набивать кеш бессмысленно — коллектор читает DOM/CDP,
+    # а не кеш, и на прогоне решается всё равно кеш-мисс.
+    "--disk-cache-size=$($DiskCacheMb * 1024)",
     "about:blank"
 )
 
