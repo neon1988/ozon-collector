@@ -23,6 +23,40 @@ def _load_hunter():
     return mod
 
 
+class TestHunterPathsInProject:
+    """Провокатор пишет сессию и журналы В ПРОЕКТ, а не в %LOCALAPPDATA%/%TEMP%.
+
+    Было: профиль %LOCALAPPDATA%\\opencode\\ozon-profile-hunter (после переноса
+    профилей в проект 07.10 не существует → hunter молча создавал новый
+    холодный профиль = заново 18+ и холодная сессия) и attempts-журнал в
+    системном temp. Оба пути обязаны быть внутри <проект>/.tmp.
+    """
+
+    def test_hunter_profile_inside_project_tmp(self):
+        mod = _load_hunter()
+        prof = mod.HUNTER_PROFILE.replace("/", os.sep).lower()
+        assert ".tmp" in prof, f"профиль вне .tmp: {mod.HUNTER_PROFILE}"
+        assert "localappdata" not in prof
+
+    def test_attempts_dir_inside_project_tmp(self):
+        mod = _load_hunter()
+        d = mod._tmp_dir("puzzle_attempts").replace("/", os.sep).lower()
+        want = os.path.join(root_of_project(), ".tmp").replace("/", os.sep).lower()
+        assert d.startswith(want), f"{d} не внутри {want}"
+
+    def test_profile_follows_ozon_profile_base(self, monkeypatch):
+        mod = _load_hunter()
+        base = os.path.join(root_of_project(), ".tmp", "profiles")
+        monkeypatch.setenv("OZON_PROFILE_BASE", base)
+        # константа вычислена при импорте — проверяем сам resolver
+        got = os.path.join(mod.PR.profile_base_dir(), "ozon-profile-hunter")
+        assert got.replace("/", os.sep).lower().startswith(base.replace("/", os.sep).lower())
+
+
+def root_of_project() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 class _FakeFactsPage:
     """Страница, отдающая СКРИПТ фактов DOM (как _STATUS_JS). Сценарий:
     каждый вызов evaluate → следующий факт; после конца скрипта — последний."""

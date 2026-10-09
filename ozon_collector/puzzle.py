@@ -36,10 +36,12 @@ import numpy as np
 
 from .puzzle_capture import (  # noqa: F401  (реэкспорт: puzzle.X работает)
     _fetch,
+    _page_shot,
     _shot_bg_clean,
     _shot_piece_margin,
     _shot_piece_margin_rect,
     _shot_bg_reason,
+    ensure_render_window,
 )
 from .puzzle_detect import (  # noqa: F401
     _detect_slot_diff,
@@ -671,6 +673,17 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                 _solve_diag(page, info, "session_blocked",
                             detail="stub present while puzzle alive")
                 return _fail("session_blocked")
+            # Живой композитор — условие любой съёмки кадра. На свёрнутом окне
+            # Chromium под Windows не отдаёт кадры вообще: скриншот виснет до
+            # таймаута (замер 2026-10-08 — три раза подряд по 6с), а
+            # captureScreenshot(fromSurface=false) отдал 210с и плоскую заливку.
+            # Session по умолчанию окно сворачивает, поэтому возвращаем его
+            # ЗДЕСЬ, до детекторов: композитору нужно время проснуться, и весь
+            # цикл съёмок (8 кадров) пойдёт уже по живому окну. Иначе 40-45с
+            # таймаутов съёмки съедали PUZZLE_BUDGET_S=60 до первого драга —
+            # это и есть боевой «исчерпан бюджет времени (60с)» при drops=0.
+            if ensure_render_window(page):
+                _attempt("win", state="restored")
             cdn = _bg_from_cdn(info)
             shot = None
             grip = None
@@ -805,7 +818,7 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
             if not cands:
                 fullshot = None
                 try:
-                    fullshot = page.screenshot(timeout=10000, animations="disabled")
+                    fullshot = _page_shot(page, animations="disabled")
                 except Exception:
                     pass
                 log.warning("solve: детекторы пусты → no_slot")
@@ -957,9 +970,18 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
                     # вызывается, и метрика solve-rate в отчёте и в
                     # recovery_telemetry демона всегда 0 (падал инвариант
                     # attempts == failures + solved).
+                    #
+                    # Порядок ИМЕННО такой: сначала _ok (он инкрементит
+                    # solved), потом лог. Наоборот сводка печатала счётчик ДО
+                    # инкремента, и на каждом успехе строка лгала «решено=0»
+                    # при фактическом снятом пазле (живой прогон 2026-10-08,
+                    # 5 из 5 пазлов: «пазл снят за 1/3 попытки; попыток=1
+                    # решено=0»). Метрика в отчёте при этом была верной —
+                    # врала только строка лога, но именно её читают при разборе.
+                    _ok("solved", bx=bx, drops=drops)
                     log.info(f"solve: ИТОГ — пазл снят за {_note_seen()} "
                              f"попытки; {puzzle_summary()}")
-                    return _ok("solved", bx=bx, drops=drops)
+                    return True
                 if r == "timeout":
                     # Бюджет времени исчерпан: значит вкладка зависла (медленный
                     # CDP), а не капча сложная. Логируем явно — иначе «не решён»
@@ -1029,9 +1051,12 @@ def solve_puzzle(page, attempts: int = PUZZLE_MAX_ATTEMPTS,
     # при фактически снятой капче.
     if _captcha_done(page):
         _PUZZLE_FAILURES[0] -= 1
+        # _ok до лога — тот же порядок, что в ветке solved: сводка читает
+        # счётчик solved, который инкрементит именно _ok.
+        _ok("late_url", drops=drops)
         log.info(f"solve: ИТОГ — капча снята поздно (URL-маркер); "
                  f"{puzzle_summary()}")
-        return _ok("late_url", drops=drops)
+        return True
     log.warning(f"solve: ИТОГ — НЕ решён за {_note_seen()} попытки "
                 f"(капча ушла, но доступа нет), дропов={drops}; "
                 f"{puzzle_summary()}")

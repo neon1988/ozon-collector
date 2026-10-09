@@ -24,6 +24,11 @@
    включён, число отзывов совпадает с `variant_count` (допуск 3%, но не меньше 1).
 2. **Только живой видимый Chromium + CDP `127.0.0.1:9222`.** Headless, API и
    geckodriver/Marionette запрещены — Ozon отдаёт антибот-заглушку.
+   «Видимый» здесь буквально: на **свёрнутом** окне Chromium под Windows не
+   отдаёт кадры композитора, `page.screenshot` виснет до таймаута (замер
+   2026-10-08: 6с ×3 подряд), `captureScreenshot(fromSurface=false)` — 210с и
+   плоская заливка. Солвер возвращает окно сам (`ensure_render_window`), но
+   считать свёрнутое окно рабочим нельзя.
 3. **QA-гейт обязателен.** `scripts/qa_raw.py` после каждого прогона; `FAIL` =
    брак, тихий пропуск брака исключён.
 4. **Состояние кампании живёт только в** `data/campaigns/{campaign}/progress.json`.
@@ -87,6 +92,15 @@ QA одного товара — `python scripts/qa_raw.py --pids <pid>`, это
   сторону. База теперь выбирается динамически (`process.cdp_port_base()`, фоллбэк
   9444+), переопределяется `OZON_CDP_PORT` / `OZON_WORKER_CDP_PORT`. Проверить:
   `python .tmp/port_check.py` или `netsh … excludedportrange`.
+- **Свёрнутое окно Chromium не отдаёт кадры вообще.** Замер 2026-10-08: на
+  `normal` скриншот 0.05с и std 32, на `minimized` — таймаут 6с подряд, а
+  `captureScreenshot(fromSurface=false)` отдал белую заливку std 0.0 через 210с.
+  `page.bring_to_front()` НЕ помогает, помогает только
+  `Browser.setWindowBounds windowState=normal` (солвер зовёт сам через
+  `ensure_render_window`). Проверить:
+  `python -c "from ozon_collector import puzzle_capture as p; ..."`.
+  Симптом в бою был неочевидный: 8 съёмок по 5с съедали `PUZZLE_BUDGET_S=60`
+  до первого драга, и лог писал «вкладка зависла» при `drops=0`.
 - Порт 9333 попадает в зарезервированный диапазон Windows (WSAEACCES) →
   альтернативные браузеры вешать на **9444**.
 - `ms-playwright/chromium` через launch нестабильна — не использовать.

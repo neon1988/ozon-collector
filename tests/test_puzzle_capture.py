@@ -162,3 +162,157 @@ def test_front_failure_without_api_attribute():
     shot = _run(page)
     assert shot is not None
     assert "front_err=AttributeError" in puzzle_capture._shot_bg_reason()
+
+
+# ---------------------------------------------------------------------------
+# ОКНО БРАУЗЕРА (живой замер 2026-10-08)
+# ---------------------------------------------------------------------------
+# Свёрнутое окно Chromium под Windows не отдаёт кадры композитора: page.screenshot
+# виснет до таймаута (6с, три раза подряд), captureScreenshot(fromSurface=false)
+# отдал 210с и плоскую заливку std=0.0. На normal — 0.05с и std 32.
+# Именно это, а не «вкладка зависла», съедало PUZZLE_BUDGET_S=60 восемью
+# съёмками по 5с до первого драга (боевой лог 07.10: drops=0, таймаут 60с).
+
+class _FakeCDP:
+    def __init__(self, state="minimized", fails=False):
+        self.state = state
+        self.fails = fails
+        self.calls = []
+
+    def send(self, method, params=None):
+        self.calls.append(method)
+        if self.fails:
+            raise RuntimeError("cdp down")
+        if method == "Browser.getWindowForTarget":
+            # Состояние окна лежит ВНУТРИ bounds — верхнего windowState в
+            # ответе нет (проверено живым замером: верхний уровень = null).
+            return {"windowId": 7,
+                    "bounds": {"windowState": self.state,
+                               "width": 1440, "height": 900}}
+        if method == "Browser.setWindowBounds":
+            self.state = (params.get("bounds") or {}).get("windowState", self.state)
+            return {}
+        raise AssertionError(f"unexpected CDP call {method}")
+
+
+class _FakeContext:
+    def __init__(self, cdp_obj):
+        self._cdp = cdp_obj
+
+    def new_cdp_session(self, _page):
+        return self._cdp
+
+
+class _FakeWinPage:
+    """Страница, умеющая только CDP-сессию (окно) и скриншот."""
+
+    def __init__(self, cdp_obj):
+        self.context = _FakeContext(cdp_obj)
+        self.shots = 0
+        self.n_front = 0
+
+    def bring_to_front(self):
+        self.n_front += 1
+
+    def screenshot(self, timeout=None, **kw):
+        self.shots += 1
+        return b"png"
+
+
+def _win_page(state="minimized", fails=False):
+    cdp_obj = _FakeCDP(state=state, fails=fails)
+    return _FakeWinPage(cdp_obj), cdp_obj
+
+
+def test_ensure_render_window_restores_minimized():
+    page, cdp_obj = _win_page("minimized")
+    with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
+        assert puzzle_capture.ensure_render_window(page) is True
+    assert cdp_obj.state == "normal"
+    assert "Browser.setWindowBounds" in cdp_obj.calls
+
+
+def test_ensure_render_window_noop_when_normal():
+    page, cdp_obj = _win_page("normal")
+    assert puzzle_capture.ensure_render_window(page) is False
+    assert "Browser.setWindowBounds" not in cdp_obj.calls
+
+
+def test_ensure_render_window_reads_state_from_bounds():
+    """Регрессия: верхнего windowState в ответе нет, состояние в bounds."""
+    cdp_obj = _FakeCDP(state="minimized")
+    page = _FakeWinPage(cdp_obj)
+    with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
+        puzzle_capture.ensure_render_window(page)
+    assert cdp_obj.state == "normal", "состояние прочитано не из bounds"
+
+
+def test_ensure_render_window_survives_cdp_error():
+    page, _cdp_obj = _win_page("minimized", fails=True)
+    with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
+        assert puzzle_capture.ensure_render_window(page) is False
+
+
+def test_ensure_render_window_without_cdp_transport():
+    """Страница без context.new_cdp_session (Firefox/старый драйвер) — не исключение."""
+    class _NoCtx:
+        def screenshot(self, timeout=None, **kw):
+            return b"png"
+
+    page = _NoCtx()
+    assert puzzle_capture.ensure_render_window(page) is False
+    assert puzzle_capture.render_window_state(page) == ""
+
+
+def test_ensure_render_window_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("OZON_PUZZLE_RESTORE_WINDOW", "0")
+    page, cdp_obj = _win_page("minimized")
+    assert puzzle_capture.ensure_render_window(page) is False
+    assert cdp_obj.calls == []
+
+
+def test_page_shot_restores_window_before_capture():
+    """Единая точка съёмки сначала возвращает окно, потом снимает."""
+    page, cdp_obj = _win_page("minimized")
+    with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
+        assert puzzle_capture._page_shot(page, animations="disabled") == b"png"
+    assert cdp_obj.state == "normal"
+    assert page.shots == 1
+
+
+def test_bring_to_front_records_window_restore():
+    reason = [""]
+    page, _cdp_obj = _win_page("minimized")
+    with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
+        puzzle_capture._bring_to_front(page, reason)
+    assert "win=restored" in reason[0]
+    assert page.n_front == 1
+
+
+class TestSolvedSummaryOrder:
+    """Строка лога не должна врать о счётчике solved.
+
+    Живой прогон 2026-10-08: на каждом успехе печаталось «пазл снят за 1/3
+    попытки; попыток=1 решено=0» — log.info стоял ДО _ok(), а solved
+    инкрементит именно _ok. Метрика в отчёте была верной, врала строка лога,
+    но её и читают при разборе прогонов.
+    """
+
+    def test_summary_line_shows_solved_one(self, monkeypatch):
+        from ozon_collector import puzzle as P
+        from ozon_collector import puzzle_state as PS
+        from tests.test_puzzle_solver_regressions import (_page_with_guard,
+                                                          _patch_pipeline)
+
+        _patch_pipeline(monkeypatch, "solved")
+        PS.reset()
+        lines = []
+        monkeypatch.setattr(P.log, "info", lambda m: lines.append(str(m)))
+
+        assert P.solve_puzzle(_page_with_guard(), attempts=1, timeout_s=5.0) is True
+        assert PS.solved() == 1, "note_solved() обязан быть вызван"
+        itog = [ln for ln in lines if "ИТОГ" in ln]
+        assert itog, f"нет строки ИТОГ в логе: {lines}"
+        assert "решено=0" not in itog[0], (
+            f"строка успеха показывает решено=0: {itog[0]}")
+        assert "решено=1" in itog[0], itog[0]

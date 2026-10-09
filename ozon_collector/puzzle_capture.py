@@ -11,8 +11,10 @@
 """
 
 import io
+import os
 import time
 import urllib.request
+import weakref
 from typing import Optional
 
 import numpy as np
@@ -22,10 +24,114 @@ from ozon_collector import log
 from .puzzle_dom import _capture_info
 
 # Однотонный кадр = неотрисованный композитор (свёрнутое/минимизированное окно,
-# гонка compositor). Скриншот при этом валиден (PNG декодируется, размеры верны),
+# гонка compositor). Скриншот при этом валилен (PNG декодируется, размеры верны),
 # но std(grayscale)≈0: детекторы читают такой кадр как «лунки нет» и попытка
 # тихо сгорает. Порог 3.0 — у реальных фонов капчи (фото) std десятки.
 FLAT_STD = 3.0
+
+# ---------------------------------------------------------------------------
+# ОКНО БРАУЗЕРА: съёмка кадра требует живого композитора
+# ---------------------------------------------------------------------------
+# Живой замер 2026-10-08 (одна и та же страница, один и тот же браузер):
+#
+#   окно normal     → page.screenshot 0.05-0.09с, 46 КБ, std 32 (кадр живой)
+#   окно minimized  → page.screenshot ТАЙМАУТ 6с, три раза подряд;
+#                     Page.captureScreenshot(fromSurface=false) — 210с и
+#                     плоская белая заливка (std 0.0)
+#
+# То есть на свёрнутом окне Chromium под Windows перестаёт отдавать кадры
+# композитора. Съёмка не «медленная» — она невозможна. При этом Session по
+# умолчанию СВОРАЧИВАЕТ окно (keep_window=OZON_KEEP_WINDOW, дефолт выкл), и
+# инвариант 2 проекта требует видимого браузера.
+#
+# Почему это убивало пазл, а не выглядело как «вкладка зависла»: на цикл
+# пазла приходится 8 съёмок с таймаутом 5с (5 в _shot_bg_clean + 2 на маржу +
+# диагностика), то есть 40-45с чистых таймаутов ДО первого драга при
+# PUZZLE_BUDGET_S=60. Боевой лог 07.10 именно такой: «исчерпан бюджет времени
+# (60с), вкладка, вероятно, зависла» при drops=0.
+#
+# Лечится не флагом браузера (--disable-features=CalculateNativeWinOcclusion
+# меняет поверхность отпечатка), а восстановлением окна через CDP: два
+# вызова, 0.016с, идемпотентно. Отключается env OZON_PUZZLE_RESTORE_WINDOW=0.
+_CDP_SESSIONS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _restore_window_enabled() -> bool:
+    return os.environ.get("OZON_PUZZLE_RESTORE_WINDOW", "1") != "0"
+
+
+def _cdp_session(page):
+    """CDP-сессия страницы (None, если транспорт не Chromium)."""
+    try:
+        sess = _CDP_SESSIONS.get(page)
+        if sess is not None:
+            return sess
+        sess = page.context.new_cdp_session(page)
+        _CDP_SESSIONS[page] = sess
+        return sess
+    except Exception as e:
+        log.debug(f"cdp_session unavailable: {type(e).__name__}: {e}")
+        return None
+
+
+def render_window_state(page) -> str:
+    """Состояние окна браузера: 'normal' | 'minimized' | 'maximized' | '' .
+
+    Состояние лежит в bounds.windowState, а не в верхнем уровне ответа
+    Browser.getWindowForTarget — на верхнем уровне его нет (проверено живым
+    замером 2026-10-08: верхний windowState = null при реально свёрнутом окне).
+    """
+    sess = _cdp_session(page)
+    if sess is None:
+        return ""
+    try:
+        w = sess.send("Browser.getWindowForTarget")
+        return str((w.get("bounds") or {}).get("windowState") or "")
+    except Exception as e:
+        log.debug(f"getWindowForTarget failed: {type(e).__name__}: {e}")
+        return ""
+
+
+def ensure_render_window(page, settle: float = 0.4) -> bool:
+    """Вернуть окно браузера из minimized в normal. True, если было свёрнуто.
+
+    Идемпотентно и дёшево: одно чтение состояния, и только если окно свёрнуто —
+    одно восстановление (замер: 0.016с) плюс короткая пауза на возобновление
+    композитора. Ошибки молча гасятся: съёмка должна падать так же, как раньше,
+    только без лишнего окна ошибок в логе.
+    """
+    if not _restore_window_enabled():
+        return False
+    if render_window_state(page) != "minimized":
+        return False
+    sess = _cdp_session(page)
+    if sess is None:
+        return False
+    try:
+        w = sess.send("Browser.getWindowForTarget")
+        sess.send("Browser.setWindowBounds",
+                  {"windowId": w["windowId"],
+                   "bounds": {"windowState": "normal"}})
+    except Exception as e:
+        log.debug(f"setWindowBounds failed: {type(e).__name__}: {e}")
+        return False
+    time.sleep(settle)
+    log.info("пазл: окно браузера было свёрнуто — восстановлено для съёмки "
+             "(на свёрнутом окне Chromium не отдаёт кадры: скриншот виснет "
+             "до таймаута)")
+    return True
+
+
+def _page_shot(page, timeout: int = 5000, **kw):
+    """Единая съёмка: перед скриншотом гарантируем живой композитор.
+
+    Все точки съёмки пазла идут через неё, поэтому свёрнутое окно больше не
+    может тихо портить кадры ни в _shot_bg_clean, ни в марже кусочка.
+    Исключение наружу не пробрасывается — вызывающий сам решает, что делать
+    с отсутствием кадра.
+    """
+    ensure_render_window(page)
+    return page.screenshot(timeout=timeout, **kw)
 
 
 def _fetch(url: str) -> io.BytesIO:
@@ -48,8 +154,7 @@ def _shoot_rect(page, hide: str, show: str, clip: dict,
     try:
         page.evaluate(hide)
         time.sleep(settle)
-        return page.screenshot(clip=clip, timeout=5000,
-                               animations="disabled")
+        return _page_shot(page, clip=clip, animations="disabled")
     except Exception as e:
         log.debug(f"shot_rect failed clip={clip} settle={settle}: "
                   f"{type(e).__name__}: {e}")
@@ -89,12 +194,21 @@ def _bring_to_front(page, reason_box=None) -> bool:
     Chromium под Windows отдаёт однотонную заливку (std≈0), если окно
     свёрнуто/закрыто другим окном: браузер отдаёт буфер, не рисуя кадр.
     Пассивная пересъёмка после паузы это не лечит, а вызывает новый таймаут и
-    сжигает лимит попыток. Поэтому перед reshoot пробуем Page.bringToFront —
-    это не «пробуем угадать», а убираем известную причину.
+    сжигает лимит попыток. Поэтому перед reshoot делаем ДВА шага: поднимаем
+    вкладку (Page.bringToFront) и возвращаем окно из minimized в normal
+    (ensure_render_window).
+
+    Именно второй шаг и есть лечение: замер 2026-10-08 показал, что
+    page.bring_to_front() на свёрнутом окне НЕ возвращает кадры (скриншот
+    продолжает висеть до таймаута), а setWindowBounds(normal) — возвращает
+    (0.05с, живой кадр).
 
     best-effort: нет API/ошибка — продолжаем как раньше, причина пишется в
     reason_box, чтобы по логу было видно, что кадр был плоским из-за окна.
     """
+    if ensure_render_window(page):
+        if reason_box is not None:
+            reason_box[0] += " win=restored"
     try:
         page.bring_to_front()
         time.sleep(0.25)
@@ -285,9 +399,10 @@ def _shot_piece_margin_rect(page, rect) -> Optional[int]:
           const c = String(el.className||'');
           if (el.id === 'puzzle' || /puzzle/.test(c))
             el.style.visibility = el.__v||''; }); }"""
-    do_shot = lambda: np.asarray(Image.open(io.BytesIO(page.screenshot(
-        clip={"x": rect[0], "y": rect[1], "width": rect[2], "height": rect[3]},
-        timeout=5000, animations="disabled"))).convert("L")).astype(float)
+    do_shot = lambda: np.asarray(Image.open(io.BytesIO(_page_shot(
+        page, clip={"x": rect[0], "y": rect[1],
+                    "width": rect[2], "height": rect[3]},
+        animations="disabled"))).convert("L")).astype(float)
     vis = do_shot()
     try:
         page.evaluate(hide)
