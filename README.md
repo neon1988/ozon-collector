@@ -652,7 +652,8 @@ python3 tests/smoke_cdp.py --compare # + сверка с tests/expected_snapshot
 
 ## Схема raw.json
 
-См. **`docs/schema.md`** (полная схема с примерами). Кратко:
+Эталон формы — **`tests/raw_fixtures/shape_minimal.json`**; живой пример —
+любой `data/{pid}_raw.json`. Кратко:
 `collector_version`, `schema_version`, `collected_at_utc`, `product_url`,
 `reviews_url`, `pid`, `incomplete`/`missing_fields` (если цена/рейтинг не
 извлечены), `target_variant`, `product` (title, `rating` + `rating_source` —

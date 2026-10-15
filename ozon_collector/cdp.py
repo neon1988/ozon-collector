@@ -362,6 +362,18 @@ def _free_stale_profile(cdp_url: str, profile_token: str) -> list[int]:
                     f"{profile_token!r}: {type(e).__name__}: {e}")
         return []
     if not holders:
+        # Порт в cdp_url мог уже смениться (динамическая база), а зомби
+        # держит профиль на СТАРОМ порту: browser_processes матчит
+        # (порт+профиль) и его не видит. Ищем по профилю на любом порту —
+        # иначе следующий Chrome умрёт о захваченный профиль (ревью
+        # 2026-10-15). Маркер запуска ниже по-прежнему отсекает чужой Chrome.
+        try:
+            holders = P.profile_processes(profile_token)
+        except Exception as e:
+            log.warning("[cdp] не удалось перечислить процессы по профилю "
+                        f"{profile_token!r}: {type(e).__name__}: {e}")
+            return []
+    if not holders:
         return []
     if not _launch_marker(P.profile_path(profile_token)):
         log.warning(f"[cdp] профиль {profile_token!r} занят посторонним "
@@ -654,8 +666,18 @@ class Session:
             if self.auto_launch and self._browser is None:
                 launch_and_wait(self.cdp_url,
                                 profile_token=self.profile_token)
-                self._browser = self._playwright.chromium.connect_over_cdp(
-                    self.cdp_url)
+                try:
+                    self._browser = self._playwright.chromium.connect_over_cdp(
+                        self.cdp_url)
+                except Exception:
+                    # Второй connect тоже упал — гасим запущенный
+                    # Playwright-подпроцесс, иначе он утекает (ревью
+                    # 2026-10-15).
+                    try:
+                        self._playwright.stop()
+                    except Exception:
+                        pass
+                    raise
                 self.browser_owner = "collector"
             else:
                 # второй connect тоже упал (или auto_launch выключен):
@@ -1383,7 +1405,9 @@ class Session:
         """Закрыть лишние вкладки и завершить сессию браузера.
 
         Браузер НЕ гасится — остаётся жив для следующей команды (chrome).
-        Все вкладки кроме pages[0] закрываются; pages[0] уводится на about:blank.
+        Закрываются только managed-вкладки коллектора; рабочая вкладка:
+        collector → about:blank, external → закрывается (она создана нами
+        через new_page; вкладки оператора не трогаются).
         """
         self.watchdog_stop()
         log.debug("Session.close()")
@@ -1429,6 +1453,16 @@ class Session:
                     try:
                         if not self.page.is_closed():
                             self.page.goto("about:blank", timeout=5000)
+                    except Exception:
+                        pass
+                elif self.page is not None and self.page in managed:
+                    # external: рабочая вкладка — НАША managed-страница
+                    # (ctx.new_page при подключении): закрываем её, чтобы не
+                    # копить свои вкладки в чужом Chrome (ревью 2026-10-15).
+                    # Чужая вкладка в managed попасть не может.
+                    try:
+                        if not self.page.is_closed():
+                            self.page.close()
                     except Exception:
                         pass
                 else:

@@ -31,7 +31,7 @@
 
 ## Проверка изменений
 
-- Тесты: `python scripts/run_tests_guarded.py` (ядро + демон, ~209 тестов демона)
+- Тесты: `python scripts/run_tests_guarded.py` (полный набор: 1662 passed на 2026-10-15)
 - Известный стабильный xfail ядра: `test_baseline_matches_source_raw` (дрейф baseline,
   помечен `xfail`, CI не блокирует). Не «чини» его, не перезаписывая baseline молча.
 - QA данных: `python scripts/qa_raw.py --pids <pid>`
@@ -41,7 +41,7 @@
 ```
 data/    {pid}_raw.json, {pid}/dom/*.html.gz, ocr_cache/, search_combined.json,
          campaigns/{campaign}/{progress,status,events.jsonl,combined_*.json}
-docs/    отчёты *.md, schema.md, qa/qa_*.{md,json}, architecture/
+docs/    digests/*.md, qa/qa_*.{md,json}, architecture/
 logs/    ozon_collector.log(.1), {campaign}_daemon.log
 ```
 

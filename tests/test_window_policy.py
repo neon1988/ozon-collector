@@ -16,6 +16,16 @@ import pytest
 from ozon_collector import window_policy as wp
 
 
+def test_user32_memoized_single_instance():
+    """_user32() мемоизирован: типы Win32 объявляются один раз на процесс.
+
+    Регрессия ревью 07.10: типы объявлялись на первом экземпляре user32, а
+    каждый вызов создавал новый → x64-обрезка hwnd со второго тика."""
+    if wp._user32() is None:
+        pytest.skip("user32 недоступен (не Windows)")
+    assert wp._user32() is wp._user32()
+
+
 class FakeWin32:
     """Подмена Win32-слоя window_policy.
 

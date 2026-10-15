@@ -12,7 +12,6 @@
 
 import json
 import os
-import tempfile
 import time
 from datetime import datetime
 
@@ -159,8 +158,9 @@ def _note_attempt() -> None:
 
 # Куда писать пер-попыточный JSONL (машиночитаемо, для классификации
 # fail-reason: detect/drag/token/UI). Диагностика, НЕ в репозиторий.
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ATTEMPT_LOG_DIR = os.environ.get(
-    "OZON_ATTEMPT_LOG", os.path.join(tempfile.gettempdir(), "puzzle_attempts"))
+    "OZON_ATTEMPT_LOG", os.path.join(_ROOT_DIR, ".tmp", "puzzle_attempts"))
 
 
 def _attempt(kind: str, **kw) -> None:

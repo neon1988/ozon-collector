@@ -144,8 +144,7 @@ def cmd_ocr(args):
     log.info(f"[cli] ocr: raw={args.raw} pid={pid} gdir={gdir} "
              f"threads={args.threads} preproc={not args.no_preproc}")
     O.ocr_gallery(raw, gdir, threads=args.threads, preproc=not args.no_preproc)
-    with open(args.raw, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
+    K.atomic_write_json(args.raw, raw)
     log.info(f"[cli] OCR: {raw.get('gallery_stats_text')}; "
              f"DONE. raw обновлён: {args.raw}")
 

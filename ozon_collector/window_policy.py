@@ -94,8 +94,12 @@ class WindowRow(NamedTuple):
         return (self.width >= MIN_GUARD_W and self.height >= MIN_GUARD_H)
 
 
+_USER32 = None
+_USER32_LOCK = threading.Lock()
+
+
 def _user32():
-    """СВОЙ дескриптор user32, а не `ctypes.windll.user32`.
+    """СВОЙ дескриптор user32, а не `ctypes.windll.user32` (мемоизирован).
 
     `ctypes.windll.*` возвращает глобальный кэш функций: объявление нами
     argtypes меняет их для ВСЕГО процесса. Из-за этого наша настройка типов
@@ -107,13 +111,23 @@ def _user32():
     CDP-модель» отключался (живой замер ревью 2026-10-06: после первого
     `foreground()` геометрия переставала определяться).
     Отдельный WinDLL даёт нам собственное пространство имён имён функций.
+    Мемоизация обязательна: `_setup_api` ставит argtypes ОДНОМУ инстансу, а
+    прежний возврат нового инстанса на каждый вызов отдавал функции БЕЗ типов
+    — HWND обрезался до 32 бит, и геометрия/фокус молча ломались со второго
+    вызова (ревью 2026-10-15).
     """
+    global _USER32
+    if _USER32 is not None:
+        return _USER32
     if os.name != "nt":
         return None
-    try:
-        return ctypes.WinDLL("user32", use_last_error=True)
-    except Exception:      # pragma: no cover - нет Windows
-        return None
+    with _USER32_LOCK:
+        if _USER32 is None:
+            try:
+                _USER32 = ctypes.WinDLL("user32", use_last_error=True)
+            except Exception:  # pragma: no cover - нет Windows
+                return None
+    return _USER32
 
 
 _API_READY = False

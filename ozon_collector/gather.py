@@ -59,9 +59,9 @@ def assert_raw_structure(raw, pid) -> None:
     if not title:
         raise B.StructureError("product.title пуст")
     low = title.lower()
-    for m in C.CHALLENGE_TITLE_MARKERS:
-        if m in low:
-            raise B.AccessChallengeError(f"анти-бот (product.title): {m}")
+    m = C.title_challenge_marker(low)
+    if m:
+        raise B.AccessChallengeError(f"анти-бот (product.title): {m}")
     # Слайдер-пазл: его h1 («Сопоставьте пазл, двигая ползунок») не входит в
     # CHALLENGE_TITLE_MARKERS (это текст внутри страницы, а не <title>), но
     # собран как название товара. Стоп-фразы — защита от капчи в product.title.

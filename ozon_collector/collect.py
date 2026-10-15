@@ -43,7 +43,7 @@ from . import cache as K
 from . import log
 from . import ozon_fetch
 from . import puzzle as _puzzle
-from .constants import CHALLENGE_TITLE_MARKERS
+from .constants import CHALLENGE_TITLE_MARKERS, title_challenge_marker
 from .cdp import Session
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.34 Safari/537.36"
@@ -880,14 +880,32 @@ def normalize_text(s: str) -> str:
     return s
 
 
+_NUMERIC_VALUE_RE = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def _variant_value_matches(value: str, text: str) -> bool:
+    """Значение варианта найдено в описании отзыва.
+
+    Числовые значения матчатся по границам цифр: '200' не должно находиться
+    в '1200' (ревью 2026-10-15 — подстрочный поиск молча пропускал чужой
+    вариант), а '90' внутри '90x6' — должно. Текстовые (цвет и т.п.) —
+    подстрокой, как раньше.
+    """
+    if _NUMERIC_VALUE_RE.fullmatch(value):
+        return re.search(rf"(?<![\d.,]){re.escape(value)}(?![\d.,])",
+                         text) is not None
+    return value in text
+
+
 def _variant_matches(target_variant: dict | None, review: dict) -> bool:
     """Совпадает ли отзыв с описанием варианта (все непустые значения).
 
     Общий предикат фильтрации отзывов варианта (topup-добор и основной
     проход) — раньше дублировался в двух местах.
     """
+    text = normalize_text(review.get("variant", ""))
     for key, val in (target_variant or {}).items():
-        if val and str(val) not in normalize_text(review.get("variant", "")):
+        if val and not _variant_value_matches(str(val), text):
             return False
     return True
 
@@ -950,16 +968,21 @@ def detect_challenge(page) -> str | None:
     сигнатуры, чтобы не ронять реальные карточки без отзывов.
     """
     try:
-        title = (page.title(timeout=8000) or "").strip().lower()
+        # Без timeout=: Playwright title() его не принимает, TypeError глушился
+        # голым except — детект челленджа по title был мёртв (ревью
+        # 2026-10-15); ffsel.title(timeout=...) значение всё равно игнорирует.
+        title = (page.title() or "").strip().lower()
     except Exception:
         title = ""
-    for m in CHALLENGE_TITLE_MARKERS:
-        if m in title:
-            return f"title:{m}"
+    m = title_challenge_marker(title)
+    if m:
+        return f"title:{m}"
     try:
+        # Без timeout=: у Playwright evaluate(expression, arg) — timeout это
+        # TypeError, который глушился и превращал детект в None (ревью
+        # 2026-10-15).
         body = (page.evaluate(
-            "() => (document.body ? document.body.innerText : '')",
-            timeout=8000) or "")
+            "() => (document.body ? document.body.innerText : '')") or "")
         body = body.lower()
     except Exception:
         return None
@@ -1490,24 +1513,25 @@ def collect_product(page, product_url: str, category: str | None = None) -> dict
     if not product:
         raise RuntimeError("JS-извлечение карточки вернуло None (антибот?)")
     title = (product.get("title") or "").strip().lower()
-    for m in CHALLENGE_TITLE_MARKERS:
-        if m in title:
-            raise B.AccessChallengeError(f"анти-бот (product.title): {m}")
+    m = title_challenge_marker(title)
+    if m:
+        raise B.AccessChallengeError(f"анти-бот (product.title): {m}")
     if category:
         product["category"] = category
     return product
 
 
 def _next_page(page) -> Optional[str]:
-    """URL следующей страницы отзывов или None.
+    """URL следующей страницы отзывов, '__IN_PLACE__' или None.
 
     Приоритет:
       1. state-paginator (data-state JSON) — только если fetchType != 'scroll'
          (scroll-подгрузка обрабатывается _scroll_to_converge);
       2. webListReviews — ссылка «Дальше» или кнопка-клик (старая разметка);
       3. fallback: любая ссылка с layout_page_index.
-    Возвращает абсолютный URL; '__CLICK__'-ветка клика по кнопке «Дальше»
-    применяется на месте и возвращает None (страница обновилась в DOM)."""
+    Возвращает абсолютный URL; для кнопочной пагинации кликает «Дальше» сама
+    (единственный клик за итерацию) и возвращает '__IN_PLACE__': страница
+    обновилась на месте, вызывающий цикл обязан пропустить goto."""
     try:
         sp = page.evaluate(
             """() => {
@@ -1529,7 +1553,13 @@ def _next_page(page) -> Optional[str]:
             return "https://www.ozon.ru" + sp
         if sp.startswith("http"):
             return sp
-    legacy = next_url(page)
+    legacy = next_url(page, click=False)
+    if legacy == "__CLICK__":
+        # Кнопочная пагинация: страница обновляется НА МЕСТЕ. Кликаем здесь
+        # (единственный клик за итерацию) и возвращаем сентинел — цикл сбора
+        # пропускает goto, иначе страница откатилась бы на стр.1.
+        raced = next_url(page, click=True)
+        return raced or "__IN_PLACE__"
     if legacy:
         return legacy
     try:
@@ -1551,8 +1581,15 @@ def _next_page(page) -> Optional[str]:
     return None
 
 
-def next_url(page) -> Optional[str]:
-    """URL следующей страницы отзывов (клик по «Дальше») или None."""
+def next_url(page, *, click: bool = True) -> Optional[str]:
+    """URL следующей страницы отзывов или None.
+
+    click=False — только обнаружение пагинации, без побочных эффектов: для
+    кнопочной разметки («Дальше» без href) возвращается сентинел '__CLICK__'.
+    Раньше детекция (_detect_pagination) кликала кнопку как побочный эффект —
+    страница уезжала на стр.2 ДО извлечения стр.1 (ревью 2026-10-15).
+    click=True — выполнить клик и дождаться обновления страницы на месте
+    (возвращает None после клика)."""
     try:
         pag = page.evaluate(
             """() => {
@@ -1572,6 +1609,8 @@ def next_url(page) -> Optional[str]:
     if not pag:
         return None
     if pag == "__CLICK__":
+        if not click:
+            return "__CLICK__"      # кнопка есть; клик — дело вызывающего
         try:
             page.evaluate(
                 """() => {
@@ -2047,7 +2086,9 @@ def _detect_pagination(page, grew: bool = True) -> str:
         result = "infinite_scroll"
     elif sp is not None:
         result = "next_button"
-    elif next_url(page):
+    elif next_url(page, click=False):
+        # click=False: детекция не имеет права кликать «Дальше» — клик здесь
+        # уводил страницу на стр.2 до извлечения стр.1 (ревью 2026-10-15).
         result = "next_button"
     else:
         result = "converged" if grew else "unknown"
@@ -2255,7 +2296,13 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
     except Exception:
         url = ""
     if "reviewsVariantMode=1" in url:
-        return {**base, "used": True, "clicked": False, "reason": "url_param"}
+        # URL-параметр — не доказательство, что фильтр применён: DOM мог
+        # показывать другой активный вариант, а used=True по строке URL гасил
+        # filter_not_used в обход инварианта I1 (ревью 2026-10-15). Если
+        # фильтр реально включён, выше сработал already_active; иначе клик
+        # ниже доведёт виджет до консистентного состояния.
+        log.info("[variant_mode] reviewsVariantMode=1 в URL, но DOM не "
+                 "подтвердил активный фильтр — кликаю «Этот вариант товара»")
     try:
         page.evaluate(
             """() => {
@@ -2368,22 +2415,29 @@ def _collect_reviews_pass(
     tel.setdefault("scroll_time", 0.0)
     tel.setdefault("extract_time", 0.0)
     tel.setdefault("pages", [])
+    skip_goto = False
     for p in range(1, max_pages + 1):
         _touch_watchdog()
-        try:
-            page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(6000)
-        except Exception as e:
-            if B.is_renderer_failure(e):
-                raise
-            name = type(e).__name__
-            if name == "TimeoutError" or "net::ERR_" in str(e) \
-                    or "Timeout" in str(e):
-                # навигация не удалась (таймаут/DNS/ERR) — продолжать разбор
-                # по старой/ошибочной странице нельзя: соберём чужой контент
-                raise
-            log.warning(f"[collect] page {p} goto warn: {e}")
-            page.wait_for_timeout(3000)
+        if skip_goto:
+            # Прошлая итерация кликнула «Дальше» и страница обновилась на
+            # месте: goto тем же URL отбросил бы её на предыдущую страницу.
+            skip_goto = False
+        else:
+            try:
+                page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(6000)
+            except Exception as e:
+                if B.is_renderer_failure(e):
+                    raise
+                name = type(e).__name__
+                if name == "TimeoutError" or "net::ERR_" in str(e) \
+                        or "Timeout" in str(e):
+                    # навигация не удалась (таймаут/DNS/ERR) — продолжать
+                    # разбор по старой/ошибочной странице нельзя: соберём
+                    # чужой контент
+                    raise
+                log.warning(f"[collect] page {p} goto warn: {e}")
+                page.wait_for_timeout(3000)
         check_challenge(page, f"reviews_page p{p}")
         _pass_age_gate(page)
         if apply_variant_mode:
@@ -2530,6 +2584,15 @@ def _collect_reviews_pass(
         if n_api:
             log.info(f"стр. {p}: API-комментарии заменили DOM у {n_api} отзывов")
         nxt = _next_page(page)
+        if nxt == "__IN_PLACE__":
+            # Кнопочная пагинация: клик сделан в _next_page, страница уже
+            # несёт следующую порцию. Не выходим и не делаем goto.
+            page_log.append({
+                "page": p, "n_found": len(data["reviews"]), "n_matched": matched_this,
+                "ok": True, "stop_reason": None, "sort": sort,
+            })
+            skip_goto = True
+            continue
         if nxt and sort is not None:
             nxt = _sort_url(nxt, SORT_PARAMS.get(sort))
         if not nxt:

@@ -55,6 +55,7 @@ from ozon_collector.collect import (
     SORT_DEVIATION_RATIO,
     VARIANT_COUNT_FULL_LIMIT,
     VARIANT_COUNT_MIN_LARGE,
+    title_challenge_marker,
 )
 
 try:
@@ -177,7 +178,7 @@ def qa_product(raw, pid):
         add("DUP_UUID", "FAIL", f"дубликатов uuid: {dup_uuid}")
 
     title = (product.get("title") or "").strip().lower()
-    challenge = bool(title) and any(m in title for m in CHALLENGE_TITLE_MARKERS)
+    challenge = bool(title) and title_challenge_marker(title) is not None
     if challenge:
         add("CHALLENGE_PAGE", "FAIL", f"title: {title[:60]!r}")
 

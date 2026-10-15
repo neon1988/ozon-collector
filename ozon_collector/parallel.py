@@ -15,7 +15,6 @@ from __future__ import annotations
 import multiprocessing
 import os
 import random
-import socket
 import sys
 import threading
 import time
@@ -124,7 +123,7 @@ def shard_items(items, parallel: int) -> list[list[tuple]]:
     Индекс — ЧАСТЬ задания (появляется в merge). Детерминизм: тот же links →
     те же шарды. Каждый товар ровно в одном шарде.
     """
-    parallel = int(parallel)
+    parallel = max(1, int(parallel))  # 0 → ZeroDivisionError в idx % parallel
     shards: list[list[tuple]] = [[] for _ in range(parallel)]
     for idx, pid, url in items:
         shards[idx % parallel].append((idx, pid, url))
@@ -134,12 +133,14 @@ def shard_items(items, parallel: int) -> list[list[tuple]]:
 # ---- Preflight: 4 независимых ресурса ---------------------------------------
 
 def _port_free(port: int) -> bool:
-    """TCP connect к 127.0.0.1:port НЕ открывается → порт свободен."""
-    try:
-        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.5):
-            return False
-    except OSError:
-        return True
+    """Свободен ли порт — по bind, а не по TCP-connect.
+
+    Connect не ловил зарезервированный Windows excludedportrange: bind даёт
+    WSAEACCES, а connect «не открывается» → ложное «свободен». Источник
+    истины один — process.port_bindable, общий с запуском браузеров.
+    """
+    ok, _why = P.port_bindable(int(port))
+    return ok
 
 
 def preflight_check(specs: list[dict]) -> list[str]:
@@ -1221,6 +1222,8 @@ def _respawn(wctx: WorkerContext, pending: list[int],
 
 def _wait_port_free(spec: dict, timeout_s: float = 8.0):
     """Дождаться освобождения CDP-порта воркера после зачистки браузера."""
+    if not spec.get("port"):
+        return          # firefox-спек: порта/CDP нет вовсе (port=None)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _port_free(spec["port"]) and not cdp.browser_alive(
@@ -1658,7 +1661,11 @@ def _await_workers(wctxs: list, deadline: float,
             # products берём из накопителя acc_products: payload упавшего
             # воркера — это последний присланный снимок (при batch_size=1 —
             # один товар), а не всё, что он собрал.
-            old_pl = _with_acc_products(wctx.payload or {}, wctx)
+            # _merge_carried: воркер сам мог быть респавном и уже нести
+            # carried_payload предыдущего преда — иначе цепочка респавнов
+            # теряет самые ранние товары (ревью 2026-10-15).
+            old_pl = _merge_carried(
+                _with_acc_products(wctx.payload or {}, wctx), wctx)
             old_products = old_pl.get("products") or []
             if old_products:
                 new.carried_payload = {
@@ -1900,7 +1907,11 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                 wctx.exitcode = wctx.proc.exitcode
             except Exception:
                 wctx.exitcode = None
-        if wctx.exitcode != 0 and pl["fatal_error"] is None:
+        if (wctx.exitcode not in (0, None) and pl["fatal_error"] is None
+                and not wctx.deadline_halted):
+            # None (процесс не сообщил код) и deadline_halted (штатный
+            # terminate по дедлайну) — не fatal: classify_status иначе
+            # пометил бы кампанию CRASH и сжёг transient-ретраи.
             pl["fatal_error"] = f"exit {wctx.exitcode}"
         pl["exitcode"] = wctx.exitcode
         payloads.append(pl)

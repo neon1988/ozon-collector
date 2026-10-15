@@ -81,6 +81,10 @@ _NO_COOLDOWN = bool(os.environ.get("KD_NO_COOLDOWN"))
 # кооперативного ожидания демон после короткой зачистки выходит принудительно.
 _STOP_EVENT = threading.Event()
 _FORCE_EXIT = threading.Event()
+# Взят ли pid-лок ЭТИМ процессом: finally/force сносят pid-файл только когда
+# он наш. Иначе выход второго демона («уже запущен» → SystemExit) удалял бы
+# pid-файл ЖИВОГО первого (ревью 2026-10-15).
+_PID_LOCK_HELD = False
 
 PYTHON = sys.executable
 QA_RAW = str(ROOT / "scripts" / "qa_raw.py")
@@ -160,6 +164,21 @@ COLLECTOR_VERSION = _COLLECTOR_VERSION
 # чистые функции
 # ---------------------------------------------------------------------------
 
+def _workers_all_fatal(combined: Optional[dict]) -> bool:
+    """ВСЕ воркеры прогона умерли (fatal_error у каждого)? None — нет данных.
+
+    Воркеры пишут fatal_error при падении и исчерпании рестартов (а оркестратор
+    завершается с exit 0). Без этой проверки мёртвый пул классифицировался
+    NORMAL_DONE и тихо «худел» без cooldown (ревью 2026-10-15). Условие «все»,
+    а не «любой»: штатный респавн одного воркера — не авария прогона, его
+    fatal_error остаётся в workers как телеметрия.
+    """
+    workers = ((combined or {}).get("parallel") or {}).get("workers") or []
+    if not workers:
+        return False
+    return all(isinstance(w, dict) and w.get("fatal_error") for w in workers)
+
+
 def classify_status(exit_code: int, combined: Optional[dict]) -> str:
     """Классифицирует итог одного прогона сбора (по combined + exit-коду, не по логу).
 
@@ -171,6 +190,11 @@ def classify_status(exit_code: int, combined: Optional[dict]) -> str:
     """
     if combined and "aborted" in combined:
         return "CHALLENGE_STORM"
+    if _workers_all_fatal(combined):
+        # Смерть всего пула — не NORMAL_DONE (у оркестратора exit 0): CRASH
+        # даёт короткий cooldown и запись в stall.crash_runs вместо тихого
+        # «успеха» с потерянными товарами.
+        return "CRASH"
     if exit_code == 0:
         if (combined or {}).get("recovery", {}).get("search_grid_empty"):
             return "EMPTY_SEARCH"
@@ -764,27 +788,55 @@ class PidLock:
         self.path = path
 
     def acquire(self, campaign: str) -> bool:
-        if self.path.is_file():
-            data = load_json(self.path)
-            pid = data.get("pid") if data else None
-            # pid обязан быть int; иначе файл битый → трактуем как stale
-            if isinstance(pid, int):
-                if _alive(pid):
-                    return False
-            self.path.unlink(missing_ok=True)
+        """Занять лок АТОМАРНО: O_CREAT|O_EXCL вместо is_file + save_json.
+
+        Старая схема давала гонку: два демона видели stale-файл, оба снимали
+        его, оба записывали себя — защита «от повторного запуска» пропускала
+        второго (ревью 2026-10-15).
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        save_json(self.path, {
-            "pid": os.getpid(), "campaign": campaign,
-            "started_at": now_utc_iso(),
-            "start_cmdline": " ".join(sys.argv),
-        })
-        return True
+        for _ in range(2):    # вторая попытка — после снятия stale-файла
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                data = load_json(self.path)
+                pid = data.get("pid") if data else None
+                # pid обязан быть int; иначе файл битый → трактуем как stale
+                if isinstance(pid, int) and _alive(pid):
+                    return False
+                self.path.unlink(missing_ok=True)
+                continue
+            except OSError:
+                return False
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({
+                    "pid": os.getpid(), "campaign": campaign,
+                    "started_at": now_utc_iso(),
+                    "start_cmdline": " ".join(sys.argv),
+                }, f, ensure_ascii=False, indent=2)
+            return True
+        return False
 
     def release(self) -> None:
+        # Снимаем только СВОЙ pid-файл: чужой демон мог атомарно занять лок
+        # после нашей проигранной гонки — release не имеет права снести его.
+        data = load_json(self.path)
+        if data and data.get("pid") != os.getpid():
+            return
         try:
             self.path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _drop_pid_file() -> None:
+    """Снять pid-файл выхода: только если лок держим МЫ (_PID_LOCK_HELD)."""
+    if not _PID_LOCK_HELD:
+        return
+    try:
+        (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _status_payload(progress: dict) -> dict:
@@ -1453,9 +1505,9 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
     combined_file = CAMPAIGNS_DIR / camp / f"combined_{run_id}.json"
     combined_file.parent.mkdir(parents=True, exist_ok=True)
     if combined is not None:
-        combined_file.write_text(
-            json.dumps(combined, ensure_ascii=False, indent=2),
-            encoding="utf-8")
+        # save_json (tmp + os.replace): читатель (status/replay/QA) никогда
+        # не увидит полузаписанный combined при крэше между write и flush.
+        save_json(combined_file, combined)
     return combined
 
 
@@ -1596,6 +1648,8 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
     lock = PidLock(DATA_DIR / "key_daemon.pid")
     if not lock.acquire(campaign):
         raise SystemExit("key_daemon уже запущен (pid-файл)")
+    global _PID_LOCK_HELD
+    _PID_LOCK_HELD = True
 
     # Единый логгер демона: оркестратор — владелец файла кампании и ротации.
     # Воркеры (collect_parallel) получают тот же путь через task["worker_log"]
@@ -2023,9 +2077,15 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             # (иначе already-verdict не попадёт в need и raw после починки не
             # пере-QA-нётся — пид навсегда останется в failed)
             if mode == "rescan" and targets:
+                # Сбрасываем вердикт ТОЛЬКО у реально пере-QA-нутых пидов:
+                # прогон мог не вернуть ни одного raw (пустая выдача или
+                # шторм до QA) — сброс вердикта у НЕперепроверенных пидов
+                # «забывал» брак, и пид выпадал из failed без повторного QA
+                # (ревью 2026-10-15).
+                rechecked = set(ok_pids) & set(targets)
                 vdict = dict(progress.get("verdicts", {}))
                 vmeta = dict(progress.get("verdict_meta", {}))
-                for p in targets:
+                for p in rechecked:
                     vdict.pop(p, None)
                     vmeta.pop(p, None)
                 progress["verdicts"] = vdict
@@ -2232,8 +2292,9 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                     datetime.now(timezone.utc) +
                     timedelta(seconds=crash_pause)).isoformat(
                         timespec="seconds")
-                log.warning(f"crash сбора (exit!=0, нет combined), cooldown "
-                    f"{crash_pause}с")
+                log.warning(f"crash сбора (условия CRASH: exit!=0 без "
+                    f"combined или весь пул воркеров fatal), exit="
+                    f"{exit_code}, cooldown {crash_pause}с")
                 _set_state(progress, "COOLDOWN_CRASH", "CRASH",
                            run_id=run_id, exit_code=exit_code)
 
@@ -2421,7 +2482,8 @@ def finalize_campaign(progress: dict, progress_path: Path,
             qa_batches.append({"batch": bi, "size": len(batch),
                                "fail": fails, "ok": qa.get("ok", 0),
                                "warn": qa.get("warn", 0),
-                               "wall_limited": qa.get("wall_limited_count", 0)})
+                               "wall_limited": qa.get("wall_limited",
+                                                    qa.get("wall_limited_count", 0))})
             log.info(f"финальный QA batch {bi}/{n}: FAIL={fails}")
             for pid in batch:
                 v = per_pid.get(pid, "OK")  # OK только при доказанных инвариантах
@@ -2863,15 +2925,9 @@ if __name__ == "__main__":
         _STOP_EVENT.set()
         if _FORCE_EXIT.is_set():
             log.error("демон: форс-выход по второму прерыванию")
-            try:
-                (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
-            except OSError:
-                pass
+            _drop_pid_file()
             import os as _os
             _os._exit(1)
         raise
     finally:
-        try:
-            (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
-        except OSError:
-            pass
+        _drop_pid_file()

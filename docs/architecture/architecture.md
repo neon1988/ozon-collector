@@ -282,8 +282,8 @@ data/   {pid}_raw.json, {pid}/dom/*.html.gz, gallery_{pid}/, ocr_cache/,
         campaigns/{campaign}/combined_{run_id}.json, campaigns/{campaign}/status.json,
         campaigns/{campaign}/events.jsonl, campaigns/{campaign}/runs/{run_id}.json,
         key_daemon.pid
-docs/   *.md отчёты, schema.md, qa/qa_*.{md,json}, architecture.md,
-        key_daemon_architecture.md
+docs/   *.md отчёты, qa/qa_*.{md,json}, architecture/,
+        digests/
 logs/   ozon_collector.log(.1), {campaign}_daemon.log
 ```
 

@@ -66,6 +66,20 @@ def test_classify_crash_vs_unknown():
     assert k.classify_status(2, {"products": []}) == "UNKNOWN_FAILURE"
 
 
+def test_classify_all_workers_fatal_is_crash():
+    """Весь пул с fatal_error → CRASH даже при exit 0 и наличии combined."""
+    combined = {"products": [], "parallel": {"workers": [
+        {"fatal_error": "RuntimeError: boom"}, {"fatal_error": "OSError: x"}]}}
+    assert k.classify_status(0, combined) == "CRASH"
+
+
+def test_classify_single_fatal_with_alive_worker_is_done():
+    """Один fatal при живом втором воркере — телеметрия респавна, не CRASH."""
+    combined = {"products": [], "parallel": {"workers": [
+        {"fatal_error": "boom"}, {"fatal_error": None}]}}
+    assert k.classify_status(0, combined) == "NORMAL_DONE"
+
+
 # --- extract pids ---
 
 def _combined(products):
@@ -1834,6 +1848,16 @@ def test_pidlock_release_already_deleted(tmp_path):
     assert lock.acquire("camp") is True
     (tmp_path / "key_daemon.pid").unlink()  # вручную удалили
     lock.release()  # не должен упасть
+
+
+def test_pidlock_release_does_not_remove_foreign_file(tmp_path):
+    """release снимает только СВОЙ pid-файл: чужой лок не сносится."""
+    lock = k.PidLock(tmp_path / "key_daemon.pid")
+    assert lock.acquire("camp") is True
+    (tmp_path / "key_daemon.pid").write_text(
+        '{"pid": 99999999, "campaign": "other"}', encoding="utf-8")
+    lock.release()
+    assert (tmp_path / "key_daemon.pid").exists()
 
 
 # --- delta ---

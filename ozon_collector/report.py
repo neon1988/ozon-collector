@@ -984,7 +984,7 @@ def _best_for_digest(pid: str, data_dir: str):
     old_version / incompatible / incomplete / bad_timestamp).
     """
     from ozon_collector import cache as K
-    from ozon_collector.constants import CHALLENGE_TITLE_MARKERS
+    from ozon_collector.constants import title_challenge_marker
 
     best = None
     best_path = None
@@ -1002,7 +1002,7 @@ def _best_for_digest(pid: str, data_dir: str):
             continue
         title = (raw.get("product") or {}).get("title") or ""
         t = title.strip().lower()
-        if any(m in t for m in CHALLENGE_TITLE_MARKERS):
+        if title_challenge_marker(t):
             reason = "challenge"
             continue
         n = int(raw.get("reviews_collected") or 0)

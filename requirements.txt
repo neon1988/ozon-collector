@@ -1,6 +1,9 @@
 pytest>=7
+pytest-timeout>=2.3  # таймауты тестов; использует scripts/run_tests_guarded.py
 playwright>=1.40
 pillow>=10.0
 pytesseract>=0.3.10
+numpy>=1.26  # обязателен: puzzle*.py импортируют numpy на уровне модуля
 opencv-python>=4.8  # опционально: предобработка OCR (gray/upscale/CLAHE)
+selenium>=4.20  # опционально: firefox-бэкенд (ffsel.py)
 # tesseract-ocr + rus: apt install tesseract-ocr tesseract-ocr-rus

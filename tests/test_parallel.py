@@ -696,8 +696,9 @@ def test_parallel_validation_bounds(monkeypatch):
     assert PMW2 == 16
     monkeypatch.setenv("OZON_PARALLEL_MAX", "8")
     reload(oc)
-    with pytest.raises(ZeroDivisionError):
-        PL.shard_items(_items(3), 0)
+    # 0/отрицательное не роняет preflight: clamp до одного шарда (ревью 2026-10-15)
+    assert PL.shard_items(_items(3), 0) == PL.shard_items(_items(3), 1)
+    assert PL.shard_items(_items(3), -2) == PL.shard_items(_items(3), 1)
 
 
 # ---- bootstrap воркер-профилей (cookies из main, §14) -------------------------

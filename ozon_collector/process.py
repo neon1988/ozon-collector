@@ -33,6 +33,8 @@ import subprocess
 import time
 from urllib.parse import urlparse
 
+from . import log
+
 if os.name == "nt":
     import ctypes
 

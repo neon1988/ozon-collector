@@ -1431,7 +1431,14 @@ def collect_search(sess, url: str, limit: int, gather_cfg: dict,
     pz = recovery.get("puzzle") or {}
     p_attempts = int(pz.get("attempts") or 0)
     p_failures = int(pz.get("failures") or 0)
-    p_solved = max(0, p_attempts - p_failures)
+    # solved — измеренная величина (заполняется round_completed); формула
+    # attempts-failures завышала solve_rate: в «решённые» попадали
+    # wall_limited и таймауты. Фоллбэк — только если solved нет вообще
+    # (direct-путь), чтобы не рисовать solved=0 при живых attempts.
+    if pz.get("solved") is not None:
+        p_solved = int(pz.get("solved") or 0)
+    else:
+        p_solved = max(0, p_attempts - p_failures) if p_attempts else 0
     challenges = int(astats.get("challenges", 0) or 0)
     combined["kpi"] = {
         "total_challenges": challenges,

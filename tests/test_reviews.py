@@ -161,17 +161,35 @@ _SNAP_WITH_OPTION = {
 }
 
 
-def test_activate_url_param_no_click():
-    """reviewsVariantMode=1 уже в URL → фильтр серверно активен, клик не нужен."""
+def test_activate_url_param_without_dom_signal_clicks():
+    """URL-параметр без подтверждения DOM — не доказательство применения
+    фильтра: виджет показывает активными «Все отзывы», клик обязателен
+    (ревью 2026-10-15; раньше used=True по строке URL обходил I1)."""
+    def _apply(self):
+        self.snap = {**self.snap, "active": "Этот вариант товара"}
+
+    page = _VariantModeFakePage(
+        _SNAP_WITH_OPTION,
+        url="https://www.ozon.ru/product/x-123/?tab=reviews&reviewsVariantMode=1",
+        on_click=_apply,
+    )
+    vm = _activate_variant_mode(page)
+    assert vm["used"] is True
+    assert vm["clicked"] is True
+    assert vm["reason"] == "click_ok"
+    assert page.click_calls == 1
+
+
+def test_activate_url_param_conflict_with_dom_fails_closed():
+    """URL-параметр есть, DOM показывает другой активный фильтр, клик не
+    сработал → used=False; слепо доверять URL нельзя."""
     page = _VariantModeFakePage(
         _SNAP_WITH_OPTION,
         url="https://www.ozon.ru/product/x-123/?tab=reviews&reviewsVariantMode=1",
     )
-    vm = _activate_variant_mode(page)
-    assert vm["used"] is True
-    assert vm["clicked"] is False
-    assert vm["reason"] == "url_param"
-    assert page.click_calls == 0
+    vm = _activate_variant_mode(page, timeout_s=0.2)
+    assert vm["used"] is False
+    assert vm["reason"] == "click_no_effect"
 
 
 def test_activate_click_ok():
@@ -498,6 +516,36 @@ def test_next_page_legacy_dalshe(browser):
     page = _open_html(browser, html)
     try:
         assert collect_mod._next_page(page) == "https://www.ozon.ru/reviews/?page=2"
+    finally:
+        page.close()
+
+
+def test_next_url_no_click_detects_without_side_effect(browser):
+    """click=False только ОБНАРУЖИВАЕТ кнопочную пагинацию: '__CLICK__' без клика.
+
+    Регрессия ревью 2026-10-15: старая детекция кликала «Дальше» как побочный
+    эффект, страница уезжала на стр.2 до извлечения стр.1."""
+    html = ('<html><body><div data-widget="webListReviews">'
+            '<div></div><div></div>'
+            '<div><button>Дальше</button></div>'
+            '</div></body></html>')
+    page = _open_html(browser, html)
+    try:
+        assert collect_mod.next_url(page, click=False) == "__CLICK__"
+        assert page.url.startswith("about:")  # клика не было, навигации нет
+    finally:
+        page.close()
+
+
+def test_next_page_click_in_place_returns_sentinel(browser):
+    """Кнопочная пагинация: клик не меняет URL → сентинел '__IN_PLACE__'."""
+    html = ('<html><body><div data-widget="webListReviews">'
+            '<div></div><div></div>'
+            '<div><button>Дальше</button></div>'
+            '</div></body></html>')
+    page = _open_html(browser, html)
+    try:
+        assert collect_mod._next_page(page) == "__IN_PLACE__"
     finally:
         page.close()
 

@@ -443,16 +443,16 @@ no-progress. Моя правка изменила поведение в эту �
   товары, потерянные при обрыве воркера после пачки, не доходят до
   `discovered_pids`. Не чинил: правка в горячем коде оркестратора, а демон сейчас
   работает. Записано в `key_daemon_architecture.md` §5.5 как открытая находка.
-- **`wall_limited` в метриках всегда 0** (`key_daemon.py:2339` читает ключ
-  `wall_limited_count`, которого нет) — однострочная правка, но она в коде
-  демона; сделать вместе с предыдущей.
-- **`classify_status` не смотрит `fatal_error`** → `NORMAL_DONE` при упавшем пуле.
-- **`constants.py`: маркер `captcha` без границ слова** → товар с «captcha» в
-  названии уходит в бесконечный retry.
-- **`cli.py ocr` пишет `raw.json` неатомарно** → гонка с демоном может затереть
-  отзывы.
-- **`requirements.txt`** без `pytest-timeout`, `numpy`, `selenium` → на свежей
-  машине тесты не запустятся.
+- ~~`wall_limited` в метриках всегда 0~~ — ✅ починено 2026-10-15 (финализация
+  читает `wall_limited`|`wall_limited_count`; см. секцию «Правки 2026-10-15»).
+- ~~`classify_status` не смотрит `fatal_error`~~ — ✅ починено 2026-10-15
+  (all-fatal → CRASH; одиночный fatal при живом воркере — телеметрия).
+- ~~`constants.py`: маркер `captcha` без границ слова~~ — ✅ починено 2026-10-15
+  (`title_challenge_marker`, все 5 потребителей).
+- ~~`cli.py ocr` пишет `raw.json` неатомарно~~ — ✅ починено 2026-10-15
+  (`K.atomic_write_json`).
+- ~~`requirements.txt` без `pytest-timeout`, `numpy`, `selenium`~~ — ✅ починено
+  2026-10-15.
 
 ## Аудит проекта подагентами (2026-10-06, 4 зоны, 48 находок)
 
@@ -2960,4 +2960,62 @@ yrow. Ожидание: слот даёт отношение контраста 
 
 `scripts/open-report.ps1 -Root D:\Users\Neon\Projects\ozon-collector`.
 Сырые данные: `.tmp/live{4,7,8,9,10,11}/` (вне git).
+
+---
+
+## Правки 2026-10-15 (аудит: ревью кода, волна 1 + волна 2)
+
+Полный прогон после правок: `python scripts/run_tests_guarded.py --timeout 900`
+→ **1662 passed, 6 skipped, 1 xfailed (4:52), exit 0**, reaper чист.
+Флейк `test_review_extract_live_markup` в полном прогоне не воспроизвёлся.
+
+Волна 1 (ядро сбора):
+- `collect.py`: детекция пагинации без клика (`next_url(click=False)` →
+  `'__CLICK__'`), клик один раз за итерацию, `'__IN_PLACE__'`-сентинел и
+  `skip_goto` в цикле (регрессия «страница уезжает на стр.2 до извлечения
+  стр.1»); `_variant_matches` — числа по границам `(?<![\d.,])…(?![\d.,])`
+  (200 не матчит 1200); detect_challenge — `title()`/`evaluate()` без
+  `timeout=` (TypeError глушился, детект был мёртв); `url_param` fall-through
+  в клик вместо `used=True` по URL без DOM-подписи (инвариант I1).
+- `parallel.py`: `shard_items` clamp ≥1 (0 → ZeroDivisionError в preflight);
+  `_port_free` → `P.port_bindable` (bind, не connect — резервации Windows);
+  fatal-guard respawn: `exitcode not in (0, None)` и не deadline_halted;
+  carried-цепочка `_merge_carried` (challenge_storm не теряется); удалён
+  неиспользуемый `import socket`.
+- `key_daemon.py`: classify_status → CRASH при «ВСЕ воркеры fatal» (без этого
+  мёртвый пул = тихий NORMAL_DONE); wall_limited финализации читает оба ключа
+  (`wall_limited`|`wall_limited_count`); combined через атомарный save_json;
+  N3 rechecked-pop; PidLock.acquire через O_CREAT|O_EXCL (гонка двух демонов);
+  PidLock.release снимает только свой файл; `_drop_pid_file` в finally/force;
+  `_PID_LOCK_HELD` вместо безусловного удаления pid-файла.
+- `search.py`: `p_solved` из `pz["solved"]`, fallback только без него.
+- `cdp.py`: `_free_stale_profile` fallback на `profile_processes`;
+  второй connect не течёт playwright; close(external) закрывает НАШУ вкладку.
+- `process.py`: `from . import log` (NameError на сетевом томе).
+
+Волна 2 (утилиты/доки):
+- `constants.py`: `title_challenge_marker()` — голый «captcha» только по
+  границам слова (товар «CaptchaMaster» больше не уходит в retry); rewired
+  все 5 потребителей (collect ×2, gather, qa_raw, report).
+- `cli.py ocr`: запись raw.json через `K.atomic_write_json` (гонка с демоном).
+- `puzzle.py`, `puzzle_state.py`: диаг-каталоги по умолчанию в `<проект>/.tmp`
+  вместо `%TEMP%` (env-override сохранён).
+- `requirements.txt`: + `pytest-timeout`, `numpy` (обязателен: модули puzzle*),
+  `selenium` (опция, ffsel).
+- README/`overview.md`/`architecture.md`: убраны битые ссылки на
+  несуществующий `docs/schema.md`; указатель на
+  `tests/raw_fixtures/shape_minimal.json`.
+
+Тесты к правкам (в полном прогоне):
+`tests/test_constants.py` (границы captcha), `test_reviews.py`
+(`next_url(click=False)` без побочных эффектов; `'__IN_PLACE__'`; url_param —
+клик при рассинхроне DOM, fail-closed при конфликте), `test_key_daemon.py`
+(all-fatal→CRASH; один fatal при живом воркере→NORMAL_DONE; PidLock не сносит
+чужой файл), `test_parallel.py:699` (clamp вместо ZeroDivisionError),
+`test_window_policy.py` (`_user32` мемоизирован).
+
+Остаётся открытым: `merge_shard_results pid:None` (решение владельца),
+rescan-монополизация, `.env.example`, `reviews_dropped_by_client_filter`.
+Устаревшие MINOR-находки 07.10 (уже починены ранее): puzzle_drag release,
+DROP_BUDGET, window_exists/_setup_api.
 

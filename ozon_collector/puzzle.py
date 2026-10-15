@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import time
 from typing import Optional
 
@@ -119,8 +118,11 @@ from ozon_collector import log
 _PBG_STATS: list = [None]
 
 
+# Каталог по умолчанию — .tmp проекта (гигиена: временное живёт в проекте),
+# а не %TEMP%; env-override для проб и тестов сохранён.
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DIAG_DIR = os.environ.get(
-    "OZON_PUZZLE_DIAG_DIR", os.path.join(tempfile.gettempdir(), "puzzle_diag"))
+    "OZON_PUZZLE_DIAG_DIR", os.path.join(_ROOT_DIR, ".tmp", "puzzle_diag"))
 # Диаг-картинки/np.save на горячем пути — только по явному env (OZON_PUZZLE_DIAG=1).
 # Fail-стадии пишутся всегда (это и есть диагностика проблем).
 _DIAG_ENABLED = os.environ.get("OZON_PUZZLE_DIAG", "0") == "1"
