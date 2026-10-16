@@ -191,11 +191,45 @@ class LaunchRun(NamedTuple):
     proc: subprocess.Popen
 
 
-def _launch_script(cdp_url: str, profile_path: str | None = None) -> LaunchRun:
+def _apply_worker_proxy_env(env: dict, profile_token: str | None) -> None:
+    """PROXY env для per-worker прокси (net.py): 1 профиль = 1 IP.
+
+    Общий хелпер launch-путей (browser._launch_script — recycle через
+    BrowserProcessManager, и cdp._launch_browser — первичный запуск): раньше
+    блок жил только в cdp, и recycle воркера поднимал его БЕЗ прокси, нарушая
+    изоляцию 1 профиль = 1 IP (аудит 2026-10-15). Дефолт — OFF: нет env →
+    нет переменной PROXY в лаунчере → Chromium идёт напрямую.
+    """
+    from . import net
+    k = net.worker_index_from_profile_token(profile_token)
+    if not k:
+        return
+    proxy = net.proxy_url_for_worker(k)
+    if not proxy:
+        return
+    try:
+        net.chrome_proxy_arg(proxy)
+    except ValueError as e:
+        log.warning(f"[launch] worker-{k}: некорректный прокси "
+                    f"({type(e).__name__}: {e}) — запуск без прокси")
+        return
+    env["PROXY"] = proxy
+    log.info(f"[launch] worker-{k}: прокси {net.mask_proxy(proxy)}"
+             + (" [ creds в URL: Chrome применит]"
+                if net.has_credentials(proxy)
+                and not proxy.lower().startswith("socks5")
+                else " [ creds в socks5-URL Chrome игнорирует — нужен PAC]"
+                if net.has_credentials(proxy) else ""))
+
+
+def _launch_script(cdp_url: str, profile_path: str | None = None,
+                   profile_token: str | None = None) -> LaunchRun:
     """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url).
 
     profile_path — полный путь --user-data-dir (для воркеров передаёт PROFILE
     env в launch_chrome.ps1/.sh; None = дефолтный профиль скрипта).
+    profile_token — токен профиля воркера: задаёт per-worker PROXY (1 профиль =
+    1 IP), тот же контракт, что в cdp._launch_browser.
     CHROME env (из OZON_CHROME_PATH или уже заданной CHROME) выбирает
     исполняемый файл браузера: системный Chrome по умолчанию, либо автономный
     Chrome-for-Testing/Edge (см. scripts/setup_bundled_chrome.py).
@@ -215,6 +249,7 @@ def _launch_script(cdp_url: str, profile_path: str | None = None) -> LaunchRun:
     chrome = _chrome_override()
     if chrome:
         env["CHROME"] = chrome
+    _apply_worker_proxy_env(env, profile_token)
     cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
            if os.name == "nt" else [str(script)])
     # Вывод лаунчера пишем в temp-файл, а не в DEVNULL: если Chromium не
@@ -674,7 +709,8 @@ class BrowserProcessManager:
         matching>1 -> BrowserOwnershipError.
         """
         wait_s = wait_s or self.launch_wait_s
-        run = _launch_script(self.cdp_url, profile_path=self.profile_path)
+        run = _launch_script(self.cdp_url, profile_path=self.profile_path,
+                             profile_token=self.profile_token)
         return self._await_launch(launch_id, wait_s, run)
 
     def _await_launch(self, launch_id: str, wait_s: float,

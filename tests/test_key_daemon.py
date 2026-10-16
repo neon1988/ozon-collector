@@ -1326,6 +1326,27 @@ def test_finalize_soft_stop_no_accepted_on_abandoned(tmp_path):
     assert set(prog["campaign_accepted_pids"]) == {"0", "1", "2"}
 
 
+def test_commit_run_results_interrupted_returns_none(tmp_path):
+    """Ctrl+C-ветка пост-обработки (#13): состояние сохраняется, выход None."""
+    pf = tmp_path / "progress.json"
+    camp_dir = tmp_path / "camp"
+    camp_dir.mkdir()
+    progress = {"discovered_pids": ["1"], "valid_pids": [], "verdicts": {}}
+    was_set = k._STOP_EVENT.is_set()
+    k._STOP_EVENT.set()
+    try:
+        res = k._commit_run_results(
+            progress, pf, "run-x", "full", None, {"products": []}, 0,
+            lambda *a, **kw: {}, tmp_path, camp_dir, set(), set())
+    finally:
+        if not was_set:
+            k._STOP_EVENT.clear()
+    assert res is None
+    assert progress["final_state"] == "INTERRUPTED"
+    assert (json.loads(pf.read_text(encoding="utf-8"))["final_state"]
+            == "INTERRUPTED")
+
+
 # ============================================================================
 # Интеграционные тесты run_campaign через монку _inproc_collect и qa_fn
 # ============================================================================
@@ -2281,6 +2302,108 @@ def test_integration_resume_uses_manifest_config(tmp_path, monkeypatch):
     # демон крутился бы 11 раз (10 без-прогресс + break).
     assert prog["final_reason"] == "no_progress"
     assert len(prog["runs"]) == 2
+
+
+def _write_resume_manifest(tmp_path, *, target_count, run_cfg):
+    """Манифест существующей кампании для resume-тестов (минимум полей)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    campaigns = tmp_path / "campaigns"
+    camp_dir = campaigns / "testcamp"
+    camp_dir.mkdir(parents=True, exist_ok=True)
+    k.save_json(camp_dir / "progress.json", {
+        "campaign": "testcamp", "target_count": target_count, "min_valid": 1,
+        "url": "u", "out": str(tmp_path / "campaign.md"),
+        "run_cfg": {"data_dir": str(data_dir), "max_age": "7d",
+                    "min_reviews": 0, "parallel": 1,
+                    "max_total_hours": 24.0, **run_cfg},
+        "started_at": k.now_utc_iso(),
+        "discovered_pids": [], "valid_pids": [], "failed_pids": [],
+        "permanently_failed_pids": [], "replacement_pids": [],
+        "verdicts": {}, "verdict_meta": {}, "running_rescans": {},
+        "runs": [], "cooldown_until": None, "challenge_seq": 0,
+        "no_progress_count": 0, "final_state": None,
+        "final_reason": None, "final_note": None,
+    })
+    return data_dir, campaigns
+
+
+def test_integration_resume_target_from_manifest(tmp_path, monkeypatch):
+    # target_count живёт в манифесте; запуск с target=99 (имитация CLI-дефолта
+    # --limit 300) не должен менять ни стоп-условие, ни срез snapshot —
+    # инвариант 4, аудит 2026-10-15.
+    data_dir, campaigns = _write_resume_manifest(
+        tmp_path, target_count=2,
+        run_cfg={"max_no_progress_runs": 3, "max_rescans": 2,
+                 "reserve_count": 1})
+    for i in range(3):
+        (data_dir / f"{i}_raw.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", campaigns)
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(k, "PYTHON", "python")
+
+    def fac(argv):
+        return {"products": [{"pid": i, "ok": True, "excluded": None}
+                             for i in range(3)], "found": 3}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: fac(
+                            k.build_cli_args(progress, run_id, mode, targets)))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+
+    prog = k.run_campaign(
+        campaign="testcamp", url="u", target=99, min_valid=2,
+        out=str(tmp_path / "campaign.md"), data_dir=str(data_dir),
+        max_no_progress_runs=10, max_total_hours=24.0, qa_fn=qa)
+    # Манифестный target_count=2: останов после ПЕРВОГО прогона (3 valid >= 2),
+    # snapshot ровно 2 пида + 1 в резерве. С CLI-target=99 демон молотил бы
+    # до no_progress и дал final_reason=no_progress.
+    assert prog["final_reason"] == "target_reached"
+    assert prog["final_state"] == "COMPLETED"
+    assert len(prog["campaign_final_pids"]) == 2
+    assert len(prog["campaign_reserve_pids"]) == 1
+
+
+def test_integration_resume_parallel_from_manifest_storm(tmp_path, monkeypatch):
+    # parallel живёт в run_cfg манифеста. Запуск с parallel=4 не должен
+    # превращать шторм одиночного (по манифесту) воркера в «частичный»:
+    # parallel==1 → ФУЛЛ-шторм → storm_streak кампании растёт (аудит 2026-10-15).
+    data_dir, campaigns = _write_resume_manifest(
+        tmp_path, target_count=5,
+        run_cfg={"max_no_progress_runs": 1, "max_rescans": 0,
+                 "reserve_count": 0})
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", campaigns)
+    monkeypatch.setattr(k, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(k, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(k, "PYTHON", "python")
+
+    def fac(argv):
+        return {"products": [], "found": 0,
+                "aborted": {"reason": "challenge_storm", "block_kind": "hard",
+                            "workers_stormed": [1], "signature": "http_429"},
+                "kpi": {"total_challenges": 1}}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {}}
+
+    monkeypatch.setattr(k, "_inproc_collect", lambda progress, run_id, mode,
+                        targets=None: fac(
+                            k.build_cli_args(progress, run_id, mode, targets)))
+    monkeypatch.setattr(k.time, "sleep", lambda s: None)
+
+    prog = k.run_campaign(
+        campaign="testcamp", url="u", target=5, min_valid=1,
+        out=str(tmp_path / "campaign.md"), data_dir=str(data_dir),
+        parallel=4, max_no_progress_runs=10, max_total_hours=24.0, qa_fn=qa)
+    assert prog["challenge_control"]["storm_streak"] == 1
+    # Диагноз честный: блок Ozon, а не «выдача перетёрлась» (1873+).
+    assert prog["final_reason"] == "challenge_storm"
 
 
 # --- краткий дайджест (--compact) -----------------------------------------

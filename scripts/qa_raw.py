@@ -110,9 +110,15 @@ def _looks_rating_only(text):
 
 def _parse_iso(s):
     try:
-        return dt.datetime.fromisoformat(s)
+        parsed = dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+    if parsed.tzinfo is None:
+        # Legacy raw писали naive-UTC без суффикса tz. Без нормализации
+        # вычитание aware-now (OLD_DATA) падало TypeError и роняло QA всей
+        # пачки, а .timestamp() читал naive как локальное время.
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
 
 
 def _official(raw):
@@ -281,9 +287,18 @@ def qa_product(raw, pid):
                 "не собрано ни одного отзыва (пустая вкладка / у выбранного варианта нет своих отзывов)")
 
     sorts_expected = raw.get("reviews_sorts") or []
-    per_sort = Counter(
-        (r.get("review_sort") or "?") for r in reviews if isinstance(r, dict)
-    )
+    # Отзыв может быть встречен в НЕСКОЛЬКИХ сортировках (review_sorts-список,
+    # канон — collect._variant_problems). Учёт только по скалярному review_sort
+    # занижал соседние сортировки и давал ложный SORT_IMBALANCE (аудит 2026-10-15).
+    per_sort = Counter()
+    for r in reviews:
+        if not isinstance(r, dict):
+            continue
+        ss = r.get("review_sorts")
+        keys = ss if isinstance(ss, list) else [r.get("review_sort")]
+        for s in keys:
+            if s:
+                per_sort[s] += 1
     # Перекос сортировок значим только при неполном сборе: когда собрано всё
     # (collected >= official), полнота уже доказана объёмом, а пропущенные
     # хвостовые сортировки — легитимный результат skip-оптимизации.

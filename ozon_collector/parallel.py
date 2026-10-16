@@ -1726,6 +1726,38 @@ def _stop_main_browser():
         log.warning(f"stop main Chromium: {type(e).__name__}: {e}")
 
 
+def _collect_worker_payloads(wctxs: list) -> list[dict]:
+    """payload'ы воркеров для merge: накопители + carried + fatal по exitcode.
+
+    Ключ fatal_error читается через .get: payload последнего done_batch его не
+    содержит (ключ есть только у _empty_payload и done-снимка), а subscript
+    падал KeyError ровно на terminate-пути (deadline/stall/stop) — том самом,
+    ради которого гвард и написан (аудит 2026-10-15).
+    """
+    payloads = []
+    for wctx in wctxs:
+        # Накопитель products обязателен и для штатно завершившегося воркера:
+        # без него merge видел бы только последний снимок payload.
+        pl = _with_acc_products(
+            wctx.payload or _empty_payload(wctx.worker_idx), wctx)
+        pl = _merge_carried(pl, wctx)
+        if wctx.exitcode is None:
+            try:
+                wctx.exitcode = wctx.proc.exitcode
+            except Exception:
+                wctx.exitcode = None
+        if (wctx.exitcode not in (0, None)
+                and pl.get("fatal_error") is None
+                and not wctx.deadline_halted):
+            # None (процесс не сообщил код) и deadline_halted (штатный
+            # terminate по дедлайну) — не fatal: classify_status иначе
+            # пометил бы кампанию CRASH и сжёг transient-ретраи.
+            pl["fatal_error"] = f"exit {wctx.exitcode}"
+        pl["exitcode"] = wctx.exitcode
+        payloads.append(pl)
+    return payloads
+
+
 def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                      query: str | None = None, max_recycles: int = 2,
                      join_timeout_s: float = 1800.0,
@@ -1895,26 +1927,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
     shards = _rebuild_shards(
         owner, pid_by_idx, url_by_idx, items, parallel)
 
-    payloads = []
-    for wctx in wctxs:
-        # Накопитель products обязателен и для штатно завершившегося воркера:
-        # без него merge видел бы только последний снимок payload.
-        pl = _with_acc_products(
-            wctx.payload or _empty_payload(wctx.worker_idx), wctx)
-        pl = _merge_carried(pl, wctx)
-        if wctx.exitcode is None:
-            try:
-                wctx.exitcode = wctx.proc.exitcode
-            except Exception:
-                wctx.exitcode = None
-        if (wctx.exitcode not in (0, None) and pl["fatal_error"] is None
-                and not wctx.deadline_halted):
-            # None (процесс не сообщил код) и deadline_halted (штатный
-            # terminate по дедлайну) — не fatal: classify_status иначе
-            # пометил бы кампанию CRASH и сжёг transient-ретраи.
-            pl["fatal_error"] = f"exit {wctx.exitcode}"
-        pl["exitcode"] = wctx.exitcode
-        payloads.append(pl)
+    payloads = _collect_worker_payloads(wctxs)
 
     products = merge_shard_results(payloads, shards)
     sort_digest_products(products)

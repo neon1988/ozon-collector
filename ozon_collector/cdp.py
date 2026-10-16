@@ -220,26 +220,10 @@ def _launch_browser(cdp_url: str, profile_path: str | None = None,
     chrome = _chrome_override()
     if chrome:
         env["CHROME"] = chrome
-    # per-worker прокси (ревизия 2.9, net.py): 1 профиль = 1 IP. Дефолт — OFF
-    # (нет env → нет переменной PROXY в лаунчере → Chromium идёт напрямую).
-    from . import net
-    k = net.worker_index_from_profile_token(profile_token)
-    if k:
-        proxy = net.proxy_url_for_worker(k)
-        if proxy:
-            try:
-                net.chrome_proxy_arg(proxy)
-            except ValueError as e:
-                log.warning(f"[cdp] worker-{k}: некорректный прокси "
-                            f"({type(e).__name__}: {e}) — запуск без прокси")
-            else:
-                env["PROXY"] = proxy
-                log.info(f"[cdp] worker-{k}: прокси {net.mask_proxy(proxy)}"
-                         + (" [ creds в URL: Chrome применит]" if net.
-                            has_credentials(proxy) and not
-                            proxy.lower().startswith("socks5") else
-                            " [ creds в socks5-URL Chrome игнорирует — нужен "
-                            "PAC]" if net.has_credentials(proxy) else ""))
+    # per-worker прокси (ревизия 2.9, net.py): 1 профиль = 1 IP. Общий хелпер
+    # с browser._launch_script (recycle через BrowserProcessManager): раньше
+    # блок жил только здесь, и recycle воркера терял прокси (аудит 2026-10-15).
+    B._apply_worker_proxy_env(env, profile_token)
     cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
            if os.name == "nt" else [str(script)])
     # Вывод лаунчера НЕ выбрасываем (ревизия 2.9): при пустом/битом
@@ -664,15 +648,16 @@ class Session:
                 self.cdp_url)
         except Exception:
             if self.auto_launch and self._browser is None:
-                launch_and_wait(self.cdp_url,
-                                profile_token=self.profile_token)
                 try:
+                    launch_and_wait(self.cdp_url,
+                                    profile_token=self.profile_token)
                     self._browser = self._playwright.chromium.connect_over_cdp(
                         self.cdp_url)
                 except Exception:
-                    # Второй connect тоже упал — гасим запущенный
-                    # Playwright-подпроцесс, иначе он утекает (ревью
-                    # 2026-10-15).
+                    # launch_and_wait бросил ЛИБО второй connect упал — гасим
+                    # запущенный Playwright-подпроцесс, иначе он утекает
+                    # (аудит 2026-10-15: раньше launch_and_wait стоял вне try,
+                    # и его падение оставляло playwright-процесс жить).
                     try:
                         self._playwright.stop()
                     except Exception:
@@ -803,7 +788,8 @@ class Session:
         # композитор рисует контент со смещением от оси мыши → синхронизируем
         # геометрию ДО сворачивания. Только для collector-браузеров:
         # external (чужой Chrome пользователя) не трогаем — его окно личное.
-        if getattr(self, "browser_owner", None) == "collector":
+        owner = getattr(self, "browser_owner", None)
+        if owner == "collector":
             self._normalize_window_geometry()
         if getattr(self, "kind", "chrome") == "firefox":
             # Firefox не сворачиваем НИКОГДА: свёрнутое окно не рендерит
@@ -813,6 +799,13 @@ class Session:
             log.info("firefox: игнорирую minimize — разворачиваю без фокуса")
             self._restore_window_native(pids=self._firefox_pids(),
                                         window_class=FIREFOX_WINDOW_CLASS)
+        elif owner == "external":
+            # Чужой Chrome оператора: окно НЕ сворачиваем и не двигаем —
+            # инвариант «не трогать чужие окна» (window_policy сторожит только
+            # collector-браузеры, а minimize лез в чужое окно напрямую;
+            # аудит 2026-10-15).
+            log.info("external Chrome: окно не сворачиваю — чужое окно "
+                     "оператора (window_policy сторожит только collector)")
         else:
             self._minimize_window_native(P.cdp_port(self.cdp_url))
 

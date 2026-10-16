@@ -252,3 +252,48 @@ def test_drag_no_probe_uses_conservative_k_and_settles():
     # r0 прочитан до расчёта dist, дальше — измерение/доводка
     assert seen[0] == 50.0
     assert max(seen) <= 60.0          # кусок не уехал за цель
+
+
+def test_drag_releases_button_when_engine_raises():
+    """Исключение в середине драга не оставляет кнопку зажатой.
+
+    Аудит 2026-10-15: без try/finally обрыв CDP (evaluate/mouse) вылетал
+    наружу с mousePressed, и следующий заход стартовал поверх зажатой
+    кнопки. Тест воспроизводит падение на чтении позиции после хвата.
+    """
+    from unittest.mock import patch
+
+    up_calls = []
+
+    class _Mouse:
+        def move(self, _x, _y, steps=None):
+            return self
+
+        def down(self):
+            return self
+
+        def up(self):
+            up_calls.append(1)
+            return self
+
+    class _Page:
+        mouse = _Mouse()
+
+        def evaluate(self, _js):
+            return None
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("cdp died mid-drag")
+
+    info = {"bg": {"r": [0, 0, 300, 100]},
+            "puzzle": {"r": [10, 20, 40, 40]}}
+    with patch.object(puzzle_drag, "_find_slider", lambda p: None), \
+         patch.object(puzzle_drag, "_read_sl_piece",
+                      lambda p: {"px": 50.0, "s": None, "ps": 10,
+                                 "ss": None}), \
+         patch.object(puzzle_drag, "_read_settled", side_effect=_boom), \
+         patch.object(puzzle_drag, "_SIMPLE_DRAG", False), \
+         patch.object(puzzle_drag.time, "sleep", lambda _s: None), \
+         pytest.raises(RuntimeError, match="cdp died mid-drag"):
+        puzzle._drag_to(_Page(), target_vx=60.0, info=info, bx=200, score=1.0)
+    assert up_calls == [1], "кнопка обязана быть отпущена в finally"

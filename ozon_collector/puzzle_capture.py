@@ -143,6 +143,25 @@ def _shot_bg_reason() -> str:
     return _SHOT_BG_REASON[0]
 
 
+# Кусочек прячем по ОДНОМУ признаку во всех съёмках (фон в _shot_bg_clean и
+# маржа в _shot_piece_margin_rect): id === 'puzzle' ИЛИ className ~ /puzzle/ —
+# как в _read_sl_piece/_capture_info. Прежний рассинхрон: фон матчил только
+# className, и кусок, опознанный по id, не прятался — кадр фона шёл с ним
+# (аудит 2026-10-15). Один источник на оба вызова исключает расхождение снова.
+_HIDE_PIECE_JS = """() => { let n=0;
+  document.querySelectorAll('img').forEach(el=>{
+    const c = String(el.className||'');
+    if (el.id === 'puzzle' || /puzzle/.test(c)) {
+      el.__v = el.style.visibility;
+      el.style.visibility = 'hidden'; n++; } });
+  return n; }"""
+
+_SHOW_PIECE_JS = """() => { document.querySelectorAll('img').forEach(el=>{
+  const c = String(el.className||'');
+  if (el.id === 'puzzle' || /puzzle/.test(c))
+    el.style.visibility = el.__v||''; }); }"""
+
+
 def _shoot_rect(page, hide: str, show: str, clip: dict,
                 settle: float = 0.15) -> Optional[bytes]:
     """Скрыть кусочек → снять прямоугольник → вернуть кусочек на место.
@@ -267,12 +286,7 @@ def _shot_bg_clean(page, info):
         _SHOT_BG_REASON[0] = (f"no_elem bg={bool(bg.get('r'))} pz={bool(pz.get('r'))} "
                               f"after_scroll has={bool(info2 and info2.get('has'))}")
         return None
-    hide = """() => { let n=0;
-      document.querySelectorAll('img').forEach(el=>{
-        if (/puzzle/.test(el.className||'')) { el.__v=el.style.visibility; el.style.visibility='hidden'; n++; } });
-      return n; }"""
-    show = """() => { document.querySelectorAll('img').forEach(el=>{
-      if (/puzzle/.test(el.className||'')) el.style.visibility = el.__v||''; }); }"""
+    hide, show = _HIDE_PIECE_JS, _SHOW_PIECE_JS
     # ждём полной загрузки картинки фона (иначе кадр снимается пустым белым
     # местом, а детектор лунки не находит ничего)
     try:
@@ -388,17 +402,7 @@ def _shot_piece_margin_rect(page, rect) -> Optional[int]:
     # возвращала None, а solve_puzzle откатывался на silL из CDN-альфы —
     # заведомо ненадёжную маржу. Именно это давало промах детектора: успехи
     # шли при марже 22, провалы при 12-15 (живой замер 2026-10-01).
-    hide = """() => { let n=0;
-        document.querySelectorAll('img').forEach(el=>{
-          const c = String(el.className||'');
-          if (el.id === 'puzzle' || /puzzle/.test(c)) {
-            el.__v = el.style.visibility;
-            el.style.visibility = 'hidden'; n++; } });
-        return n; }"""
-    show = """() => { document.querySelectorAll('img').forEach(el=>{
-          const c = String(el.className||'');
-          if (el.id === 'puzzle' || /puzzle/.test(c))
-            el.style.visibility = el.__v||''; }); }"""
+    hide, show = _HIDE_PIECE_JS, _SHOW_PIECE_JS
     do_shot = lambda: np.asarray(Image.open(io.BytesIO(_page_shot(
         page, clip={"x": rect[0], "y": rect[1],
                     "width": rect[2], "height": rect[3]},

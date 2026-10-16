@@ -351,6 +351,57 @@ class TestSessionAutoLaunch:
             cdp.Session("http://127.0.0.1:9999")
         assert calls["n"] == 0
 
+    def test_launch_retry_failure_stops_playwright(self, monkeypatch):
+        """Первый connect упал, launch_and_wait бросил — Playwright-подпроцесс
+        обязан быть погашен, иначе он утекает (аудит 2026-10-15)."""
+        self._install(monkeypatch, lambda: True)
+
+        def boom(*a, **kw):
+            raise RuntimeError("browser never came up")
+
+        monkeypatch.setattr(cdp, "launch_and_wait", boom)
+        stopped = []
+
+        class FakeChromium:
+            def connect_over_cdp(self, url):
+                raise RuntimeError("TargetClosedError")
+
+        class FakePW:
+            chromium = FakeChromium()
+
+            def start(self):
+                return self
+
+            def stop(self):
+                stopped.append(True)
+
+        monkeypatch.setattr(cdp, "sync_playwright", lambda: FakePW())
+        with pytest.raises(RuntimeError):
+            cdp.Session("http://127.0.0.1:9999")
+        assert stopped, "Playwright не остановлен — подпроцесс утёк"
+
+    def test_external_chrome_window_not_minimized(self, monkeypatch):
+        """Чужой Chrome: окно пользователя не сворачиваем (аудит 2026-10-15)."""
+        self._install(monkeypatch, lambda: True)
+        monkeypatch.setattr(cdp, "_launch_marker", lambda p: False)
+        calls = []
+        monkeypatch.setattr(cdp.Session, "_minimize_window_native",
+                            lambda *a, **kw: calls.append("minimize"))
+        s = cdp.Session("http://127.0.0.1:9999")
+        assert s.browser_owner == "external"
+        assert calls == [], "внешнее окно оператора свернули"
+
+    def test_collector_chrome_window_still_minimized(self, monkeypatch):
+        """Наш Chrome по-прежнему сворачивается (контроль к тесту external)."""
+        self._install(monkeypatch, lambda: True)
+        monkeypatch.setattr(cdp, "_launch_marker", lambda p: True)
+        calls = []
+        monkeypatch.setattr(cdp.Session, "_minimize_window_native",
+                            lambda *a, **kw: calls.append("minimize"))
+        s = cdp.Session("http://127.0.0.1:9999")
+        assert s.browser_owner == "collector"
+        assert calls == ["minimize"]
+
     def test_reconnect_after_close(self, monkeypatch):
         """reconnect: закрывает старую сессию и подключается заново."""
         self._install(monkeypatch, lambda: True)

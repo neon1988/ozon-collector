@@ -1,6 +1,7 @@
 # Текущее состояние — ozon-collector
 
-Обновлено 2026-10-08: ПАЗЛ — СЪЁМКА КАДРА, А НЕ ДЕТЕКТОР, БЫЛА УЗКИМ МЕСТОМ.
+Обновлено 2026-10-16: аудит 15.10 — BLOCKER + все 15 MAJOR починены, полный
+verify ALL GREEN (секция «Аудит 2026-10-15, волна правок 2026-10-16» в конце).
 
 ## Правка 7 (2026-10-08): свёрнутое окно убивало съёмку → пазл не доезжал до драга
 
@@ -3018,4 +3019,62 @@ yrow. Ожидание: слот даёт отношение контраста 
 rescan-монополизация, `.env.example`, `reviews_dropped_by_client_filter`.
 Устаревшие MINOR-находки 07.10 (уже починены ранее): puzzle_drag release,
 DROP_BUDGET, window_exists/_setup_api.
+
+---
+
+## Аудит 2026-10-15, волна правок 2026-10-16: BLOCKER + все 15 MAJOR сделаны
+
+Полный список: **`docs/audit_2026-10-15.md`**. Коммит-чекпойнт до правок:
+`dc9edcd`. Полный verify после правок: **ALL GREEN, 1688 passed, 6 skipped,
+1 xfailed (4:47), exit 0**, reaper чист.
+
+BLOCKER и ядро:
+- **#1 BLOCKER** `parallel.py` → `pl.get("fatal_error")` + 3 теста
+  (`test_parallel_restart.py`, 30 passed).
+- **#2** resume: `target`/`parallel` берутся из манифеста, не из CLI.
+- **#4** `cdp.py`: `launch_and_wait` в try + `_playwright.stop()` — тест
+  `test_launch_retry_failure_stops_playwright`.
+- **#5** `browser.py`: recycle воркера ставит PROXY (общий
+  `_apply_worker_proxy_env`, `cdp._launch_browser` переиспользован).
+- **#6** `cdp.py`: external-Chrome не сворачивается (гейт owner).
+- **#14/#15** `qa_raw.py`: перекос сортировок читает `review_sorts` с фоллбэком;
+  naive `collected_at_utc` → UTC.
+
+I1 (вариант-фильтр vs `--reviews-api`), выбор из двух вариантов фикса:
+- **#3** `api_plan(..., apply_variant_mode=True)` → `(False, "variant_mode_native")`:
+  при нативном фильтре предсрез отключён целиком. Фильтровать API-отзывы до
+  merge невозможно: `normalize_review` не даёт variant-поля. Дефолт fail-safe
+  (True), `tests/test_reviews_api.py` — 45 passed, включая
+  `test_native_mode_is_default_refusal`.
+
+Пазл (#7–#12):
+- `puzzle_input.py:175` — `k = min(2, max(0, n - 3))` (n=3 больше не ValueError;
+  PATH_MIN_POINTS=3 — n=3 достижим через `_fit_points`);
+- `puzzle.py` — спай переставляется на КАЖДЫЙ solve (лечит stale `_SPY_OK`
+  после new_tab/recycle); `okc` на истёкшем дедлайне → `done`, не `timeout`;
+  логи «вкладка зависла» → «медленный probe/бюджет съеден драгами»;
+- `puzzle_drag.py` — драг в `try/finally` (`_release()` при исключении);
+- `puzzle_capture.py` — единые `_HIDE_PIECE_JS`/`_SHOW_PIECE_JS` (id-or-class)
+  вместо двух расходящихся копий.
+- 8 новых тестов; RED до фикса воспроизведён (drag: `up_calls == []`); набор
+  пазла: 157 passed, 1 skipped.
+
+Архитектура (#13):
+- пост-обработка прогона (~159 строк) вынесена из `run_campaign` в
+  `_commit_run_results` (`key_daemon.py:1625`), возвращает
+  `(status, new_disc, new_valid, new_checked)` либо `None` (Ctrl+C /
+  недостоверная QA-сводка → выход из цикла). `test_key_daemon.py` — 300 passed.
+
+Открыто: 40 MINOR из аудита (не начаты), `merge_shard_results pid:None`
+(решение владельца), rescan-монополизация, `.env.example`,
+`reviews_dropped_by_client_filter`.
+**Не проверено вживую:** правки I1/прокси/окон на реальном Ozon не прогонялись
+(антибот трогается в горячем пути; живая проверка — при следующем запуске
+кампании владельцем).
+
+Побочный фикс инфраструктуры: глобальный `verify-gate.ts` ложно считал зелёный
+прогон красным из-за подстроки «failed» в «1 xfailed» (найдено на этом же
+коммите; обход — `.tmp/verify-ack`). Регекс: `(?<![Xx])` перед `FAIL`/`FAILED`,
+регресс-тест `verify-gate.smoke.mts` 5b; `~/.config/opencode/scripts/verify.ps1
+-Quick` → ALL GREEN.
 

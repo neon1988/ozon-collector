@@ -1622,6 +1622,181 @@ def reconcile_validity(progress: dict, new_checked: dict,
 # главный цикл
 # ---------------------------------------------------------------------------
 
+def _commit_run_results(progress, progress_path, run_id, mode, targets,
+                        combined, exit_code, qa_fn, data_dir, camp_dir,
+                        before_disc, before_valid):
+    """Пост-обработка прогона (аудит 2026-10-15, #13).
+
+    Граница прогона: вливает pid, накопленные чекпоинтом (late-reconcile),
+    классифицирует статус, проверяет QA новых кандидатов, обновляет
+    счётчики runs/progress/stall и печатает честный итог «без результата».
+    Возвращает (status, new_disc, new_valid, new_checked) — их ждут реакции
+    по статусу в run_campaign; None — результат терминален (Ctrl+C или
+    недостоверная QA-сводка), цикл кампании должен выйти.
+    """
+
+    # Граница прогона: вливаем pid, накопленные чекпоинтом. Нужно ДО
+    # подсчёта new_disc/new_valid и до save_json, иначе товары,
+    # собранные в последние минуты прогона (или упавшей веткой:
+    # UNKNOWN_FAILURE/CHALLENGE_STORM с пустым combined), не попадут
+    # в манифест и следующий прогон соберёт их заново.
+    _late = _reconcile_inflight(progress, camp_dir / INFLIGHT_NAME,
+                                data_dir, qa_fn=qa_fn, ctx=f"[{run_id}]")
+    if _late:
+        log.info(f"[{run_id}] inflight → discovered: +{len(_late)} pid")
+
+    status = classify_status(exit_code, combined)
+    _journal_stage(progress, run_id, "run_completed",
+                   {"status": status, "exit_code": exit_code})
+    _absorb_recovery_telemetry(progress, combined)
+    _absorb_session_auth(progress, combined)
+
+    # FORCE (2-й Ctrl+C) в worker-фазе: _await_workers уже принудительно
+    # завершил воркеров (зачистка их браузеров в родителе). Не уходим в
+    # graceful INTERRUPTED/сохранение — экстренный выход (семантика force).
+    if _FORCE_EXIT.is_set():
+        _emergency_shutdown(progress_path, force="workers")
+
+    # Ctrl+C во время сбора: collect_parallel вернулся с уже собранным
+    # payload (воркеры сворачиваются). Сохраняем, что реально собрано
+    # (discovery/QA/reconcile по частичным данным), НЕ трогая счётчики
+    # статуса/шторма, и выходим на INTERRUPTED (обработается на верху
+    # цикла). PROGRESS_EVERY=5 даёт payload даже у прерванных воркеров.
+    if _STOP_EVENT.is_set():
+        log.warning("демон: сбор прерван Ctrl+C — сохраняю частичный "
+                    "результат этого прогона")
+        discovered = extract_discovered_pids(combined)
+        ok_pids = extract_ok_pids(combined)
+        if discovered:
+            progress["discovered_pids"] = normalize_pids(
+                list(progress.get("discovered_pids", [])) + list(discovered))
+        if ok_pids:
+            new_checked = classify_new_pids(progress, ok_pids, qa_fn=qa_fn)
+            reconcile_validity(progress, new_checked, data_dir)
+        _journal_stage(progress, run_id, "state_committed",
+                       {"interrupted": True})
+        progress["final_state"] = "INTERRUPTED"
+        progress["final_reason"] = "user_interrupt"
+        progress["final_note"] = "остановлено пользователем (Ctrl+C)"
+        save_json(progress_path, progress)
+        return None
+
+    discovered = extract_discovered_pids(combined)
+    ok_pids = extract_ok_pids(combined)
+    # детерминированный порядок (нормализация дедуплицирует, сохраняя порядок)
+    progress["discovered_pids"] = normalize_pids(
+        list(progress.get("discovered_pids", [])) + list(discovered))
+
+    # не собираем брак напрямую: новые кандидаты → QA
+    # в rescan-режиме сбрасываем вердикты целей, чтобы их ПЕРЕпроверить
+    # (иначе already-verdict не попадёт в need и raw после починки не
+    # пере-QA-нётся — пид навсегда останется в failed)
+    if mode == "rescan" and targets:
+        # Сбрасываем вердикт ТОЛЬКО у реально пере-QA-нутых пидов:
+        # прогон мог не вернуть ни одного raw (пустая выдача или
+        # шторм до QA) — сброс вердикта у НЕперепроверенных пидов
+        # «забывал» брак, и пид выпадал из failed без повторного QA
+        # (ревью 2026-10-15).
+        rechecked = set(ok_pids) & set(targets)
+        vdict = dict(progress.get("verdicts", {}))
+        vmeta = dict(progress.get("verdict_meta", {}))
+        for p in rechecked:
+            vdict.pop(p, None)
+            vmeta.pop(p, None)
+        progress["verdicts"] = vdict
+        progress["verdict_meta"] = vmeta
+    new_checked = classify_new_pids(progress, ok_pids, qa_fn=qa_fn)
+    if new_checked.get("parse_error"):
+        progress["final_state"] = "NEEDS_ATTENTION"
+        progress["final_reason"] = "qa_parse_error"
+        progress["final_note"] = "QA-сводка недостоверна (не сошлись инварианты)"
+        notify(progress, "NEEDS_ATTENTION: QA-сводка недостоверна")
+        log.error("QA parse_error → NEEDS_ATTENTION")
+        save_json(progress_path, progress)
+        return None
+    reconcile_validity(progress, new_checked, data_dir)
+
+    new_disc = delta(before_disc, progress.get("discovered_pids", []))
+    new_valid = delta(before_valid, progress.get("valid_pids", []))
+    # Прогресс есть → сбрасываем ОБЩИЙ счётчик (шторм/краши больше не фон).
+    # Иначе после серии штормов без прогресса, а затем успеха, no_progress
+    # останется высоким → ложный ABANDONED.
+    if new_disc or new_valid:
+        progress["no_progress_count"] = 0
+        progress["challenge_seq"] = 0
+        # прогресс → шкала эскалации challenge сбрасывается
+        cc = progress.get("challenge_control") or {}
+        cc["storm_streak"] = 0
+        progress["challenge_control"] = cc
+    progress["runs"] = progress.get("runs", []) + [{
+        "run_id": run_id, "mode": mode, "status": status,
+        "exit_code": exit_code, "before_count": len(before_disc),
+        "after_count": len(progress.get("discovered_pids", [])),
+        "before_valid": len(before_valid),
+        "after_valid": len(progress.get("valid_pids", [])),
+        "new_discovered": sorted(new_disc),
+        "new_valid": sorted(new_valid),
+        "qa_checked": new_checked["checked"],
+    }]
+
+    # ---- разделённые счётчики прогресса и стагнации ----
+    # progress — что дал этот прогон; stall — по ТИПУ отсутствия прогресса
+    # (выдача кончилась / challenge / crash / какой-то прогресс был).
+    prog = dict(progress.get("progress", {}))
+    prog["new_discovered"] = prog.get("new_discovered", 0) + len(new_disc)
+    prog["new_valid"] = prog.get("new_valid", 0) + len(new_valid)
+    prog["rescans_fixed"] = prog.get("rescans_fixed", 0) + (
+        len(new_valid) if mode == "rescan" else 0)
+    prog["rescans_failed"] = prog.get("rescans_failed", 0) + (
+        len(new_disc) - len(new_valid) if mode == "rescan" else 0)
+    progress["progress"] = prog
+
+    stall = dict(progress.get("stall", {}))
+    if status in ("NORMAL_DONE", "EMPTY_SEARCH") \
+            and not new_disc and not new_valid:
+        # выдача перетёрлась известными — стагнация discovery/valid
+        stall["full_runs_without_discovery"] = \
+            stall.get("full_runs_without_discovery", 0) + 1
+        if mode == "full":
+            stall["full_runs_without_valid"] = \
+                stall.get("full_runs_without_valid", 0) + 1
+    # Счётчики серий — только ПОДРЯД идущие сбои (ADR §14.5/§14.6).
+    # Раньше transient_failures и storm_streak были lifetime-счётчиками:
+    # 2 шторма вчера + 2 сегодня (или 2 UNKNOWN_FAILURE до обеда + 2
+    # после) давали NEEDS_ATTENTION ПОСЛЕ ЧАСОВ нормальной работы, т.е.
+    # 12-часовая кампания была обречена на смерть по календарю.
+    if status != "UNKNOWN_FAILURE" and progress.get("transient_failures"):
+        log.info(f"серия UNKNOWN_FAILURE прервана ({status}) → "
+                 f"transient_failures сброшен")
+        progress["transient_failures"] = 0
+    if status == "CHALLENGE_STORM":
+        stall["challenge_runs"] = stall.get("challenge_runs", 0) + 1
+    elif status == "NORMAL_DONE" and (new_disc or new_valid):
+        cc = progress.get("challenge_control") or {}
+        if cc.get("storm_streak"):
+            log.info(f"прогресс ({len(new_disc)}+{len(new_valid)}) → "
+                     f"storm_streak сброшен")
+            cc["storm_streak"] = 0
+            progress["challenge_control"] = cc
+    if status == "CRASH":
+        stall["crash_runs"] = stall.get("crash_runs", 0) + 1
+    progress["stall"] = stall
+
+    # Честный итог: NORMAL_DONE означает «воркеры отработали», а не
+    # «собрано всё». Показываем, сколько товаров из выдачи осталось
+    # без результата — иначе «нормально завершил» выглядит как успех
+    # (жалоба 2026-10-06: три запуска подряд 21 → 37 → 58 valid, а демон
+    # рапортовал нормальное завершение).
+    _pending = pending_pids(progress)
+    log.info(f"[{run_id}] status={status}: discovered "
+        f"{len(progress.get('discovered_pids', []))} "
+        f"valid {len(progress.get('valid_pids', []))} "
+        f"(new_disc={len(new_disc)}, new_valid={len(new_valid)})"
+        + (f" БЕЗ РЕЗУЛЬТАТА: {len(_pending)} — вернутся в очередь"
+           if _pending else " без результата: 0"))
+    return status, new_disc, new_valid, new_checked
+
+
 def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  out: str, data_dir: str = DEFAULT_DATA_DIR,
                  max_age: str = "7d", min_reviews: int = 40,
@@ -1798,6 +1973,13 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                                         max_no_progress_runs)
         max_rescans = rcfg.get("max_rescans", max_rescans)
         reserve_count = rcfg.get("reserve_count", reserve_count)
+        # target_count и parallel — тоже из манифеста (инвариант 4), а не из
+        # аргументов запуска: иначе стоп-условие цикла (valid >= target), срез
+        # snapshot/reserve и шторм-эскалация зависели бы от --limit/--parallel
+        # текущего запуска. CLI-дефолт --limit 300 на resume молча уводил
+        # кампанию в долгий добор «до 300» (аудит 2026-10-15).
+        target = int(progress.get("target_count", target))
+        parallel = max(1, int(rcfg.get("parallel", parallel)))
 
         # session_budget_wall_clock: если передан аргументом запуска, синхронизируем
         # в run_cfg (позволяет менять лимит run между запусками, сохраняя
@@ -2020,165 +2202,12 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                 exit_code = 1
             finally:
                 stop_checkpoint(checkpoint)
-            # Граница прогона: вливаем pid, накопленные чекпоинтом. Нужно ДО
-            # подсчёта new_disc/new_valid и до save_json, иначе товары,
-            # собранные в последние минуты прогона (или упавшей веткой:
-            # UNKNOWN_FAILURE/CHALLENGE_STORM с пустым combined), не попадут
-            # в манифест и следующий прогон соберёт их заново.
-            _late = _reconcile_inflight(progress, camp_dir / INFLIGHT_NAME,
-                                        data_dir, qa_fn=qa_fn, ctx=f"[{run_id}]")
-            if _late:
-                log.info(f"[{run_id}] inflight → discovered: +{len(_late)} pid")
-
-            status = classify_status(exit_code, combined)
-            _journal_stage(progress, run_id, "run_completed",
-                           {"status": status, "exit_code": exit_code})
-            _absorb_recovery_telemetry(progress, combined)
-            _absorb_session_auth(progress, combined)
-
-            # FORCE (2-й Ctrl+C) в worker-фазе: _await_workers уже принудительно
-            # завершил воркеров (зачистка их браузеров в родителе). Не уходим в
-            # graceful INTERRUPTED/сохранение — экстренный выход (семантика force).
-            if _FORCE_EXIT.is_set():
-                _emergency_shutdown(progress_path, force="workers")
-
-            # Ctrl+C во время сбора: collect_parallel вернулся с уже собранным
-            # payload (воркеры сворачиваются). Сохраняем, что реально собрано
-            # (discovery/QA/reconcile по частичным данным), НЕ трогая счётчики
-            # статуса/шторма, и выходим на INTERRUPTED (обработается на верху
-            # цикла). PROGRESS_EVERY=5 даёт payload даже у прерванных воркеров.
-            if _STOP_EVENT.is_set():
-                log.warning("демон: сбор прерван Ctrl+C — сохраняю частичный "
-                            "результат этого прогона")
-                discovered = extract_discovered_pids(combined)
-                ok_pids = extract_ok_pids(combined)
-                if discovered:
-                    progress["discovered_pids"] = normalize_pids(
-                        list(progress.get("discovered_pids", [])) + list(discovered))
-                if ok_pids:
-                    new_checked = classify_new_pids(progress, ok_pids, qa_fn=qa_fn)
-                    reconcile_validity(progress, new_checked, data_dir)
-                _journal_stage(progress, run_id, "state_committed",
-                               {"interrupted": True})
-                progress["final_state"] = "INTERRUPTED"
-                progress["final_reason"] = "user_interrupt"
-                progress["final_note"] = "остановлено пользователем (Ctrl+C)"
-                save_json(progress_path, progress)
+            committed = _commit_run_results(
+                progress, progress_path, run_id, mode, targets, combined,
+                exit_code, qa_fn, data_dir, camp_dir, before_disc, before_valid)
+            if committed is None:
                 break
-
-            discovered = extract_discovered_pids(combined)
-            ok_pids = extract_ok_pids(combined)
-            # детерминированный порядок (нормализация дедуплицирует, сохраняя порядок)
-            progress["discovered_pids"] = normalize_pids(
-                list(progress.get("discovered_pids", [])) + list(discovered))
-
-            # не собираем брак напрямую: новые кандидаты → QA
-            # в rescan-режиме сбрасываем вердикты целей, чтобы их ПЕРЕпроверить
-            # (иначе already-verdict не попадёт в need и raw после починки не
-            # пере-QA-нётся — пид навсегда останется в failed)
-            if mode == "rescan" and targets:
-                # Сбрасываем вердикт ТОЛЬКО у реально пере-QA-нутых пидов:
-                # прогон мог не вернуть ни одного raw (пустая выдача или
-                # шторм до QA) — сброс вердикта у НЕперепроверенных пидов
-                # «забывал» брак, и пид выпадал из failed без повторного QA
-                # (ревью 2026-10-15).
-                rechecked = set(ok_pids) & set(targets)
-                vdict = dict(progress.get("verdicts", {}))
-                vmeta = dict(progress.get("verdict_meta", {}))
-                for p in rechecked:
-                    vdict.pop(p, None)
-                    vmeta.pop(p, None)
-                progress["verdicts"] = vdict
-                progress["verdict_meta"] = vmeta
-            new_checked = classify_new_pids(progress, ok_pids, qa_fn=qa_fn)
-            if new_checked.get("parse_error"):
-                progress["final_state"] = "NEEDS_ATTENTION"
-                progress["final_reason"] = "qa_parse_error"
-                progress["final_note"] = "QA-сводка недостоверна (не сошлись инварианты)"
-                notify(progress, "NEEDS_ATTENTION: QA-сводка недостоверна")
-                log.error("QA parse_error → NEEDS_ATTENTION")
-                save_json(progress_path, progress)
-                break
-            reconcile_validity(progress, new_checked, data_dir)
-
-            new_disc = delta(before_disc, progress.get("discovered_pids", []))
-            new_valid = delta(before_valid, progress.get("valid_pids", []))
-            # Прогресс есть → сбрасываем ОБЩИЙ счётчик (шторм/краши больше не фон).
-            # Иначе после серии штормов без прогресса, а затем успеха, no_progress
-            # останется высоким → ложный ABANDONED.
-            if new_disc or new_valid:
-                progress["no_progress_count"] = 0
-                progress["challenge_seq"] = 0
-                # прогресс → шкала эскалации challenge сбрасывается
-                cc = progress.get("challenge_control") or {}
-                cc["storm_streak"] = 0
-                progress["challenge_control"] = cc
-            progress["runs"] = progress.get("runs", []) + [{
-                "run_id": run_id, "mode": mode, "status": status,
-                "exit_code": exit_code, "before_count": len(before_disc),
-                "after_count": len(progress.get("discovered_pids", [])),
-                "before_valid": len(before_valid),
-                "after_valid": len(progress.get("valid_pids", [])),
-                "new_discovered": sorted(new_disc),
-                "new_valid": sorted(new_valid),
-                "qa_checked": new_checked["checked"],
-            }]
-
-            # ---- разделённые счётчики прогресса и стагнации ----
-            # progress — что дал этот прогон; stall — по ТИПУ отсутствия прогресса
-            # (выдача кончилась / challenge / crash / какой-то прогресс был).
-            prog = dict(progress.get("progress", {}))
-            prog["new_discovered"] = prog.get("new_discovered", 0) + len(new_disc)
-            prog["new_valid"] = prog.get("new_valid", 0) + len(new_valid)
-            prog["rescans_fixed"] = prog.get("rescans_fixed", 0) + (
-                len(new_valid) if mode == "rescan" else 0)
-            prog["rescans_failed"] = prog.get("rescans_failed", 0) + (
-                len(new_disc) - len(new_valid) if mode == "rescan" else 0)
-            progress["progress"] = prog
-
-            stall = dict(progress.get("stall", {}))
-            if status in ("NORMAL_DONE", "EMPTY_SEARCH") \
-                    and not new_disc and not new_valid:
-                # выдача перетёрлась известными — стагнация discovery/valid
-                stall["full_runs_without_discovery"] = \
-                    stall.get("full_runs_without_discovery", 0) + 1
-                if mode == "full":
-                    stall["full_runs_without_valid"] = \
-                        stall.get("full_runs_without_valid", 0) + 1
-            # Счётчики серий — только ПОДРЯД идущие сбои (ADR §14.5/§14.6).
-            # Раньше transient_failures и storm_streak были lifetime-счётчиками:
-            # 2 шторма вчера + 2 сегодня (или 2 UNKNOWN_FAILURE до обеда + 2
-            # после) давали NEEDS_ATTENTION ПОСЛЕ ЧАСОВ нормальной работы, т.е.
-            # 12-часовая кампания была обречена на смерть по календарю.
-            if status != "UNKNOWN_FAILURE" and progress.get("transient_failures"):
-                log.info(f"серия UNKNOWN_FAILURE прервана ({status}) → "
-                         f"transient_failures сброшен")
-                progress["transient_failures"] = 0
-            if status == "CHALLENGE_STORM":
-                stall["challenge_runs"] = stall.get("challenge_runs", 0) + 1
-            elif status == "NORMAL_DONE" and (new_disc or new_valid):
-                cc = progress.get("challenge_control") or {}
-                if cc.get("storm_streak"):
-                    log.info(f"прогресс ({len(new_disc)}+{len(new_valid)}) → "
-                             f"storm_streak сброшен")
-                    cc["storm_streak"] = 0
-                    progress["challenge_control"] = cc
-            if status == "CRASH":
-                stall["crash_runs"] = stall.get("crash_runs", 0) + 1
-            progress["stall"] = stall
-
-            # Честный итог: NORMAL_DONE означает «воркеры отработали», а не
-            # «собрано всё». Показываем, сколько товаров из выдачи осталось
-            # без результата — иначе «нормально завершил» выглядит как успех
-            # (жалоба 2026-10-06: три запуска подряд 21 → 37 → 58 valid, а демон
-            # рапортовал нормальное завершение).
-            _pending = pending_pids(progress)
-            log.info(f"[{run_id}] status={status}: discovered "
-                f"{len(progress.get('discovered_pids', []))} "
-                f"valid {len(progress.get('valid_pids', []))} "
-                f"(new_disc={len(new_disc)}, new_valid={len(new_valid)})"
-                + (f" БЕЗ РЕЗУЛЬТАТА: {len(_pending)} — вернутся в очередь"
-                   if _pending else " без результата: 0"))
+            status, new_disc, new_valid, new_checked = committed
 
             # ---- реакция по статусу ----
             if status == "CHALLENGE_STORM":

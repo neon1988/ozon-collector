@@ -8,6 +8,7 @@ import pathlib
 
 import pytest
 
+from ozon_collector import browser as B
 from ozon_collector import cdp
 from ozon_collector import net
 from ozon_collector import parallel
@@ -148,6 +149,58 @@ def test_main_profile_never_gets_proxy(launcher, monkeypatch):
     cdp._launch_browser("http://127.0.0.1:9222", profile_path="p",
                         profile_token="ozon-profile")
     assert "PROXY" not in launcher.env
+
+
+@pytest.fixture
+def browser_launcher(monkeypatch, tmp_path):
+    """Шпион subprocess.Popen для browser._launch_script (recycle-путь)."""
+    spy = _PopenSpy()
+    script = tmp_path / "launch_chrome.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    monkeypatch.setattr(B.subprocess, "Popen", spy)
+    monkeypatch.setattr(B, "_launch_script_path", lambda: script)
+    monkeypatch.setattr(B, "_launch_script_name", lambda: script.name)
+    _clear(monkeypatch)
+    return spy
+
+
+@pytest.mark.allow_browser_launch
+def test_browser_launch_script_receives_proxy_env(browser_launcher,
+                                                  monkeypatch):
+    """browser._launch_script (recycle через BrowserProcessManager) кладёт
+    PROXY воркера — раньше прокси терялся при recycle (аудит 2026-10-15)."""
+    monkeypatch.setenv("OZON_PROXY_URLS", "http://p1:1,http://p2:2")
+    B._launch_script("http://127.0.0.1:9224", profile_path="p",
+                     profile_token="ozon-profile-worker-2")
+    assert browser_launcher.env["PROXY"] == "http://p2:2"
+    assert browser_launcher.env["PORT"] == "9224"
+
+
+@pytest.mark.allow_browser_launch
+def test_browser_launch_script_main_profile_no_proxy(browser_launcher,
+                                                     monkeypatch):
+    monkeypatch.setenv("OZON_PROXY_URLS", "http://p1:1")
+    B._launch_script("http://127.0.0.1:9222", profile_path="p",
+                     profile_token="ozon-profile")
+    assert "PROXY" not in browser_launcher.env
+
+
+def test_process_manager_forwards_profile_token(monkeypatch, tmp_path):
+    """BrowserProcessManager.launch обязан передать token в _launch_script,
+    иначе per-worker прокси не применится при recycle (аудит 2026-10-15)."""
+    seen = {}
+
+    def spy_script(url, profile_path=None, profile_token=None):
+        seen["token"] = profile_token
+        return B.LaunchRun("", None)
+
+    monkeypatch.setattr(B, "_launch_script", spy_script)
+    monkeypatch.setattr(B.BrowserProcessManager, "_await_launch",
+                        lambda self, *a, **kw: None)
+    m = B.BrowserProcessManager("http://127.0.0.1:9223",
+                                profile_token="ozon-profile-worker-2")
+    assert m.launch("L1") is None
+    assert seen["token"] == "ozon-profile-worker-2"
 
 
 def test_worker_spec_exposes_masked_proxy(monkeypatch):

@@ -177,3 +177,82 @@ def test_success_goes_through_ok_and_counts_solved(monkeypatch):
             == PS._PUZZLE_FAILURES[0] + PS._PUZZLE_SOLVED[0]), (
         "инвариант attempts == failures + solved нарушен")
     PS.reset()
+
+
+def _fake_clock(monkeypatch):
+    """Управляемые часы: бюджет solve_puzzle читает только time.monotonic."""
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(P.time, "monotonic", lambda: clock["t"])
+    return clock
+
+
+def test_okc_drag_survives_expired_deadline(monkeypatch):
+    """Драг подтвердил снятие, бюджет истёк во время него → это успех.
+
+    Аудит 2026-10-15: безусловный `if _expired(): return "timeout"` после
+    `_drag_to` выбрасывал okc=True — при фактически снятой капче вкладку
+    уводили в recycle, а KPI писал провал.
+    """
+    _patch_pipeline(monkeypatch, "solved")
+    P._SPY_OK[0] = False
+    clock = _fake_clock(monkeypatch)
+
+    def _drag_ok_after_budget(*_a, **_kw):
+        clock["t"] += 1.0
+        return True
+
+    monkeypatch.setattr(P, "_drag_to", _drag_ok_after_budget)
+    PS.reset()
+    ok = P.solve_puzzle(_page_with_guard(), attempts=1, timeout_s=0.05)
+    assert ok is True, "okc=True не должен превращаться в timeout"
+    assert PS._PUZZLE_SOLVED[0] == 1
+    assert PS._PUZZLE_FAILURES[0] == 0
+    assert (PS._PUZZLE_ATTEMPTS[0]
+            == PS._PUZZLE_FAILURES[0] + PS._PUZZLE_SOLVED[0])
+    PS.reset()
+
+
+def test_expired_deadline_without_okc_still_times_out(monkeypatch):
+    """Без подтверждения драга истёкший бюджет — по-прежнему timeout.
+
+    Гарантия, что правка okc не отменила страховку: провал обязан уйти в
+    лестницу восстановления (recycle), а не крутиться в цикле.
+    """
+    _patch_pipeline(monkeypatch, "reject")
+    P._SPY_OK[0] = False
+    clock = _fake_clock(monkeypatch)
+
+    def _drag_fail_after_budget(*_a, **_kw):
+        clock["t"] += 1.0
+        return False
+
+    monkeypatch.setattr(P, "_drag_to", _drag_fail_after_budget)
+    PS.reset()
+    ok = P.solve_puzzle(_page_with_guard(), attempts=1, timeout_s=0.05)
+    assert ok is False
+    assert PS._PUZZLE_FAILURES[0] == 1
+    PS.reset()
+
+
+def test_slot_spy_is_rearmed_on_every_solve(monkeypatch):
+    """Spy переустанавливается на каждом solve (new_tab/recycle дают новый JS).
+
+    Аудит 2026-10-15: флаг «один раз на процесс» оставался True после смены
+    страницы, установка пропускалась, и точная цель из кода капчи молча
+    терялась — детекторы оставались лишь фолбэком.
+    """
+    _patch_pipeline(monkeypatch, "solved")
+    P._SPY_OK[0] = False
+    calls = []
+
+    def _spy(page):
+        calls.append(page)
+        return True
+
+    monkeypatch.setattr(P, "_slot_spy_install", _spy)
+    PS.reset()
+    assert P.solve_puzzle(_page_with_guard(), attempts=1, timeout_s=5.0) is True
+    assert P.solve_puzzle(_page_with_guard(), attempts=1, timeout_s=5.0) is True
+    assert len(calls) == 2, (
+        f"второй solve не переустановил spy: установок {len(calls)}")
+    PS.reset()

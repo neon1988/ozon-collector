@@ -2816,11 +2816,15 @@ def reviews_api_enabled(flag: bool | None = None) -> bool:
 
 
 def _reviews_api_prepass(page, pid: str | None, target_variant: dict,
-                         rating_count, sorts, enabled: bool) -> dict:
+                         rating_count, sorts, enabled: bool,
+                         apply_variant_mode: bool = True) -> dict:
     """Быстрый предсрез отзывов через API. Всегда safe: на любой проблеме → {}.
 
     complete=True только когда API вернул не меньше доверенного rating_count и
     не нужен вариант/мульти-сорт (тогда DOM-страницы можно не докручивать).
+    apply_variant_mode=True (дефолт сбора) закрывает предсрез целиком: API не
+    несёт variant-поля, и merge влил бы отзывы чужих вариантов (I1, аудит
+    2026-10-15) — см. ozon_fetch.api_plan.
     """
     tel = {"enabled": bool(enabled), "used": False, "reason": "",
            "fetched": 0, "pages": 0, "complete": False, "reviews": []}
@@ -2831,7 +2835,8 @@ def _reviews_api_prepass(page, pid: str | None, target_variant: dict,
         tel["reason"] = "no_pid"
         return tel
     allowed, why = ozon_fetch.api_plan(target_variant,
-                                       need_dom_extras=bool(sorts))
+                                       need_dom_extras=bool(sorts),
+                                       apply_variant_mode=apply_variant_mode)
     if not allowed:
         tel["reason"] = why
         return tel
@@ -2869,9 +2874,11 @@ def _collect_reviews_stage(sess, rurl, target_variant, rating_count, pid,
     """
     api_ctx = _reviews_api_prepass(
         sess.page, pid, target_variant, rating_count, sorts,
-        enabled=reviews_api_enabled(reviews_api))
+        enabled=reviews_api_enabled(reviews_api),
+        apply_variant_mode=apply_variant_mode)
     # Покрытие доказано счётчиком из карточки → глубокий DOM-скролл не нужен.
-    # Мульти-сорт и вариант-фильтр сюда не попадают (см. ozon_fetch.api_plan).
+    # Мульти-сорт и variant-режим (CLI или нативный) сюда не попадают — см.
+    # ozon_fetch.api_plan.
     eff_max_pages = 1 if api_ctx.get("complete") else max_pages
     if api_ctx.get("complete"):
         log.info(f"[reviews-api] покрытие доказано "
@@ -2927,7 +2934,8 @@ def collect(
     reviews_api — быстрый предсрез отзывов через ozon_fetch (None → env
     OZON_REVIEWS_API, по умолчанию выключено). DOM остаётся источником
     истины: API лишь дополняет список, а не докручивает страницы, пока не
-    докажет покрытие rating_count (см. _reviews_api_prepass).
+    докажет покрытие rating_count (см. _reviews_api_prepass). При включённом
+    apply_variant_mode предсрез отключается целиком (I1, см. api_plan).
     Возвращает dict."""
     target_variant = parse_variant(variant)
     sess_owned = sess is None

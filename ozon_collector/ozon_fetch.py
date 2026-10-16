@@ -207,7 +207,8 @@ def normalize_review(raw: Any) -> Optional[dict]:
 
 
 def api_plan(target_variant: Optional[dict] = None,
-             need_dom_extras: bool = True) -> tuple[bool, str]:
+             need_dom_extras: bool = True,
+             apply_variant_mode: bool = True) -> tuple[bool, str]:
     """Допустим ли API-предсрез в этом сборе — (да, причина).
 
     Отказоустойчиво по умолчанию: спорные случаи уходят в DOM, а не в API.
@@ -215,6 +216,11 @@ def api_plan(target_variant: Optional[dict] = None,
       * variant-фильтр (--variant-*: Цвет/Размер/Габариты) API не умеет —
         отзыв другого варианта попадёт в товар. Применяем нативный фильтр
         Ozon «Этот вариант» нельзя без перезагрузки страницы → отказ;
+      * нативный variant-режим (apply_variant_mode, дефолт) ограничивает DOM
+        отзывами целевого варианта, но API-отзывы не несут variant-поля и
+        отфильтровать их нечем: merge добавил бы чужие варианты в raw
+        (инвариант I1, аудит 2026-10-15). Поэтому режим отказывает от API
+        целиком — потеря ускорения дешевле смешения вариантов;
       * если DOM сортируется по нескольким sort-проходам или нужны
         DOM-only поля (photos/replies/стабильность страниц) — API лишь
         дополняет, но сортировку/стабильность не заменяет (need_dom_extras).
@@ -223,6 +229,8 @@ def api_plan(target_variant: Optional[dict] = None,
         keys = [k for k, v in (target_variant or {}).items() if v]
         if keys:
             return False, f"variant_filter({','.join(keys[:3])})"
+    if apply_variant_mode:
+        return False, "variant_mode_native"
     return True, "ok" if need_dom_extras else "no_dom_extras"
 
 

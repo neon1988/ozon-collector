@@ -316,3 +316,48 @@ class TestSolvedSummaryOrder:
         assert "решено=0" not in itog[0], (
             f"строка успеха показывает решено=0: {itog[0]}")
         assert "решено=1" in itog[0], itog[0]
+
+
+def test_piece_hide_show_matchers_canonical():
+    """Оба общих скрипта матчат кусок по id ИЛИ классу (как _read_sl_piece)."""
+    for js in (puzzle_capture._HIDE_PIECE_JS, puzzle_capture._SHOW_PIECE_JS):
+        assert "el.id === 'puzzle'" in js
+        assert "/puzzle/.test(c)" in js
+
+
+def test_bg_clean_uses_shared_hide_show_js(monkeypatch):
+    """_shot_bg_clean прячет кусок общим скриптом, а не своей копией.
+
+    Аудит 2026-10-15: здесь матчился только className, и кусок, опознанный
+    по id, не прятался — кадр фона шёл с ним, diff детекторов слеп.
+    """
+    monkeypatch.setattr(puzzle_capture, "_HIDE_PIECE_JS", "HIDE_SENTINEL")
+    monkeypatch.setattr(puzzle_capture, "_SHOW_PIECE_JS", "SHOW_SENTINEL")
+    page = _FakePage([_png(_textured())])
+    seen = []
+    orig = page.evaluate
+
+    def _record(js):
+        seen.append(js)
+        return orig(js)
+
+    page.evaluate = _record
+    assert _run(page) is not None
+    assert "HIDE_SENTINEL" in seen and "SHOW_SENTINEL" in seen
+
+
+def test_margin_rect_uses_shared_hide_show_js(monkeypatch):
+    """Маржа кусочка прячет его тем же общим скриптом (единый матчер)."""
+    monkeypatch.setattr(puzzle_capture, "_HIDE_PIECE_JS", "HIDE_SENTINEL")
+    monkeypatch.setattr(puzzle_capture, "_SHOW_PIECE_JS", "SHOW_SENTINEL")
+    good = _png(_textured())
+    seen = []
+
+    class _P:
+        def evaluate(self, js):
+            seen.append(js)
+
+    monkeypatch.setattr(puzzle_capture, "_page_shot", lambda page, **kw: good)
+    monkeypatch.setattr(puzzle_capture.time, "sleep", lambda _s: None)
+    puzzle_capture._shot_piece_margin_rect(_P(), [0, 0, 60, 40])
+    assert "HIDE_SENTINEL" in seen and "SHOW_SENTINEL" in seen

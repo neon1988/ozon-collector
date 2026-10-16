@@ -533,3 +533,36 @@ def test_await_force_priority_over_stop(monkeypatch):
     assert called == []
     assert not w.proc.is_alive()
     assert len(out) == 1 and out[0] is w
+
+
+# ---- _collect_worker_payloads (регрессия dc9edcd, аудит 2026-10-15) ----------
+
+def test_collect_payloads_no_keyerror_on_terminate_done_batch():
+    """Terminate-путь: payload done_batch без ключа fatal_error не роняет merge.
+
+    Регрессия dc9edcd: `pl["fatal_error"]` давал KeyError при exitcode≠0 (в том
+    числе deadline_halted — `and` вычислял subscript раньше флага)."""
+    w = _mk_worker(done=False, exitcode=1,
+                   payload={"products": [], "processed_indexes": [0],
+                            "failed_indexes": []})
+    w.deadline_halted = True
+    pl = PL._collect_worker_payloads([w])[0]
+    assert pl["exitcode"] == 1
+    assert pl.get("fatal_error") is None    # дедлайн — не fatal
+
+
+def test_collect_payloads_marks_fatal_without_key():
+    """Тот же payload без deadline_halted → fatal проставляется, не KeyError."""
+    w = _mk_worker(done=False, exitcode=1,
+                   payload={"products": [], "processed_indexes": [],
+                            "failed_indexes": []})
+    pl = PL._collect_worker_payloads([w])[0]
+    assert pl["fatal_error"] == "exit 1"
+
+
+def test_collect_payloads_exitcode_none_not_fatal():
+    """exitcode None (процесс не сообщил код) — не fatal."""
+    w = _mk_worker(done=False, exitcode=None, payload={"products": []})
+    pl = PL._collect_worker_payloads([w])[0]
+    assert pl["exitcode"] is None
+    assert pl.get("fatal_error") is None

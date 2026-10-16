@@ -629,7 +629,8 @@ def _patch_manager(monkeypatch, processes=None, cdp_ready=None):
         launch_wait_s=0.2, kill_wait_s=0.2, capture_interval=0.01)
     monkeypatch.setattr(B.time, "sleep", lambda s: None)
     monkeypatch.setattr(B, "_launch_script",
-                        lambda cdp_url, profile_path=None: None)
+                        lambda cdp_url, profile_path=None,
+                        profile_token=None: None)
     if processes is not None:
         monkeypatch.setattr(P, "browser_processes",
                             lambda *a, **kw: processes() if callable(processes)

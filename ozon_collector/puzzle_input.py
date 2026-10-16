@@ -172,7 +172,10 @@ def _human_drag_path(x0: float, y0: float, x1: float, y1: float,
         # У края дорожки перелёта нет: превышать нечего, остаток добирает
         # измерительный цикл (puzzle_drag), а не «угадайка» мышью.
         over = 0.0
-    hold = sorted(rng.sample(range(2, n - 1), k=min(2, max(1, n - 3))))
+    # k=0 при n<=3: диапазон индексов [2..n-2] пуст (PATH_MIN_POINTS=3 — при
+    # урезанном бюджете n=3 реален), а прежний max(1, ...) требовал сэмпл из
+    # пустого диапазона → ValueError посреди драга (аудит 2026-10-15).
+    hold = sorted(rng.sample(range(2, n - 1), k=min(2, max(0, n - 3))))
     dx = x1 - x0
     dy1 = y1 - y0
     dist = math.hypot(dx, dy1)

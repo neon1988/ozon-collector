@@ -220,6 +220,33 @@ def test_sort_imbalance_skipped_on_complete_collection():
     assert rep["verdict"] == "OK"
 
 
+def test_sort_imbalance_counts_multi_sort_reviews():
+    # Отзыв, встреченный в ДВУХ сортировках (review_sorts-список), должен
+    # засчитываться обеим — как в collect._variant_problems. Учёт только по
+    # скалярному review_sort делал score_asc ложно провальным (аудит 2026-10-15).
+    revs = [_rev(f"b{i}", sort="published_at_desc") for i in range(6)]
+    for r in revs:
+        r["review_sorts"] = ["published_at_desc", "score_asc"]
+    raw = _raw(vc=20, reviews=revs,
+               sorts=("published_at_desc", "score_asc"))
+    rep = qa_product(raw, "42")
+    assert "SORT_IMBALANCE" not in _codes(rep)
+    assert rep["metrics"]["per_sort_coverage"] == {
+        "published_at_desc": 6, "score_asc": 6}
+
+
+def test_naive_collected_at_utc_does_not_crash():
+    # Legacy raw: naive-UTC без суффикса tz. Вычитание aware-now в OLD_DATA
+    # падало TypeError и роняло QA всей пачки, а .timestamp() читал naive
+    # как локальное время — свежие отзывы ложно попадали в FUTURE_DATE
+    # (аудит 2026-10-15).
+    raw = _raw(vc=5)
+    raw["collected_at_utc"] = dt.datetime.now(
+        dt.timezone.utc).replace(tzinfo=None).isoformat()
+    rep = qa_product(raw, "42")
+    assert rep["verdict"] == "OK"
+
+
 def test_zero_reviews_fail():
     raw = _raw(vc=0, rc=None, reviews=[])
     rep = qa_product(raw, "42")

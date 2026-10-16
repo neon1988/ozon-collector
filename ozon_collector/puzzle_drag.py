@@ -424,8 +424,10 @@ def _drag_to(page, target_vx: float, info, bx, score,
         не замораживается после зонда;
       * длина траектории подбирается под остаток бюджета, а обрезанная
         траектория всё равно доставляет конечную координату;
-      * кнопка отпускается на ЛЮБОМ выходе из захода (_finish) — иначе
-        следующий заход стартует поверх mousePressed.
+      * кнопка отпускается на ЛЮБОМ выходе из захода (_finish) и на любом
+        исключении (finally вокруг всего движка) — иначе прерванный драг
+        оставляет кнопку зажатой, и следующий заход стартует поверх
+        mousePressed (аудит 2026-10-15).
     """
     _LAST_MOVE[0] = None
     # Состояние кнопки: нужно, чтобы отпускание было идемпотентным. Второй
@@ -586,314 +588,317 @@ def _drag_to(page, target_vx: float, info, bx, score,
         return _drop_and_confirm()
 
     last = {}
-    for _try in range(3):
-        if deadline and time.monotonic() > deadline:
-            return _finish(stop="deadline_before_pick")
-        _t0_read = time.monotonic()
-        r0 = _read_sl_piece(page)
-        _diag["t_read_s"] += time.monotonic() - _t0_read
-        _diag["probe_reads"] += 1
-        log.debug(f"drag try={_try} gx={gx:.1f} gy={gy:.1f} r0={r0} "
-                  f"t_read={time.monotonic() - _t0_read:.2f}s")
-        if not r0 or r0.get("px") is None:
-            # Кусок мог исчезнуть на пересборке капчи после неудачного дропа:
-            # img#puzzle грузируется заново через 0.3-2s. Поллинг; если не
-            # появился — это НЕ «пазл снят», а только реальное снятие
-            # челленджа даёт True (2026-09-22: ложные okc=True из no_piece
-            # раздували успехи и жечь свип по устаревшим кандидатам).
-            r0 = _wait_piece(page, deadline=deadline)
-            if r0 is None:
-                _attempt("drag", note="no_piece", bx=bx, score=score,
-                         target_vx=round(target_vx, 1))
-                return _await_verdict(page, left=_left(deadline)) != "no"
-        if _SIMPLE_DRAG:
-            # Один непрерывный драг: гипотеза, что возвратно-точный FSM
-            # (зонд вперёд + до 18 микрокоррекций) Ozon читает как
-            # «начал тянуть и бросил» и перезагружает пазл (наблюдение
-            # пользователя 2026-10-01). Включается флагом, чтобы можно было
-            # A/B сравнить на живых прогонах.
-            _solved = _simple_drag_once()
-            if _solved:
-                return True
-            _release()
-            return False
-        # подвод мыши к точке хвата (визуально-естественно) затем нажим
-        _grip(gx, gy, rng_x)
-        time.sleep(random.uniform(0.05, 0.12))
-        # Калибровочный зонд по расстоянию до цели (НЕ фиксированные 40px):
-        # близкая лунка раньше перешагивалась зондом. Длина здесь не влияет на
-        # точность big-move: шаг считается от ФАКТИЧЕСКОГО px после зонда,
-        # т.е. dest = mouse + (target - px_now)/k — probe-agnostic.
-        calib = _calib_step(abs(target_vx - (r0.get("px") or 0)))
-        k = 1.0
-        r1 = r0
-        if calib > 0.0:
-            # калибровочный сдвиг человеческой траекторией. Дедлайн можно
-            # передавать: конечная координата зонда всё равно доставляется
-            # (см. _human_move), а измерение Δкусок/Δмышь от обрезки не
-            # зависит — оно и есть смысл зонда.
-            _t_probe = time.monotonic()
-            _human_move(page, _human_path(gx + rng_x, gy, gx + calib + rng_x, gy,
-                                          n=16, arc=3.0),
-                        deadline=deadline)
-            time.sleep(random.uniform(0.1, 0.22))
-            _t_probe = time.monotonic() - _t_probe
-            _t_r1 = time.monotonic()
-            # Замер после кадра страницы: без этого k считается по позиции
-            # с ПРОШЛОГО кадра (см. SETTLE_*).
-            r1 = _read_settled(page, deadline)
-            _t_r1 = time.monotonic() - _t_r1
-            _diag["t_move_s"] += _t_probe
-            _diag["t_read_s"] += _t_r1
-            _diag["probe_reads"] += 1
-            k = _k_from_probe(r0, r1, calib, grip_mode)
-            _diag["k"] = None if k is None else round(float(k), 3)
-            log.debug(f"drag calib timing: t_probe={_t_probe:.2f}s "
-                      f"t_r1={_t_r1:.2f}s")
-        else:
-            # зона для зонда нет (цель вплотную): k неизвестен → берём
-            # консервативную 1.0 (недооценка скорее, чем перелёт) и отдаём
-            # доводку замкнутому контуру, который меряет реальный px каждый шаг.
-            log.debug(f"drag calib skipped dist="
-                      f"{abs(target_vx - (r0.get('px') or 0)):.1f} k=1.0")
-        # ЖИВОСТЬ ДРАГА. Если после mousedown + калибровочного зонда кусок/ручка
-        # не сдвинулись (|dpx| <= 1px) — мышь не зацепила цель, и никакая
-        # доводка это не спасёт. Это НЕ метрика, а поломка, поэтому она видна
-        # в логе голосом WARNING и отдельной записью no_move с фактическим
-        # сдвигом: иначе «пазл стоит, ничего не происходит» неотличимо от
-        # «мышь едет, но лунка не та» (наблюдение пользователя 2026-10-01).
-        _moved = None
-        if r1 and r1.get("px") is not None and r0.get("px") is not None:
-            _moved = round(r1["px"] - r0["px"], 2)
-        _LAST_MOVE[0] = _moved
-        _diag["moved_px"] = _moved
-        log.debug(f"drag r1={r1} calib={calib} moved_px={_moved} k={k}")
-        if k is None:
-            # ХВАТ НЕ УДАЛСЯ (кусок не поехал). Отделено от «коэффициент вне
-            # номинала»: полоса 0.4..3.0 раньше была общей для обоих случаев,
-            # и настоящий малый коэффициент (0.373 в замере 2026-10-07)
-            # объявлялся поломкой захвата — три полных зонда впустую.
-            _release()
-            time.sleep(random.uniform(0.3, 0.5))
-            log.warning(f"drag: КУСОК НЕ ДВИНУЛСЯ (moved_px={_moved}, "
-                        f"calib={calib:.1f}, grip={grip_mode} @"
-                        f"({gx:.0f},{gy:.0f}) bx={bx}) — мышь не зацепила "
-                        f"цель, доводка невозможна")
-            _attempt("drag", note="no_move", bx=bx, score=score,
-                     target_vx=round(target_vx, 1), calib=round(calib, 1),
-                     moved_px=_moved, gx=round(gx, 1), gy=round(gy, 1),
-                     grip=grip_mode)
-            _attempt("drag", note="grip_fail", bx=bx, score=score,
-                     target_vx=round(target_vx, 1), k=k, grip=grip_mode,
-                     moved_px=_moved, no_move=True)
-            rng_x = random.uniform(-9, 9)
-            if grip_mode == "piece":
-                # При повторном хвате НЕ рандом: читаем живую непрозрачную точку
-                # куска через canvas (точка с alpha>80 в css-боксе). CDN-маска
-                # может не совпасть с рендером после перерисовки куска (grip_fail),
-                # canvas-точка — это реальное изломанное положение на экране.
-                off = _piece_grip_offset(page)
-                if off:
-                    nx, ny = off
-                    gx = min(pz_r[0] + pz_r[2], max(pz_r[0], pz_r[0] + nx))
-                    gy = min(pz_r[1] + pz_r[3], max(pz_r[1], pz_r[1] + ny))
-                else:
-                    gx = min(pz_r[0] + pz_r[2], max(pz_r[0], gx + random.uniform(-12, 12)))
-                    gy = min(pz_r[1] + pz_r[3], max(pz_r[1], gy + random.uniform(-8, 8)))
-            continue  # хват не удался — пробуем другую точку
-        if not _k_usable(k):
-            _release()
-            time.sleep(random.uniform(0.3, 0.5))
-            log.warning(f"drag: коэффициент мышь→кусок k={k} вне пригодной "
-                        f"полосы {K_USABLE} при живом куске (moved_px={_moved}) — "
-                        f"хват считаем несостоявшимся")
-            _attempt("drag", note="grip_fail", bx=bx, score=score,
-                     target_vx=round(target_vx, 1), k=k, grip=grip_mode,
-                     moved_px=_moved, no_move=False)
-            rng_x = random.uniform(-9, 9)
-            continue
-        if not (K_NOMINAL[0] <= k <= K_NOMINAL[1]):
-            # Кусок едет, но связка аномальна. Это НЕ поломка: доводим по
-            # измеренному коэффициенту и говорим об аномалии голосом, иначе
-            # «солвер едет по неверному масштабу» снова придётся выводить из
-            # разбора лога.
-            log.warning(f"drag: коэффициент мышь→кусок k={k:.3f} вне номинальной "
-                        f"полосы {K_NOMINAL} — довожу по измеренному и перемеряю "
-                        f"каждый шаг")
-            _attempt("drag", note="gain_offnominal", bx=bx, score=score,
-                     target_vx=round(target_vx, 1), k=round(k, 3),
-                     grip=grip_mode, moved_px=_moved)
-        px_now = r1.get("px") or r0.get("px")
-        err = px_now - target_vx
-        if abs(err) <= ACC:
-            time.sleep(random.uniform(0.15, 0.3))
-            _solved = _drop_and_confirm()
-            _attempt("drag", note="acc_ok", bx=bx, score=score,
-                     target_vx=round(target_vx, 1), k=k, calib=calib,
-                     settled=True, solved=_solved, grip=grip_mode)
-            return _solved
-        # большой сдвиг в ожидаемую позицию (остаточная ошибка докручивается).
-        # d_mouse — сдвиг МЫШИ, а не слайдера: k теперь полный коэффициент
-        # мышь→кусок, и подставлять его в координату мыши можно без домножения
-        # на связку мышь→слайдер.
-        d_mouse = _step_mouse(err, k)
-        if d_mouse == 0.0:
-            return _finish(stop="k_unusable", final_err=round(err, 2))
-        prev_px = px_now
-        prev_mouse = gx + calib + rng_x
-        dest = max(track[0] + 1,
-                   min(max_hx, prev_mouse + d_mouse + move_noise))
-        log.debug(f"drag to dest={dest:.1f} (err={err:.1f} d_mouse={d_mouse:.1f} "
-                  f"k={k:.3f} calib={calib})")
-        _shape = _human_drag(page, prev_mouse, gy, dest, gy, bound=max_hx,
-                             deadline=deadline)
-        log.debug(f"drag shape={_shape}")
-        time.sleep(random.uniform(0.15, 0.3))
-        cur = dest
-        settled = False
-        stuck = 0
-        iters = 0
-        for _i in range(MICRO_MAX_ITERS):
-            iters = _i + 1
-            _diag["iters"] = iters
+    try:
+        for _try in range(3):
             if deadline and time.monotonic() > deadline:
-                return _finish(stop="deadline_micro",
-                               final_err=round(err, 2) if last.get("px")
-                               is not None else None)
-            _t_read = time.monotonic()
-            rr = _read_settled(page, deadline)
-            _t_read = time.monotonic() - _t_read
-            _diag["t_read_s"] += _t_read
+                return _finish(stop="deadline_before_pick")
+            _t0_read = time.monotonic()
+            r0 = _read_sl_piece(page)
+            _diag["t_read_s"] += time.monotonic() - _t0_read
             _diag["probe_reads"] += 1
-            if not rr or rr.get("px") is None:
-                log.debug(f"drag i={_i} piece gone")
-                settled = True
-                _diag["stop"] = "piece_gone"
-                break
-            last = rr
-            err = (rr.get("px") or 0) - target_vx
-            _diag["final_err"] = round(err, 2)
-            # ПЕРЕМЕР коэффициента по факту: пара (Δмышь, Δкусок) прошлого
-            # шага — это единственное честное измерение в подвиревшей вкладке.
-            # Без этого доводка едет по модели, замеренной до первого же хода
-            # (см. _gain_update и разбор прогона 2026-10-07).
-            k_new, _k_ok = _gain_update(k, rr["px"] - prev_px,
-                                        cur - prev_mouse)
-            if _k_ok:
-                k = k_new
-                _diag["k_rem"] = _diag.get("k_rem", 0) + 1
-            _diag["k"] = round(float(k), 3)
-            log.debug(f"drag i={_i} px={rr.get('px')} s={rr.get('s')} "
-                      f"err={err:+.2f} k={k:.3f} t_read={_t_read:.2f}s")
-            if abs(err) <= ACC:
-                settled = True
-                _diag["stop"] = "acc_ok"
-                break
-            step_px = _step_mouse(err, k)
-            if step_px == 0.0:
-                _diag["stop"] = _diag.get("stop") or "k_unusable"
-                break
-            prev_px, prev_mouse = rr["px"], cur
-            _dest = max(track[0] + 1, min(max_hx, cur + step_px))
-            if abs(_dest - cur) < 0.3:
-                # Мёртвая зона: шаг по модели не меняет положение мыши. Две
-                # такие итерации подряд — модель не сходится, дальше крутить
-                # бессмысленно: дроп делается с тем, что есть (см. ниже).
-                _dest = cur
-                stuck += 1
-                if stuck >= 2:
-                    _diag["stop"] = _diag.get("stop") or "stuck"
-                    break
-            else:
-                stuck = 0
-            _t_move = time.monotonic()
-            _human_move(page, _human_path(cur, gy, _dest, gy,
-                                          n=10, arc=1.2),
-                        deadline=deadline)
-            # ТАЙМИНГ (2026-10-02): живой лог показал 11 с между соседними
-            # шагами при норме 0.4 с, то есть CDP-вызовы висят в 25 раз
-            # дольше. Разделение read/move отвечает на вопрос, что именно
-            # тормозит, а по догадке править нельзя.
-            _t_move = time.monotonic() - _t_move
-            _diag["t_move_s"] += _t_move
-            log.debug(f"drag i={_i} t_move={_t_move:.2f}s "
-                      f"t_step={_t_read + _t_move:.2f}s")
-            time.sleep(random.uniform(0.1, 0.24))
-            cur = _dest
-        else:
-            _diag["stop"] = _diag.get("stop") or "iters_exhausted"
-        _diag["settled"] = settled
-        log.debug(f"drag settle={settled} cur={cur:.1f}")
-        cur2 = cur
-        if last.get("px") is not None:
-            _e = (last.get("px") or 0) - target_vx
-            nudge_prev_px, nudge_prev_mouse = last["px"], cur2
-            for _n in range(random.randint(1, 3)):
-                if deadline and time.monotonic() > deadline:
-                    return _finish(stop="deadline_nudge",
-                                   final_err=round(_e, 2))
-                if abs(_e) <= 0.4:
-                    break
-                _sd = _step_mouse(_e, k, step_cap=NUDGE_STEP_CAP)
-                if _sd == 0.0:
-                    break
-                _nc = max(track[0] + 1, min(max_hx, cur2 + _sd))
-                _t_move = time.monotonic()
-                _human_move(page, _human_path(cur2, gy, _nc, gy, n=6, arc=0.8),
+            log.debug(f"drag try={_try} gx={gx:.1f} gy={gy:.1f} r0={r0} "
+                      f"t_read={time.monotonic() - _t0_read:.2f}s")
+            if not r0 or r0.get("px") is None:
+                # Кусок мог исчезнуть на пересборке капчи после неудачного дропа:
+                # img#puzzle грузируется заново через 0.3-2s. Поллинг; если не
+                # появился — это НЕ «пазл снят», а только реальное снятие
+                # челленджа даёт True (2026-09-22: ложные okc=True из no_piece
+                # раздували успехи и жечь свип по устаревшим кандидатам).
+                r0 = _wait_piece(page, deadline=deadline)
+                if r0 is None:
+                    _attempt("drag", note="no_piece", bx=bx, score=score,
+                             target_vx=round(target_vx, 1))
+                    return _await_verdict(page, left=_left(deadline)) != "no"
+            if _SIMPLE_DRAG:
+                # Один непрерывный драг: гипотеза, что возвратно-точный FSM
+                # (зонд вперёд + до 18 микрокоррекций) Ozon читает как
+                # «начал тянуть и бросил» и перезагружает пазл (наблюдение
+                # пользователя 2026-10-01). Включается флагом, чтобы можно было
+                # A/B сравнить на живых прогонах.
+                _solved = _simple_drag_once()
+                if _solved:
+                    return True
+                _release()
+                return False
+            # подвод мыши к точке хвата (визуально-естественно) затем нажим
+            _grip(gx, gy, rng_x)
+            time.sleep(random.uniform(0.05, 0.12))
+            # Калибровочный зонд по расстоянию до цели (НЕ фиксированные 40px):
+            # близкая лунка раньше перешагивалась зондом. Длина здесь не влияет на
+            # точность big-move: шаг считается от ФАКТИЧЕСКОГО px после зонда,
+            # т.е. dest = mouse + (target - px_now)/k — probe-agnostic.
+            calib = _calib_step(abs(target_vx - (r0.get("px") or 0)))
+            k = 1.0
+            r1 = r0
+            if calib > 0.0:
+                # калибровочный сдвиг человеческой траекторией. Дедлайн можно
+                # передавать: конечная координата зонда всё равно доставляется
+                # (см. _human_move), а измерение Δкусок/Δмышь от обрезки не
+                # зависит — оно и есть смысл зонда.
+                _t_probe = time.monotonic()
+                _human_move(page, _human_path(gx + rng_x, gy, gx + calib + rng_x, gy,
+                                              n=16, arc=3.0),
                             deadline=deadline)
-                _diag["t_move_s"] += time.monotonic() - _t_move
-                time.sleep(random.uniform(0.18, 0.45))
-                nudge_prev_mouse = cur2
-                cur2 = _nc
-                _t_read = time.monotonic()
-                rr2 = _read_settled(page, deadline)
-                _diag["t_read_s"] += time.monotonic() - _t_read
+                time.sleep(random.uniform(0.1, 0.22))
+                _t_probe = time.monotonic() - _t_probe
+                _t_r1 = time.monotonic()
+                # Замер после кадра страницы: без этого k считается по позиции
+                # с ПРОШЛОГО кадра (см. SETTLE_*).
+                r1 = _read_settled(page, deadline)
+                _t_r1 = time.monotonic() - _t_r1
+                _diag["t_move_s"] += _t_probe
+                _diag["t_read_s"] += _t_r1
                 _diag["probe_reads"] += 1
-                if not rr2 or rr2.get("px") is None:
+                k = _k_from_probe(r0, r1, calib, grip_mode)
+                _diag["k"] = None if k is None else round(float(k), 3)
+                log.debug(f"drag calib timing: t_probe={_t_probe:.2f}s "
+                          f"t_r1={_t_r1:.2f}s")
+            else:
+                # зона для зонда нет (цель вплотную): k неизвестен → берём
+                # консервативную 1.0 (недооценка скорее, чем перелёт) и отдаём
+                # доводку замкнутому контуру, который меряет реальный px каждый шаг.
+                log.debug(f"drag calib skipped dist="
+                          f"{abs(target_vx - (r0.get('px') or 0)):.1f} k=1.0")
+            # ЖИВОСТЬ ДРАГА. Если после mousedown + калибровочного зонда кусок/ручка
+            # не сдвинулись (|dpx| <= 1px) — мышь не зацепила цель, и никакая
+            # доводка это не спасёт. Это НЕ метрика, а поломка, поэтому она видна
+            # в логе голосом WARNING и отдельной записью no_move с фактическим
+            # сдвигом: иначе «пазл стоит, ничего не происходит» неотличимо от
+            # «мышь едет, но лунка не та» (наблюдение пользователя 2026-10-01).
+            _moved = None
+            if r1 and r1.get("px") is not None and r0.get("px") is not None:
+                _moved = round(r1["px"] - r0["px"], 2)
+            _LAST_MOVE[0] = _moved
+            _diag["moved_px"] = _moved
+            log.debug(f"drag r1={r1} calib={calib} moved_px={_moved} k={k}")
+            if k is None:
+                # ХВАТ НЕ УДАЛСЯ (кусок не поехал). Отделено от «коэффициент вне
+                # номинала»: полоса 0.4..3.0 раньше была общей для обоих случаев,
+                # и настоящий малый коэффициент (0.373 в замере 2026-10-07)
+                # объявлялся поломкой захвата — три полных зонда впустую.
+                _release()
+                time.sleep(random.uniform(0.3, 0.5))
+                log.warning(f"drag: КУСОК НЕ ДВИНУЛСЯ (moved_px={_moved}, "
+                            f"calib={calib:.1f}, grip={grip_mode} @"
+                            f"({gx:.0f},{gy:.0f}) bx={bx}) — мышь не зацепила "
+                            f"цель, доводка невозможна")
+                _attempt("drag", note="no_move", bx=bx, score=score,
+                         target_vx=round(target_vx, 1), calib=round(calib, 1),
+                         moved_px=_moved, gx=round(gx, 1), gy=round(gy, 1),
+                         grip=grip_mode)
+                _attempt("drag", note="grip_fail", bx=bx, score=score,
+                         target_vx=round(target_vx, 1), k=k, grip=grip_mode,
+                         moved_px=_moved, no_move=True)
+                rng_x = random.uniform(-9, 9)
+                if grip_mode == "piece":
+                    # При повторном хвате НЕ рандом: читаем живую непрозрачную точку
+                    # куска через canvas (точка с alpha>80 в css-боксе). CDN-маска
+                    # может не совпасть с рендером после перерисовки куска (grip_fail),
+                    # canvas-точка — это реальное изломанное положение на экране.
+                    off = _piece_grip_offset(page)
+                    if off:
+                        nx, ny = off
+                        gx = min(pz_r[0] + pz_r[2], max(pz_r[0], pz_r[0] + nx))
+                        gy = min(pz_r[1] + pz_r[3], max(pz_r[1], pz_r[1] + ny))
+                    else:
+                        gx = min(pz_r[0] + pz_r[2], max(pz_r[0], gx + random.uniform(-12, 12)))
+                        gy = min(pz_r[1] + pz_r[3], max(pz_r[1], gy + random.uniform(-8, 8)))
+                continue  # хват не удался — пробуем другую точку
+            if not _k_usable(k):
+                _release()
+                time.sleep(random.uniform(0.3, 0.5))
+                log.warning(f"drag: коэффициент мышь→кусок k={k} вне пригодной "
+                            f"полосы {K_USABLE} при живом куске (moved_px={_moved}) — "
+                            f"хват считаем несостоявшимся")
+                _attempt("drag", note="grip_fail", bx=bx, score=score,
+                         target_vx=round(target_vx, 1), k=k, grip=grip_mode,
+                         moved_px=_moved, no_move=False)
+                rng_x = random.uniform(-9, 9)
+                continue
+            if not (K_NOMINAL[0] <= k <= K_NOMINAL[1]):
+                # Кусок едет, но связка аномальна. Это НЕ поломка: доводим по
+                # измеренному коэффициенту и говорим об аномалии голосом, иначе
+                # «солвер едет по неверному масштабу» снова придётся выводить из
+                # разбора лога.
+                log.warning(f"drag: коэффициент мышь→кусок k={k:.3f} вне номинальной "
+                            f"полосы {K_NOMINAL} — довожу по измеренному и перемеряю "
+                            f"каждый шаг")
+                _attempt("drag", note="gain_offnominal", bx=bx, score=score,
+                         target_vx=round(target_vx, 1), k=round(k, 3),
+                         grip=grip_mode, moved_px=_moved)
+            px_now = r1.get("px") or r0.get("px")
+            err = px_now - target_vx
+            if abs(err) <= ACC:
+                time.sleep(random.uniform(0.15, 0.3))
+                _solved = _drop_and_confirm()
+                _attempt("drag", note="acc_ok", bx=bx, score=score,
+                         target_vx=round(target_vx, 1), k=k, calib=calib,
+                         settled=True, solved=_solved, grip=grip_mode)
+                return _solved
+            # большой сдвиг в ожидаемую позицию (остаточная ошибка докручивается).
+            # d_mouse — сдвиг МЫШИ, а не слайдера: k теперь полный коэффициент
+            # мышь→кусок, и подставлять его в координату мыши можно без домножения
+            # на связку мышь→слайдер.
+            d_mouse = _step_mouse(err, k)
+            if d_mouse == 0.0:
+                return _finish(stop="k_unusable", final_err=round(err, 2))
+            prev_px = px_now
+            prev_mouse = gx + calib + rng_x
+            dest = max(track[0] + 1,
+                       min(max_hx, prev_mouse + d_mouse + move_noise))
+            log.debug(f"drag to dest={dest:.1f} (err={err:.1f} d_mouse={d_mouse:.1f} "
+                      f"k={k:.3f} calib={calib})")
+            _shape = _human_drag(page, prev_mouse, gy, dest, gy, bound=max_hx,
+                                 deadline=deadline)
+            log.debug(f"drag shape={_shape}")
+            time.sleep(random.uniform(0.15, 0.3))
+            cur = dest
+            settled = False
+            stuck = 0
+            iters = 0
+            for _i in range(MICRO_MAX_ITERS):
+                iters = _i + 1
+                _diag["iters"] = iters
+                if deadline and time.monotonic() > deadline:
+                    return _finish(stop="deadline_micro",
+                                   final_err=round(err, 2) if last.get("px")
+                                   is not None else None)
+                _t_read = time.monotonic()
+                rr = _read_settled(page, deadline)
+                _t_read = time.monotonic() - _t_read
+                _diag["t_read_s"] += _t_read
+                _diag["probe_reads"] += 1
+                if not rr or rr.get("px") is None:
+                    log.debug(f"drag i={_i} piece gone")
+                    settled = True
+                    _diag["stop"] = "piece_gone"
                     break
-                k_new, _k_ok = _gain_update(k, rr2["px"] - nudge_prev_px,
-                                            cur2 - nudge_prev_mouse)
+                last = rr
+                err = (rr.get("px") or 0) - target_vx
+                _diag["final_err"] = round(err, 2)
+                # ПЕРЕМЕР коэффициента по факту: пара (Δмышь, Δкусок) прошлого
+                # шага — это единственное честное измерение в подвиревшей вкладке.
+                # Без этого доводка едет по модели, замеренной до первого же хода
+                # (см. _gain_update и разбор прогона 2026-10-07).
+                k_new, _k_ok = _gain_update(k, rr["px"] - prev_px,
+                                            cur - prev_mouse)
                 if _k_ok:
                     k = k_new
                     _diag["k_rem"] = _diag.get("k_rem", 0) + 1
-                    _diag["k"] = round(float(k), 3)
-                nudge_prev_px = rr2["px"]
-                _e = (rr2.get("px") or 0) - target_vx
-                _diag["final_err"] = round(_e, 2)
-                last = rr2
-                # settled означает «ошибка в допуске», а не «прочитали позицию»:
-                # прежняя строка ставила True безусловно, и паспорт врал.
-                settled = abs(_e) <= ACC
-        time.sleep(random.uniform(0.25, 0.4))
-        _solved = _drop_and_confirm()
-        _err_last = None
-        if last.get("px") is not None:
-            _err_last = round((last.get("px") or 0) - target_vx, 1)
-        _diag["settled"] = settled
-        _diag["final_err"] = _err_last
-        _diag["solved"] = bool(_solved)
-        _diag["stop"] = _diag.get("stop") or ("settle_end" if _solved
-                                              else "dropped_not_solved")
-        _attempt("drag", note="settle_end", bx=bx, score=score,
-                 target_vx=round(target_vx, 1), k=k, calib=calib,
-                 settled=settled,
-                 solved=_solved, err=_err_last, cur=round(cur, 1),
-                 iters=iters, k_rem=_diag.get("k_rem", 0),
-                 px=last.get("px"), s=last.get("s"),
-                 ps=last.get("ps"), ss=last.get("ss"), grip=grip_mode)
-        if _solved:
-            _diag["t_total_s"] = round(time.monotonic() - _t_drag, 2)
-            for _n in ("t_read_s", "t_move_s"):
-                _diag[_n] = round(_diag[_n], 2)
-            _LAST_DRAG_DIAG.clear()
-            _LAST_DRAG_DIAG.update(_diag)
-        else:
-            _finish()
-        return _solved
-    _release()
-    _attempt("drag", note="grip_exhausted", bx=bx, score=score,
-             target_vx=round(target_vx, 1))
-    return _finish(stop="grip_exhausted")
+                _diag["k"] = round(float(k), 3)
+                log.debug(f"drag i={_i} px={rr.get('px')} s={rr.get('s')} "
+                          f"err={err:+.2f} k={k:.3f} t_read={_t_read:.2f}s")
+                if abs(err) <= ACC:
+                    settled = True
+                    _diag["stop"] = "acc_ok"
+                    break
+                step_px = _step_mouse(err, k)
+                if step_px == 0.0:
+                    _diag["stop"] = _diag.get("stop") or "k_unusable"
+                    break
+                prev_px, prev_mouse = rr["px"], cur
+                _dest = max(track[0] + 1, min(max_hx, cur + step_px))
+                if abs(_dest - cur) < 0.3:
+                    # Мёртвая зона: шаг по модели не меняет положение мыши. Две
+                    # такие итерации подряд — модель не сходится, дальше крутить
+                    # бессмысленно: дроп делается с тем, что есть (см. ниже).
+                    _dest = cur
+                    stuck += 1
+                    if stuck >= 2:
+                        _diag["stop"] = _diag.get("stop") or "stuck"
+                        break
+                else:
+                    stuck = 0
+                _t_move = time.monotonic()
+                _human_move(page, _human_path(cur, gy, _dest, gy,
+                                              n=10, arc=1.2),
+                            deadline=deadline)
+                # ТАЙМИНГ (2026-10-02): живой лог показал 11 с между соседними
+                # шагами при норме 0.4 с, то есть CDP-вызовы висят в 25 раз
+                # дольше. Разделение read/move отвечает на вопрос, что именно
+                # тормозит, а по догадке править нельзя.
+                _t_move = time.monotonic() - _t_move
+                _diag["t_move_s"] += _t_move
+                log.debug(f"drag i={_i} t_move={_t_move:.2f}s "
+                          f"t_step={_t_read + _t_move:.2f}s")
+                time.sleep(random.uniform(0.1, 0.24))
+                cur = _dest
+            else:
+                _diag["stop"] = _diag.get("stop") or "iters_exhausted"
+            _diag["settled"] = settled
+            log.debug(f"drag settle={settled} cur={cur:.1f}")
+            cur2 = cur
+            if last.get("px") is not None:
+                _e = (last.get("px") or 0) - target_vx
+                nudge_prev_px, nudge_prev_mouse = last["px"], cur2
+                for _n in range(random.randint(1, 3)):
+                    if deadline and time.monotonic() > deadline:
+                        return _finish(stop="deadline_nudge",
+                                       final_err=round(_e, 2))
+                    if abs(_e) <= 0.4:
+                        break
+                    _sd = _step_mouse(_e, k, step_cap=NUDGE_STEP_CAP)
+                    if _sd == 0.0:
+                        break
+                    _nc = max(track[0] + 1, min(max_hx, cur2 + _sd))
+                    _t_move = time.monotonic()
+                    _human_move(page, _human_path(cur2, gy, _nc, gy, n=6, arc=0.8),
+                                deadline=deadline)
+                    _diag["t_move_s"] += time.monotonic() - _t_move
+                    time.sleep(random.uniform(0.18, 0.45))
+                    nudge_prev_mouse = cur2
+                    cur2 = _nc
+                    _t_read = time.monotonic()
+                    rr2 = _read_settled(page, deadline)
+                    _diag["t_read_s"] += time.monotonic() - _t_read
+                    _diag["probe_reads"] += 1
+                    if not rr2 or rr2.get("px") is None:
+                        break
+                    k_new, _k_ok = _gain_update(k, rr2["px"] - nudge_prev_px,
+                                                cur2 - nudge_prev_mouse)
+                    if _k_ok:
+                        k = k_new
+                        _diag["k_rem"] = _diag.get("k_rem", 0) + 1
+                        _diag["k"] = round(float(k), 3)
+                    nudge_prev_px = rr2["px"]
+                    _e = (rr2.get("px") or 0) - target_vx
+                    _diag["final_err"] = round(_e, 2)
+                    last = rr2
+                    # settled означает «ошибка в допуске», а не «прочитали позицию»:
+                    # прежняя строка ставила True безусловно, и паспорт врал.
+                    settled = abs(_e) <= ACC
+            time.sleep(random.uniform(0.25, 0.4))
+            _solved = _drop_and_confirm()
+            _err_last = None
+            if last.get("px") is not None:
+                _err_last = round((last.get("px") or 0) - target_vx, 1)
+            _diag["settled"] = settled
+            _diag["final_err"] = _err_last
+            _diag["solved"] = bool(_solved)
+            _diag["stop"] = _diag.get("stop") or ("settle_end" if _solved
+                                                  else "dropped_not_solved")
+            _attempt("drag", note="settle_end", bx=bx, score=score,
+                     target_vx=round(target_vx, 1), k=k, calib=calib,
+                     settled=settled,
+                     solved=_solved, err=_err_last, cur=round(cur, 1),
+                     iters=iters, k_rem=_diag.get("k_rem", 0),
+                     px=last.get("px"), s=last.get("s"),
+                     ps=last.get("ps"), ss=last.get("ss"), grip=grip_mode)
+            if _solved:
+                _diag["t_total_s"] = round(time.monotonic() - _t_drag, 2)
+                for _n in ("t_read_s", "t_move_s"):
+                    _diag[_n] = round(_diag[_n], 2)
+                _LAST_DRAG_DIAG.clear()
+                _LAST_DRAG_DIAG.update(_diag)
+            else:
+                _finish()
+            return _solved
+        _release()
+        _attempt("drag", note="grip_exhausted", bx=bx, score=score,
+                 target_vx=round(target_vx, 1))
+        return _finish(stop="grip_exhausted")
+    finally:
+        _release()
 
 
 def _piece_grip_offset(page):

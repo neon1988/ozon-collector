@@ -69,8 +69,18 @@ class TestNormalizeReview:
 
 class TestApiPlan:
     def test_allowed_without_variant(self):
-        ok, why = ozon_fetch.api_plan({})
+        ok, why = ozon_fetch.api_plan({}, apply_variant_mode=False)
         assert ok is True and why == "ok"
+
+    def test_refused_for_native_variant_mode(self):
+        """Нативный «Этот вариант» (дефолт) закрывает API: merge не умеет
+        фильтровать чужие варианты — смешение в raw ломает I1."""
+        ok, why = ozon_fetch.api_plan({}, apply_variant_mode=True)
+        assert ok is False and why == "variant_mode_native"
+
+    def test_native_mode_is_default_refusal(self):
+        """Забытый аргумент не открывает API-путь молча (fail-safe)."""
+        assert ozon_fetch.api_plan({})[1] == "variant_mode_native"
 
     def test_refused_for_variant(self):
         """API не умеет фильтр «Этот вариант» — отзыв чужого варианта попадёт."""
@@ -78,10 +88,12 @@ class TestApiPlan:
         assert ok is False and "variant_filter" in why
 
     def test_empty_variant_values_ignored(self):
-        assert ozon_fetch.api_plan({"Цвет": ""})[0] is True
+        assert ozon_fetch.api_plan(
+            {"Цвет": ""}, apply_variant_mode=False)[0] is True
 
     def test_no_dom_extras_reason(self):
-        ok, why = ozon_fetch.api_plan(None, need_dom_extras=False)
+        ok, why = ozon_fetch.api_plan(None, need_dom_extras=False,
+                                      apply_variant_mode=False)
         assert ok is True and why == "no_dom_extras"
 
 
@@ -189,29 +201,43 @@ class TestPrepass:
         assert tel["used"] is False
         assert "variant_filter" in tel["reason"]
 
+    def test_native_variant_mode_blocks_api(self):
+        """apply_variant_mode (дефолт) закрывает предсрез целиком: API-отзывы
+        не несут variant-поля, merge добавил бы чужие варианты (I1)."""
+        page = _FakePage([_api_payload([{"uuid": "a", "text": "x"}])])
+        tel = C._reviews_api_prepass(page, "42", {}, 370, None, True,
+                                     apply_variant_mode=True)
+        assert tel["used"] is False
+        assert tel["reason"] == "variant_mode_native"
+        assert page.urls == [], "запрос к API не должен уходить вообще"
+
     def test_partial_when_below_rating_count(self):
         page = _FakePage([_api_payload([{"uuid": "a", "text": "x"}])])
-        tel = C._reviews_api_prepass(page, "42", {}, 370, None, True)
+        tel = C._reviews_api_prepass(page, "42", {}, 370, None, True,
+                                     apply_variant_mode=False)
         assert tel["used"] is True and tel["fetched"] == 1
         assert tel["complete"] is False and tel["reason"] == "partial"
         assert tel["elapsed_ms"] >= 0
 
     def test_complete_when_covers_rating_count(self):
         page = _FakePage([_api_payload([{"uuid": "a", "text": "x"}])])
-        tel = C._reviews_api_prepass(page, "42", {}, 1, None, True)
+        tel = C._reviews_api_prepass(page, "42", {}, 1, None, True,
+                                     apply_variant_mode=False)
         assert tel["complete"] is True and tel["reason"] == "complete"
 
     def test_multi_sort_never_short_circuits(self):
         """Мульти-сорт даёт разные выборки — API их не заменяет."""
         page = _FakePage([_api_payload([{"uuid": "a", "text": "x"}])])
         tel = C._reviews_api_prepass(page, "42", {}, 1,
-                                     ["published_at_desc"], True)
+                                     ["published_at_desc"], True,
+                                     apply_variant_mode=False)
         assert tel["complete"] is False
 
     def test_error_is_swallowed(self):
         """Ошибка транспорта не должна ронять товар — DOM остаётся путём."""
         page = _FakePage([RuntimeError("page gone")])
-        tel = C._reviews_api_prepass(page, "42", {}, 370, None, True)
+        tel = C._reviews_api_prepass(page, "42", {}, 370, None, True,
+                                     apply_variant_mode=False)
         assert tel["used"] is False and tel["fetched"] == 0
         assert tel["reason"] in ("fetch_failed",) or tel["reason"].startswith(
             "error:")
@@ -220,7 +246,7 @@ class TestPrepass:
         with patch.object(ozon_fetch, "fetch_slice",
                           side_effect=ValueError("boom")):
             tel = C._reviews_api_prepass(_FakePage([]), "42", {}, 370, None,
-                                         True)
+                                         True, apply_variant_mode=False)
         assert tel["used"] is False
         assert tel["reason"] == "error:ValueError"
         assert tel["reviews"] == []
@@ -243,7 +269,7 @@ class _StageRecorder:
 
 
 def _stage(recorder, pid="42", rating_count=370, sorts=None, api=True,
-           api_reviews=None):
+           api_reviews=None, variant_mode=False):
     from unittest.mock import patch as _patch
     with _patch.object(C, "collect_reviews", recorder), \
          _patch.object(ozon_fetch, "fetch_slice",
@@ -253,7 +279,7 @@ def _stage(recorder, pid="42", rating_count=370, sorts=None, api=True,
                                      "complete_url": "", "error": ""}):
         return C._collect_reviews_stage(
             _FakeSess(), "https://ozon.ru/p/42/?tab=reviews", {}, rating_count,
-            pid, 12, 40, True, sorts, {}, False, api)
+            pid, 12, 40, variant_mode, sorts, {}, False, api)
 
 
 class TestReviewsStage:
@@ -262,6 +288,17 @@ class TestReviewsStage:
         reviews, pages, _pl, _vm, tel = _stage(rec, api=False)
         assert rec.max_pages == 12, "без API докручиваем как раньше"
         assert tel["used"] is False
+        assert [r["uuid"] for r in reviews] == ["d1"]
+
+    def test_native_variant_mode_blocks_api_in_stage(self):
+        """Дефолтный variant-режим: API-добавок нет, DOM докручивается полно."""
+        rec = _StageRecorder([{"uuid": "d1"}])
+        reviews, _p, _pl, _vm, tel = _stage(
+            rec, rating_count=1, api_reviews=[{"uuid": "a", "text": "x"}],
+            variant_mode=True)
+        assert rec.max_pages == 12
+        assert tel["used"] is False and tel["reason"] == "variant_mode_native"
+        assert "api_added" not in tel
         assert [r["uuid"] for r in reviews] == ["d1"]
 
     def test_partial_api_does_not_limit_dom(self):
