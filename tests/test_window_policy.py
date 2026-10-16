@@ -282,6 +282,22 @@ def test_event_is_logged_for_measurement(monkeypatch, caplog):
     assert "9222" in caplog.text
 
 
+def test_events_mirror_to_project_log(monkeypatch, caplog):
+    """Записи сторожа дублируются в проектный лог: daemon-лог был слеп к
+    событиям сторожа — жалобу «окна открываются» нечем было проверить
+    (разбор 2026-10-16)."""
+    seen = []
+    monkeypatch.setattr(wp.plog, "debug",
+                        lambda msg, extra=None: seen.append(("debug", msg)))
+    monkeypatch.setattr(wp.plog, "warning",
+                        lambda msg, extra=None: seen.append(("warning", msg)))
+    with caplog.at_level("DEBUG", logger="ozon_collector.window_policy"):
+        wp.log.info("window_policy: тестовое событие")
+        wp.log.warning("window_policy: тестовое предупреждение")
+    assert ("debug", "window_policy: тестовое событие") in seen
+    assert ("warning", "window_policy: тестовое предупреждение") in seen
+
+
 @pytest.mark.skipif(wp.os.name != "nt", reason="Win32: нужен Windows")
 def test_real_win32_enumeration_is_read_only():
     """Живой Win32: только ПЕРЕЧИСЛЕНИЕ окон, без единого действия над ними.

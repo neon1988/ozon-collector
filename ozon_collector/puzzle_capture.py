@@ -235,7 +235,6 @@ def _bring_to_front(page, reason_box=None) -> bool:
     hid = ensure_render_window(page)
     try:
         page.bring_to_front()
-        time.sleep(0.25)
         if reason_box is not None:
             reason_box[0] += " front=ok"
     except Exception as e:
@@ -244,8 +243,12 @@ def _bring_to_front(page, reason_box=None) -> bool:
         else:
             log.debug(f"bring_to_front failed: {type(e).__name__}: {e}")
         return False
+    # Прячем СРАЗУ после активации: bring_to_front может показать окно, и пауза
+    # до пересъёмки должна идти уже скрытыми (показ окна — жалоба «окна
+    # вылезают», замер 2026-10-16).
     if ensure_render_window(page):
         hid = True
+    time.sleep(0.25)
     if hid and reason_box is not None:
         reason_box[0] += " win=hidden"
     return True

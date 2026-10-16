@@ -171,6 +171,9 @@ public class ChromeLaunch {
     [DllImport("kernel32.dll")]
     static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
     public const int STARTF_USESHOWWINDOW = 0x00000001;
     public const short SW_HIDE = 0;
     public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
@@ -223,6 +226,10 @@ if ($listener -or $httpBusy) {
 # Полная командная строка: chrome.exe + аргументы (CreateProcessW, Unicode).
 $allArgs = @($chromeArgs) + @($proxyArg)
 $cmdLine = "`"$Chrome`" " + (($allArgs | Where-Object { $_ }) -join " ")
+# Фокус запоминаем ДО запуска: Chrome крадёт его через 0.3-0.4 с после
+# CreateProcess (замер 2026-10-06), и поздний захват сделал бы «предыдущим»
+# сам Chrome — Restore-Focus возвращал бы фокус ему (пустышка).
+$prevFg = [ChromeLaunch]::GetForegroundWindow()
 $targetPid = [ChromeLaunch]::Launch($cmdLine)
 if ($targetPid -lt 0) {
     Write-Host "Не удалось запустить Chromium (CreateProcess, Win32Error=$(-$targetPid))" -ForegroundColor Red
@@ -354,7 +361,6 @@ public static class TaskbarTab {
     }
 }
 "@
-$prevFg = [FocusSave]::GetForegroundWindow()
 
 function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
     # Применяет к окну WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW, НЕ показывая его:
@@ -376,6 +382,9 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
         if ($h -ne [IntPtr]::Zero) {
             $style = [LaunchChromeMin]::GetWindowLong($h, $GWL_EXSTYLE)
             [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $style -bor $WS_EX_NOACTIVATE -bor $WS_EX_TOOLWINDOW) | Out-Null
+            # SW_HIDE безусловно: если окно всё-таки успело показаться, смена
+            # стилей его не прячет и оно остаётся видимым до сторожа (2-7 с).
+            [LaunchChromeMin]::ShowWindow($h, 0) | Out-Null
             [void][TaskbarTab]::Delete($h)   # снять кнопку панели задач: смена TOOLWINDOW уже созданную не убирает
             return $true
         }
@@ -412,6 +421,12 @@ function Restore-Focus {
 # Первый проход: находим окно и ставим WS_EX_NOACTIVATE как можно раньше,
 # НЕ показывая его (оно скрыто с рождения — SW_HIDE).
 $minimized = Invoke-MinimizeNoActivate $targetPid 10000
+
+# Chrome крадёт фокус через 0.3-0.4 с после старта (замер 2026-10-06). Даём
+# краже случиться и сразу возвращаем фокус на место: иначе окно пользователя
+# стоит без фокуса все ~6 с ожидания порта и до connect демона.
+Start-Sleep -Milliseconds 500
+Restore-Focus -PrevFg $prevFg
 
 # Ждём, пока CDP-порт ответит: к этому моменту Chrome закончил старт и
 # свои попытки активации окна (мелькание).
@@ -472,6 +487,11 @@ if (-not $ready) {
 if (-not $minimized) {
     $minimized = Invoke-MinimizeNoActivate $targetPid 3000
 }
+# Фокус: Chrome крадёт его на старте (SetForegroundWindow, замер 2026-10-06),
+# а демон-сторож вернёт его только к connect (2-7 с) — всё это время окно
+# пользователя без фокуса. Вызов был потерян при переписывании лаунчера,
+# функция Restore-Focus оставалась мёртвой; возвращён 2026-10-16.
+Restore-Focus -PrevFg $prevFg
 if ($minimized) {
     Write-Host "OK: окно PID $targetPid скрыто, стиль TOOLWINDOW|NOACTIVATE применён"
 } else {

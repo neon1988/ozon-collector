@@ -51,7 +51,31 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Dict, Iterable, NamedTuple, Optional
 
+from . import log as plog
+
+
+class _ProjectLogBridge(logging.Handler):
+    """Дублирует записи сторожа в файл проектного лога (daemon-логи).
+
+    Стандартный logging к файлу демона не подключён: события сторожа («было
+    видимо», «убран из охраны», возврат фокуса) в логах не были видны, и
+    жалобу «окна открываются» нечем было проверить (разбор 2026-10-16).
+    События идут в файл (debug), предупреждения — и в консоль.
+    """
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            if record.levelno >= logging.WARNING:
+                plog.warning(record.getMessage())
+            else:
+                plog.debug(record.getMessage())
+        except Exception:
+            pass
+
+
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
+log.addHandler(_ProjectLogBridge())
 
 # Интервал опроса: окно в normal живёт у нас ~1.4 с (замер), 150 мс даёт
 # ~10 кадров на событие и не грузит CPU (EnumWindows по всем окнам <1 мс).
