@@ -15,6 +15,11 @@
 # Restore clears WS_EX_NOACTIVATE so the user can interact with the page and
 # keeps WS_EX_TOOLWINDOW so the button does not come back; the launcher and
 # cdp.Session re-add NOACTIVATE on every collector minimize.
+#
+# Minimize also calls ITaskbarList::DeleteTab + SW_HIDE/SW_SHOWMINNOACTIVE:
+# changing WS_EX_TOOLWINDOW alone does NOT remove a taskbar button that was
+# already created at window birth — Explorer must re-create the state (live
+# finding 2026-10-16: styles were on, buttons stayed).
 
 param(
     [switch]$List,
@@ -45,7 +50,8 @@ public class CollectorTrayWin {
     public const int WS_EX_NOACTIVATE = 0x08000000;
     public const int WS_EX_TOOLWINDOW = 0x00000080;
     public const int SW_RESTORE = 9;
-    public const int SW_MINIMIZE = 6;
+    public const int SW_HIDE = 0;
+    public const int SW_SHOWMINNOACTIVE = 7;
 
     public static List<IntPtr> FindByPids(int[] pids) {
         var set = new HashSet<int>(pids);
@@ -82,7 +88,35 @@ public class CollectorTrayWin {
     public static void Minimize(IntPtr h) {
         int st = GetWindowLong(h, GWL_EXSTYLE);
         SetWindowLong(h, GWL_EXSTYLE, st | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
-        ShowWindow(h, SW_MINIMIZE);
+        TaskbarTab.Delete(h);
+        ShowWindow(h, SW_HIDE);
+        ShowWindow(h, SW_SHOWMINNOACTIVE);
+    }
+}
+
+[ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090")]
+public class CTaskbarList { }
+
+[ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ITaskbarList {
+    void HrInit();
+    void AddTab(IntPtr hwnd);
+    void DeleteTab(IntPtr hwnd);
+    void ActivateTab(IntPtr hwnd);
+    void SetActiveAlt(IntPtr hwnd);
+}
+
+public static class TaskbarTab {
+    public static bool Delete(IntPtr h) {
+        try {
+            var t = (ITaskbarList)new CTaskbarList();
+            t.HrInit();
+            t.DeleteTab(h);
+            return true;
+        } catch {
+            return false;
+        }
     }
 }
 "@
