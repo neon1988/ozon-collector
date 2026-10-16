@@ -123,6 +123,25 @@ class TestDaemonTrayLifecycle:
         assert captured["idents"] == sentinel
         assert captured["wait_s"] == k._TRAY_KILL_WAIT_S
 
+    @pytest.mark.skipif(os.name != "nt", reason="трей — Windows-only")
+    def test_spawn_clears_stale_user_visible_flag(self, monkeypatch):
+        """Залипший флаг видимых окон (трей убили taskkill'ом) при старте
+        сбора снимается, иначе сторож молчал бы весь прогон."""
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delenv("OZON_TRAY", raising=False)
+        monkeypatch.setattr(k, "_kill_stale_trays", lambda: [])
+        from ozon_collector import window_policy
+        called = []
+        monkeypatch.setattr(window_policy, "clear_user_visible",
+                            lambda: called.append(1))
+
+        class FakeProc:
+            pid = 4322
+
+        monkeypatch.setattr(k.subprocess, "Popen", lambda *a, **kw: FakeProc())
+        assert k._start_tray_companion() is not None
+        assert called, "key_daemon не снял залипший флаг user-visible"
+
     def test_main_passes_no_tray_flag(self, monkeypatch):
         monkeypatch.setattr(k, "run_campaign", lambda **kw: {
             "campaign": kw["campaign"], "target_count": 5, "min_valid": 1,
@@ -182,3 +201,72 @@ def test_tray_hide_uses_sw_hide_not_show_minimized():
     assert "SW_SHOWMINNOACTIVE" not in code, \
         "трей снова показывает окно свёрнутым (плитка-призрак)"
     assert "ShowWindow(h, SW_HIDE)" in code, "трей не прячет окно через SW_HIDE"
+
+
+def test_tray_restore_makes_normal_taskbar_window():
+    """«Развернуть окна сбора» → обычное окно на панели задач, не «toolbox».
+
+    Требование владельца 2026-10-16: «пусть уж будут на панель задач а не в
+    toolbox». Значит Restore снимает ОБА EX-стиля (TOOLWINDOW убирает
+    toolbox-вид и Alt+Tab-исключение, NOACTIVATE — блокировку ввода) и явно
+    создаёт кнопку: Explorer не создаёт её для окна, рождённого скрытым
+    (живая находка 2026-10-16: стили сняты, кнопки не появились сами).
+    """
+    t = _text(TRAY)
+    assert "& ~WS_EX_NOACTIVATE & ~WS_EX_TOOLWINDOW" in t, \
+        "Restore не снимает оба EX-стиля"
+    assert "TaskbarTab.Add(h)" in t, "Restore не создаёт кнопку панели задач"
+    assert "t.AddTab(h)" in t, "AddTab не вызывается у COM-объекта"
+
+
+def test_tray_user_visible_flag_contract():
+    """Флаг data/window_visible.flag — контракт трея с Python-сторожем.
+
+    Пока окна показаны, сторож (window_policy.user_visible) и проба окна в
+    пайплайне пазла не должны ничего прятать. Флаг ставится в Show и
+    снимается в Hide/Close-Tray; патруль панели задач при флаге спит.
+    """
+    t = _text(TRAY)
+    assert "window_visible.flag" in t, "трей не пишет флаг user-visible"
+    assert "Set-UserVisibleFlag" in t
+    assert "Clear-UserVisibleFlag" in t
+    show = t.index("function Show-CollectorWindows")
+    hide = t.index("function Hide-CollectorWindows")
+    show_body = t[show:hide]
+    assert show_body.index("Set-UserVisibleFlag") < show_body.index("Restore($h)"), \
+        "флаг ставится после показа (сторож успеет спрятать окно)"
+
+
+def test_tray_reconcile_enforces_both_modes():
+    """Трей — переключатель РЕЖИМА (слова владельца 2026-10-16): visible —
+    «должны показываться» (патруль возвращает скрытое окно нового воркера),
+    hidden — «не должны показываться» (патруль прячет самовольно показанное).
+    """
+    t = _text(TRAY)
+    rec = t[t.index("function Reconcile-CollectorWindows"):]
+    rec = rec[:rec.index("if ($List)")]
+    assert "Test-UserVisibleFlag" in rec, "патруль не читает режим"
+    assert "RestoreBackground" in rec, \
+        "visible-режим не восстанавливает скрытые окна"
+    assert "Minimize($h)" in rec, \
+        "hidden-режим не прячет самовольно показанное окно"
+    assert "EnsureNoTaskbar" in rec, "патруль не чистит кнопки панели задач"
+
+
+def test_tray_exit_stops_daemon():
+    """«Выход» останавливает и сбор, а не только иконку.
+
+    Ответ владельца 2026-10-16 на уточнение: «Выход завершает и сбор».
+    Механика: Ctrl+C в консоль демона (graceful SIGINT → INTERRUPTED), при
+    повторном клике — форс-путь, при неудаче — Stop-Process. Живая проверка
+    -SendCtrlC выполняется отдельно; здесь — контракт кода.
+    """
+    t = _text(TRAY)
+    assert "$itemExit.add_Click({ Stop-Daemon })" in t, \
+        "«Выход» снова только закрывает иконку"
+    assert "GenerateConsoleCtrlEvent" in t, "нет Ctrl+C в консоль демона"
+    assert "AttachConsole" in t, "нет привязки к консоли демона"
+    assert "SetConsoleCtrlHandler" in t, "трей убьёт себя своим же Ctrl+C"
+    assert "[int]$SendCtrlC = 0" in t and "Send-TrayCtrlC" in t, \
+        "нет скрытого CLI -SendCtrlC для живой проверки"
+    assert "Stop-DaemonHard" in t, "нет жёсткого fallback-пути"

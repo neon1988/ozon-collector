@@ -17,13 +17,22 @@
    уйти в foreground и через минуту, когда лаунчер давно отработал.
 
 Поэтому лечение симптома, а не «одной строки»: фоновый сторож, который держит
-инвариант «окно браузера коллектора свёрнуто, фокус принадлежит пользователю».
+инвариант «окно браузера коллектора скрыто, фокус принадлежит пользователю».
 Источник событий логируется, чтобы при следующем живом прогоне было видно, кто
 именно показывает окно.
+
+Обновление 2026-10-16 (мандат владельца: окна «вылезают» сами — их видно):
+теперь окна коллектора рождаются скрытыми (SW_HIDE от CreateProcess), кадры
+на скрытом окне идут, а всплытие — это Chrome/Windows, показавшие окно через
+30-40 с после старта. Сторож снова ВКЛЮЧЁН ПО УМОЛЧАНИЮ (выключить:
+`OZON_WINDOW_GUARD=0`). Исключение из инварианта — флаг
+`data/window_visible.flag`: его ставит трей, когда пользователь сам развернул
+окна сбора («Развернуть окна сбора»); пока флаг есть, сторож спит.
 
 Что guard НЕ делает (намеренно):
 - не трогает окна чужих браузеров: фильтр по pid, зарегистрированным Session
   с `browser_owner == "collector"`; чужой Chrome пользователя не сворачивается;
+- не трогает НИЧЕГО, пока пользователь развернул окна из трея (флаг-файл);
 - не работает в режиме `--window-mode visible` (там окно должно быть видно);
 - не трогает Firefox: у него своя политика (свёрнутое окно не рендерит lazy-блоки,
   см. cdp._apply_window_policy);
@@ -39,6 +48,7 @@ import os
 import threading
 import time
 from ctypes import wintypes
+from pathlib import Path
 from typing import Dict, Iterable, NamedTuple, Optional
 
 log = logging.getLogger(__name__)
@@ -66,18 +76,35 @@ FOCUS_RETRY_S = 3.0
 # редко.
 IDENTITY_RECHECK_S = 15.0
 
-# Ручное открытие окна пользователем уважается: окно браузера коллектора не
-# надо сворачивать, если пользователь сам его открыл («восстановить» в
-# контекстном меню таскбара). Признак ручного действия — свежий РЕАЛЬНЫЙ ввод:
-# Windows не учитывает программные вызовы и SendInput в GetLastInputInfo,
-# поэтому «Chromium сам показал» и «пользователь кликнул» различимы (замер
-# 2026-10-06). Держим окно не дольше HOLD_S, иначе забытый открытый браузер
-# останется висеть навсегда.
-INPUT_FRESH_S = 1.5
-try:
-    HOLD_S = float(os.environ.get("OZON_WINDOW_HOLD_S", "300"))
-except ValueError:          # «5m», «не число» → дефолт, а не ImportError
-    HOLD_S = 300.0
+# «Пользователь смотрит окна сбора»: флаг-файл ставит/снимает трей-пульт
+# («Развернуть окна сбора» / «Свернуть окна сбора»), а при старте сбора его
+# снимает key_daemon (clear_user_visible — на случай трея прошлого запуска,
+# убитого жёстко). Пока файл есть, сторож НИЧЕГО не трогает: ни окна, ни
+# фокус — пользователь осознанно развернул окна и работает с ними.
+# Раньше это состояние угадывалось по свежести реального ввода
+# (INPUT_FRESH_S/HOLD_S); от эвристики отказались 2026-10-16: всплывающий
+# Chrome крадёт фокус, и «пользователь печатает» ошибочно принималось за
+# «пользователь открыл окно» — окно оставалось на экране (ровно то, на что
+# жалуется владелец).
+USER_VISIBLE_FLAG = (Path(__file__).resolve().parent.parent
+                     / "data" / "window_visible.flag")
+
+
+def user_visible() -> bool:
+    """Пользователь развернул окна сбора из трея (флаг активен)."""
+    try:
+        return USER_VISIBLE_FLAG.exists()
+    except OSError:            # сбой ФС — не повод падать и не повод молчать
+        return False
+
+
+def clear_user_visible() -> None:
+    """Снять залипший флаг (вызов при старте сбора, из key_daemon)."""
+    try:
+        USER_VISIBLE_FLAG.unlink(missing_ok=True)
+    except OSError as e:
+        log.debug(f"window_policy: clear_user_visible err "
+                  f"{type(e).__name__}: {e}")
 
 
 class WindowRow(NamedTuple):
@@ -428,35 +455,6 @@ def _kernel32():
         return None
 
 
-class _LastInputInfo(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-
-def last_input_age_s():
-    """Секунд с последнего РЕАЛЬНОГО ввода пользователя (None — неизвестно).
-
-    Ключевое измеренное свойство (2026-10-06): программные вызовы
-    ShowWindow/SetForegroundWindow и SendInput НЕ обновляют GetLastInputInfo.
-    Поэтому окно, «прыгнувшее» от Chromium, отличается от окна, открытого
-    кликом пользователя, — без подмены фокуса и без хуков.
-    """
-    user32 = _user32()
-    k32 = _kernel32()
-    if user32 is None or k32 is None:
-        return None
-    _setup_api(user32)
-    try:
-        info = _LastInputInfo()
-        info.cbSize = ctypes.sizeof(info)
-        if not user32.GetLastInputInfo(ctypes.byref(info)):
-            return None
-        now_ms = k32.GetTickCount() & 0xFFFFFFFF
-        return ((now_ms - info.dwTime) & 0xFFFFFFFF) / 1000.0
-    except Exception as e:
-        log.debug(f"window_policy: last_input_age err {type(e).__name__}: {e}")
-        return None
-
-
 def _pid_alive(pid: int) -> bool:
     """Жив ли процесс (быстро: OpenProcess + код выхода, без WMI)."""
     k32 = _kernel32()
@@ -524,7 +522,7 @@ class WindowGuard:
         self._thread: Optional[threading.Thread] = None
         self._last_fg: Optional[int] = None       # последнее «пользовательское» окно
         self._last_focus_try: float = 0.0
-        self._holds: Dict[int, float] = {}           # hwnd -> момент открытия
+        self._uv_logged = False                    # «сторож спит» в лог один раз
         self._identity_checked: Dict[int, float] = {}  # pid -> когда сверяли порт
         self._fixed = 0                           # счётчик для телеметрии
         self._focus_fixed = 0
@@ -610,49 +608,24 @@ class WindowGuard:
                      f"окна этого процесса не трогаем")
         return [p for p, _ in stale]
 
-    def _user_opened(self, row, fg, age) -> bool:
-        """Открыл ли окно пользователь сам (а не Chromium изнутри).
-
-        Два условия, оба измерены:
-        - свежий РЕАЛЬНЫЙ ввод (age <= INPUT_FRESH_S): программные ShowWindow
-          и SendInput в GetLastInputInfo не попадают, значит клик по таскбару
-          виден, а «прыжок» Chromium — нет;
-        - фокус на НАШЕМ окне: если фокус у пользователя (он печатает/работает),
-          а окно браузера просто выскочило, уважать его нельзя — свернём.
-        """
-        if age is None or age > INPUT_FRESH_S:
-            return False
-        if fg is not None and fg.hwnd != row.hwnd:
-            return False
-        if row.hwnd not in self._holds:
-            log.info(f"window_policy: окно pid={row.pid} открыто пользователем "
-                     f"(ввод {age:.2f}с назад) — не сворачиваю "
-                     f"{HOLD_S:.0f}с, фокус не отбираю")
-        self._holds.setdefault(row.hwnd, time.monotonic())
-        return True
-
-    def _hold_active_for(self, hwnd: int) -> bool:
-        """Удерживается ли окно hwnd открытым пользователем (и не истекло)."""
-        started = self._holds.get(hwnd)
-        if started is None:
-            return False
-        if time.monotonic() - started > HOLD_S:
-            self._holds.pop(hwnd, None)
-            return False
-        return True
-
-    def _hold_active(self, row) -> bool:
-        """Окно удерживается открытым пользователем (и ещё не истекло)."""
-        return self._hold_active_for(row.hwnd)
-
     def tick(self) -> dict:
-        """Одна итерация: вернуть инвариант «окно свёрнуто, фокус у пользователя».
+        """Одна итерация: вернуть инвариант «окно скрыто, фокус у пользователя».
 
-        Исключение из инварианта — окно, открытое пользователем руками: оно не
-        сворачивается HOLD_S секунд и не отбирает фокус.
+        Единственное исключение — флаг user_visible(): трей развернул окна для
+        пользователя, и сторож не трогает ни окна, ни фокус, пока флаг стоит.
 
         Возвращает счётчики (для тестов и телеметрии).
         """
+        if user_visible():
+            if not self._uv_logged:
+                self._uv_logged = True
+                log.info("window_policy: окна развёрнуты пользователем (трей) — "
+                         "сторож спит, окна не трогаю")
+            return {"unminimized": 0, "focus_restored": 0}
+        if self._uv_logged:
+            self._uv_logged = False
+            log.info("window_policy: флаг трея снят — сторож снова следит "
+                     "за окнами")
         # Реестр чистим ПЕРВЫМ делом: упавший браузер оставляет pid в реестре, а
         # Windows переиспользует pid — дальше по нему сворачивалось бы уже чужое
         # окно. Пересобираем pids ПОСЛЕ чистки, иначе подставной pid успеет
@@ -662,34 +635,30 @@ class WindowGuard:
         if not pids:
             return {"unminimized": 0, "focus_restored": 0}
         unminimized = 0
-        held = 0
         fg = foreground()
-        age = last_input_age_s() if fg is not None and fg.pid in pids else None
         for row in list_chrome_windows():
             if row.pid not in pids:
                 continue                       # чужой браузер — не трогаем
-            if not row.visible or row.iconic:
-                self._holds.pop(row.hwnd, None)   # окно скрыто/свёрнуто — забыть
-                continue
+            if not row.visible:
+                continue                       # окно уже скрыто
             if not row.is_main_window:
                 continue                       # попап/инфобар — не наше окно
-            if self._hold_active(row) or self._user_opened(row, fg, age):
-                held += 1
-                continue
+            # Включая iconic: свёрнутое, но ВИДИМОЕ окно — «мини-плитка-призрак»
+            # над панелью задач (замер 2026-10-16), её тоже прячем. Невидимое
+            # окно (IsWindowVisible=False) не трогаем: лишние ShowWindow —
+            # мерцание рендера.
             if minimize_hwnd(row.hwnd):
                 unminimized += 1
                 self._fixed += 1
+                ghost = " («мини-плитка-призрак»)" if row.iconic else ""
                 log.info(
                     f"window_policy: окно браузера pid={row.pid} "
-                    f"(порт {pids[row.pid]}) вышло из minimized "
-                    f"({row.width}x{row.height}) — возвращаю в minimized; "
+                    f"(порт {pids[row.pid]}) было видимо{ghost} "
+                    f"({row.width}x{row.height}) — прячу; "
                     f"заголовок {row.title[:40]!r}")
         focus_restored = 0
         if fg is not None:
-            # Удержание проверяем по КОНКРЕТНОМУ окну в фокусе, а не по
-            # «словарь непуст»: удержание чужого окна не должно отменять возврат
-            # фокуса для остальных браузеров процесса (их 9-17).
-            if fg.pid in pids and not self._hold_active_for(fg.hwnd):
+            if fg.pid in pids:
                 if self._last_fg and window_exists(self._last_fg):
                     # Не чаще FOCUS_RETRY_S: если возврат не помог, ALT-trick
                     # не должен «стрелять» каждые 150 мс — это уже шум в
@@ -703,12 +672,9 @@ class WindowGuard:
                             log.info(
                                 f"window_policy: фокус был у браузера "
                                 f"pid={fg.pid} — вернул окно пользователя")
-            elif fg.pid not in pids:
+            else:
                 self._last_fg = fg.hwnd
-        out = {"unminimized": unminimized, "focus_restored": focus_restored}
-        if held:
-            out["user_held"] = held
-        return out
+        return {"unminimized": unminimized, "focus_restored": focus_restored}
 
     @property
     def counters(self) -> dict:
@@ -739,19 +705,21 @@ _GUARD_LOCK = threading.Lock()
 
 
 def enabled_by_env() -> bool:
-    """Включён ли сторож. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕН.
+    """Включён ли сторож. ПО УМОЛЧАНИЮ ВКЛЮЧЁН (мандат владельца 2026-10-16).
 
-    Пользователь 2026-10-06: «Хватит трогать мои браузеры, сворачивать. Трогай
-    только свои». Окна браузеров коллектора — его рабочие окна, он сам их
-    открывает и сам ими пользуется, поэтому сторож по умолчанию не
-    регистрирует ни одного pid и не делает ничего. Включается явно:
-    `OZON_WINDOW_GUARD=1`.
+    Окна сбора «вылезают» сами (Chrome показывает окно через 30-40 с после
+    старта) и мешают работе — сторож обязан их прятать. Раньше (просьба
+    «трогай только свои», 2026-10-06) он был выключен; теперь выключение
+    только явное: `OZON_WINDOW_GUARD=0` (или off/false/no). Сторож трогает
+    ТОЛЬКО окна собственных браузеров коллектора (реестр Session) и молчит,
+    пока стоит флаг user_visible() (пользователь развернул окна из трея).
     """
-    return os.environ.get("OZON_WINDOW_GUARD", "0") == "1"
+    flag = (os.environ.get("OZON_WINDOW_GUARD") or "").strip().lower()
+    return flag not in {"0", "off", "false", "no"}
 
 
 def guard() -> Optional[WindowGuard]:
-    """Синглтон сторожа на процесс (None, если выключен).
+    """Синглтон сторожа на процесс (None, только если явно выключен env).
 
     9-17 Session не должны плодить потоки, но и выключенный сторож не должен
     поднимать фоновый поток впустую.

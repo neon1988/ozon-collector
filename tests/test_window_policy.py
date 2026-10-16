@@ -4,10 +4,12 @@
 (list_chrome_windows/foreground/minimize_hwnd/restore_focus/window_exists),
 поэтому тест идёт без живого Windows и без браузера.
 
-Требование, которое здесь защищается (измерение 2026-10-06): окно браузера
-коллектора не должно ни всплывать на экран, ни забирать фокус; при этом чужие
-окна (браузер пользователя, другой Chrome) не трогаются, а режим visible и
-внутренние окна/попапы того же Chrome — тоже.
+Требование, которое здесь защищается (мандат владельца 2026-10-16): окна
+браузеров коллектора не должны всплывать на экран и не должны забирать
+фокус. Исключение ровно одно — флаг data/window_visible.flag, который ставит
+трей («Развернуть окна сбора»): пока флаг есть, сторож спит. Чужие окна
+(браузер пользователя, другой Chrome), попапы того же Chrome и невидимые
+окна — не трогаются вовсе.
 """
 from __future__ import annotations
 
@@ -35,11 +37,10 @@ class FakeWin32:
     подменяют эти две функции сами.
     """
 
-    def __init__(self, windows=None, fg=None, fg_exists=True, input_age=99.0):
+    def __init__(self, windows=None, fg=None, fg_exists=True):
         self.windows = list(windows or [])
         self.fg = fg
         self.fg_exists = fg_exists
-        self.input_age = input_age
         self.minimized: list[int] = []
         self.focus_calls: list[int] = []
 
@@ -47,7 +48,6 @@ class FakeWin32:
         monkeypatch.setattr(wp, "list_chrome_windows",
                             lambda: list(self.windows))
         monkeypatch.setattr(wp, "foreground", lambda: self.fg)
-        monkeypatch.setattr(wp, "last_input_age_s", lambda: self.input_age)
         monkeypatch.setattr(wp, "_pid_alive", lambda pid: True)
         monkeypatch.setattr(wp, "_pid_owns_port", lambda pid, port: True)
 
@@ -80,13 +80,20 @@ def test_unminimized_own_window_is_minimized_back(monkeypatch):
     assert out["unminimized"] == 1
 
 
-def test_already_minimized_own_window_is_untouched(monkeypatch):
-    """Свёрнутое окно не трогаем: лишние ShowWindow вредны (мерцание рендера)."""
+def test_visible_iconic_ghost_strip_is_hidden(monkeypatch):
+    """Видимое свёрнутое окно — «мини-плитка-призрак» — прячется как обычное.
+
+    Живой замер 2026-10-16: SW_MINIMIZE/SW_SHOWMINNOACTIVE дают vis=True
+    icon=True (полоска с крестиком над панелью задач) и кадров не отдают.
+    Невидимое окно (IsWindowVisible=False) не трогаем — см.
+    test_hidden_window_is_not_minimized.
+    """
     fake = FakeWin32(windows=[_win(11, 500, iconic=True)]).install(monkeypatch)
     g = wp.WindowGuard()
     g.watch(500, "9222", autostart=False)
-    g.tick()
-    assert fake.minimized == []
+    out = g.tick()
+    assert fake.minimized == [11]
+    assert out["unminimized"] == 1
 
 
 def test_foreign_browser_window_never_touched(monkeypatch):
@@ -271,7 +278,7 @@ def test_event_is_logged_for_measurement(monkeypatch, caplog):
     g.watch(500, "9222", autostart=False)
     with caplog.at_level("INFO", logger="ozon_collector.window_policy"):
         g.tick()
-    assert "вышло из minimized" in caplog.text
+    assert "было видимо" in caplog.text
     assert "9222" in caplog.text
 
 
@@ -317,10 +324,10 @@ def test_focus_retry_is_rate_limited(monkeypatch):
     assert calls["n"] == 2, "после паузы попытка повторяется"
 
 
-def test_stale_input_window_is_minimized(monkeypatch):
-    """Всплытие БЕЗ свежего ввода (Chromium сам) — сворачиваем."""
+def test_self_shown_window_is_hidden_without_flag(monkeypatch):
+    """Всплытие без флага трея (Chromium сам показал окно) — прячем."""
     fake = FakeWin32(windows=[_win(141, 500, iconic=False)],
-                     fg=_win(141, 500), input_age=99.0).install(monkeypatch)
+                     fg=_win(141, 500)).install(monkeypatch)
     g = wp.WindowGuard()
     g.watch(500, "9222", autostart=False)
     out = g.tick()
@@ -328,72 +335,70 @@ def test_stale_input_window_is_minimized(monkeypatch):
     assert out["unminimized"] == 1
 
 
-def test_window_opened_by_user_is_respected(monkeypatch):
-    """Пользователь открыл окно сам (свежий ввод + фокус на окне) — не трогаем.
+def test_user_visible_flag_makes_guard_sleep(monkeypatch):
+    """Пользователь развернул окна из трея (флаг) — сторож не трогает ничего.
 
-    Именно это требование пользователя: «восстановить» из контекстного меню
-    таскбара должно работать, как раньше.
+    Именно это требование владельца: трей «Развернуть окна сбора» показывает
+    окна для работы; сторож (Python в демоне и воркерах) видит флаг
+    data/window_visible.flag и спит, пока флаг стоит.
     """
     fake = FakeWin32(windows=[_win(151, 500, iconic=False)],
-                     fg=_win(151, 500), input_age=0.2).install(monkeypatch)
+                     fg=_win(151, 500)).install(monkeypatch)
+    monkeypatch.setattr(wp, "user_visible", lambda: True)
     g = wp.WindowGuard()
     g.watch(500, "9222", autostart=False)
     out = g.tick()
-    assert fake.minimized == [], "окно пользователя сворачивать нельзя"
-    assert out.get("user_held") == 1
+    assert fake.minimized == [], "при флаге окна пользователя не трогаем"
+    assert out == {"unminimized": 0, "focus_restored": 0}
 
 
-def test_hold_expires_and_window_is_minimized_again(monkeypatch):
-    """Забытое открытое окно не висит вечно: после HOLD_S сторож возвращает
-    minimized (иначе забытый браузер останется на экране)."""
-    fake = FakeWin32(windows=[_win(161, 500, iconic=False)],
-                     fg=_win(161, 500), input_age=0.2).install(monkeypatch)
+def test_flag_removed_and_windows_are_hidden_again(monkeypatch):
+    """Флаг снят («Свернуть окна сбора») — сторож снова прячет окна."""
+    fake = FakeWin32(windows=[_win(161, 500, iconic=False)]).install(monkeypatch)
+    flag = {"on": True}
+    monkeypatch.setattr(wp, "user_visible", lambda: flag["on"])
     g = wp.WindowGuard()
     g.watch(500, "9222", autostart=False)
-    g.tick()
-    assert fake.minimized == []
-    fake.input_age = 99.0                 # ввод прошёл, окно забыли
-    g._holds[161] -= (wp.HOLD_S + 1)
+    assert g.tick()["unminimized"] == 0
+    flag["on"] = False
     out = g.tick()
     assert fake.minimized == [161]
     assert out["unminimized"] == 1
 
 
-def test_window_popup_while_user_types_elsewhere_is_minimized(monkeypatch):
-    """Пользователь печатает в другом окне, а браузер выскочил — сворачиваем.
-
-    Свежий ввод сам по себе не повод уважать окно: решает фокус.
-    """
+def test_popup_while_focus_elsewhere_is_hidden(monkeypatch):
+    """Окно выскочило, фокус у пользователя (другое приложение) — прячем."""
     fake = FakeWin32(windows=[_win(171, 500, iconic=False)],
-                     fg=_win(172, 4242), input_age=0.1).install(monkeypatch)
+                     fg=_win(172, 4242)).install(monkeypatch)
     g = wp.WindowGuard()
     g.watch(500, "9222", autostart=False)
     out = g.tick()
     assert fake.minimized == [171]
+    assert out["focus_restored"] == 0
 
 
-def test_focus_not_stolen_while_user_holds_window(monkeypatch):
-    """Пока окно удерживается пользователем, фокус на нём не отбираем."""
+def test_flag_makes_guard_leave_focus_alone(monkeypatch):
+    """При флаге трея сторож не вмешивается и в фокус."""
     fake = FakeWin32(windows=[_win(181, 500, iconic=False)],
-                     fg=_win(181, 500), input_age=0.2).install(monkeypatch)
+                     fg=_win(181, 500)).install(monkeypatch)
+    monkeypatch.setattr(wp, "user_visible", lambda: True)
     g = wp.WindowGuard()
     g.watch(500, "9222", autostart=False)
     g._last_fg = 182
     g.tick()
-    assert fake.focus_calls == [], "фокус у окна пользователя не трогаем"
+    assert fake.focus_calls == [], "фокус при флаге не трогаем"
 
 
-def test_hold_cleared_when_window_minimized_by_user(monkeypatch):
-    """Пользователь сам свернул окно — удержание сброшено."""
-    fake = FakeWin32(windows=[_win(191, 500, iconic=False)],
-                     fg=_win(191, 500), input_age=0.2).install(monkeypatch)
+def test_user_visible_state_is_logged_once(monkeypatch, caplog):
+    """«Сторож спит» пишется в лог один раз, а не каждый тик 150 мс."""
+    FakeWin32(windows=[]).install(monkeypatch)
+    monkeypatch.setattr(wp, "user_visible", lambda: True)
     g = wp.WindowGuard()
     g.watch(500, "9222", autostart=False)
-    g.tick()
-    assert 191 in g._holds
-    fake.windows = [_win(191, 500, iconic=True)]
-    g.tick()
-    assert 191 not in g._holds
+    with caplog.at_level("INFO", logger="ozon_collector.window_policy"):
+        g.tick()
+        g.tick()
+    assert caplog.text.count("сторож спит") == 1
 
 
 def test_singleton_guard_is_one_per_process():
@@ -426,28 +431,30 @@ def _guard_with(monkeypatch, g=None):
     return g
 
 
-def test_guard_disabled_by_default(monkeypatch):
-    """ПО УМОЛЧАНИЮ сторож выключен: окна пользователя не трогаем.
+def test_guard_enabled_by_default(monkeypatch):
+    """ПО УМОЛЧАНИЮ сторож ВКЛЮЧЁН.
 
-    Требование пользователя 2026-10-06: «Хватит трогать мои браузеры,
-    сворачивать. Трогай только свои». Пока `OZON_WINDOW_GUARD` не задан,
-    guard() возвращает None и ни один pid не регистрируется.
+    Мандат владельца 2026-10-16: окна сбора «вылезают» сами и мешают работе —
+    сторож обязан их прятать. Выключение — только явное (OZON_WINDOW_GUARD=0).
     """
     monkeypatch.delenv("OZON_WINDOW_GUARD", raising=False)
-    assert wp.enabled_by_env() is False
-    assert wp.guard() is None
-
-
-def test_guard_enabled_only_by_explicit_env(monkeypatch):
-    monkeypatch.setenv("OZON_WINDOW_GUARD", "1")
     assert wp.enabled_by_env() is True
     assert wp.guard() is wp.guard()
+
+
+def test_guard_disabled_only_by_explicit_env(monkeypatch):
+    """Выключение — только явное значение (0/off/false/no)."""
+    for val in ("0", "off", "false", "no", " OFF "):
+        monkeypatch.setenv("OZON_WINDOW_GUARD", val)
+        assert wp.enabled_by_env() is False, f"{val!r} должен выключать сторожа"
+    monkeypatch.setenv("OZON_WINDOW_GUARD", "1")
+    assert wp.enabled_by_env() is True
 
 
 def test_session_does_not_touch_windows_when_guard_disabled(monkeypatch):
     """Выключенный сторож — Session не вызывает его методов вовсе."""
     from ozon_collector import cdp
-    monkeypatch.delenv("OZON_WINDOW_GUARD", raising=False)
+    monkeypatch.setenv("OZON_WINDOW_GUARD", "0")
 
     class Boom(wp.WindowGuard):
         def watch(self, *a, **k):
@@ -575,36 +582,50 @@ def test_identity_recheck_is_throttled(monkeypatch):
     assert calls["n"] == first + 1, "после паузы сверка повторяется"
 
 
-def test_hold_on_other_window_does_not_block_focus_return(monkeypatch):
-    """Удержание ОДНОГО окна не отменяет возврат фокуса для остальных pid.
+def test_focus_return_works_with_two_watched_browsers(monkeypatch):
+    """Оба всплывших окна прячутся, фокус возвращается пользователю.
 
-    Раньше проверка была «словарь _holds непуст» → одно удержание гасило возврат
-    фокуса сразу для всех 9-17 браузеров процесса (ревью 2026-10-06).
+    Регрессия ревью 2026-10-06 (переписана под модель «флаг вместо удержаний»,
+    2026-10-16): удержание/показ одного окна не должно ломать возврат фокуса
+    для остальных браузеров процесса (их 9-17).
     """
     fake = FakeWin32(windows=[_win(21, 500, iconic=False),
                               _win(22, 600, iconic=False)],
-                     fg=_win(21, 500), input_age=0.2).install(monkeypatch)
+                     fg=_win(21, 500)).install(monkeypatch)
     g = wp.WindowGuard()
     g.watch(500, "9222", autostart=False)
     g.watch(600, "9223", autostart=False)
     g._last_fg = 99
     out = g.tick()
-    assert out.get("user_held") == 1, "окно 21 удержано (свежий ввод)"
-    # окно 600 не в фокусе → не удержано → сворачивается, и фокус не отбираем
-    # именно из-за удержания окна 21
-    assert fake.minimized == [22]
+    assert fake.minimized == [21, 22]
+    assert out["focus_restored"] == 1
+    assert fake.focus_calls == [99]
 
 
-def test_bad_hold_env_does_not_break_import(monkeypatch):
-    """OZON_WINDOW_HOLD_S='5m' не должен ронять импорт модуля."""
-    import importlib
-    monkeypatch.setenv("OZON_WINDOW_HOLD_S", "5m")
-    try:
-        reloaded = importlib.reload(wp)
-        assert reloaded.HOLD_S == 300.0
-    finally:
-        monkeypatch.delenv("OZON_WINDOW_HOLD_S", raising=False)
-        importlib.reload(wp)
+def test_flag_file_roundtrip(monkeypatch, tmp_path):
+    """user_visible() читает флаг, clear_user_visible() снимает (идемпотентно).
+
+    Флаг — единственный источник истины «пользователь смотрит окна»; залипший
+    файл от жёстко убитого трея снимает clear_user_visible() при старте сбора.
+    """
+    flag = tmp_path / "window_visible.flag"
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    assert wp.user_visible() is False
+    flag.write_text("1", encoding="utf-8")
+    assert wp.user_visible() is True
+    wp.clear_user_visible()
+    assert wp.user_visible() is False
+    wp.clear_user_visible()      # повторный вызов — не исключение
+
+
+def test_user_visible_flag_lives_in_data_dir():
+    """Флаг — общий контракт трей↔Python: data/window_visible.flag.
+
+    Трей (PowerShell) и сторож (Python) обязаны указывать на один файл; смена
+    пути здесь = сломанная синхронизация, поэтому путь фиксируется тестом.
+    """
+    assert wp.USER_VISIBLE_FLAG.name == "window_visible.flag"
+    assert wp.USER_VISIBLE_FLAG.parent.name == "data"
 
 
 @pytest.mark.skipif(wp.os.name != "nt", reason="поток: нужен Windows")

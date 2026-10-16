@@ -842,12 +842,11 @@ class Session:
     def _sync_window_guard(self, why: str = "", enforce_hidden: bool = False):
         """Регистрировать окно браузера в стороже окон (см. window_policy).
 
-        По умолчанию сторож ВЫКЛЮЧЕН (`OZON_WINDOW_GUARD=1` включает): окна
-        браузеров коллектора — рабочие окна пользователя, он сам их открывает
-        и сворачивает, и просьба «трогай только свои» (2026-10-06) означает
-        отказ от любого вмешательства по умолчанию. Здесь же проверяется
-        keep_window, owner и движок: даже при включённом флаге сторож работает
-        только для собственных браузеров коллектора в режиме hidden.
+        С 2026-10-16 сторож ВКЛЮЧЁН ПО УМОЛЧАНИЮ (выключить:
+        `OZON_WINDOW_GUARD=0`): всплывающие окна сбора — прямая жалоба
+        владельца. Здесь проверяются keep_window, owner и движок: сторож
+        работает только для собственных браузеров коллектора в режиме hidden,
+        а при флаге трея (пользователь развернул окна) спит целиком.
         """
         pid = getattr(getattr(self, "browser_pid", None), "pid", None)
         if not pid:
@@ -1066,6 +1065,46 @@ class Session:
                     break
         except Exception as e:
             log.debug(f"minimize_window native: {type(e).__name__}: {e}")
+
+    def _ensure_window_hidden(self) -> bool | None:
+        """Скрыть окно браузера, если оно РЕАЛЬНО видимо (Win32-проба).
+
+        Вызывается из puzzle_capture.ensure_render_window. CDP-состояние
+        «minimized» НЕ отличает скрытое SW_HIDE-окно (а на нём кадры идут!)
+        от окна, которое Chrome показал сам: у всех 8 скрытых окон
+        windowState="minimized" (живой замер 2026-10-16, probe_state). Поэтому
+        истину берём у Windows, а не у CDP.
+
+        True  — окно было видимо и скрыто (показанное→скрытое окно снова
+                отдаёт кадры ≤9с, живой замер);
+        False — трогать нечего: окно уже скрыто / чужой Chrome / пользователь
+                сам развернул окна из трея (window_policy.user_visible);
+        None  — нет данных: не Windows, нет pid, окно не найдено.
+        """
+        if os.name != "nt":
+            return None
+        pid = getattr(getattr(self, "browser_pid", None), "pid", None)
+        if not pid:
+            return None
+        if getattr(self, "browser_owner", None) != "collector":
+            return False          # чужой Chrome пользователя не трогаем никогда
+        if _WP.user_visible():
+            # Пользователь развернул окна из трея и смотрит их — не мешаем
+            # (сторож окон в это время тоже спит, флаг общий).
+            return False
+        try:
+            rows = [r for r in _WP.list_chrome_windows()
+                    if r.pid == int(pid) and r.is_main_window]
+        except Exception as e:
+            log.debug(f"ensure_window_hidden: enum err {type(e).__name__}: {e}")
+            return None
+        if not rows:
+            return None           # окно не найдено — не гадаем
+        changed = False
+        for row in rows:
+            if row.visible and _WP.minimize_hwnd(row.hwnd):
+                changed = True
+        return changed
 
     def _keep_window_visible(self):
         """OZON_KEEP_WINDOW=1: развернуть окно браузера и показать его.
@@ -1334,18 +1373,25 @@ class Session:
             self._watchdog = None
 
     def _attach_geom_guard(self):
-        """Привязать read-only геометрический guard к текущей странице.
+        """Привязать к текущей странице геометрический guard и пробу окна.
 
-        page-атрибут (не глобальное состояние, не меняет сигнатуры вызовов):
-        puzzle.solve_puzzle берёт `getattr(page, "_geom_guard", None)` и
-        вызывает его перед решением. Guard живёт в Session — ему нужны
-        browser_pid/новый browser (Win32 GetWindowRect + CDP bounds).
+        page-атрибуты (не глобальное состояние, не меняет сигнатуры вызовов):
+        - `_geom_guard`: puzzle.solve_puzzle берёт `getattr(page, "_geom_guard",
+          None)` и вызывает его перед решением (Win32 GetWindowRect + CDP
+          bounds). Guard живёт в Session — ему нужны browser_pid/новый browser.
+        - `_ozon_ensure_window_hidden`: puzzle_capture.ensure_render_window
+          больше НЕ показывает окно через CDP setWindowBounds (именно этот
+          вызов показывал окна пользователю — живой замер 2026-10-16); вместо
+          этого прячет окно, если оно РЕАЛЬНО видимо. CDP-состояние для этого
+          не годится (у скрытого SW_HIDE-окна оно тоже «minimized»), поэтому
+          истина — Win32 IsWindowVisible.
         External-браузеры тоже получают guard, но его проверка для
-        не-Windows/без-окна возвращает True (no-op) — личную геометрию
-        пользователя не трогаем.
+        не-Windows/без-окна возвращает True (no-op), а проба окна — False
+        (owner != collector) — личные окна пользователя не трогаем.
         """
         try:
             self.page._geom_guard = self._geometry_guard
+            self.page._ozon_ensure_window_hidden = self._ensure_window_hidden
         except Exception:
             pass
 

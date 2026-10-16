@@ -30,33 +30,34 @@ from .puzzle_dom import _capture_info
 FLAT_STD = 3.0
 
 # ---------------------------------------------------------------------------
-# ОКНО БРАУЗЕРА: съёмка кадра требует живого композитора
+# ОКНО БРАУЗЕРА: съёмка кадра требует СКРЫТОГО — и никогда показанного — окна
 # ---------------------------------------------------------------------------
-# Живой замер 2026-10-08 (одна и та же страница, один и тот же браузер):
+# Живые замеры (одна и та же страница, один и тот же браузер):
 #
-#   окно normal     → page.screenshot 0.05-0.09с, 46 КБ, std 32 (кадр живой)
-#   окно minimized  → page.screenshot ТАЙМАУТ 6с, три раза подряд;
-#                     Page.captureScreenshot(fromSurface=false) — 210с и
-#                     плоская белая заливка (std 0.0)
+#   2026-10-08  окно normal    → screenshot 0.05-0.09с, std 32 (кадр живой)
+#               окно minimized → таймаут 6с ×3; fromSurface=false — 210с,
+#                                белая заливка (std 0.0)
+#   2026-10-16  скрыто с рождения (SW_HIDE от CreateProcess) → кадр 0.06с
+#               свёрнуто (SW_MINIMIZE) → «мини-плитка-призрак», кадров нет
+#               показано → обратно SW_HIDE → кадры возвращаются ≤9с
 #
-# То есть на свёрнутом окне Chromium под Windows перестаёт отдавать кадры
-# композитора. Съёмка не «медленная» — она невозможна. При этом Session по
-# умолчанию СВОРАЧИВАЕТ окно (keep_window=OZON_KEEP_WINDOW, дефолт выкл), и
-# инвариант 2 проекта требует видимого браузера.
+# Вывод: кадры идут на СКРЫТОМ окне. Ранняя модель «поднять окно в normal
+# перед съёмкой» (CDP setWindowBounds) кадры давала, но БУКВАЛЬНО показывала
+# окно пользователю — это и было всплытие окон в бою 2026-10-16 (живой замер:
+# worker показан ровно в момент лога «окно… восстановлено для съёмки»).
+# Поэтому окно НИКОГДА не показывается: если оно реально видимо (Win32
+# IsWindowVisible), его прячут через SW_HIDE — кадры вернутся сами.
 #
-# Почему это убивало пазл, а не выглядело как «вкладка зависла»: на цикл
-# пазла приходится 8 съёмок с таймаутом 5с (5 в _shot_bg_clean + 2 на маржу +
-# диагностика), то есть 40-45с чистых таймаутов ДО первого драга при
-# PUZZLE_BUDGET_S=60. Боевой лог 07.10 именно такой: «исчерпан бюджет времени
-# (60с), вкладка, вероятно, зависла» при drops=0.
-#
-# Лечится не флагом браузера (--disable-features=CalculateNativeWinOcclusion
-# меняет поверхность отпечатка), а восстановлением окна через CDP: два
-# вызова, 0.016с, идемпотентно. Отключается env OZON_PUZZLE_RESTORE_WINDOW=0.
+# CDP-состояние окна не различает SW_HIDE и реальный показ: у всех 8 скрытых
+# окон windowState="minimized" (живой замер 2026-10-16, probe_state). Поэтому
+# истину даёт OS-проба, привязанная Session'ом
+# (page._ozon_ensure_window_hidden, см. cdp.Session._attach_geom_guard).
+# Нет пробы (не Windows/чужой Chrome) — no-op.
+# Отключается env OZON_PUZZLE_RESTORE_WINDOW=0.
 _CDP_SESSIONS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
-def _restore_window_enabled() -> bool:
+def _ensure_hidden_enabled() -> bool:
     return os.environ.get("OZON_PUZZLE_RESTORE_WINDOW", "1") != "0"
 
 
@@ -93,42 +94,49 @@ def render_window_state(page) -> str:
 
 
 def ensure_render_window(page, settle: float = 0.4) -> bool:
-    """Вернуть окно браузера из minimized в normal. True, если было свёрнуто.
+    """Скрыть окно, если оно реально видимо. True — окно было видимо и скрыто.
 
-    Идемпотентно и дёшево: одно чтение состояния, и только если окно свёрнуто —
-    одно восстановление (замер: 0.016с) плюс короткая пауза на возобновление
-    композитора. Ошибки молча гасятся: съёмка должна падать так же, как раньше,
-    только без лишнего окна ошибок в логе.
+    Окно НИКОГДА не показывается: показанное окно и есть «всплытие», которое
+    видит пользователь (живой замер 2026-10-16: setWindowBounds(normal)
+    показывал worker-окно ровно в момент лога). На скрытом окне кадры
+    композитора идут, поэтому лечение — SW_HIDE, а не показ.
+
+    CDP-состояние — дешёвый предфильтр: у скрытого SW_HIDE-окна оно тоже
+    «minimized» (не отличает от показанного), поэтому реальное состояние
+    спрашивает OS-проба, привязанная Session'ом
+    (page._ozon_ensure_window_hidden). Пробы нет — no-op (не гадаем).
+    Ошибки молча гасятся: съёмка должна падать так же, как раньше, только без
+    лишнего окна ошибок в логе.
     """
-    if not _restore_window_enabled():
+    if not _ensure_hidden_enabled():
         return False
     if render_window_state(page) != "minimized":
         return False
-    sess = _cdp_session(page)
-    if sess is None:
+    probe = getattr(page, "_ozon_ensure_window_hidden", None)
+    if probe is None:
         return False
     try:
-        w = sess.send("Browser.getWindowForTarget")
-        sess.send("Browser.setWindowBounds",
-                  {"windowId": w["windowId"],
-                   "bounds": {"windowState": "normal"}})
+        changed = probe()
     except Exception as e:
-        log.debug(f"setWindowBounds failed: {type(e).__name__}: {e}")
+        log.debug(f"ensure_window_hidden failed: {type(e).__name__}: {e}")
+        return False
+    if not changed:
         return False
     time.sleep(settle)
-    log.info("пазл: окно браузера было свёрнуто — восстановлено для съёмки "
-             "(на свёрнутом окне Chromium не отдаёт кадры: скриншот виснет "
-             "до таймаута)")
+    log.info("пазл: окно браузера было видимо — скрыто для съёмки "
+             "(кадры композитора идут на скрытом окне; показ окна убран — "
+             "он и был всплытием)")
     return True
 
 
 def _page_shot(page, timeout: int = 5000, **kw):
-    """Единая съёмка: перед скриншотом гарантируем живой композитор.
+    """Единая съёмка: перед скриншотом прячем окно, если оно реально видимо.
 
-    Все точки съёмки пазла идут через неё, поэтому свёрнутое окно больше не
-    может тихо портить кадры ни в _shot_bg_clean, ни в марже кусочка.
-    Исключение наружу не пробрасывается — вызывающий сам решает, что делать
-    с отсутствием кадра.
+    Кадры композитора идут только на скрытом окне (живой замер 2026-10-16),
+    все точки съёмки пазла идут через неё, поэтому видимое окно не может
+    тихо портить кадры ни в _shot_bg_clean, ни в марже кусочка. Исключение
+    наружу не пробрасывается — вызывающий сам решает, что делать с
+    отсутствием кадра.
     """
     ensure_render_window(page)
     return page.screenshot(timeout=timeout, **kw)
@@ -208,38 +216,39 @@ def _frame_painted(bg_l: Optional[np.ndarray]) -> tuple[bool, str]:
 
 
 def _bring_to_front(page, reason_box=None) -> bool:
-    """Попытка поднять окно перед пересъёмкой однотонного кадра.
+    """Попытка поднять вкладку перед пересъёмкой однотонного кадра.
 
-    Chromium под Windows отдаёт однотонную заливку (std≈0), если окно
-    свёрнуто/закрыто другим окном: браузер отдаёт буфер, не рисуя кадр.
+    Chromium под Windows отдаёт однотонную заливку (std≈0), когда кадр не
+    рисуется: свёрнутое окно или показанное и скрытое меньше ~9с назад.
     Пассивная пересъёмка после паузы это не лечит, а вызывает новый таймаут и
-    сжигает лимит попыток. Поэтому перед reshoot делаем ДВА шага: поднимаем
-    вкладку (Page.bringToFront) и возвращаем окно из minimized в normal
-    (ensure_render_window).
+    сжигает лимит попыток. Поэтому перед reshoot: прячем окно, если оно
+    реально видимо (ensure_render_window — окно НИКОГДА не показываем: показ и
+    был жалобой «окна вылезают», замер 2026-10-16), и поднимаем вкладку
+    (Page.bringToFront).
 
-    Именно второй шаг и есть лечение: замер 2026-10-08 показал, что
-    page.bring_to_front() на свёрнутом окне НЕ возвращает кадры (скриншот
-    продолжает висеть до таймаута), а setWindowBounds(normal) — возвращает
-    (0.05с, живой кадр).
+    Активация вкладки физически может показать окно Chromium — поэтому после
+    неё проба повторяется, и окно остаётся скрытым при любом исходе.
 
     best-effort: нет API/ошибка — продолжаем как раньше, причина пишется в
     reason_box, чтобы по логу было видно, что кадр был плоским из-за окна.
     """
-    if ensure_render_window(page):
-        if reason_box is not None:
-            reason_box[0] += " win=restored"
+    hid = ensure_render_window(page)
     try:
         page.bring_to_front()
         time.sleep(0.25)
         if reason_box is not None:
             reason_box[0] += " front=ok"
-        return True
     except Exception as e:
         if reason_box is not None:
             reason_box[0] += f" front_err={type(e).__name__}"
         else:
             log.debug(f"bring_to_front failed: {type(e).__name__}: {e}")
         return False
+    if ensure_render_window(page):
+        hid = True
+    if hid and reason_box is not None:
+        reason_box[0] += " win=hidden"
+    return True
 
 
 def _shot_bg_clean(page, info):

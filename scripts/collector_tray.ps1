@@ -11,15 +11,25 @@
 #   pwsh -NoProfile -File scripts/collector_tray.ps1 -List  # print found windows, no GUI
 #   pwsh -NoProfile -File scripts/collector_tray.ps1 -Show  # restore collector windows once
 #   pwsh -NoProfile -File scripts/collector_tray.ps1 -Hide  # hide collector windows once
+#   pwsh -NoProfile -File scripts/collector_tray.ps1 -SendCtrlC <pid>  # Ctrl+C to that console (debug)
 #
 # Finds ONLY collector Chromium windows: chrome.exe whose command line contains
 # --user-data-dir with "ozon-profile" token (main + worker-N profiles). Foreign
 # Chrome windows of the user are never touched.
 #
-# Collector windows carry WS_EX_TOOLWINDOW (no taskbar button, not in Alt+Tab);
-# Restore clears WS_EX_NOACTIVATE so the user can interact with the page and
-# keeps WS_EX_TOOLWINDOW so the button does not come back; the launcher and
-# cdp.Session re-add NOACTIVATE on every collector hide.
+# The tray is a MODE TOGGLE for collector windows (owner's wording 2026-10-16):
+# «Свернуть» → hidden mode: no collector window is ever shown; «Развернуть» →
+# visible mode: all collector windows are shown. Mode lives in the flag file
+# data/window_visible.flag, shared with Python (window_policy.user_visible).
+# In visible mode the reconcile timer also re-shows a newly born (still hidden)
+# window without stealing focus; in hidden mode it hides a self-shown window.
+# Restore («Развернуть») makes collectors NORMAL taskbar windows (owner's demand
+# 2026-10-16: «пусть уж будут на панель задач а не в toolbox»): clears BOTH
+# WS_EX_TOOLWINDOW and WS_EX_NOACTIVATE, SW_RESTOREs, applies
+# ITaskbarList::AddTab and takes foreground. While windows are shown the flag is
+# set — the window guard and the puzzle capture touch nothing the user is
+# looking at. Hide clears the flag and re-adds TOOLWINDOW/NOACTIVATE + SW_HIDE +
+# DeleteTab.
 #
 # Hide calls SW_HIDE + ITaskbarList::DeleteTab — NOT SW_MINIMIZE /
 # SW_SHOWMINNOACTIVE: a minimized TOOLWINDOW window is rendered by Windows as a
@@ -28,14 +38,23 @@
 # WS_EX_TOOLWINDOW alone does NOT remove a taskbar button that was already
 # created at window birth — Explorer must re-create the state (live finding
 # 2026-10-16: styles were on, buttons stayed). A reconcile timer (every 2s)
-# additionally deletes any button that reappears while the tray runs, so
-# collector windows can never sit on the taskbar (owner's demand: windows are
-# restored from the tray icon, not from the taskbar).
+# additionally deletes any button that reappears while the tray runs; in
+# visible mode the same timer instead re-shows hidden collector windows.
+#
+# «Выход» stops the COLLECTION, not just the icon (owner's demand 2026-10-16:
+# «выход в трее, а сборщик продолжает работать» → «Выход завершает и сбор»):
+# the first click sends Ctrl+C to the daemon console — its graceful path
+# (progress saved, final_state=INTERRUPTED). The icon stays until the daemon is
+# really gone (the watchdog closes it within ~2s). A second click escalates
+# (another Ctrl+C = the daemon's own _FORCE_EXIT path); a third click or a
+# console-less daemon falls back to Stop-Process -Force (workers drop their
+# browsers via the parent watchdog).
 
 param(
     [switch]$List,
     [switch]$Show,
     [switch]$Hide,
+    [int]$SendCtrlC = 0,
     [int]$WatchPid = 0
 )
 
@@ -55,6 +74,8 @@ public class CollectorTrayWin {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int max);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError=true)] public static extern int GetWindowLong(IntPtr hWnd, int idx);
     [DllImport("user32.dll", SetLastError=true)] public static extern int SetWindowLong(IntPtr hWnd, int idx, int val);
 
@@ -89,11 +110,31 @@ public class CollectorTrayWin {
         return GetWindowLong(h, GWL_EXSTYLE);
     }
 
+    // «Окно реально видно пользователю»: не SW_HIDE и не иконизировано.
+    public static bool IsShown(IntPtr h) {
+        return IsWindowVisible(h) && !IsIconic(h);
+    }
+
+    // Restore = «окно снова обычное»: панель задач + взаимодействие. Оба
+    // EX-стиля снимаются (TOOLWINDOW давал «toolbox» — жалоба владельца),
+    // кнопку создаём явно: Explorer сам её не создаёт для окна, которое уже
+    // рождалось скрытым без кнопки (живая находка 2026-10-16).
     public static void Restore(IntPtr h) {
         int st = GetWindowLong(h, GWL_EXSTYLE);
-        SetWindowLong(h, GWL_EXSTYLE, (st & ~WS_EX_NOACTIVATE) | WS_EX_TOOLWINDOW);
+        SetWindowLong(h, GWL_EXSTYLE, st & ~WS_EX_NOACTIVATE & ~WS_EX_TOOLWINDOW);
         ShowWindow(h, SW_RESTORE);
+        TaskbarTab.Add(h);
         SetForegroundWindow(h);
+    }
+
+    // Показ нового окна в режиме visible без кражи фокуса: воркер может
+    // родиться в любой момент, выдирать фокус у печатающего пользователя
+    // нельзя (жалоба владельца про «печатаю — вылезают окна»).
+    public static void RestoreBackground(IntPtr h) {
+        int st = GetWindowLong(h, GWL_EXSTYLE);
+        SetWindowLong(h, GWL_EXSTYLE, st & ~WS_EX_NOACTIVATE & ~WS_EX_TOOLWINDOW);
+        ShowWindow(h, SW_RESTORE);
+        TaskbarTab.Add(h);
     }
 
     public static void Minimize(IntPtr h) {
@@ -110,6 +151,29 @@ public class CollectorTrayWin {
         if ((st & WS_EX_TOOLWINDOW) == 0)
             SetWindowLong(h, GWL_EXSTYLE, st | WS_EX_TOOLWINDOW);
         TaskbarTab.Delete(h);
+    }
+
+    // «Выход» = остановка сбора: Ctrl+C в консоль демона. Это его штатный
+    // graceful-путь: SIGINT → INTERRUPTED, воркеры сворачиваются, прогресс
+    // сохраняется; ВТОРОЙ Ctrl+C — его же форс-путь (_FORCE_EXIT). Приём:
+    // трей живёт без консоли → FreeConsole; AttachConsole к демону; у себя
+    // Ctrl+C игнорируем (иначе убьём трей вместе с событием);
+    // GenerateConsoleCtrlEvent(0, 0) шлёт событие всем, кто привязан к этой
+    // консоли, — демону и его дереву.
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint dwProcessId);
+    [DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+    [DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroup);
+
+    public static bool SendCtrlC(uint pid) {
+        FreeConsole();
+        if (!AttachConsole(pid)) return false;
+        try {
+            SetConsoleCtrlHandler(IntPtr.Zero, true);
+            return GenerateConsoleCtrlEvent(0, 0);
+        } finally {
+            FreeConsole();
+        }
     }
 }
 
@@ -143,27 +207,36 @@ public interface ITaskbarListLegacy {
 }
 
 public static class TaskbarTab {
-    public static bool Delete(IntPtr h) {
-        object o;
+    static object Create() {
         try {
-            o = new CTaskbarList();
+            return new CTaskbarList();
         } catch {
             try {
-                o = new CTaskbarListLegacy();
+                return new CTaskbarListLegacy();
             } catch {
-                return false;
+                return null;
             }
         }
+    }
+
+    public static bool Add(IntPtr h) {
+        var o = Create();
+        if (o == null) return false;
         try {
-            if (o is ITaskbarList) {
-                var t = (ITaskbarList)o;
-                t.HrInit();
-                t.DeleteTab(h);
-            } else {
-                var t = (ITaskbarListLegacy)o;
-                t.HrInit();
-                t.DeleteTab(h);
-            }
+            if (o is ITaskbarList) { var t = (ITaskbarList)o; t.HrInit(); t.AddTab(h); }
+            else { var t = (ITaskbarListLegacy)o; t.HrInit(); t.AddTab(h); }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    public static bool Delete(IntPtr h) {
+        var o = Create();
+        if (o == null) return false;
+        try {
+            if (o is ITaskbarList) { var t = (ITaskbarList)o; t.HrInit(); t.DeleteTab(h); }
+            else { var t = (ITaskbarListLegacy)o; t.HrInit(); t.DeleteTab(h); }
             return true;
         } catch {
             return false;
@@ -180,7 +253,35 @@ function Get-CollectorWindows {
     return @([CollectorTrayWin]::FindByPids($pids))
 }
 
+# Флаг «пользователь смотрит окна сбора» — общий контракт с Python-сторожем
+# (ozon_collector/window_policy.py: USER_VISIBLE_FLAG, user_visible): пока файл
+# существует, сторож и проба окна в пайплайне пазла не прячут НИЧЕГО. Пишет
+# только трей; снимает трей при «Свернуть»/«Выход» или key_daemon при старте
+# сбора (залипший флаг).
+$script:FlagDir = Join-Path (Split-Path -Parent $PSScriptRoot) "data"
+$script:FlagPath = Join-Path $script:FlagDir "window_visible.flag"
+
+function Set-UserVisibleFlag {
+    New-Item -ItemType Directory -Path $script:FlagDir -Force | Out-Null
+    New-Item -ItemType File -Path $script:FlagPath -Force | Out-Null
+}
+
+function Clear-UserVisibleFlag {
+    Remove-Item -LiteralPath $script:FlagPath -Force -ErrorAction SilentlyContinue
+}
+
+function Test-UserVisibleFlag {
+    return (Test-Path -LiteralPath $script:FlagPath)
+}
+
+function Send-TrayCtrlC {
+    param([int]$TargetPid)
+    return [CollectorTrayWin]::SendCtrlC([uint32]$TargetPid)
+}
+
 function Show-CollectorWindows {
+    # Флаг ДО показа: сторож не должен успеть спрятать окно в момент показа.
+    Set-UserVisibleFlag
     $wins = @(Get-CollectorWindows)
     foreach ($h in $wins) { [CollectorTrayWin]::Restore($h) }
     return $wins.Count
@@ -189,15 +290,35 @@ function Show-CollectorWindows {
 function Hide-CollectorWindows {
     $wins = @(Get-CollectorWindows)
     foreach ($h in $wins) { [CollectorTrayWin]::Minimize($h) }
+    # Флаг ПОСЛЕ скрытия: пока прятали — сторож молчал.
+    Clear-UserVisibleFlag
     return $wins.Count
 }
 
 function Reconcile-CollectorWindows {
-    # Патруль панели задач: даже если окно создало кнопку в обход лаунчера
-    # (или её пересоздал Explorer/Chromium), снимаем её в течение пары секунд.
-    # Живой отзыв владельца 2026-10-16: «мини-плитки» на панели при сборе.
+    # Патруль трея — исполнитель РЕЖИМА окна (переключатель «Развернуть/
+    # Свернуть», требование владельца 2026-10-16): visible — все окна сбора
+    # видны; hidden — ни одно окно не видно. Режим живёт в флаге, его же
+    # читает Python-сторож (window_policy.user_visible).
+    # visible: новое окно (рестарт воркера) рождается скрытым — показываем
+    # без кражи фокуса. hidden: самовольно показавшееся окно прячем, у
+    # остальных снимаем кнопку панели задач (подстраховка от Explorer).
     $wins = @(Get-CollectorWindows)
-    foreach ($h in $wins) { [CollectorTrayWin]::EnsureNoTaskbar($h) }
+    if (Test-UserVisibleFlag) {
+        foreach ($h in $wins) {
+            if (-not [CollectorTrayWin]::IsShown($h)) {
+                [CollectorTrayWin]::RestoreBackground($h)
+            }
+        }
+        return
+    }
+    foreach ($h in $wins) {
+        if ([CollectorTrayWin]::IsWindowVisible($h) -or [CollectorTrayWin]::IsIconic($h)) {
+            [CollectorTrayWin]::Minimize($h)
+        } else {
+            [CollectorTrayWin]::EnsureNoTaskbar($h)
+        }
+    }
 }
 
 if ($List) {
@@ -218,6 +339,14 @@ if ($Show) {
 if ($Hide) {
     Write-Output ("minimized: {0}" -f (Hide-CollectorWindows))
     exit 0
+}
+if ($SendCtrlC -gt 0) {
+    if (Send-TrayCtrlC -TargetPid $SendCtrlC) {
+        Write-Output ("ctrl+c sent to pid {0}" -f $SendCtrlC)
+        exit 0
+    }
+    Write-Output ("ctrl+c FAILED for pid {0} (no console attached?)" -f $SendCtrlC)
+    exit 1
 }
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -254,12 +383,56 @@ $itemHide.add_Click({
         if ($n -eq 0) { $notify.ShowBalloonTip(2000, "ozon-collector", "Окна сбора не найдены (демон не запущен?)", [System.Windows.Forms.ToolTipIcon]::Info) }
     })
 function Close-Tray {
+    # Иконка уходит — флаг «пользователь смотрит окна» снимаем: он живёт
+    # ровно столько, сколько трей (key_daemon при старте сбора тоже
+    # подстрахуется clear_user_visible).
+    Clear-UserVisibleFlag
     $notify.Visible = $false
     $notify.Dispose()
     $ctx.ExitThread()
 }
 
-$itemExit.add_Click({ Close-Tray })
+$script:stopStage = 0
+
+function Stop-DaemonHard {
+    Stop-Process -Id $WatchPid -Force -ErrorAction SilentlyContinue
+    Close-Tray
+}
+
+function Stop-Daemon {
+    # «Выход» = остановка СБОРА (требование владельца: «Выход завершает и
+    # сбор»). Каскад: 1-й клик — Ctrl+C демону (graceful: прогресс
+    # сохраняется, final_state=INTERRUPTED), иконка живёт до реальной смерти
+    # демона (watchdog закроет трей ≤2с); 2-й клик — ещё Ctrl+C (форс-путь
+    # демона, _FORCE_EXIT); 3-й — Stop-Process -Force (воркеры сами снимут
+    # браузеры через parent watchdog). Ctrl+C послать некуда (у демона нет
+    # консоли / ошибка) — жёсткий путь сразу.
+    if ($WatchPid -le 0) { Close-Tray; return }   # отладочный режим без демона
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $WatchPid" `
+        -ErrorAction SilentlyContinue
+    if (-not $proc -or $proc.CommandLine -notlike "*key_daemon*") {
+        Close-Tray                                # демона уже нет
+        return
+    }
+    $script:stopStage++
+    if ($script:stopStage -eq 1) {
+        $notify.ShowBalloonTip(3000, "ozon-collector",
+            "Останавливаю сбор… Прогресс сохранится. Повторное «Выход» — принудительно.",
+            [System.Windows.Forms.ToolTipIcon]::Info)
+        if (-not (Send-TrayCtrlC -TargetPid $WatchPid)) { Stop-DaemonHard }
+        return
+    }
+    if ($script:stopStage -eq 2) {
+        $notify.ShowBalloonTip(3000, "ozon-collector",
+            "Принудительная остановка…",
+            [System.Windows.Forms.ToolTipIcon]::Info)
+        if (-not (Send-TrayCtrlC -TargetPid $WatchPid)) { Stop-DaemonHard }
+        return
+    }
+    Stop-DaemonHard
+}
+
+$itemExit.add_Click({ Stop-Daemon })
 $notify.ContextMenuStrip = $menu
 $notify.add_MouseDoubleClick({ [void](Show-CollectorWindows) })
 

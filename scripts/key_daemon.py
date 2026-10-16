@@ -884,6 +884,13 @@ def _start_tray_companion(disabled: bool = False):
         log.warning(f"трей: скрипт не найден: {TRAY_SCRIPT}")
         return None
     try:
+        # Залипший флаг «пользователь смотрит окна» (трей убили taskkill'ом, не
+        # через «Выход») блокировал бы сторож на весь прогон: снимаем до старта.
+        from ozon_collector import window_policy
+        window_policy.clear_user_visible()
+    except Exception as exc:
+        log.warning(f"трей: сброс флага user-visible не удался: {exc}")
+    try:
         gone = _kill_stale_trays()
         if gone:
             log.info(f"трей: снят прошлый экземпляр (pid={gone})")

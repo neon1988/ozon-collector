@@ -165,13 +165,14 @@ def test_front_failure_without_api_attribute():
 
 
 # ---------------------------------------------------------------------------
-# ОКНО БРАУЗЕРА (живой замер 2026-10-08)
+# ОКНО БРАУЗЕРА (живые замеры 2026-10-08 и 2026-10-16)
 # ---------------------------------------------------------------------------
-# Свёрнутое окно Chromium под Windows не отдаёт кадры композитора: page.screenshot
-# виснет до таймаута (6с, три раза подряд), captureScreenshot(fromSurface=false)
-# отдал 210с и плоскую заливку std=0.0. На normal — 0.05с и std 32.
-# Именно это, а не «вкладка зависла», съедало PUZZLE_BUDGET_S=60 восемью
-# съёмками по 5с до первого драга (боевой лог 07.10: drops=0, таймаут 60с).
+# Кадры композитора: скрытое с рождения окно — 0.06с, свёрнутое — таймаут 6с
+# (три раза подряд; fromSurface=false отдал 210с и плоскую заливку, замер
+# 2026-10-08), показанное окно — видно пользователю (замер 2026-10-16: показ
+# через setWindowBounds совпал с логом «окно восстановлено»). Поэтому
+# единственное лечение — SW_HIDE видимого окна (OS-проба из Session), а НЕ
+# показ окна через CDP.
 
 class _FakeCDP:
     def __init__(self, state="minimized", fails=False):
@@ -204,12 +205,19 @@ class _FakeContext:
 
 
 class _FakeWinPage:
-    """Страница, умеющая только CDP-сессию (окно) и скриншот."""
+    """Страница, умеющая только CDP-сессию (окно), скриншот и OS-пробу окна.
 
-    def __init__(self, cdp_obj):
+    `_ozon_ensure_window_hidden` привязывает Session (cdp.Session.
+    _attach_geom_guard); в тестах его роль играет probe: True — окно было
+    видимо и скрыто, False — трогать нечего, None/нет атрибута — нет данных.
+    """
+
+    def __init__(self, cdp_obj, probe=None):
         self.context = _FakeContext(cdp_obj)
         self.shots = 0
         self.n_front = 0
+        if probe is not None:
+            self._ozon_ensure_window_hidden = probe
 
     def bring_to_front(self):
         self.n_front += 1
@@ -219,21 +227,35 @@ class _FakeWinPage:
         return b"png"
 
 
-def _win_page(state="minimized", fails=False):
+def _win_page(state="minimized", fails=False, probe=None):
     cdp_obj = _FakeCDP(state=state, fails=fails)
-    return _FakeWinPage(cdp_obj), cdp_obj
+    return _FakeWinPage(cdp_obj, probe=probe), cdp_obj
 
 
-def test_ensure_render_window_restores_minimized():
-    page, cdp_obj = _win_page("minimized")
+def test_ensure_render_window_hides_visible_window():
+    """Окно реально видимо (проба True) → скрыто; CDP-показ не вызывается."""
+    calls = {"n": 0}
+
+    def _probe():
+        calls["n"] += 1
+        return True
+    page, cdp_obj = _win_page("minimized", probe=_probe)
     with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
         assert puzzle_capture.ensure_render_window(page) is True
-    assert cdp_obj.state == "normal"
-    assert "Browser.setWindowBounds" in cdp_obj.calls
+    assert calls["n"] == 1
+    assert "Browser.setWindowBounds" not in cdp_obj.calls, \
+        "показ окна через CDP вернулся — именно он и был всплытием"
+
+
+def test_ensure_render_window_noop_when_probe_false():
+    """Проба False (уже скрыто / чужой Chrome / флаг трея) → no-op."""
+    page, cdp_obj = _win_page("minimized", probe=lambda: False)
+    assert puzzle_capture.ensure_render_window(page) is False
+    assert "Browser.setWindowBounds" not in cdp_obj.calls
 
 
 def test_ensure_render_window_noop_when_normal():
-    page, cdp_obj = _win_page("normal")
+    page, cdp_obj = _win_page("normal", probe=lambda: True)
     assert puzzle_capture.ensure_render_window(page) is False
     assert "Browser.setWindowBounds" not in cdp_obj.calls
 
@@ -241,16 +263,29 @@ def test_ensure_render_window_noop_when_normal():
 def test_ensure_render_window_reads_state_from_bounds():
     """Регрессия: верхнего windowState в ответе нет, состояние в bounds."""
     cdp_obj = _FakeCDP(state="minimized")
-    page = _FakeWinPage(cdp_obj)
+    page = _FakeWinPage(cdp_obj, probe=lambda: True)
     with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
-        puzzle_capture.ensure_render_window(page)
-    assert cdp_obj.state == "normal", "состояние прочитано не из bounds"
+        assert puzzle_capture.ensure_render_window(page) is True
+
+
+def test_ensure_render_window_without_probe_is_noop():
+    """Нет пробы (не Windows / чужой Chrome / старая страница) — no-op."""
+    page, _ = _win_page("minimized")      # проба не привязана
+    assert puzzle_capture.ensure_render_window(page) is False
 
 
 def test_ensure_render_window_survives_cdp_error():
-    page, _cdp_obj = _win_page("minimized", fails=True)
+    page, _cdp_obj = _win_page("minimized", fails=True, probe=lambda: True)
     with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
         assert puzzle_capture.ensure_render_window(page) is False
+
+
+def test_ensure_render_window_survives_probe_error():
+    """Падение пробы — False, а не исключение в съёмке."""
+    def _boom():
+        raise RuntimeError("probe down")
+    page, _ = _win_page("minimized", probe=_boom)
+    assert puzzle_capture.ensure_render_window(page) is False
 
 
 def test_ensure_render_window_without_cdp_transport():
@@ -266,26 +301,26 @@ def test_ensure_render_window_without_cdp_transport():
 
 def test_ensure_render_window_can_be_disabled(monkeypatch):
     monkeypatch.setenv("OZON_PUZZLE_RESTORE_WINDOW", "0")
-    page, cdp_obj = _win_page("minimized")
+    page, cdp_obj = _win_page("minimized", probe=lambda: True)
     assert puzzle_capture.ensure_render_window(page) is False
     assert cdp_obj.calls == []
 
 
-def test_page_shot_restores_window_before_capture():
-    """Единая точка съёмки сначала возвращает окно, потом снимает."""
-    page, cdp_obj = _win_page("minimized")
+def test_page_shot_hides_window_before_capture():
+    """Единая точка съёмки сначала прячет видимое окно, потом снимает."""
+    page, _cdp_obj = _win_page("minimized", probe=lambda: True)
     with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
         assert puzzle_capture._page_shot(page, animations="disabled") == b"png"
-    assert cdp_obj.state == "normal"
     assert page.shots == 1
 
 
-def test_bring_to_front_records_window_restore():
+def test_bring_to_front_records_window_hide():
+    """_bring_to_front: при видимом окне пишет win=hidden и поднимает вкладку."""
     reason = [""]
-    page, _cdp_obj = _win_page("minimized")
+    page, _cdp_obj = _win_page("minimized", probe=lambda: True)
     with patch.object(puzzle_capture.time, "sleep", lambda _s: None):
-        puzzle_capture._bring_to_front(page, reason)
-    assert "win=restored" in reason[0]
+        assert puzzle_capture._bring_to_front(page, reason) is True
+    assert "win=hidden" in reason[0]
     assert page.n_front == 1
 
 

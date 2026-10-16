@@ -706,6 +706,8 @@ class TestGeometryGuard:
         s.page = page
         s._attach_geom_guard()
         assert getattr(page, "_geom_guard", None) == s._geometry_guard
+        assert getattr(page, "_ozon_ensure_window_hidden", None) == \
+            s._ensure_window_hidden, "проба скрытия окна не привязана к page"
 
 
 # ---- ревизия 2.9: Page Visibility/focus телеметрия fingerprint --------------

@@ -30,6 +30,12 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Сторож окон (ozon_collector/window_policy) с 2026-10-16 включён ПО УМОЛЧАНИЮ.
+# В общем наборе он должен молчать: pid-ы в тестах вымышленные, а EnumWindows
+# и фоновый поток сторожа — настоящие (утечка потока в pytest). Тесты самого
+# сторожа снимают/ставят env точечно через monkeypatch.
+os.environ.setdefault("OZON_WINDOW_GUARD", "0")
+
 from ozon_collector.collect import PRODUCT_JS, REVIEWS_JS, VARIANT_MODE_JS  # noqa: E402
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
