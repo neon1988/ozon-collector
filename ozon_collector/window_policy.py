@@ -267,14 +267,15 @@ def foreground() -> Optional[WindowRow]:
 
 
 def minimize_hwnd(hwnd: int) -> bool:
-    """user32: WS_EX_NOACTIVATE + SW_MINIMIZE — то же, что делает Session."""
+    """user32: WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW + SW_MINIMIZE — как Session."""
     user32 = _user32()
     if user32 is None:
         return False
     _setup_api(user32)
     try:
         style = user32.GetWindowLongW(hwnd, -20)       # GWL_EXSTYLE
-        user32.SetWindowLongW(hwnd, -20, style | 0x08000000)  # NOACTIVATE
+        # NOACTIVATE — не крадёт фокус; TOOLWINDOW — нет кнопки на панели задач
+        user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x00000080)
         user32.ShowWindow(hwnd, 6)                    # SW_MINIMIZE
         return True
     except Exception as e:

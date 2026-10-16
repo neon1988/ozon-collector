@@ -199,6 +199,11 @@ fingerprint — грубый отпечаток сессии; полный probe
 - **Скрытый запуск и фокус:** окно создаётся скрытым (SW_HIDE), затем
   свёрнутым без активации (SW_SHOWMINNOACTIVE + WS_EX_NOACTIVATE + HWND_TOPMOST).
   Фокус возвращается предыдущему окну силами лаунчера (см. оговорку ниже).
+- **Вне панели задач (2026-10-16):** окна коллектора несут `WS_EX_TOOLWINDOW`
+  (ставит лаунчер; поддерживают `cdp._minimize_window_native` /
+  `_restore_window_native`, `window_policy.minimize_hwnd`, трей) — кнопки на
+  панели задач и в Alt+Tab нет. Управление окнами — `scripts/collector_tray.ps1`
+  (иконка в трее: развернуть/свернуть; разворот под пазл — `ensure_render_window`).
 - **Оговорка, измеренная 2026-10-06:** «фокус возвращается» выполняется не
   всегда. Когда фокус уже сидит на окне Chromium, ни `AttachThreadInput`
   (возвращает 0), ни `SwitchToThisWindow`, ни `SetForegroundWindow` из
@@ -220,6 +225,7 @@ fingerprint — грубый отпечаток сессии; полный probe
 | Воспроизводится и без кода коллектора (только `launch_chrome.ps1`), и не лечится ни SW_HIDE, ни `ShowWindow(SW_SHOWMINNOACTIVE)`, ни `SetTopmost`, ни чистым профилем, ни одним браузером вместо трёх | [FACT] |
 | Источник — внутри Chromium/Windows, не в одной строке нашего кода | [FACT] (ограничение вывода) |
 | `ozon_collector/window_policy.py` (сторож, **выключен** без `OZON_WINDOW_GUARD=1`): окно в minimized за ~0.06 с, фокус возвращается ALT-trick'ом | [FACT] на живых прогонах 06.10; по умолчанию не применяется |
+| `WS_EX_TOOLWINDOW` на окнах коллектора: нет кнопки на панели задач и в Alt+Tab; трей-пульт `scripts/collector_tray.ps1` | [FACT] стили на 8 живых окнах 2026-10-16 (`ex=0x08200188`); визуально чистота панели — за владельцем |
 | `GetLastInputInfo` не учитывает ни программные `ShowWindow`, ни `SendInput` — ручное открытие окна отличается от самовсплытия | [FACT], замер 06.10 |
 | Влияние режима окна на challenge rate (document.hidden) | [HYPOTHESIS], A/B не проводился |
 - **Порт:** `--remote-debugging-port=9222` (воркеры `9222+k`), CDP на localhost.

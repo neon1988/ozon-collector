@@ -1015,6 +1015,9 @@ class Session:
                                 window_class: str = "Chrome_WidgetWin_1"):
         """user32: свёртывание + запрет активации окна браузера (Windows).
 
+        Плюс WS_EX_TOOLWINDOW: окно не висит на панели задач и не попадает
+        в Alt+Tab (управление окнами коллектора — scripts/collector_tray.ps1).
+
         Chromium: pids вычисляются по port (chrome с --remote-debugging-port,
         наш воркер). Firefox: pids передаются явно (нет порта), класс окна
         MozillaWindowClass. Не-Windows — no-op.
@@ -1028,6 +1031,7 @@ class Session:
             user32 = ctypes.windll.user32
             GWL_EXSTYLE = -20
             WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080   # нет кнопки на панели задач
             SW_MINIMIZE = 6
 
             if pids is None:
@@ -1039,7 +1043,8 @@ class Session:
                 if hwnd:
                     style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
                     user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                          style | WS_EX_NOACTIVATE)
+                                          style | WS_EX_NOACTIVATE
+                                          | WS_EX_TOOLWINDOW)
                     user32.ShowWindow(hwnd, SW_MINIMIZE)
                     break
         except Exception as e:
@@ -1086,7 +1091,7 @@ class Session:
         Дублирует путь launch_chrome.ps1, но применим к уже работающему окну
         (после reconnect/перезапуска коллектором). Chromium: pids из порта;
         Firefox: pids явные + класс MozillaWindowClass. NOACTIVATE + SW_RESTORE,
-        фокус не крадём.
+        фокус не крадём. TOOLWINDOW сохраняем — панель задач остаётся чистой.
         """
         if os.name != "nt":
             return
@@ -1097,6 +1102,7 @@ class Session:
             user32 = ctypes.windll.user32
             GWL_EXSTYLE = -20
             WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080   # нет кнопки на панели задач
             SW_RESTORE = 9
             HWND_TOPMOST = -1
             SWP_NOMOVE = 0x0002
@@ -1117,7 +1123,8 @@ class Session:
                 if hwnd:
                     style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
                     user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                          style | WS_EX_NOACTIVATE)
+                                          style | WS_EX_NOACTIVATE
+                                          | WS_EX_TOOLWINDOW)
                     user32.ShowWindow(hwnd, 9)  # SW_RESTORE
                     user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE

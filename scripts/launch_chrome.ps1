@@ -262,6 +262,12 @@ public class LaunchChromeMin {
 
 $GWL_EXSTYLE = -20
 $WS_EX_NOACTIVATE = 0x08000000
+# WS_EX_TOOLWINDOW: окно-«инструмент» — Windows не рисует его на панели задач
+# и не включает в Alt+Tab. Ставим вместе с NOACTIVATE: окна коллектора не
+# мешают пользователю, разворачивать их — через scripts/collector_tray.ps1
+# (или сам коллектор под пазл). Chrome может пере-навешивать свои стили —
+# ниже стиль переприменяется в контрольных проходах.
+$WS_EX_TOOLWINDOW = 0x00000080
 
 # Запоминаем окно, которое было в фокусе ДО запуска — вернём ему фокус после
 # (Chrome при старте сам вызывает SetForegroundWindow и крадёт фокус).
@@ -295,7 +301,7 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowWindow = $tr
         $h = if ($win) { [LaunchChromeMin]::FindMainWindow($PidToWatch) } else { [IntPtr]::Zero }
         if ($h -ne [IntPtr]::Zero) {
             $style = [LaunchChromeMin]::GetWindowLong($h, $GWL_EXSTYLE)
-            [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $style -bor $WS_EX_NOACTIVATE) | Out-Null
+            [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $style -bor $WS_EX_NOACTIVATE -bor $WS_EX_TOOLWINDOW) | Out-Null
             if ($ShowWindow) {
                 [LaunchChromeMin]::ShowWindow($h, 7) | Out-Null          # SW_SHOWMINNOACTIVE (свёрнутое, без активации)
                 [void][LaunchChromeMin]::SetTopmost($h)                  # поверх всех, без активации
