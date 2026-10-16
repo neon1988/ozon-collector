@@ -340,7 +340,12 @@ def delete_taskbar_tab(hwnd: int) -> bool:
 
 
 def minimize_hwnd(hwnd: int) -> bool:
-    """user32: WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW + SW_MINIMIZE — как Session."""
+    """user32: WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW + SW_HIDE — как Session.
+
+    Именно SW_HIDE, а не SW_MINIMIZE: свёрнутое TOOLWINDOW-окно Windows
+    рисуется «мини-плиткой-призраком» над панелью задач и не отдаёт кадры
+    (живой замер 2026-10-16); скрытое окно кадры отдаёт.
+    """
     user32 = _user32()
     if user32 is None:
         return False
@@ -349,7 +354,7 @@ def minimize_hwnd(hwnd: int) -> bool:
         style = user32.GetWindowLongW(hwnd, -20)       # GWL_EXSTYLE
         # NOACTIVATE — не крадёт фокус; TOOLWINDOW — нет кнопки на панели задач
         user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x00000080)
-        user32.ShowWindow(hwnd, 6)                    # SW_MINIMIZE
+        user32.ShowWindow(hwnd, 0)                    # SW_HIDE
         delete_taskbar_tab(int(hwnd))
         return True
     except Exception as e:

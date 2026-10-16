@@ -10,7 +10,7 @@
 #   pwsh -NoProfile -File scripts/collector_tray.ps1        # tray icon, no watchdog (debug)
 #   pwsh -NoProfile -File scripts/collector_tray.ps1 -List  # print found windows, no GUI
 #   pwsh -NoProfile -File scripts/collector_tray.ps1 -Show  # restore collector windows once
-#   pwsh -NoProfile -File scripts/collector_tray.ps1 -Hide  # minimize collector windows once
+#   pwsh -NoProfile -File scripts/collector_tray.ps1 -Hide  # hide collector windows once
 #
 # Finds ONLY collector Chromium windows: chrome.exe whose command line contains
 # --user-data-dir with "ozon-profile" token (main + worker-N profiles). Foreign
@@ -19,15 +19,18 @@
 # Collector windows carry WS_EX_TOOLWINDOW (no taskbar button, not in Alt+Tab);
 # Restore clears WS_EX_NOACTIVATE so the user can interact with the page and
 # keeps WS_EX_TOOLWINDOW so the button does not come back; the launcher and
-# cdp.Session re-add NOACTIVATE on every collector minimize.
+# cdp.Session re-add NOACTIVATE on every collector hide.
 #
-# Minimize also calls ITaskbarList::DeleteTab + SW_HIDE/SW_SHOWMINNOACTIVE:
-# changing WS_EX_TOOLWINDOW alone does NOT remove a taskbar button that was
-# already created at window birth — Explorer must re-create the state (live
-# finding 2026-10-16: styles were on, buttons stayed). A reconcile timer
-# (every 2s) additionally deletes any button that reappears while the tray
-# runs, so collector windows can never sit on the taskbar (owner's demand:
-# windows are restored from the tray icon, not from the taskbar).
+# Hide calls SW_HIDE + ITaskbarList::DeleteTab — NOT SW_MINIMIZE /
+# SW_SHOWMINNOACTIVE: a minimized TOOLWINDOW window is rendered by Windows as a
+# small "ghost strip" with a close cross above the taskbar (live finding
+# 2026-10-16 — owner's «мини-плитка») and stops serving frames. Changing
+# WS_EX_TOOLWINDOW alone does NOT remove a taskbar button that was already
+# created at window birth — Explorer must re-create the state (live finding
+# 2026-10-16: styles were on, buttons stayed). A reconcile timer (every 2s)
+# additionally deletes any button that reappears while the tray runs, so
+# collector windows can never sit on the taskbar (owner's demand: windows are
+# restored from the tray icon, not from the taskbar).
 
 param(
     [switch]$List,
@@ -60,7 +63,6 @@ public class CollectorTrayWin {
     public const int WS_EX_TOOLWINDOW = 0x00000080;
     public const int SW_RESTORE = 9;
     public const int SW_HIDE = 0;
-    public const int SW_SHOWMINNOACTIVE = 7;
 
     public static List<IntPtr> FindByPids(int[] pids) {
         var set = new HashSet<int>(pids);
@@ -98,8 +100,9 @@ public class CollectorTrayWin {
         int st = GetWindowLong(h, GWL_EXSTYLE);
         SetWindowLong(h, GWL_EXSTYLE, st | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
         TaskbarTab.Delete(h);
+        // Только SW_HIDE: SW_MINIMIZE/SW_SHOWMINNOACTIVE рисуют над панелью
+        // задач «мини-плитку-призрак» с крестиком (живой замер 2026-10-16).
         ShowWindow(h, SW_HIDE);
-        ShowWindow(h, SW_SHOWMINNOACTIVE);
     }
 
     public static void EnsureNoTaskbar(IntPtr h) {

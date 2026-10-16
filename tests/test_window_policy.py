@@ -675,6 +675,52 @@ def test_minimize_hwnd_wires_taskbar_delete(monkeypatch):
         _destroy_probe_hwnd(hwnd)
 
 
+def test_minimize_hwnd_uses_sw_hide_not_sw_minimize(monkeypatch):
+    """Прячем окно через SW_HIDE (0), а не SW_MINIMIZE (6).
+
+    Живой замер 2026-10-16: свёрнутое TOOLWINDOW-окно Windows рисует над
+    панелью задач «мини-плитку-призрак» с крестиком и не отдаёт кадры;
+    скрытое окно кадры отдаёт.
+    """
+    calls = []
+
+    class _FakeUser32:
+        def GetWindowLongW(self, hwnd, idx):
+            return 0
+
+        def SetWindowLongW(self, hwnd, idx, val):
+            return 0
+
+        def ShowWindow(self, hwnd, cmd):
+            calls.append(cmd)
+            return True
+
+    monkeypatch.setattr(wp, "_user32", lambda: _FakeUser32())
+    monkeypatch.setattr(wp, "_setup_api", lambda user32: None)
+    monkeypatch.setattr(wp, "delete_taskbar_tab", lambda hwnd: True)
+    assert wp.minimize_hwnd(0x1234) is True
+    assert calls == [0], \
+        f"minimize_hwnd послал ShowWindow(cmd={calls}), нужен только SW_HIDE=0"
+
+
+def test_cdp_minimize_native_hides_not_minimizes():
+    """CDP-путь скрывает окно (SW_HIDE=0), а не сворачивает (SW_MINIMIZE=6).
+
+    Свёрнутое TOOLWINDOW-окно рисует «мини-плитку-призрак» над панелью задач
+    и не отдаёт кадры — пазл на нём виснет (живой замер 2026-10-16).
+    """
+    import inspect
+
+    from ozon_collector import cdp as C
+
+    src = inspect.getsource(C.Session._minimize_window_native)
+    assert "SW_HIDE = 0" in src
+    assert "ShowWindow(hwnd, SW_HIDE)" in src
+    assert "SW_MINIMIZE = 6" not in src, "вернулась константа свёртывания"
+    assert "ShowWindow(hwnd, SW_MINIMIZE)" not in src, \
+        "CDP-путь снова сворачивает окно вместо скрытия"
+
+
 @pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only")
 def test_cdp_minimize_native_wires_taskbar_delete(monkeypatch):
     """CDP-путь свёртывания шлёт DeleteTab для найденного hwnd."""

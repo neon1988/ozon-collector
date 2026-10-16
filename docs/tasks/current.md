@@ -1,9 +1,63 @@
 # Текущее состояние — ozon-collector
 
-Обновлено 2026-10-16 (3): третий заход по окнам сбора — реальный баг GUID
-DeleteTab, патруль панели задач, убран стартовый balloon трея («плитка над
-панелью задач»). Ранее в тот же день: трей-пульт + TOOLWINDOW (секция
-«Правка 8»); аудит 15.10 — BLOCKER + все 15 MAJOR починены, verify ALL GREEN.
+Обновлено 2026-10-16 (4): четвёртый заход по «плитке» — найден настоящий корень
+(свёрнутое TOOLWINDOW-окно = полоска-призрак с крестиком) и устранён: окна
+коллектора больше не показываются вовсе, прячутся только SW_HIDE. Ранее:
+третий заход (GUID DeleteTab, патруль панели задач, balloon); трей-пульт
+(«Правка 8»); 15.10 — BLOCKER + все 15 MAJOR аудита починены, verify ALL GREEN.
+
+## Четвёртый заход (2026-10-16): настоящий корень «плитки» — свёрнутое TOOLWINDOW-окно
+
+**Запрос владельца:** «плитка над панелью задач до сих пор появляется» (после
+третьего захода; та диагностика «тост трея» оказалась неверной).
+
+**Корень (живой замер).** «Плитка» = свёрнутое окно Chromium с
+`WS_EX_TOOLWINDOW`: Windows рисует его полоской ~160×28 с крестиком над
+панелью задач. Воспроизведение `.tmp/launch_observe.log`: `pid=36224
+hwnd=75051462 ex=0x08200188 tool=True vis=True icon=True rect=0,1004,160,1032
+title='about:blank - Google Chrome'`; 8 воркеров → 8 плиток (скрин владельца
+`.tmp/tile.png`). Источник — шоу-луп лаунчера (`Invoke-MinimizeNoActivate …
+$true` → SW_SHOWMINNOACTIVE+TOPMOST; живёт с ac31583, 2026-08-17).
+
+**Матрица живая (2026-10-16, порт 9444, профиль worker-1):**
+
+| окно | кадры page.screenshot |
+|---|---|
+| скрыто с рождения (SW_HIDE от CreateProcess) | OK 0.06с |
+| свёрнуто (SW_MINIMIZE = плитка на экране) | FAIL TimeoutError 6с |
+| показано натив (SW_RESTORE+TOPMOST) | OK |
+| показано → SW_HIDE | FAIL, само-лечение ≤~9с (на +8с OK) |
+| показано → SW_MINIMIZE → пауза → SW_HIDE | FAIL + плитка (rect 0,1004,160,1032) |
+| показано → offscreen-парковка (-32000) | OK сразу |
+
+Плюс: rAF/`visibilityState=visible` во всех состояниях; CDP-ввод (mousemove)
+доходит и в скрытое, и в паркованное окно.
+
+**Правка (4 файла):** показ окна исключён полностью, прячем только SW_HIDE.
+`launch_chrome.ps1` — шоу-луп удалён, окно остаётся скрытым с рождения (стиль
+TOOLWINDOW|NOACTIVATE, DeleteTab безусловно, сообщение «окно PID … скрыто»);
+`cdp._minimize_window_native` — `SW_HIDE=0` вместо `SW_MINIMIZE=6`;
+`window_policy.minimize_hwnd` — `ShowWindow(hwnd, 0)`; `collector_tray.ps1` —
+`Minimize` только SW_HIDE (SW_SHOWMINNOACTIVE-танцы удалены).
+
+**Живая проверка** (реальный исправленный лаунчер, `.tmp/live_fix_probe.ps1` +
+`live_fix_probe.log`): со старта `vis=False icon=False tool=True`, кадры
+0.06–0.07с; на скриншоте экрана `live_fix_born.png` плитки над панелью задач
+нет; показ из трея (SW_RESTORE) работает.
+
+**Тесты (+4, 149 passed):** `test_ps1_leaves_window_hidden_on_start`,
+`test_tray_hide_uses_sw_hide_not_show_minimized`,
+`test_minimize_hwnd_uses_sw_hide_not_sw_minimize`,
+`test_cdp_minimize_native_hides_not_minimizes`; докстринг
+`test_ps1_deletes_taskbar_tab_on_show` обновлён.
+
+**Риски (приняты):**
+- Пазл на скрытом окне вживую не проверен (кадры + CDP-ввод локально работают).
+  Если Ozon-пазл сломается — вернуть показ (трей/`ensure_render_window`);
+  offscreen-парковка — запасной путь без разрыва кадров (bring-back не доведён:
+  SetWindowPos с изменением размера не сработал — разобрать при надобности).
+- `SW_HIDE` показанного окна: кадры стоят до ~9с. В проде путь редкий
+  («юзер развернул из трея → сторож снова спрятал»).
 
 ## Правка 8 (2026-10-16): управление окнами сбора — трей + вне панели задач
 

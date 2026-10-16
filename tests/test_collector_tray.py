@@ -166,3 +166,19 @@ def test_tray_startup_shows_no_balloon():
     assert "Иконка окон сбора активна" not in t, \
         "стартовый balloon вернулся"
     assert "ShowBalloonTip" in t, "потерян balloon «окна не найдены»"
+
+
+def test_tray_hide_uses_sw_hide_not_show_minimized():
+    """«Свернуть окна сбора» прячет окно, а не показывает свёрнутым.
+
+    Живой замер 2026-10-16: SW_MINIMIZE / SW_SHOWMINNOACTIVE на
+    TOOLWINDOW-окне рисует над панелью задач «мини-плитку-призрак» с
+    крестиком (vis=True icon=True rect=0,1004,160,1032) и окно перестаёт
+    отдавать кадры. Прячем только SW_HIDE.
+    """
+    t = _text(TRAY)
+    code = "\n".join(ln for ln in t.splitlines()
+                     if not ln.lstrip().startswith(("#", "//")))
+    assert "SW_SHOWMINNOACTIVE" not in code, \
+        "трей снова показывает окно свёрнутым (плитка-призрак)"
+    assert "ShowWindow(h, SW_HIDE)" in code, "трей не прячет окно через SW_HIDE"

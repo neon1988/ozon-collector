@@ -219,12 +219,32 @@ def test_ps1_markers_are_ascii():
 
 
 def test_ps1_deletes_taskbar_tab_on_show():
-    """Показ окна в лаунчере обязан снимать кнопку панели задач.
+    """Применяя стиль, лаунчер обязан снять кнопку панели задач (DeleteTab).
 
-    Смена WS_EX_TOOLWINDOW уже созданную кнопку не убирает (живая находка
-    2026-10-16) — нужен явный ITaskbarList::DeleteTab."""
+    Старт окно НЕ показывает (см. test_ps1_leaves_window_hidden), но кнопка
+    могла создаться в обход (Explorer/Chromium), а смена WS_EX_TOOLWINDOW уже
+    созданную кнопку не убирает (живая находка 2026-10-16) — нужен явный
+    ITaskbarList::DeleteTab."""
     ps1 = _text(PS1)
     assert "ITaskbarList" in ps1 and "DeleteTab" in ps1, \
         "launch_chrome.ps1 потерял снятие кнопки панели задач"
     assert "[TaskbarTab]::Delete($h)" in ps1, \
-        "DeleteTab объявлен, но не вызывается при показе окна"
+        "DeleteTab объявлен, но не вызывается при применении стиля"
+
+
+def test_ps1_leaves_window_hidden_on_start():
+    """Лаунчер НЕ показывает окно на старте — даже свёрнутым.
+
+    Живой замер 2026-10-16: SW_SHOWMINNOACTIVE рождает над панелью задач
+    «мини-плитку-призрак» с крестиком (vis=True icon=True
+    rect=0,1004,160,1032 — та самая «плитка» владельца) и на свёрнутом окне
+    не идут кадры. Окно остаётся скрытым (SW_HIDE от CreateProcess), к нему
+    применяется только стиль TOOLWINDOW|NOACTIVATE.
+    """
+    ps1 = _text(PS1)
+    assert "Invoke-MinimizeNoActivate $targetPid 300 $true" not in ps1, \
+        "в лаунчер вернулся шоу-луп (показ окна свёрнутым)"
+    assert "ShowWindow($h, 7)" not in ps1, \
+        "лаунчер снова показывает окно (SW_SHOWMINNOACTIVE=$h,7)"
+    assert "окно PID $targetPid скрыто" in ps1, \
+        "лаунчер не сообщает, что окно скрыто"

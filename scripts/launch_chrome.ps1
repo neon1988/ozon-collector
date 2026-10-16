@@ -112,8 +112,12 @@ $proxyArg = if ($Proxy) { "--proxy-server=$Proxy" } else { $null }
 
 # Запуск через CreateProcess со STARTUPINFO.wShowWindow=SW_HIDE (0):
 # окно создаётся СКРЫТЫМ и физически не может активироваться/украсть фокус,
-# даже если Chrome при старте пытается показать себя. После полной готовности
-# CDP (конец скрипта) показываем окно свёрнутым без активации (SW_SHOWMINNOACTIVE).
+# даже если Chrome при старте пытается показать себя. К скрытому окну
+# применяется WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW; показывать его (даже
+# свёрнутым) нельзя: SW_SHOWMINNOACTIVE рисует над панелью задач
+# мини-плитку-призрак с крестиком, а свёрнутое окно перестаёт отдавать кадры
+# (живой замер 2026-10-16). Окно показывает трей («Развернуть окна сбора»)
+# или ensure_render_window при необходимости.
 # В отличие от Start-Process -WindowStyle Minimized (SW_SHOWMINIMIZED), который
 # АКТИВИРУЕТ окно на ~30-100мс и крадёт фокус у пользователя (прерывает печать).
 # Весь вызов — внутри C#-метода: маршалинг структуры STARTUPINFO через
@@ -216,9 +220,10 @@ if ($targetPid -lt 0) {
     exit 1
 }
 
-# Показываем главное окно запущенного инстанса свёрнутым без активации:
-# SW_SHOWMINNOACTIVE показывает сразу свёрнутым (без мелькания), без кражи фокуса.
-# Фильтр по PID запущенного процесса — окна обычного Chrome не трогаем.
+# Применяем стиль TOOLWINDOW|NOACTIVATE главному окну запущенного инстанса,
+# НЕ показывая его: окно остаётся скрытым (SW_HIDE от CreateProcess), кадры
+# при этом доступны (замер 2026-10-16). Фильтр по PID запущенного процесса —
+# окна обычного Chrome не трогаем.
 Add-Type @"
 using System;
 using System.Collections.Generic;
@@ -342,11 +347,13 @@ public static class TaskbarTab {
 "@
 $prevFg = [FocusSave]::GetForegroundWindow()
 
-function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowWindow = $true) {
-    # Показывает окно БЕЗ активации и прижимает поверх всех (HWND_TOPMOST):
-    # окно ВИДИМО и не перехватывает фокус. SW_RESTORE выставляет WS_VISIBLE
-    # (иначе окно остаётся «видимым» для EnumWindows, но не на экране).
-    # $ShowWindow=$false — только ставим WS_EX_NOACTIVATE, не показывая окно.
+function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
+    # Применяет к окну WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW, НЕ показывая его:
+    # показ даже свёрнутым рождает над панелью задач «мини-плитку-призрак» с
+    # крестиком (живой замер 2026-10-16) и на свёрнутом окне не идут кадры.
+    # Показывающей ветки здесь больше нет; показ окна — трей или CDP
+    # setWindowBounds, когда он реально нужен.
+    # DeleteTab снимает кнопку панели задач, если она успела создаться.
     $deadline = (Get-Date).AddMilliseconds($WaitMs)
     while ((Get-Date) -lt $deadline) {
         $win = Get-Process -Id $PidToWatch -ErrorAction SilentlyContinue
@@ -360,11 +367,7 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowWindow = $tr
         if ($h -ne [IntPtr]::Zero) {
             $style = [LaunchChromeMin]::GetWindowLong($h, $GWL_EXSTYLE)
             [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $style -bor $WS_EX_NOACTIVATE -bor $WS_EX_TOOLWINDOW) | Out-Null
-            if ($ShowWindow) {
-                [LaunchChromeMin]::ShowWindow($h, 7) | Out-Null          # SW_SHOWMINNOACTIVE (свёрнутое, без активации)
-                [void][LaunchChromeMin]::SetTopmost($h)                  # поверх всех, без активации
-                [void][TaskbarTab]::Delete($h)   # снять кнопку панели задач: смена TOOLWINDOW уже созданную не убирает
-            }
+            [void][TaskbarTab]::Delete($h)   # снять кнопку панели задач: смена TOOLWINDOW уже созданную не убирает
             return $true
         }
         Start-Sleep -Milliseconds 30
@@ -399,7 +402,7 @@ function Restore-Focus {
 
 # Первый проход: находим окно и ставим WS_EX_NOACTIVATE как можно раньше,
 # НЕ показывая его (оно скрыто с рождения — SW_HIDE).
-$minimized = Invoke-MinimizeNoActivate $targetPid 10000 $false
+$minimized = Invoke-MinimizeNoActivate $targetPid 10000
 
 # Ждём, пока CDP-порт ответит: к этому моменту Chrome закончил старт и
 # свои попытки активации окна (мелькание).
@@ -453,20 +456,17 @@ if (-not $ready) {
     exit 1
 }
 
-# Контрольные проходы ПОСЛЕ полного старта: повторно применяем стиль
-# WS_EX_NOACTIVATE, показываем окно (SW_RESTORE) и прижимаем поверх всех
-# (HWND_TOPMOST), затем возвращаем фокус. Окно ВИДИМО всегда, фокус не крадёт.
+# Окно НЕ показываем вообще. Показ даже свёрнутым (SW_SHOWMINNOACTIVE) рождает
+# над панелью задач мини-плитку-призрак с крестиком (живой замер 2026-10-16:
+# vis=True icon=True rect=0,1004,160,1032 — «плитка» владельца) и на свёрнутом
+# окне перестают идти кадры. Окно остаётся скрытым (SW_HIDE от CreateProcess).
 if (-not $minimized) {
-    $minimized = Invoke-MinimizeNoActivate $targetPid 3000 $false
-}
-for ($i = 0; $i -lt 3; $i++) {
-    [void](Invoke-MinimizeNoActivate $targetPid 300 $true)
-    Restore-Focus -PrevFg $prevFg -Verbose ($i -eq 0)
+    $minimized = Invoke-MinimizeNoActivate $targetPid 3000
 }
 if ($minimized) {
-    Write-Host "OK: окно PID $targetPid показано поверх всех (TOPMOST), фокус не крадётся"
+    Write-Host "OK: окно PID $targetPid скрыто, стиль TOOLWINDOW|NOACTIVATE применён"
 } else {
-    Write-Warning "не удалось найти окно PID $targetPid для показа"
+    Write-Warning "не удалось найти окно PID $targetPid для применения стиля"
 }
 Write-Host "LAUNCHER-DIAG: chrome=$Chrome profile=$Profile port=$Port proxy=$proxyNote pid=$targetPid"
 exit 0
