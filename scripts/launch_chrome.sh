@@ -36,6 +36,9 @@ date -Is > "$PROFILE/.ozon_collector_launched"
 # работает и лишний флаг там — заметный сигнал automation (в .ps1 его нет
 # намеренно, см. комментарий к $chromeArgs). Остальные флаги держат
 # .sh и .ps1 синхронными: НЕ добавлять --enable-automation.
+# --deny-permission-prompts: Chrome рисует permission-бабл («… запрашивает
+# разрешение на:» ОТДЕЛЬНЫМ ВИДИМЫМ окном даже при скрытом главном (живой
+# замер 2026-10-16) — глушим: запросы авто-отклоняются, UI не создаётся.
 DISPLAY=${DISPLAY:-:0}
 # Потолок дискового кеша Chromium (МБ, флаг принимает килобайты). Живой замер
 # 2026-10-07: профиль раздувался до 880 МБ, 92% — воспроизводимый кеш, а не
@@ -56,6 +59,7 @@ DISPLAY="$DISPLAY" setsid bash -c "$CHROME --remote-debugging-port=$PORT \
   --user-data-dir=$PROFILE \
   --no-first-run --no-default-browser-check \
   --disable-features=OptimizationHints,MediaRouter \
+  --deny-permission-prompts \
   --disk-cache-size=$((DISK_CACHE_MB * 1024)) \
   --window-size=1440,900 --no-sandbox $PROXY_ARGS about:blank" & disown
 

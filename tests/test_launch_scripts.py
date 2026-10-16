@@ -119,6 +119,22 @@ def test_both_use_automation_disabled():
             f"{os.path.basename(path)} передаёт --enable-automation")
 
 
+def test_both_deny_permission_prompts():
+    """Permission-бабл Chrome — отдельное ВИДИМОЕ окно даже при скрытом главном.
+
+    Живой замер 2026-10-16: через ~2с после загрузки ozon-страницы Chrome
+    создаёт окно «www.ozon.ru запрашивает разрешение на:» (vis=True noact=False
+    tool=True rect=1218,136,1552,442) и держит его открытым — владелец видит
+    «плитку» поверх своих окон. Флаг авто-отклоняет промпты, UI не рисуется.
+    Источник семантики: chromium components/permissions/README.md.
+    """
+    for path, t in ((PS1, _text(PS1)), (SH, _text(SH))):
+        name = os.path.basename(path)
+        assert "--deny-permission-prompts" in t, (
+            f"{name} потерял --deny-permission-prompts: permission-бабл "
+            f"Chrome снова станет видимым окном поверх чужих окон")
+
+
 def test_ps1_parses_as_powershell():
     """Синтаксическая проверка PS1 (на Windows; на других ОС — пропуск)."""
     if os.name != "nt":
