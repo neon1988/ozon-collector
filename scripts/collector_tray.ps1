@@ -2,7 +2,12 @@
 # Tray companion for ozon-collector Chromium windows (Windows, pwsh 7+).
 #
 # Usage:
-#   pwsh -NoProfile -File scripts/collector_tray.ps1        # tray icon, resident
+#   pwsh -NoProfile -File scripts/collector_tray.ps1 -WatchPid <pid>
+#       normal mode: key_daemon.main() starts the tray exactly like this. The
+#       icon lives with the collection: the watchdog below exits the tray
+#       within ~2s after the watched daemon pid dies (works on taskkill too,
+#       so the icon can never hang around after the run stops).
+#   pwsh -NoProfile -File scripts/collector_tray.ps1        # tray icon, no watchdog (debug)
 #   pwsh -NoProfile -File scripts/collector_tray.ps1 -List  # print found windows, no GUI
 #   pwsh -NoProfile -File scripts/collector_tray.ps1 -Show  # restore collector windows once
 #   pwsh -NoProfile -File scripts/collector_tray.ps1 -Hide  # minimize collector windows once
@@ -24,7 +29,8 @@
 param(
     [switch]$List,
     [switch]$Show,
-    [switch]$Hide
+    [switch]$Hide,
+    [int]$WatchPid = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -194,14 +200,38 @@ $itemHide.add_Click({
         $n = Hide-CollectorWindows
         if ($n -eq 0) { $notify.ShowBalloonTip(2000, "ozon-collector", "Окна сбора не найдены (демон не запущен?)", [System.Windows.Forms.ToolTipIcon]::Info) }
     })
-$itemExit.add_Click({
-        $notify.Visible = $false
-        $notify.Dispose()
-        $ctx.ExitThread()
-    })
+function Close-Tray {
+    $notify.Visible = $false
+    $notify.Dispose()
+    $ctx.ExitThread()
+}
+
+$itemExit.add_Click({ Close-Tray })
 $notify.ContextMenuStrip = $menu
 $notify.add_MouseDoubleClick({ [void](Show-CollectorWindows) })
 
 $ctx = New-Object System.Windows.Forms.ApplicationContext
-$notify.ShowBalloonTip(3000, "ozon-collector", "Иконка окон сбора активна: правый клик — меню", [System.Windows.Forms.ToolTipIcon]::Info)
+
+if ($WatchPid -gt 0) {
+    # Watchdog: трей живёт ровно столько, сколько демон. Проверка по cmdline,
+    # а не только по pid, — защита от переиспользования PID (identity-подход).
+    $watch = New-Object System.Windows.Forms.Timer
+    $watch.Interval = 2000
+    $watch.add_Tick({
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $WatchPid" `
+                -ErrorAction SilentlyContinue
+            if (-not $proc -or $proc.CommandLine -notlike "*key_daemon*") {
+                $watch.Stop()
+                Close-Tray
+            }
+        })
+    $watch.Start()
+}
+
+$hint = if ($WatchPid -gt 0) {
+    "Иконка окон сбора активна (закрывается вместе со сбором): правый клик — меню"
+} else {
+    "Иконка окон сбора активна: правый клик — меню"
+}
+$notify.ShowBalloonTip(3000, "ozon-collector", $hint, [System.Windows.Forms.ToolTipIcon]::Info)
 [System.Windows.Forms.Application]::Run($ctx)

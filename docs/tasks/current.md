@@ -34,9 +34,18 @@ test_launch_scripts + test_cdp_launch + test_launch_diagnostics` — 134 passed.
 не пересобирает состояние задним числом. Лечение: `ITaskbarList::DeleteTab` +
 цикл SW_HIDE → SW_SHOWMINNOACTIVE (добавлено в трей `Minimize`). Новые запуски
 кнопку не создают вовсе: лаунчер ставит стиль до первого показа окна.
-Вторая ловушка того же отзыва: иконка трея не исчезает при остановке сбора —
-трей это отдельный резидентный процесс-пульт (выход — ПКМ → «Выход»), а не
-часть демона.
+Вторая ловушка того же отзыва: иконка трея не исчезала при остановке сбора —
+трей был отдельным резидентом. Исправлено в тот же день: трей стал частью
+сбора — `key_daemon.main()` поднимает `collector_tray.ps1 -WatchPid <pid
+демона>` (CREATE_NO_WINDOW; отключение `--no-tray` / `OZON_TRAY=0`; в pytest
+не спавнится), а watchdog в трее раз в 2с проверяет cmdline демона (маркер
+`key_daemon`, защита от PID-reuse) и закрывает иконку после его смерти —
+работает и при taskkill. Перед спавном снимаются треи прошлых запусков
+(identity: powershell/pwsh + маркер `collector_tray.ps1` в cmdline,
+`process.command_line_processes`). Живая проверка 2026-10-16: probe-«демон»
+запустил трей (powershell pid 27624, `-WatchPid 38780`), после принудительного
+убийства probe трей исчез за ≤6с. Тесты: `tests/test_collector_tray.py` —
+10 новых, `test_process.py::test_command_line_processes_filters_by_token`.
 
 ## Правка 7 (2026-10-08): свёрнутое окно убивало съёмку → пазл не доезжал до драга
 

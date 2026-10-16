@@ -60,6 +60,7 @@ sys.path.insert(0, str(ROOT))
 from ozon_collector import log
 from ozon_collector import net
 from ozon_collector.browser import AccessChallengeError
+from ozon_collector.process import command_line_processes, kill_identities
 from ozon_collector.search import CollectionInterrupted
 
 DATA_DIR = ROOT / "data"
@@ -837,6 +838,72 @@ def _drop_pid_file() -> None:
         (DATA_DIR / "key_daemon.pid").unlink(missing_ok=True)
     except OSError:
         pass
+
+
+# ---- трей-пульт окон сбора ------------------------------------------------
+# Трей — часть сбора, а не резидент (просьба владельца 2026-10-16): демон
+# поднимает его на старте и передаёт -WatchPid, трей сам выходит в течение
+# ~2с после смерти демона (watchdog внутри скрипта по cmdline) — иконка не
+# может «зависнуть» даже при taskkill. Ручной standalone-запуск скрипта
+# остался для отладки (-List/-Show/-Hide).
+
+TRAY_SCRIPT = ROOT / "scripts" / "collector_tray.ps1"
+_TRAY_CMD_TOKEN = "collector_tray.ps1"
+_TRAY_KILL_WAIT_S = 2.0
+
+
+def _stale_tray_processes() -> list:
+    """Identity треев прошлых запусков (powershell/pwsh + маркер в cmdline)."""
+    idents = []
+    for name in ("powershell", "pwsh"):
+        idents.extend(command_line_processes(name, _TRAY_CMD_TOKEN))
+    return idents
+
+
+def _kill_stale_trays() -> list[int]:
+    """Снять треи прошлых запусков — только после сверки identity."""
+    return kill_identities(_stale_tray_processes(), wait_s=_TRAY_KILL_WAIT_S)
+
+
+def _start_tray_companion(disabled: bool = False):
+    """Поднять трей-пульт, привязанный к этому процессу демона. None — не поднят.
+
+    Спавн отключён при: --no-tray, env OZON_TRAY=0, не-Windows, pytest
+    (PYTEST_CURRENT_TEST: тесты зовут main() in-process, GUI там не нужен).
+    Старые треи (в т.ч. запущенные руками) сначала снимаются по identity —
+    иначе после «трей живёт со сбором» на панели копилась бы вторая иконка.
+    """
+    if disabled or os.name != "nt":
+        return None
+    flag = (os.environ.get("OZON_TRAY") or "").strip().lower()
+    if flag in {"0", "off", "false", "no"}:
+        return None
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    if not TRAY_SCRIPT.exists():
+        log.warning(f"трей: скрипт не найден: {TRAY_SCRIPT}")
+        return None
+    try:
+        gone = _kill_stale_trays()
+        if gone:
+            log.info(f"трей: снят прошлый экземпляр (pid={gone})")
+    except Exception as exc:
+        # Трей — удобство, а не часть сбора: его проблемы не роняют кампанию.
+        log.warning(f"трей: чистка прошлых экземпляров не удалась: {exc}")
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-File", str(TRAY_SCRIPT), "-WatchPid", str(os.getpid())]
+    try:
+        # CREATE_NO_WINDOW: у трея скрытая консоль, виден только значок.
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    except OSError as exc:
+        log.warning(f"трей: powershell не запустился: {exc}")
+        return None
+    log.info(f"трей: пульт окон сбора запущен (powershell pid={proc.pid}, "
+             f"watch_pid={os.getpid()})")
+    return proc
 
 
 def _status_payload(progress: dict) -> dict:
@@ -2731,6 +2798,10 @@ def parse_args(argv=None):
                     help="пауза (сек) при challenge-storm перед следующей "
                          "попыткой (фиксированная, не растёт)")
     ap.add_argument("--notify", default="off", help="'off' | 'toast'")
+    ap.add_argument("--no-tray", action="store_true",
+                    help="не поднимать трей-пульт окон сбора. По умолчанию "
+                         "трей стартует вместе с демоном и сам закрывается "
+                         "вместе с ним (watchdog по pid); env OZON_TRAY=0 — то же")
     ap.add_argument("--force-new", action="store_true",
                     help="принудительно пересоздать кампанию, игнорируя "
                          "несовпадение identity (URL/схема) при resume")
@@ -2890,6 +2961,9 @@ def main(argv=None):
         campaign, name_source, name_source_value = args.campaign, "explicit", None
     else:
         campaign, name_source, name_source_value = campaign_from_url(args.url or "")
+    # Трей-пульт: рождается вместе со сбором, сам выходит после смерти демона
+    # (см. _start_tray_companion) — отдельный резидент больше не нужен.
+    _start_tray_companion(disabled=args.no_tray)
     out = args.out or f"docs/digests/{campaign}.md"
     progress = run_campaign(
         campaign=campaign, url=args.url or "", target=args.limit,

@@ -288,6 +288,19 @@ def test_identity_alive_dead_pid():
     assert P.identity_alive(P.ProcessIdentity(pid=999999999, start_key="x")) is False
 
 
+def test_command_line_processes_filters_by_token(monkeypatch):
+    """Трей-пульт находится по маркеру в cmdline, чужие powershell — нет."""
+    fake = [
+        (111, ["powershell", "-File", "D:\\proj\\scripts\\collector_tray.ps1"], 1),
+        (222, ["powershell", "-File", "D:\\proj\\scripts\\other.ps1"], 1),
+    ]
+    monkeypatch.setattr(P, "_iter_named_processes", lambda name: iter(fake))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid=pid, start_key="t"))
+    got = P.command_line_processes("powershell", "collector_tray.ps1")
+    assert [i.pid for i in got] == [111]
+
+
 def test_wait_exit_dead_identity_is_true():
     assert P.wait_exit(P.ProcessIdentity(pid=999999999, start_key="x"),
                        wait_s=0.2) is True

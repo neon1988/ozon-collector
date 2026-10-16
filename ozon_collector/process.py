@@ -1043,6 +1043,24 @@ def _iter_named_processes(name: str):
             int(ppid) if ppid is not None else None)
 
 
+def command_line_processes(name: str, token: str) -> list[ProcessIdentity]:
+    """Идентичности процессов name.exe, в argv которых есть подстрока token.
+
+    Для вспомогательных процессов проекта (трей-пульт collector_tray.ps1):
+    атрибуция по маркеру в командной строке, затем физическая identity
+    (pid + start_key) — та же защита от PID-reuse, что и у браузеров.
+    """
+    need = token.lower()
+    out: list[ProcessIdentity] = []
+    for pid, argv, _ppid in _iter_named_processes(name):
+        if not any(need in a.lower() for a in argv):
+            continue
+        ident = process_identity(pid)
+        if ident is not None:
+            out.append(ident)
+    return out
+
+
 def firefox_browser_processes(profile_token: str) -> list[ProcessIdentity]:
     """Идентичности Firefox-процессов на нашем профиле token.
 
