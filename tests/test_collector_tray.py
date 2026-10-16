@@ -138,3 +138,31 @@ class TestDaemonTrayLifecycle:
         k.main(["--url", "https://www.ozon.ru/category/x-1/", "--limit", "5",
                 "--min-valid", "1", "--no-tray"])
         assert captured["disabled"] is True
+
+
+def test_tray_reconcile_contract():
+    """Патруль панели задач: каждые 2с снимать кнопки окон сбора.
+
+    Требование владельца 2026-10-16: окна сбора не висят на панели задач,
+    восстанавливаются из трея. Даже если кнопку создал кто-то в обход
+    лаунчера — патруль её удаляет (смена TOOLWINDOW кнопку не убирает).
+    """
+    t = _text(TRAY)
+    assert "Reconcile-CollectorWindows" in t
+    assert "EnsureNoTaskbar" in t, "патруль не восстанавливает TOOLWINDOW/кнопку"
+    assert "DeleteTab" in t, "патруль не вызывает ITaskbarList::DeleteTab"
+    assert "$reconcile.Interval = 2000" in t, "патруль не поставлен на таймер"
+
+
+def test_tray_startup_shows_no_balloon():
+    """Стартового всплывающего уведомления быть не должно.
+
+    Win11 рисует его тостом-«плиткой» над панелью задач и подсвечивает
+    иконку при каждом старте сбора (живой отзыв владельца 2026-10-16:
+    «плитка над панелью задач до сих пор появляется»). Уведомление
+    «окна не найдены» по клику в меню остаётся.
+    """
+    t = _text(TRAY)
+    assert "Иконка окон сбора активна" not in t, \
+        "стартовый balloon вернулся"
+    assert "ShowBalloonTip" in t, "потерян balloon «окна не найдены»"

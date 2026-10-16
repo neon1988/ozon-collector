@@ -281,6 +281,64 @@ public class FocusSave {
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 }
+
+// ITaskbarList pairs: live check 2026-10-16 (Win11, explorerframe.dll) —
+// CLSID {56FDF344…} + IID {56FDF342…} works; the reversed pair from older
+// SDK samples gives REGDB_E_CLASSNOTREG / E_NOINTERFACE. Try both.
+[ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")]
+public class CTaskbarList { }
+
+[ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090")]
+public class CTaskbarListLegacy { }
+
+[ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ITaskbarList {
+    void HrInit();
+    void AddTab(IntPtr hwnd);
+    void DeleteTab(IntPtr hwnd);
+    void ActivateTab(IntPtr hwnd);
+    void SetActiveAlt(IntPtr hwnd);
+}
+
+[ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ITaskbarListLegacy {
+    void HrInit();
+    void AddTab(IntPtr hwnd);
+    void DeleteTab(IntPtr hwnd);
+    void ActivateTab(IntPtr hwnd);
+    void SetActiveAlt(IntPtr hwnd);
+}
+
+public static class TaskbarTab {
+    public static bool Delete(IntPtr h) {
+        object o;
+        try {
+            o = new CTaskbarList();
+        } catch {
+            try {
+                o = new CTaskbarListLegacy();
+            } catch {
+                return false;
+            }
+        }
+        try {
+            if (o is ITaskbarList) {
+                var t = (ITaskbarList)o;
+                t.HrInit();
+                t.DeleteTab(h);
+            } else {
+                var t = (ITaskbarListLegacy)o;
+                t.HrInit();
+                t.DeleteTab(h);
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+}
 "@
 $prevFg = [FocusSave]::GetForegroundWindow()
 
@@ -305,6 +363,7 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs, [bool]$ShowWindow = $tr
             if ($ShowWindow) {
                 [LaunchChromeMin]::ShowWindow($h, 7) | Out-Null          # SW_SHOWMINNOACTIVE (свёрнутое, без активации)
                 [void][LaunchChromeMin]::SetTopmost($h)                  # поверх всех, без активации
+                [void][TaskbarTab]::Delete($h)   # снять кнопку панели задач: смена TOOLWINDOW уже созданную не убирает
             }
             return $true
         }

@@ -24,7 +24,10 @@
 # Minimize also calls ITaskbarList::DeleteTab + SW_HIDE/SW_SHOWMINNOACTIVE:
 # changing WS_EX_TOOLWINDOW alone does NOT remove a taskbar button that was
 # already created at window birth — Explorer must re-create the state (live
-# finding 2026-10-16: styles were on, buttons stayed).
+# finding 2026-10-16: styles were on, buttons stayed). A reconcile timer
+# (every 2s) additionally deletes any button that reappears while the tray
+# runs, so collector windows can never sit on the taskbar (owner's demand:
+# windows are restored from the tray icon, not from the taskbar).
 
 param(
     [switch]$List,
@@ -98,12 +101,25 @@ public class CollectorTrayWin {
         ShowWindow(h, SW_HIDE);
         ShowWindow(h, SW_SHOWMINNOACTIVE);
     }
+
+    public static void EnsureNoTaskbar(IntPtr h) {
+        int st = GetWindowLong(h, GWL_EXSTYLE);
+        if ((st & WS_EX_TOOLWINDOW) == 0)
+            SetWindowLong(h, GWL_EXSTYLE, st | WS_EX_TOOLWINDOW);
+        TaskbarTab.Delete(h);
+    }
 }
 
-[ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090")]
+// ITaskbarList pairs: live check 2026-10-16 (Win11, explorerframe.dll) —
+// CLSID {56FDF344…} + IID {56FDF342…} works; the reversed pair from older
+// SDK samples gives REGDB_E_CLASSNOTREG / E_NOINTERFACE. Try both.
+[ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")]
 public class CTaskbarList { }
 
-[ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")]
+[ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090")]
+public class CTaskbarListLegacy { }
+
+[ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090")]
 [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 public interface ITaskbarList {
     void HrInit();
@@ -113,12 +129,38 @@ public interface ITaskbarList {
     void SetActiveAlt(IntPtr hwnd);
 }
 
+[ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ITaskbarListLegacy {
+    void HrInit();
+    void AddTab(IntPtr hwnd);
+    void DeleteTab(IntPtr hwnd);
+    void ActivateTab(IntPtr hwnd);
+    void SetActiveAlt(IntPtr hwnd);
+}
+
 public static class TaskbarTab {
     public static bool Delete(IntPtr h) {
+        object o;
         try {
-            var t = (ITaskbarList)new CTaskbarList();
-            t.HrInit();
-            t.DeleteTab(h);
+            o = new CTaskbarList();
+        } catch {
+            try {
+                o = new CTaskbarListLegacy();
+            } catch {
+                return false;
+            }
+        }
+        try {
+            if (o is ITaskbarList) {
+                var t = (ITaskbarList)o;
+                t.HrInit();
+                t.DeleteTab(h);
+            } else {
+                var t = (ITaskbarListLegacy)o;
+                t.HrInit();
+                t.DeleteTab(h);
+            }
             return true;
         } catch {
             return false;
@@ -145,6 +187,14 @@ function Hide-CollectorWindows {
     $wins = @(Get-CollectorWindows)
     foreach ($h in $wins) { [CollectorTrayWin]::Minimize($h) }
     return $wins.Count
+}
+
+function Reconcile-CollectorWindows {
+    # Патруль панели задач: даже если окно создало кнопку в обход лаунчера
+    # (или её пересоздал Explorer/Chromium), снимаем её в течение пары секунд.
+    # Живой отзыв владельца 2026-10-16: «мини-плитки» на панели при сборе.
+    $wins = @(Get-CollectorWindows)
+    foreach ($h in $wins) { [CollectorTrayWin]::EnsureNoTaskbar($h) }
 }
 
 if ($List) {
@@ -212,6 +262,12 @@ $notify.add_MouseDoubleClick({ [void](Show-CollectorWindows) })
 
 $ctx = New-Object System.Windows.Forms.ApplicationContext
 
+# Патруль панели задач каждые 2с: кнопки окон сбора не должны существовать.
+$reconcile = New-Object System.Windows.Forms.Timer
+$reconcile.Interval = 2000
+$reconcile.add_Tick({ Reconcile-CollectorWindows })
+$reconcile.Start()
+
 if ($WatchPid -gt 0) {
     # Watchdog: трей живёт ровно столько, сколько демон. Проверка по cmdline,
     # а не только по pid, — защита от переиспользования PID (identity-подход).
@@ -228,10 +284,8 @@ if ($WatchPid -gt 0) {
     $watch.Start()
 }
 
-$hint = if ($WatchPid -gt 0) {
-    "Иконка окон сбора активна (закрывается вместе со сбором): правый клик — меню"
-} else {
-    "Иконка окон сбора активна: правый клик — меню"
-}
-$notify.ShowBalloonTip(3000, "ozon-collector", $hint, [System.Windows.Forms.ToolTipIcon]::Info)
+# Стартовый balloon убран (живой отзыв владельца 2026-10-16: «плитка над
+# панелью задач до сих пор появляется»): Win11 рисует всплывающее уведомление
+# тостом над панелью и подсвечивает иконку при каждом запуске сбора. Тост о
+# «окна не найдены» остаётся — он только по явному клику в меню.
 [System.Windows.Forms.Application]::Run($ctx)

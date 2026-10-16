@@ -621,3 +621,77 @@ def test_guard_thread_starts_once_and_stops():
     thread.join(timeout=5)
     assert not thread.is_alive()
     assert not g.alive
+
+
+def _make_probe_hwnd():
+    """Реальное top-level окно (без показа) — hwnd для живых Win32-тестов.
+
+    Заглушка user32 здесь не нужна: проводку DeleteTab проверяем на настоящем
+    окне, иначе тест проверял бы пустоту.
+    """
+    import ctypes
+    user32 = ctypes.windll.user32
+    user32.CreateWindowExW.restype = ctypes.c_void_p
+    user32.CreateWindowExW.argtypes = [
+        ctypes.c_ulong, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    return user32.CreateWindowExW(0, "STATIC", "taskbar-delete-probe",
+                                  0x80000000, 0, 0, 40, 40,
+                                  None, None, None, None)
+
+
+def _destroy_probe_hwnd(hwnd):
+    import ctypes
+    ctypes.windll.user32.DestroyWindow(ctypes.c_void_p(hwnd))
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only (COM ITaskbarList)")
+def test_delete_taskbar_tab_real_com_pipeline():
+    """DeleteTab на реальном hwnd: ctypes-COM обязан вернуть S_OK.
+
+    Регрессия 2026-10-16: кнопка панели задач не снимается сменой
+    WS_EX_TOOLWINDOW — лечится только ITaskbarList::DeleteTab."""
+    hwnd = _make_probe_hwnd()
+    assert hwnd, "не удалось создать тестовое окно"
+    try:
+        assert wp.delete_taskbar_tab(int(hwnd)) is True, \
+            "ITaskbarList::DeleteTab не отработал (COM/vtable сломан)"
+    finally:
+        _destroy_probe_hwnd(hwnd)
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only")
+def test_minimize_hwnd_wires_taskbar_delete(monkeypatch):
+    """Сворачивание окна обязано снять кнопку панели задач (проводка)."""
+    recorded = []
+    monkeypatch.setattr(wp, "delete_taskbar_tab", recorded.append)
+    hwnd = _make_probe_hwnd()
+    assert hwnd
+    try:
+        assert wp.minimize_hwnd(int(hwnd)) is True
+        assert recorded == [int(hwnd)], "кнопка не снята при minimize_hwnd"
+    finally:
+        _destroy_probe_hwnd(hwnd)
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only")
+def test_cdp_minimize_native_wires_taskbar_delete(monkeypatch):
+    """CDP-путь свёртывания шлёт DeleteTab для найденного hwnd."""
+    from ozon_collector import cdp as C
+    recorded = []
+    monkeypatch.setattr(C, "_window_for_pid", lambda *a, **kw: 0x1234)
+    monkeypatch.setattr(wp, "delete_taskbar_tab", recorded.append)
+    C.Session._minimize_window_native(pids=[4242])
+    assert recorded == [0x1234], "CDP-свёртывание не сняло кнопку"
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only")
+def test_cdp_restore_native_wires_taskbar_delete(monkeypatch):
+    """CDP-путь показа (reconnect/restore/OZON_KEEP_WINDOW) снимает кнопку."""
+    from ozon_collector import cdp as C
+    recorded = []
+    monkeypatch.setattr(C, "_window_for_pid", lambda *a, **kw: 0x1234)
+    monkeypatch.setattr(wp, "delete_taskbar_tab", recorded.append)
+    C.Session._restore_window_native(pids=[4242])
+    assert recorded == [0x1234], "restore не снял кнопку панели задач"

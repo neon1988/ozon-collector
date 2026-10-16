@@ -266,6 +266,79 @@ def foreground() -> Optional[WindowRow]:
                      width=width, height=height)
 
 
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(d1, d2, d3, rest):
+    return _GUID(d1, d2, d3, (ctypes.c_ubyte * 8)(*rest))
+
+
+# ITaskbarList: живая проверка 2026-10-16 (Windows 11, explorerframe.dll) —
+# работает CLSID {56FDF344…} + IID {56FDF342…}; обратная пара из старых
+# SDK-примеров даёт REGDB_E_CLASSNOTREG / E_NOINTERFACE. Пробуем обе.
+_TASKBAR_LIST_PAIRS = (
+    (_guid(0x56FDF344, 0xFD6D, 0x11D0,
+           (0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90)),
+     _guid(0x56FDF342, 0xFD6D, 0x11D0,
+           (0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90))),
+    (_guid(0x56FDF342, 0xFD6D, 0x11D0,
+           (0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90)),
+     _guid(0x56FDF344, 0xFD6D, 0x11D0,
+           (0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90))),
+)
+
+
+def delete_taskbar_tab(hwnd: int) -> bool:
+    """ITaskbarList::DeleteTab(hwnd) — снять кнопку окна с панели задач.
+
+    Смена WS_EX_TOOLWINDOW уже созданную кнопку НЕ убирает (живая находка
+    2026-10-16: стиль на всех окнах, кнопки остались), поэтому после каждого
+    показа окна кнопку снимаем явно. comtypes/pywin32 в зависимостях проекта
+    нет — COM вручную на ctypes: CoCreateInstance(CLSID_TaskbarList) и вызовы
+    через vtable (IUnknown: 0..2, ITaskbarList: HrInit=3, DeleteTab=5).
+    """
+    if os.name != "nt":
+        return False
+    try:
+        ole32 = ctypes.WinDLL("ole32")
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        ole32.CoCreateInstance.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        ole32.CoCreateInstance.restype = ctypes.c_long
+        # STA; RPC_E_CHANGED_MODE (поток уже инициализирован иначе) не мешает.
+        ole32.CoInitializeEx(None, 2)
+        taskbar = ctypes.c_void_p()
+        for clsid, iid in _TASKBAR_LIST_PAIRS:
+            taskbar = ctypes.c_void_p()
+            hr = ole32.CoCreateInstance(
+                ctypes.byref(clsid), None, 1, ctypes.byref(iid),
+                ctypes.byref(taskbar))
+            if hr == 0 and taskbar:
+                break
+        if not taskbar:
+            return False
+        vtable = ctypes.cast(
+            taskbar, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        ).contents
+        hr_init = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vtable[3])
+        delete_tab = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)(vtable[5])
+        release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
+        try:
+            hr_init(taskbar)
+            rc = delete_tab(taskbar, ctypes.c_void_p(int(hwnd)))
+        finally:
+            release(taskbar)
+        return rc == 0
+    except Exception as e:
+        log.debug(f"window_policy: delete_taskbar_tab err {type(e).__name__}: {e}")
+        return False
+
+
 def minimize_hwnd(hwnd: int) -> bool:
     """user32: WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW + SW_MINIMIZE — как Session."""
     user32 = _user32()
@@ -277,6 +350,7 @@ def minimize_hwnd(hwnd: int) -> bool:
         # NOACTIVATE — не крадёт фокус; TOOLWINDOW — нет кнопки на панели задач
         user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x00000080)
         user32.ShowWindow(hwnd, 6)                    # SW_MINIMIZE
+        delete_taskbar_tab(int(hwnd))
         return True
     except Exception as e:
         log.debug(f"window_policy: minimize err {type(e).__name__}: {e}")

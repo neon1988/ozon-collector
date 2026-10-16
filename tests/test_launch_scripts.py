@@ -216,3 +216,15 @@ def test_ps1_markers_are_ascii():
         if "LAUNCHER-ERROR:" in line or "LAUNCHER-WARN:" in line:
             marker = line[line.index("LAUNCHER-"):]
             assert all(ord(ch) < 128 for ch in marker), line
+
+
+def test_ps1_deletes_taskbar_tab_on_show():
+    """Показ окна в лаунчере обязан снимать кнопку панели задач.
+
+    Смена WS_EX_TOOLWINDOW уже созданную кнопку не убирает (живая находка
+    2026-10-16) — нужен явный ITaskbarList::DeleteTab."""
+    ps1 = _text(PS1)
+    assert "ITaskbarList" in ps1 and "DeleteTab" in ps1, \
+        "launch_chrome.ps1 потерял снятие кнопки панели задач"
+    assert "[TaskbarTab]::Delete($h)" in ps1, \
+        "DeleteTab объявлен, но не вызывается при показе окна"

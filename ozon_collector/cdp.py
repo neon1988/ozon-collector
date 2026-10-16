@@ -1046,6 +1046,10 @@ class Session:
                                           style | WS_EX_NOACTIVATE
                                           | WS_EX_TOOLWINDOW)
                     user32.ShowWindow(hwnd, SW_MINIMIZE)
+                    # Кнопку снимаем и здесь: смена TOOLWINDOW уже созданную
+                    # кнопку панели задач не убирает (находка 2026-10-16).
+                    from ozon_collector import window_policy as _wp
+                    _wp.delete_taskbar_tab(int(hwnd))
                     break
         except Exception as e:
             log.debug(f"minimize_window native: {type(e).__name__}: {e}")
@@ -1129,6 +1133,8 @@ class Session:
                     user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                                         | 0x0040)  # SWP_SHOWWINDOW
+                    from ozon_collector import window_policy as _wp
+                    _wp.delete_taskbar_tab(int(hwnd))
                     break
         except Exception as e:
             log.debug(f"restore_window native: {type(e).__name__}: {e}")
