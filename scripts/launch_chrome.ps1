@@ -196,50 +196,13 @@ public class ChromeLaunch {
 }
 "@
 
-# --- Гейт: порт ДОЛЖЕН быть полностью свободен ------------------------------
-# Проверяем НЕ ТОЛЬКО HTTP-ответ /json/version, но и сам TCP-listener. Ловушка,
-# найденная в бою: порт был занят посторонним процессом, /json/version не
-# отвечал (гейт считал порт свободным), Chrome стартовал, НО не смог привязать
-# DevTools к 127.0.0.1 и тихо ушёл в [::1] — CDP там живой, но коллектор
-# (который ходит на 127.0.0.1) «не видит» браузера, запускает новый, а тот
-# умирает о занятый профиль. Три ретрая в никуда вместо одного честного отказа.
-# Плюс чужой/старый Chromium на этом порту даёт ложный "OK" на /json/version.
-$listener = $null
-try {
-    $listener = Get-NetTCPConnection -State Listen -LocalPort $Port `
-                  -ErrorAction Stop | Select-Object -First 1
-} catch { }
-$httpBusy = $false
-try {
-    $null = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
-    $httpBusy = $true
-} catch { }
-if ($listener -or $httpBusy) {
-    $lp = if ($listener) { $listener.OwningProcess } else { "?" }
-    $lname = try { (Get-Process -Id $lp -ErrorAction Stop).ProcessName } catch { "?" }
-    Write-Host "LAUNCHER-ERROR: port $Port is NOT free (listener pid=$lp $lname, /json/version responds=$httpBusy) - refusing to start" -ForegroundColor Red
-    Write-Host "LAUNCHER-ERROR: Chrome would bind [::1] instead and go invisible to CDP on 127.0.0.1" -ForegroundColor Red
-    Write-Host "LAUNCHER-ERROR: chrome=$Chrome profile=$Profile" -ForegroundColor Red
-    exit 1
-}
-
-# Полная командная строка: chrome.exe + аргументы (CreateProcessW, Unicode).
-$allArgs = @($chromeArgs) + @($proxyArg)
-$cmdLine = "`"$Chrome`" " + (($allArgs | Where-Object { $_ }) -join " ")
-# Фокус запоминаем ДО запуска: Chrome крадёт его через 0.3-0.4 с после
-# CreateProcess (замер 2026-10-06), и поздний захват сделал бы «предыдущим»
-# сам Chrome — Restore-Focus возвращал бы фокус ему (пустышка).
-$prevFg = [ChromeLaunch]::GetForegroundWindow()
-$targetPid = [ChromeLaunch]::Launch($cmdLine)
-if ($targetPid -lt 0) {
-    Write-Host "Не удалось запустить Chromium (CreateProcess, Win32Error=$(-$targetPid))" -ForegroundColor Red
-    exit 1
-}
-
-# Применяем стиль TOOLWINDOW|NOACTIVATE главному окну запущенного инстанса,
-# НЕ показывая его: окно остаётся скрытым (SW_HIDE от CreateProcess), кадры
-# при этом доступны (замер 2026-10-16). Фильтр по PID запущенного процесса —
-# окна обычного Chrome не трогаем.
+# Классы и константы стилей КОМПИЛИРУЮТСЯ ЗДЕСЬ — ДО CreateProcess.
+# Раньше первый Add-Type стоял ПОСЛЕ старта Chrome и его компиляция
+# (~1-3 с вместе с загрузкой PS-профиля) откладывала первый проход
+# скрытия: показанное Chrome в эту щель стартовое окно жило секундами
+# (живой замер 2026-10-16: пустое тёмное окно с одним крестиком, без кнопки
+# панели задач — показано ДО того, как первый проход вообще начался).
+# Теперь опрос окна стартует через миллисекунды после CreateProcess.
 Add-Type @"
 using System;
 using System.Collections.Generic;
@@ -362,6 +325,46 @@ public static class TaskbarTab {
 }
 "@
 
+# --- Гейт: порт ДОЛЖЕН быть полностью свободен ------------------------------
+# Проверяем НЕ ТОЛЬКО HTTP-ответ /json/version, но и сам TCP-listener. Ловушка,
+# найденная в бою: порт был занят посторонним процессом, /json/version не
+# отвечал (гейт считал порт свободным), Chrome стартовал, НО не смог привязать
+# DevTools к 127.0.0.1 и тихо ушёл в [::1] — CDP там живой, но коллектор
+# (который ходит на 127.0.0.1) «не видит» браузера, запускает новый, а тот
+# умирает о занятый профиль. Три ретрая в никуда вместо одного честного отказа.
+# Плюс чужой/старый Chromium на этом порту даёт ложный "OK" на /json/version.
+$listener = $null
+try {
+    $listener = Get-NetTCPConnection -State Listen -LocalPort $Port `
+                  -ErrorAction Stop | Select-Object -First 1
+} catch { }
+$httpBusy = $false
+try {
+    $null = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
+    $httpBusy = $true
+} catch { }
+if ($listener -or $httpBusy) {
+    $lp = if ($listener) { $listener.OwningProcess } else { "?" }
+    $lname = try { (Get-Process -Id $lp -ErrorAction Stop).ProcessName } catch { "?" }
+    Write-Host "LAUNCHER-ERROR: port $Port is NOT free (listener pid=$lp $lname, /json/version responds=$httpBusy) - refusing to start" -ForegroundColor Red
+    Write-Host "LAUNCHER-ERROR: Chrome would bind [::1] instead and go invisible to CDP on 127.0.0.1" -ForegroundColor Red
+    Write-Host "LAUNCHER-ERROR: chrome=$Chrome profile=$Profile" -ForegroundColor Red
+    exit 1
+}
+
+# Полная командная строка: chrome.exe + аргументы (CreateProcessW, Unicode).
+$allArgs = @($chromeArgs) + @($proxyArg)
+$cmdLine = "`"$Chrome`" " + (($allArgs | Where-Object { $_ }) -join " ")
+# Фокус запоминаем ДО запуска: Chrome крадёт его через 0.3-0.4 с после
+# CreateProcess (замер 2026-10-06), и поздний захват сделал бы «предыдущим»
+# сам Chrome — Restore-Focus возвращал бы фокус ему (пустышка).
+$prevFg = [ChromeLaunch]::GetForegroundWindow()
+$targetPid = [ChromeLaunch]::Launch($cmdLine)
+if ($targetPid -lt 0) {
+    Write-Host "Не удалось запустить Chromium (CreateProcess, Win32Error=$(-$targetPid))" -ForegroundColor Red
+    exit 1
+}
+
 function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
     # Применяет к окну WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW, НЕ показывая его:
     # показ даже свёрнутым рождает над панелью задач «мини-плитку-призрак» с
@@ -381,7 +384,12 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
         $h = if ($win) { [LaunchChromeMin]::FindMainWindow($PidToWatch) } else { [IntPtr]::Zero }
         if ($h -ne [IntPtr]::Zero) {
             $style = [LaunchChromeMin]::GetWindowLong($h, $GWL_EXSTYLE)
-            [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $style -bor $WS_EX_NOACTIVATE -bor $WS_EX_TOOLWINDOW) | Out-Null
+            $want = $style -bor $WS_EX_NOACTIVATE -bor $WS_EX_TOOLWINDOW
+            if ($want -ne $style) {
+                # Только изменение: путь зовётся в CDP-цикле каждые ~50 мс,
+                # лишний SetWindowLong зря дёргал бы неклиентскую рамку.
+                [LaunchChromeMin]::SetWindowLong($h, $GWL_EXSTYLE, $want) | Out-Null
+            }
             # SW_HIDE безусловно: если окно всё-таки успело показаться, смена
             # стилей его не прячет и оно остаётся видимым до сторожа (2-7 с).
             [LaunchChromeMin]::ShowWindow($h, 0) | Out-Null
@@ -428,14 +436,19 @@ $minimized = Invoke-MinimizeNoActivate $targetPid 10000
 Start-Sleep -Milliseconds 500
 Restore-Focus -PrevFg $prevFg
 
-# Ждём, пока CDP-порт ответит: к этому моменту Chrome закончил старт и
-# свои попытки активации окна (мелькание).
+# Ждём, пока CDP-порт ответит: к этому моменту Chrome закончил старт.
+# Тик 50 мс (а не 500): каждый тик окно перепрятывается — Chrome может
+# ПОКАЗАТЬ его в любой момент старта, а первый проход к этому времени уже
+# завершился (живой замер 2026-10-16: вспышка vis=True ~100 мс при тике
+# 100 мс сразу после навигации; при опоздании первого прохода — секунды).
 $ready = $false
-for ($i = 0; $i -lt 20; $i++) {
-    Start-Sleep -Milliseconds 500
+for ($i = 0; $i -lt 200; $i++) {
+    Start-Sleep -Milliseconds 50
     if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
         break        # Chromium умер (например, профиль уже открыт) — ждать порт бессмысленно
     }
+    # Пере-скрытие: NO-OP, если окно уже скрыто (стиль не переставляется).
+    $null = Invoke-MinimizeNoActivate $targetPid 20
     try {
         $ver = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
         $ready = $true
@@ -484,9 +497,10 @@ if (-not $ready) {
 # над панелью задач мини-плитку-призрак с крестиком (живой замер 2026-10-16:
 # vis=True icon=True rect=0,1004,160,1032 — «плитка» владельца) и на свёрнутом
 # окне перестают идти кадры. Окно остаётся скрытым (SW_HIDE от CreateProcess).
-if (-not $minimized) {
-    $minimized = Invoke-MinimizeNoActivate $targetPid 3000
-}
+# Финальный проход — БЕЗУСЛОВНО (до 2026-10-16 он шёл только при провале
+# первого): между проходами Chrome мог показать окно повторно.
+$finalHide = Invoke-MinimizeNoActivate $targetPid 3000
+$minimized = $minimized -or $finalHide
 # Фокус: Chrome крадёт его на старте (SetForegroundWindow, замер 2026-10-06),
 # а демон-сторож вернёт его только к connect (2-7 с) — всё это время окно
 # пользователя без фокуса. Вызов был потерян при переписывании лаунчера,

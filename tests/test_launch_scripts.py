@@ -264,3 +264,41 @@ def test_ps1_leaves_window_hidden_on_start():
         "лаунчер снова показывает окно (SW_SHOWMINNOACTIVE=$h,7)"
     assert "окно PID $targetPid скрыто" in ps1, \
         "лаунчер не сообщает, что окно скрыто"
+
+
+def test_ps1_compiles_helpers_before_createprocess():
+    """Add-Type классов скрытия/фокуса — ДО CreateProcess.
+
+    Живой замер 2026-10-16: Chrome показывает стартовое окно в первые
+    секунды, а компиляция C#-классов ПОСЛЕ его старта (~1-3 с вместе с
+    загрузкой PS-профиля) откладывала первый проход скрытия — окно жило
+    секундами (тёмное окно с одним крестиком на скриншотах владельца).
+    """
+    ps1 = _text(PS1)
+    launch = ps1.index("[ChromeLaunch]::Launch")
+    for cls in ("public class ChromeLaunch",
+                "public class LaunchChromeMin",
+                "public class FocusSave"):
+        assert ps1.index(cls) < launch, (
+            f"{cls} компилируется после CreateProcess — окно успеет показаться")
+
+
+def test_ps1_rehides_window_until_cdp_ready():
+    """Пере-скрытие окна: первый проход, каждый тик ожидания CDP, финал.
+
+    Chrome может ПОКАЗАТЬ окно в любой момент старта (живой замер 2026-10-16:
+    вспышка vis=True ~100 мс при тике 100 мс; при опоздании первого прохода —
+    секунды, пока не подключится сторож). Поэтому тик ожидания CDP — 50 мс
+    с пере-скрытием, а финальный проход БЕЗУСЛОВНЫЙ: иначе показанное ПОСЛЕ
+    первого прохода окно остаётся видимым до сторожа (2-7 с) или до connect.
+    """
+    ps1 = _text(PS1)
+    assert ps1.count("Invoke-MinimizeNoActivate $targetPid") >= 3, (
+        "меньше трёх проходов скрытия: первый + тики CDP + безусловный финал")
+    assert "for ($i = 0; $i -lt 200; $i++) {" in ps1, \
+        "ожидание CDP снова с тиком 500 мс (пере-скрытие в тике потеряно)"
+    assert "if (-not $minimized) {" not in ps1, \
+        "финальный проход снова условный — показанное после первого прохода " \
+        "окно не перепрятывается"
+    assert "$minimized = $minimized -or $finalHide" in ps1, \
+        "финальный проход потерял объединение статуса ($finalHide)"
