@@ -13,6 +13,9 @@
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from ozon_collector import window_policy as wp
@@ -576,7 +579,8 @@ def test_pid_that_stopped_owning_port_is_dropped(monkeypatch):
 def test_identity_recheck_is_throttled(monkeypatch):
     """Полная сверка порта — раз в IDENTITY_RECHECK_S, не каждый тик.
 
-    Она поднимает PowerShell, поэтому 150-мс тик не должен её дёргать.
+    Она читает сокет-таблицу ядра (с 2026-10-17 дёшево), но 150-мс тик не
+    должен дёргать её без нужды: pid-реюзы редки.
     """
     calls = {"n": 0}
 
@@ -596,6 +600,153 @@ def test_identity_recheck_is_throttled(monkeypatch):
     g._identity_checked[500] -= (wp.IDENTITY_RECHECK_S + 1)
     g.tick()
     assert calls["n"] == first + 1, "после паузы сверка повторяется"
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only (iphlpapi)")
+def test_port_owner_pids_finds_listener():
+    """Сокет-таблица ядра отдаёт pid держателя LISTEN-сокета (без WMI).
+
+    На этом пути стоит identity-сверка сторожа: раньше каждый вызов поднимал
+    PowerShell (~0.5-1 с), и первый тик с показом окна опаздывал — живой замер
+    2026-10-17: вспышка 0.73 с. Проверка живая: реальный сокет этого процесса.
+    """
+    import os as _os
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        owners = wp.port_owner_pids(port)
+        assert owners is not None, \
+            "сокет-таблица недоступна — identity уйдёт на медленный fallback"
+        assert _os.getpid() in owners, "свой LISTEN-сокет обязан быть в таблице"
+    finally:
+        s.close()
+
+
+def test_pid_owns_port_prefers_socket_table(monkeypatch):
+    """Быстрый путь identity: порт держит ровно этот pid (сокет-таблица)."""
+    monkeypatch.setattr(wp, "port_owner_pids", lambda port: {42})
+    assert wp._pid_owns_port(42, "9222") is True
+    assert wp._pid_owns_port(7, "9222") is False
+
+
+def test_pid_owns_port_falls_back_to_cmdline(monkeypatch):
+    """Таблица недоступна → исторический fallback по командной строке."""
+    monkeypatch.setattr(wp, "port_owner_pids", lambda port: None)
+    called = []
+    monkeypatch.setattr(
+        wp, "_pid_owns_port_via_cmdline",
+        lambda pid, port: (called.append((pid, port)), True)[1])
+    assert wp._pid_owns_port(42, "9222") is True
+    assert called == [(42, "9222")]
+
+
+def test_should_hide_show_event_matrix():
+    """Решение хука показа: фильтр тот же, что у тика (наши окна, не попапы)."""
+    base = dict(pid=500, class_name="Chrome_WidgetWin_1", width=1440,
+                height=900, watched={500: "9222"})
+    assert wp.should_hide_show_event(**base, uv=False) is True
+    assert wp.should_hide_show_event(**base, uv=True) is False, \
+        "пользователь развернул окна из трея — хук обязан молчать"
+    assert wp.should_hide_show_event(**{**base, "pid": 999}, uv=False) is False
+    assert wp.should_hide_show_event(
+        **{**base, "class_name": "MozillaWindowClass"}, uv=False) is False
+    assert wp.should_hide_show_event(
+        **{**base, "width": 200, "height": 40}, uv=False) is False, \
+        "мелкий попап/инфобар не трогаем"
+
+
+def test_show_event_callback_hides_watched_window(monkeypatch):
+    """EVENT_OBJECT_SHOW нашего окна гасится колбэком сразу, не тиком.
+
+    Замер 2026-10-17: Chrome показывает окно сам при создании вкладки через
+    CDP (`/json/new`) — тик 150 мс на это опаздывает.
+    """
+    hidden = []
+
+    def _fake_min(hwnd):
+        hidden.append(hwnd)
+        return True
+
+    class _U32:
+        def GetWindowRect(self, hwnd, ref):
+            rect = ref._obj
+            rect.left = 0
+            rect.top = 0
+            rect.right = 1440
+            rect.bottom = 900
+            return True
+
+    monkeypatch.setattr(wp, "minimize_hwnd", _fake_min)
+    monkeypatch.setattr(wp, "_setup_api", lambda u: None)
+    monkeypatch.setattr(wp, "_user32", lambda: _U32())
+    monkeypatch.setattr(wp, "_window_pid", lambda u, h: 500)
+    monkeypatch.setattr(wp, "_window_class", lambda u, h: "Chrome_WidgetWin_1")
+    monkeypatch.setattr(wp, "user_visible", lambda: False)
+    g = wp.WindowGuard()
+    g.watch(500, "9222", autostart=False)
+    g._on_win_event(None, wp.EVENT_OBJECT_SHOW, 1234, wp.OBJID_WINDOW, 0, 0, 0)
+    assert hidden == [1234], "показавшееся окно нашего pid обязано прятаться"
+    monkeypatch.setattr(wp, "_window_pid", lambda u, h: 999)
+    g._on_win_event(None, wp.EVENT_OBJECT_SHOW, 1235, wp.OBJID_WINDOW, 0, 0, 0)
+    assert hidden == [1234], "чужой pid хук не трогает"
+    g._on_win_event(None, 0x8003, 1236, wp.OBJID_WINDOW, 0, 0, 0)
+    assert hidden == [1234], "не-show событие игнорируется"
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="поток хука: нужен Windows")
+def test_event_hook_thread_starts_and_stops():
+    """Поток хука не течёт: стартует со сторожем, гаснет по WM_QUIT.
+
+    Висящий поток — заведённый инцидент проекта (awk.exe, см. AGENTS.md);
+    поэтому start() обязан поднимать насос ровно один, а stop() — будить его.
+    """
+    import time
+    g = wp.WindowGuard(poll_s=0.01)
+    g.start()
+    hook_thread = g._hook_thread
+    assert hook_thread is not None and hook_thread.is_alive()
+    deadline = time.monotonic() + 3.0
+    while g._hook_tid is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    g.stop()
+    hook_thread.join(timeout=5)
+    assert not hook_thread.is_alive(), "поток хука не остановился по WM_QUIT"
+    g._thread.join(timeout=5)
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="поток хука: нужен Windows")
+def test_event_hook_stop_immediately_after_start():
+    """stop() сразу после start() не оставляет висящий поток-насос.
+
+    Гонка: stop() успевал до публикации _hook_tid, WM_QUIT отправить было
+    некуда, и поток навсегда зависал в GetMessageW (находка ревью 2026-10-17:
+    утечка в 27 из 30 циклов start/stop). Фикс — самопроверка _stop сразу
+    после SetWinEventHook, до входа в насос.
+    """
+    for _ in range(10):
+        g = wp.WindowGuard(poll_s=0.01)
+        g.start()
+        g.stop()
+        g._hook_thread.join(timeout=5)
+        g._thread.join(timeout=5)
+        assert not g._hook_thread.is_alive(), \
+            "поток хука пережил stop() — гонка публикации _hook_tid вернулась"
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="kernel32: нужен Windows")
+def test_process_image_basename_reads_real_process():
+    """Живой тест: имя образа процесса читается через QueryFullProcessImageNameW.
+
+    Ошибка в ctypes-сигнатуре видна только на живом вызове: фильтр по имени в
+    _chrome_pids_for_port вернул бы пусто и свернул бы не то окно.
+    """
+    name = wp.process_image_basename(wp.os.getpid())
+    assert name, "имя образа текущего процесса не прочиталось"
+    assert name.lower().startswith("python"), f"неожиданное имя: {name}"
 
 
 def test_focus_return_works_with_two_watched_browsers(monkeypatch):
@@ -740,22 +891,80 @@ def test_minimize_hwnd_uses_sw_hide_not_sw_minimize(monkeypatch):
         f"minimize_hwnd послал ShowWindow(cmd={calls}), нужен только SW_HIDE=0"
 
 
-def test_cdp_minimize_native_hides_not_minimizes():
-    """CDP-путь скрывает окно (SW_HIDE=0), а не сворачивает (SW_MINIMIZE=6).
+def test_show_hwnd_restores_with_show_window_flag(monkeypatch):
+    """Show path: SW_RESTORE (9) + SWP_SHOWWINDOW (0x0040), no activation.
 
-    Свёрнутое TOOLWINDOW-окно рисует «мини-плитку-призрак» над панелью задач
-    и не отдаёт кадры — пазл на нём виснет (живой замер 2026-10-16).
+    A window hidden with SW_HIDE at start is shown only by SW_RESTORE +
+    SWP_SHOWWINDOW; NOACTIVATE keeps the user focus; SetWindowPos targets
+    TOPMOST (-1); the taskbar button is removed explicitly
+    (audit 2026-10-18, D2).
+    """
+    show_calls = []
+    pos_calls = []
+
+    class _FakeUser32:
+        def GetWindowLongW(self, hwnd, idx):
+            return 0
+
+        def SetWindowLongW(self, hwnd, idx, val):
+            return 0
+
+        def ShowWindow(self, hwnd, cmd):
+            show_calls.append(cmd)
+            return True
+
+        def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+            pos_calls.append((insert_after, flags))
+            return True
+
+    deleted = []
+    monkeypatch.setattr(wp, "_user32", lambda: _FakeUser32())
+    monkeypatch.setattr(wp, "_setup_api", lambda user32: None)
+    monkeypatch.setattr(wp, "delete_taskbar_tab", deleted.append)
+    assert wp.show_hwnd(0x1234) is True
+    assert show_calls == [9], \
+        f"show_hwnd послал ShowWindow(cmd={show_calls}), нужен SW_RESTORE=9"
+    assert pos_calls == [(-1, 0x0002 | 0x0001 | 0x0010 | 0x0040)], \
+        "SetWindowPos: TOPMOST + NOMOVE|NOSIZE|NOACTIVATE|SHOWWINDOW"
+    assert deleted == [0x1234], "кнопка панели задач не снята при показе"
+
+
+def test_cdp_minimize_native_delegates_to_canon():
+    """The CDP hide path must call the window_policy.minimize_hwnd canon.
+
+    The single SW_HIDE implementation lives in window_policy (its own test:
+    test_minimize_hwnd_uses_sw_hide_not_sw_minimize). Duplicating it in cdp
+    already caused two SW_MINIMIZE regressions: a minimized TOOLWINDOW window
+    is drawn by Windows as a ghost tile and stops delivering frames (live
+    measurement 2026-10-16) — now there is a single implementation
+    (audit 2026-10-18, D2).
     """
     import inspect
 
     from ozon_collector import cdp as C
 
     src = inspect.getsource(C.Session._minimize_window_native)
-    assert "SW_HIDE = 0" in src
-    assert "ShowWindow(hwnd, SW_HIDE)" in src
+    assert "minimize_hwnd" in src, "cdp не зовёт канон скрытия"
+    assert "user32.ShowWindow" not in src, \
+        "реализация скрытия вернулась в cdp — канон должен быть один"
     assert "SW_MINIMIZE = 6" not in src, "вернулась константа свёртывания"
-    assert "ShowWindow(hwnd, SW_MINIMIZE)" not in src, \
-        "CDP-путь снова сворачивает окно вместо скрытия"
+
+
+def test_cdp_restore_native_delegates_to_canon():
+    """The CDP show path must call the window_policy.show_hwnd canon.
+
+    The single SW_RESTORE + SetWindowPos implementation lives in
+    window_policy (audit 2026-10-18, D2).
+    """
+    import inspect
+
+    from ozon_collector import cdp as C
+
+    src = inspect.getsource(C.Session._restore_window_native)
+    assert "show_hwnd" in src, "cdp не зовёт канон показа"
+    assert "user32.SetWindowPos" not in src \
+        and "user32.ShowWindow" not in src, \
+        "реализация показа вернулась в cdp — канон должен быть один"
 
 
 @pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only")
@@ -778,3 +987,434 @@ def test_cdp_restore_native_wires_taskbar_delete(monkeypatch):
     monkeypatch.setattr(wp, "delete_taskbar_tab", recorded.append)
     C.Session._restore_window_native(pids=[4242])
     assert recorded == [0x1234], "restore не снял кнопку панели задач"
+
+
+# ---- сентинел показов: в скрытом режиме окна сбора не появляются вообще ----
+# (требование владельца 2026-10-17)
+
+class TestSentinel:
+    @pytest.fixture(autouse=True)
+    def _guard_on(self, monkeypatch):
+        # conftest глушит сторожа (setdefault OZON_WINDOW_GUARD=0): для тестов
+        # сентинела включаем явно, «выключенные» тесты ставят 0 сами.
+        monkeypatch.setenv("OZON_WINDOW_GUARD", "1")
+        monkeypatch.delenv("OZON_KEEP_WINDOW", raising=False)
+
+    def _rows(self):
+        return [
+            _win(101, 500, visible=True),                      # наше видимое главное
+            _win(102, 501, visible=True, width=420, height=220),  # наш попап
+            _win(103, 502, visible=False),                     # наше скрытое
+            _win(104, 999, visible=True),                      # чужой Chrome
+        ]
+
+    _OURS = {500: "ozon-profile", 501: "ozon-profile", 502: "ozon-profile"}
+
+    @staticmethod
+    def _record(hidden):
+        def _hide(hwnd):
+            hidden.append(hwnd)
+            return True
+        return _hide
+
+    def test_tick_hides_only_own_visible_main(self):
+        hidden = []
+        res = wp.sentinel_tick(hide=self._record(hidden), rows=self._rows(),
+                               pids=dict(self._OURS), uv=lambda: False)
+        assert hidden == [101], \
+            f"спрятать обязан только 101 (наше видимое главное), а не {hidden}"
+        assert res["hidden"] == 1 and res["visible"] == 1
+
+    def test_tick_respects_user_visible(self):
+        hidden = []
+        res = wp.sentinel_tick(hide=self._record(hidden), rows=self._rows(),
+                               pids=dict(self._OURS), uv=lambda: True)
+        assert hidden == [] and res["skipped"] == "user_visible"
+
+    def test_tick_off_when_guard_disabled(self, monkeypatch):
+        monkeypatch.setenv("OZON_WINDOW_GUARD", "0")
+        hidden = []
+        res = wp.sentinel_tick(hide=self._record(hidden), rows=self._rows(),
+                               pids=dict(self._OURS), uv=lambda: False)
+        assert hidden == [] and res["skipped"] == "guard_off"
+
+    def test_tick_off_with_keep_window(self, monkeypatch):
+        monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+        hidden = []
+        res = wp.sentinel_tick(hide=self._record(hidden), rows=self._rows(),
+                               pids=dict(self._OURS), uv=lambda: False)
+        assert hidden == [] and res["skipped"] == "keep_window", \
+            "visible-режим (env) обязан отличаться от выключенного гейта"
+
+    def test_on_show_hides_our_window(self, monkeypatch):
+        hidden = []
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 500)
+        ok = wp.sentinel_on_show(0x1010, hide=self._record(hidden),
+                                 pids=dict(self._OURS), uv=lambda: False)
+        assert ok is True and hidden == [0x1010]
+
+    def test_on_show_ignores_foreign_window(self, monkeypatch):
+        hidden = []
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 999)
+        ok = wp.sentinel_on_show(0x2020, hide=self._record(hidden),
+                                 pids=dict(self._OURS), uv=lambda: False)
+        assert ok is False and hidden == [], "чужое окно трогать нельзя"
+
+    def test_on_show_skips_in_user_visible(self, monkeypatch):
+        hidden = []
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 500)
+        ok = wp.sentinel_on_show(0x3030, hide=self._record(hidden),
+                                 pids=dict(self._OURS), uv=lambda: True)
+        assert ok is False and hidden == [], \
+            "в режиме visible пользователь смотрит окна — не прячем"
+
+    @pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only")
+    def test_start_is_idempotent_and_stops(self, monkeypatch):
+        monkeypatch.setattr(wp, "sentinel_tick", lambda **kw: {"stub": True})
+        try:
+            assert wp.sentinel_start() is True
+            assert wp.sentinel_start() is True, "повторный старт идемпотентен"
+        finally:
+            wp.sentinel_stop()
+        assert wp._SENTINEL is None
+
+    def test_start_off_when_guard_disabled(self, monkeypatch):
+        monkeypatch.setenv("OZON_WINDOW_GUARD", "0")
+        assert wp.sentinel_start() is False
+
+    # ---- шторм-защита скана профилей (находка ревью 2026-10-17) ----------
+
+    @staticmethod
+    def _fresh_state():
+        return {"stop": None, "pids": {}, "pids_ts": 0.0, "scan_ts": 0.0,
+                "scan_start": 0.0, "scan_raw": 0, "alien": {},
+                "alien_lock": threading.Lock(), "lock": threading.Lock()}
+
+    def test_empty_pids_cache_lives_ttl(self, monkeypatch):
+        """Пустой результат скана — тоже кэш: не скан на каждый вызов."""
+        calls = {"n": 0}
+
+        def _scan():
+            calls["n"] += 1
+            return [], 1
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "_SENTINEL", self._fresh_state())
+        assert wp._sentinel_pids() == {}
+        assert wp._sentinel_pids() == {}
+        assert calls["n"] == 1, \
+            "пустой кэш обязан жить TTL, а не сканировать каждый вызов"
+
+    def test_refresh_throttled(self, monkeypatch):
+        """refresh=True не чаще min-интервала: show-события не штормят скан."""
+        calls = {"n": 0}
+
+        def _scan():
+            calls["n"] += 1
+            return [], 1
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "_SENTINEL", self._fresh_state())
+        assert wp._sentinel_pids(refresh=True) == {}
+        assert wp._sentinel_pids(refresh=True) == {}
+        assert calls["n"] == 1, "два refresh подряд — один скан"
+
+    def test_on_show_prefilter_no_scan_for_foreign_app(self, monkeypatch):
+        """Не-chrome окно чужого приложения до скана профилей не доходит."""
+        scans = {"n": 0}
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 999)
+        monkeypatch.setattr(wp, "process_image_basename",
+                            lambda pid: "explorer.exe")
+        monkeypatch.setattr(
+            wp, "_sentinel_pids",
+            lambda refresh=False: scans.__setitem__("n", scans["n"] + 1) or {})
+        ok = wp.sentinel_on_show(0x4040, hide=lambda h: True,
+                                 uv=lambda: False)
+        assert ok is False and scans["n"] == 0
+
+    def test_on_show_alien_chrome_cached(self, monkeypatch):
+        """Чужой chrome.exe кэшируется (alien): повторный показ без скана.
+
+        Здесь работает НАСТОЯЩИЙ _sentinel_pids (со сканом-заглушкой): метка
+        чужака ставится только по скану, начавшемуся после показа события.
+        """
+        scans = {"n": 0}
+
+        def _scan():
+            scans["n"] += 1
+            return [], 1
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 777)
+        monkeypatch.setattr(wp, "process_image_basename",
+                            lambda pid: "chrome.exe")
+        monkeypatch.setattr(wp, "_SENTINEL", self._fresh_state())
+        assert wp.sentinel_on_show(0x5050, hide=lambda h: True,
+                                   uv=lambda: False) is False
+        n_after_first = scans["n"]
+        assert n_after_first >= 1, "первый показ обязан дойти до скана"
+        assert 777 in wp._SENTINEL["alien"], \
+            "скан начался после события — метке чужака доверяем"
+        # Кэш «протух»: без alien-пути второй показ обязан был бы сканировать
+        # (иначе assertion ниже зелёный и без проверяемого кода).
+        wp._SENTINEL.update(pids_ts=0.0, scan_ts=0.0, scan_start=0.0)
+        assert wp.sentinel_on_show(0x5051, hide=lambda h: True,
+                                   uv=lambda: False) is False
+        assert scans["n"] == n_after_first, \
+            "чужой chrome.exe кэшируется (alien): повторный показ без скана"
+
+    def test_on_show_throttled_refresh_does_not_poison_alien(
+            self, monkeypatch):
+        """Троттлинг refresh не метит НАШ свежий pid чужим по старому скану.
+
+        Регресс ревью 2026-10-17: скан был ДО спавна браузера, refresh пойман
+        троттлингом (или уже летит в другом потоке) — кэш отдаёт данные без
+        нашего pid, и метка «чужой» слепила бы хук на 60 с.
+        """
+        scans = {"n": 0}
+
+        def _scan():
+            scans["n"] += 1
+            return [], 1
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 777)
+        monkeypatch.setattr(wp, "process_image_basename",
+                            lambda pid: "chrome.exe")
+        st = self._fresh_state()
+        old = time.monotonic() - 0.3          # скан 0.3 с назад — ДО показа
+        st.update(pids_ts=old, scan_ts=old, scan_start=old)
+        monkeypatch.setattr(wp, "_SENTINEL", st)
+        assert wp.sentinel_on_show(0x6060, hide=lambda h: True,
+                                   uv=lambda: False) is False
+        assert scans["n"] == 0, \
+            "fast path и refresh — из кэша (TTL + троттлинг), без скана"
+        assert 777 not in (st.get("alien") or {}), \
+            "скан, начавшийся ДО показа, — не доказательство чужеродности"
+
+    def test_tick_foreign_chrome_cached_no_repeat_scan(self, monkeypatch):
+        """Тик: чужой chrome.exe уходит в alien — повторный скан не нужен.
+
+        Регресс ревью 2026-10-17: тик сканировал профили каждые ~2 с, пока
+        на экране висело ЛЮБОЕ чужое окно chrome.exe (личный Chrome).
+        """
+        scans = {"n": 0}
+
+        def _scan():
+            scans["n"] += 1
+            return [], 1
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "process_image_basename",
+                            lambda pid: "chrome.exe")
+        monkeypatch.setattr(wp, "_SENTINEL", self._fresh_state())
+        rows = [_win(104, 999, visible=True)]          # чужой Chrome
+        hide = self._record([])
+        res = wp.sentinel_tick(hide=hide, rows=rows, uv=lambda: False)
+        assert res["hidden"] == 0 and res["visible"] == 0
+        assert scans["n"] == 1 and 999 in wp._SENTINEL["alien"]
+        # Кэш «протух»: без alien-пути второй тик обязан был бы сканировать
+        wp._SENTINEL.update(pids_ts=0.0, scan_ts=0.0, scan_start=0.0)
+        res = wp.sentinel_tick(hide=hide, rows=rows, uv=lambda: False)
+        assert res["hidden"] == 0
+        assert scans["n"] == 1, \
+            "чужой chrome.exe из alien-кэша — без повторного скана"
+
+    def test_tick_stale_cache_does_not_poison_our_pid(self, monkeypatch):
+        """Тик не метит свежий НАШ pid чужим по кэшу, снятому до его спавна.
+
+        Регресс ревью 2026-10-17 (раунд 2): `ours` из ещё свежего TTL-кэша
+        не содержит только что заспавненный браузер, а тик метил его alien
+        на 60 с — оба слоя сентинела слепли, окно оставалось видимым.
+        """
+        scans = {"n": 0}
+
+        def _scan():
+            scans["n"] += 1
+            return [], 1
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "process_image_basename",
+                            lambda pid: "chrome.exe")
+        st = self._fresh_state()
+        old = time.monotonic() - 0.3     # кэш свеж по TTL, снят ДО спавна
+        st.update(pids_ts=old, scan_ts=old, scan_start=old)
+        monkeypatch.setattr(wp, "_SENTINEL", st)
+        res = wp.sentinel_tick(hide=self._record([]),
+                               rows=[_win(101, 500, visible=True)],
+                               uv=lambda: False)
+        assert scans["n"] == 0, "TTL-кэш свежий — скана нет"
+        assert 500 not in (st.get("alien") or {}), \
+            "кэш старше наблюдения окна не доказывает чужеродность"
+
+    def test_tick_prefilter_no_scan_for_foreign_app(self, monkeypatch):
+        """Тик: не-chrome окно чужого приложения до скана профилей не доходит."""
+        scans = {"n": 0}
+
+        def _scan():
+            scans["n"] += 1
+            return [], 1
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "process_image_basename",
+                            lambda pid: "explorer.exe")
+        monkeypatch.setattr(wp, "_SENTINEL", self._fresh_state())
+        res = wp.sentinel_tick(hide=self._record([]),
+                               rows=[_win(105, 998, visible=True)],
+                               uv=lambda: False)
+        assert res["hidden"] == 0 and scans["n"] == 0
+
+    def test_failed_scan_does_not_look_fresh(self, monkeypatch):
+        """Упавший скан: бампается только scan_ts, pids_ts не врёт.
+
+        Регресс ревью 2026-10-17 (раунд 2): исключение в скане оставляло
+        «свежий успешный» пустой кэш — trusted-якорь пропускал метку alien
+        для нашего pid по данным, которых не существует.
+        """
+        def _scan():
+            raise RuntimeError("powershell битый")
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "process_image_basename",
+                            lambda pid: "chrome.exe")
+        st = self._fresh_state()
+        monkeypatch.setattr(wp, "_SENTINEL", st)
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 777)
+        assert wp.sentinel_on_show(0x7070, hide=lambda h: True,
+                                   uv=lambda: False) is False
+        assert st["scan_ts"] > 0.0, "попытка скана отмечена (троттлинг)"
+        assert st.get("pids_ts", 0.0) == 0.0, \
+            "упавший скан не должен выглядеть свежим успешным"
+        assert 777 not in (st.get("alien") or {}), \
+            "по несуществующим данным метку чужака ставить нельзя"
+
+    def test_silent_empty_scan_does_not_poison_alien(self, monkeypatch):
+        """Тихий пустой скан PS (raw=0) — не «состоявшийся»: метки чужака нет.
+
+        `process._win_iter_chromium_processes` глотает сбой PowerShell молча;
+        пустой результат проходил якорь pids_ts, и наш свежий pid уходил в
+        alien на 60 с (MAJOR-1 review-skeptic 2026-10-17). Пустой список при
+        видимом chrome.exe физически невозможен — доверия такому скану нет.
+        """
+        scans = {"n": 0}
+
+        def _scan():
+            scans["n"] += 1
+            return [], 0
+
+        monkeypatch.setattr(wp, "_our_profile_chromium_stat", _scan)
+        monkeypatch.setattr(wp, "process_image_basename",
+                            lambda pid: "chrome.exe")
+        st = self._fresh_state()
+        monkeypatch.setattr(wp, "_SENTINEL", st)
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 777)
+        assert wp.sentinel_on_show(0x8080, hide=lambda h: True,
+                                   uv=lambda: False) is False
+        assert scans["n"] == 1, \
+            "refresh после пустого скана — из кэша (троттлинг), не второй PS"
+        assert st["scan_ts"] > 0.0, "попытка скана отмечена (троттлинг)"
+        assert st.get("pids_ts", 0.0) == 0.0, \
+            "пустой скан при видимом chrome.exe — не состоявшийся"
+        assert 777 not in (st.get("alien") or {}), \
+            "по тихо пустому скану метку чужака ставить нельзя"
+
+
+# ---- свип окон-сирот: kill-путь (находка ревью 2026-10-17: был без тестов) --
+
+class TestSweepStrayBrowsers:
+    def _install(self, monkeypatch, ours, *, responds=False):
+        """Подмена наружного мира свипа; возвращает счётчик вызовов kill."""
+        import types
+
+        from ozon_collector import process as P
+        calls = {"records": None}
+        monkeypatch.setattr(wp, "user_visible", lambda: False)
+        monkeypatch.setattr(wp, "enabled_by_env", lambda: True)
+        monkeypatch.setattr(wp, "list_chrome_windows", lambda: [])
+        monkeypatch.setattr(wp, "_our_profile_chromium", lambda: list(ours))
+        monkeypatch.setattr(wp, "_stray_first_seen", {})
+        monkeypatch.setattr(P, "cdp_responds",
+                            lambda url, timeout_s=1.0: responds)
+        monkeypatch.setattr(P, "process_identity",
+                            lambda pid: types.SimpleNamespace(pid=pid))
+
+        def _kill(records, wait_s=3.0):
+            calls["records"] = list(records)
+            return [types.SimpleNamespace(identity=r.identity)
+                    for r in records]
+
+        monkeypatch.setattr(P, "kill_records", _kill)
+        return calls
+
+    def test_kill_path_identity_and_grace(self, monkeypatch):
+        """CDP молчит дольше grace → kill только по ProcessRecord-identity."""
+        ours = [(111, "ozon-profile", 9444, True)]
+        calls = self._install(monkeypatch, ours, responds=False)
+        assert wp.sweep_stray_browsers(grace_s=45.0, now=100.0)["killed"] == 0, \
+            "первый проход лишь фиксирует «CDP молчит» (grace не вышел)"
+        res = wp.sweep_stray_browsers(grace_s=45.0, now=200.0)
+        assert res["killed"] == 1 and res["killed_pids"] == [111]
+        recs = calls["records"]
+        assert [(r.launch_id, r.identity.pid) for r in recs] == [
+            ("sweep:ozon-profile", 111)], \
+            "kill_records обязан получить ProcessRecord с launch_id и identity"
+        assert wp._stray_first_seen == {}, "порт убран из first_seen после kill"
+
+    def test_cdp_alive_no_kill_and_clears_seen(self, monkeypatch):
+        ours = [(111, "ozon-profile", 9444, True)]
+        calls = self._install(monkeypatch, ours, responds=True)
+        assert wp.sweep_stray_browsers(grace_s=0.0, now=100.0)["killed"] == 0
+        assert calls["records"] is None
+        assert wp._stray_first_seen == {}
+
+    def test_user_visible_skips_everything(self, monkeypatch):
+        ours = [(111, "ozon-profile", 9444, True)]
+        calls = self._install(monkeypatch, ours, responds=False)
+        monkeypatch.setattr(wp, "user_visible", lambda: True)
+        res = wp.sweep_stray_browsers(now=200.0)
+        assert res["skipped"] == "user_visible" and res["killed"] == 0
+        assert calls["records"] is None
+
+    def test_window_pass_hides_only_own_visible_main(self, monkeypatch):
+        ours = [(500, "ozon-profile", 9444, True)]
+        self._install(monkeypatch, ours, responds=True)
+        rows = [_win(101, 500, visible=True),
+                _win(102, 500, visible=True, width=420, height=220),
+                _win(104, 999, visible=True)]
+        hidden = []
+        monkeypatch.setattr(wp, "list_chrome_windows", lambda: rows)
+        monkeypatch.setattr(wp, "minimize_hwnd",
+                            lambda hwnd: (hidden.append(hwnd), True)[1])
+        res = wp.sweep_stray_browsers(now=100.0)
+        assert hidden == [101] and res["hidden"] == 1 and res["visible"] == 1, \
+            "попап своего Chrome и чужое окно не трогаются"
+
+
+# ---- D4/D5 (audit 2026-10-18): process.pid_alive/env_bool delegation -------
+
+def test_pid_alive_delegates_to_process(monkeypatch):
+    """D4: the single liveness implementation is process.pid_alive (guard
+    2**24, isinstance); window_policy no longer duplicates OpenProcess."""
+    seen = []
+
+    def fake_alive(pid):
+        seen.append(pid)
+        return True
+
+    monkeypatch.setattr(wp._proc, "pid_alive", fake_alive)
+    assert wp._pid_alive(1234) is True
+    assert seen == [1234]
+
+    monkeypatch.undo()
+    assert wp._pid_alive(2 ** 24) is False  # guard from the shared impl
+
+
+def test_keep_window_env_uses_shared_env_bool(monkeypatch):
+    """D5: OZON_KEEP_WINDOW=true/yes/on is recognized the same way as in
+    launch_chrome.ps1 and cdp.Session (shared process.env_bool)."""
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "true")
+    assert wp._keep_window_env() is True
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "0")
+    assert wp._keep_window_env() is False
+    monkeypatch.delenv("OZON_KEEP_WINDOW", raising=False)
+    assert wp._keep_window_env() is False

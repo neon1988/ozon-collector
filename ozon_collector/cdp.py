@@ -5,8 +5,6 @@ import json
 import os
 import subprocess
 import time
-from pathlib import Path
-from typing import NamedTuple
 from typing import Optional
 
 
@@ -14,7 +12,8 @@ from playwright.sync_api import sync_playwright
 
 from . import browser as B
 from .browser import (BrowserWatchdog, is_renderer_failure,
-                      AccessChallengeError, _chrome_override)
+                      AccessChallengeError, LaunchRun,
+                      _launch_script_name, _launch_script_path)
 from . import launchlog as _LL
 from . import log
 from . import ffsel
@@ -91,14 +90,47 @@ def _window_for_pid(pid: int, require_visible: bool = True,
 
 
 def _chrome_pids_for_port(port: int):
-    """PID chrome-процессов с --remote-debugging-port=port (наш воркер)."""
+    """PID chrome-процессов, слушающих CDP-порт (наш воркер).
+
+    Быстрый путь: LISTEN-сокет порта держит сам браузерный процесс
+    (сокет-таблица ядра, ~1 мс; живой замер 2026-10-17). Фильтр по имени
+    образа — чужой процесс на порту не должен попасть под сворачивание.
+    Fallback — исторический wmic по командной строке (до 2 с), только если
+    таблица недоступна.
+    """
     if os.name != "nt":
         return set()
+    try:
+        owners = _WP.port_owner_pids(int(port))
+    except Exception:
+        owners = None
+    if owners is None:
+        return _chrome_pids_for_port_wmic(port)
+    pids = set()
+    for pid in owners:
+        try:
+            name = _WP.process_image_basename(int(pid))
+        except Exception:
+            name = None
+        if name and name.lower() == "chrome.exe":
+            pids.add(int(pid))
+    if not pids:
+        # Таблица пуста (LISTEN ещё не встал, нестандартный bind) или держатель
+        # не chrome.exe — не теряем исторический путь целиком (находка ревью
+        # 2026-10-17); wmic медленнее, но на такой аномалии всё равно выигрыш.
+        return _chrome_pids_for_port_wmic(port)
+    return pids
+
+
+def _chrome_pids_for_port_wmic(port: int):
+    """Fallback: PID chrome.exe с --remote-debugging-port=port в cmdline."""
     out = subprocess.run(
         ["wmic", "process", "where", "Name='chrome.exe'",
          "get", "ProcessId,CommandLine", "/format:csv"],
         capture_output=True, text=True, encoding="utf-8",
-        errors="replace", timeout=10).stdout
+        errors="replace", timeout=10,
+        creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                       if os.name == "nt" else 0)).stdout
     pids = set()
     for line in out.splitlines():
         if f"--remote-debugging-port={port}" in line:
@@ -177,69 +209,20 @@ def _js_label(js: str) -> str:
     return s[:40] + ("…" if len(s) > 40 else "")
 
 
-def _launch_script_name() -> str:
-    """Имя скрипта запуска браузера для текущей ОС."""
-    return "launch_chrome.ps1" if os.name == "nt" else "launch_chrome.sh"
-
-
-def _launch_script_path() -> Path:
-    """Путь к скрипту запуска браузера (Windows → .ps1, иначе → .sh)."""
-    return (Path(__file__).resolve().parent.parent / "scripts"
-            / _launch_script_name())
-
-
-class LaunchRun(NamedTuple):
-    """Результат запуска лаунчера: путь лога + процесс (для fail-fast)."""
-
-    path: str
-    proc: subprocess.Popen
-
-
 def _launch_browser(cdp_url: str, profile_path: str | None = None,
                     profile_token: str | None = None) -> LaunchRun:
-    """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url).
+    """Launch live Chromium via scripts/launch_chrome (port from cdp_url).
 
-    profile_path — полный путь --user-data-dir (для воркеров передаёт PROFILE
-    env в launch_chrome.ps1/.sh; None = дефолтный профиль скрипта).
-    CHROME env (из OZON_CHROME_PATH или уже заданной CHROME) выбирает
-    исполняемый файл: системный Chrome либо автономный Chrome-for-Testing/Edge.
+    The single implementation lives in browser._launch_script: Popen /
+    CREATE_NO_WINDOW / log / proxy are shared by the initial launch and the
+    recycle path (audit 2026-10-18, D1). cdp path/name helpers are injected so
+    monkeypatches of cdp._launch_script_path / cdp._launch_script_name keep
+    working for tests and calling code.
     """
-    script = _launch_script_path()
-    if not script.exists():
-        raise RuntimeError(
-            f"{_launch_script_name()} не найден: {script}\n"
-            f"Запустите браузер вручную: "
-            f"powershell -ExecutionPolicy Bypass -File scripts/launch_chrome.ps1"
-            if os.name == "nt" else
-            f"sh scripts/launch_chrome.sh"
-        )
-    env = dict(os.environ)
-    env["PORT"] = str(P.cdp_port(cdp_url))
-    if profile_path:
-        env["PROFILE"] = profile_path
-    chrome = _chrome_override()
-    if chrome:
-        env["CHROME"] = chrome
-    # per-worker прокси (ревизия 2.9, net.py): 1 профиль = 1 IP. Общий хелпер
-    # с browser._launch_script (recycle через BrowserProcessManager): раньше
-    # блок жил только здесь, и recycle воркера терял прокси (аудит 2026-10-15).
-    B._apply_worker_proxy_env(env, profile_token)
-    cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
-           if os.name == "nt" else [str(script)])
-    # Вывод лаунчера НЕ выбрасываем (ревизия 2.9): при пустом/битом
-    # launch_chrome.ps1 коллектор раньше получал только «CDP-браузер не
-    # поднялся за 30с» и неделю гадал про DISPLAY, хотя Chromium даже не
-    # запускался. Пишем в temp-файл, читаем хвост при неудаче.
-    path = _LL.launcher_log_path(P.cdp_port(cdp_url))
-    try:
-        with open(path, "wb") as fh:      # truncate: лог всегда от THIS запуска
-            proc = subprocess.Popen(cmd, env=env,
-                                    stdin=subprocess.DEVNULL,
-                                    stdout=fh, stderr=subprocess.STDOUT)
-    except OSError as e:
-        raise RuntimeError(f"не удалось запустить {_launch_script_name()}: "
-                           f"{type(e).__name__}: {e}") from e
-    return LaunchRun(path, proc)
+    return B._launch_script(cdp_url, profile_path=profile_path,
+                            profile_token=profile_token,
+                            script_path=_launch_script_path(),
+                            script_name=_launch_script_name())
 
 
 def _launcher_log_tail(path, limit: int = 12) -> str:
@@ -596,7 +579,7 @@ class Session:
         # keep_window: None → env OZON_KEEP_WINDOW (1 = окно видимо/наверху),
         # иначе явный bool из конфига CLI (--window-mode visible/hidden).
         self.keep_window = (keep_window if keep_window is not None
-                            else os.environ.get("OZON_KEEP_WINDOW") == "1")
+                            else P.env_bool("OZON_KEEP_WINDOW"))
         self.browser_owner = "external"   # external | collector (ADR §14.1)
         self.browser_pid = None
         self.browser_profile = (
@@ -793,7 +776,19 @@ class Session:
         # external (чужой Chrome пользователя) не трогаем — его окно личное.
         owner = getattr(self, "browser_owner", None)
         if owner == "collector":
+            # Сторож — ДО нормализации: setWindowBounds(normal) внутри неё
+            # ПОКАЗЫВАЕТ окно (живой замер 2026-10-17), а watch ставит
+            # hook/tick, которые гасят показ за миллисекунды. Без этого окно
+            # висело бы до первого прохода сторожа — это и видел владелец
+            # «прям сразу при старте сбора».
+            # (sweep_stray_browsers в прод не подключён — задел, review
+            # 2026-10-17; фактический механизм — сентинел в window_policy.)
+            self._sync_window_guard(" pre-normalize", enforce_hidden=True)
             self._normalize_window_geometry()
+            # Показ от setWindowBounds(normal) гасит зарегистрированный выше
+            # сторож (hook/tick, миллисекунды), а штатное скрытие ниже — общий
+            # _minimize_window_native в хвосте функции (не дублировать: тест
+            # test_collector_chrome_window_still_minimized ждёт ровно один вызов).
         if getattr(self, "kind", "chrome") == "firefox":
             # Firefox не сворачиваем НИКОГДА: свёрнутое окно не рендерит
             # lazy-блоки (0 отзывов) и теряет вкладку при выгрузке по памяти
@@ -1015,37 +1010,24 @@ class Session:
     @staticmethod
     def _minimize_window_native(port: int | None = None, pids=None,
                                 window_class: str = "Chrome_WidgetWin_1"):
-        """user32: скрытие + запрет активации окна браузера (Windows).
+        """user32: hide the browser window and keep it non-activating (Windows).
 
-        Плюс WS_EX_TOOLWINDOW: окно не висит на панели задач и не попадает
-        в Alt+Tab (управление окнами коллектора — scripts/collector_tray.ps1).
+        Finds the main window by pid and delegates the per-hwnd work to the
+        window_policy.minimize_hwnd canon (SW_HIDE + NOACTIVATE|TOOLWINDOW +
+        DeleteTab). Duplicating this logic caused two SW_MINIMIZE regressions
+        already: a minimized TOOLWINDOW window is drawn by Windows as a ghost
+        tile above the taskbar and stops delivering frames (live measurement
+        2026-10-16) — now there is a single implementation (audit 2026-10-18,
+        D2).
 
-        Скрываем именно SW_HIDE, а не SW_MINIMIZE: свёрнутое TOOLWINDOW-окно
-        Windows рисует «мини-плиткой-призраком» над панелью задач (живой замер
-        2026-10-16: SW_SHOWMINNOACTIVE/SW_MINIMIZE → vis=True icon=True
-        rect=0,1004,160,1032) и перестаёт отдавать кадры (скриншот пазла виснет
-        6с). Скрытое с рождения окно кадры отдаёт (замер: 0.06с) — пазл
-        снимается без показа окна. Показанное и затем скрытое окно снова отдаёт
-        кадры через ~9с (само-лечение, замер) — поэтому скрытие показанного
-        окна остаётся редким сценарием («юзер развернул из трея»).
-        require_visible=True: скрытое окно не ищем — оно уже скрыто.
-
-        Chromium: pids вычисляются по port (chrome с --remote-debugging-port,
-        наш воркер). Firefox: pids передаются явно (нет порта), класс окна
-        MozillaWindowClass. Не-Windows — no-op.
+        Chromium: pids are derived from the port (chrome with
+        --remote-debugging-port, our worker). Firefox: pids are passed
+        explicitly (no port), window class MozillaWindowClass. Non-Windows is
+        a no-op.
         """
         if os.name != "nt":
             return
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            GWL_EXSTYLE = -20
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TOOLWINDOW = 0x00000080   # нет кнопки на панели задач
-            SW_HIDE = 0
-
             if pids is None:
                 if port is None:
                     return
@@ -1053,15 +1035,7 @@ class Session:
             for pid in pids:
                 hwnd = _window_for_pid(pid, window_class=window_class)
                 if hwnd:
-                    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                          style | WS_EX_NOACTIVATE
-                                          | WS_EX_TOOLWINDOW)
-                    user32.ShowWindow(hwnd, SW_HIDE)
-                    # Кнопку снимаем и здесь: смена TOOLWINDOW уже созданную
-                    # кнопку панели задач не убирает (находка 2026-10-16).
-                    from ozon_collector import window_policy as _wp
-                    _wp.delete_taskbar_tab(int(hwnd))
+                    _WP.minimize_hwnd(int(hwnd))
                     break
         except Exception as e:
             log.debug(f"minimize_window native: {type(e).__name__}: {e}")
@@ -1142,51 +1116,28 @@ class Session:
     @staticmethod
     def _restore_window_native(port: int | None = None, pids=None,
                                window_class: str = "Chrome_WidgetWin_1"):
-        """user32: SW_RESTORE + TOPMOST окна браузера (Windows), без активации.
+        """user32: SW_RESTORE + TOPMOST the browser window (Windows), no activation.
 
-        Дублирует путь launch_chrome.ps1, но применим к уже работающему окну
-        (после reconnect/перезапуска коллектором). Chromium: pids из порта;
-        Firefox: pids явные + класс MozillaWindowClass. NOACTIVATE + SW_RESTORE,
-        фокус не крадём. TOOLWINDOW сохраняем — панель задач остаётся чистой.
+        Finds the main window and delegates the per-hwnd work to the
+        window_policy.show_hwnd canon (audit 2026-10-18, D2).
+        require_visible=False: the main browser window is found even while
+        hidden (SW_HIDE at start) — otherwise it could never be found and
+        shown (chicken-and-egg). Chromium: pids from the port; Firefox:
+        explicit pids + MozillaWindowClass. NOACTIVATE + SW_RESTORE keeps the
+        user focus; TOOLWINDOW stays — the taskbar stays clean.
         """
         if os.name != "nt":
             return
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            GWL_EXSTYLE = -20
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TOOLWINDOW = 0x00000080   # нет кнопки на панели задач
-            SW_RESTORE = 9
-            HWND_TOPMOST = -1
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
-            SWP_NOACTIVATE = 0x0010
-
             if pids is None:
                 if port is None:
                     return
                 pids = _chrome_pids_for_port(port)
             for pid in pids:
-                # require_visible=False: главное окно браузера находим даже В
-                # СКРЫТОМ состоянии (SW_HIDE при старте) — иначе его нельзя
-                # найти и показать (замкнутый круг). SW_RESTORE +
-                # SWP_SHOWWINDOW гарантированно показывают невидимое окно.
                 hwnd = _window_for_pid(pid, require_visible=False,
                                        window_class=window_class)
                 if hwnd:
-                    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                          style | WS_EX_NOACTIVATE
-                                          | WS_EX_TOOLWINDOW)
-                    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-                    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-                                        | 0x0040)  # SWP_SHOWWINDOW
-                    from ozon_collector import window_policy as _wp
-                    _wp.delete_taskbar_tab(int(hwnd))
+                    _WP.show_hwnd(int(hwnd))
                     break
         except Exception as e:
             log.debug(f"restore_window native: {type(e).__name__}: {e}")

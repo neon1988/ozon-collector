@@ -35,6 +35,7 @@ import re
 import time
 import urllib.parse
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 from . import VERSION, SCHEMA_VERSION, DEFAULT_CDP_URL
@@ -250,514 +251,53 @@ def _sort_url(url: str, sort: str | None) -> str:
     return urllib.parse.urlunparse(u._replace(query=urllib.parse.urlencode(q)))
 
 # ---------------------------------------------------------------------------
+# Collector JS lives in ozon_collector/js/*.js (audit 2026-10-18, step 9):
+# the literals inflated the module to ~3100 lines. The text is unchanged —
+# each constant equals the exact file content; _JS_FILES is the registry
+# checked by a contract test.
+# ---------------------------------------------------------------------------
+_JS_DIR = Path(__file__).resolve().parent / "js"
+
+_JS_FILES = {
+    "PRODUCT_JS": "product.js",
+    "REVIEWS_JS": "reviews.js",
+    "REVIEW_IDS_JS": "review_ids.js",
+    "SCROLL_TO_LAST_REVIEW_JS": "scroll_to_last_review.js",
+    "SCROLL_STEP_UP_JS": "scroll_step_up.js",
+    "SCROLL_STEP_DOWN_JS": "scroll_step_down.js",
+    "EXPAND_REVIEWS_JS": "expand_reviews.js",
+    "MARK_COMMENT_CARDS_JS": "mark_comment_cards.js",
+    "VARIANT_MODE_JS": "variant_mode.js",
+    "_CHALLENGE_LOOKS_JS": "challenge_looks.js",
+    "_AGE_GATE_PROBE_JS": "age_gate_probe.js",
+    "_PAGE_READY_JS": "page_ready.js",
+    "_AGE_GATE_STATE_JS": "age_gate_state.js",
+    "_AGE_GATE_CONFIRM_JS": "age_gate_confirm.js",
+    "_AUTH_DOM_JS": "auth_dom.js",
+    "_PAGE_GEOM_JS": "page_geom.js",
+    "_CARDS_COUNT_JS": "cards_count.js",
+}
+
+
+def _load_js(fname: str) -> str:
+    """JS file text from ozon_collector/js (UTF-8, no BOM)."""
+    return (_JS_DIR / fname).read_text(encoding="utf-8")
+
+# ---------------------------------------------------------------------------
 # JS-извлечение карточки товара (включая структурированную цену price_parts)
 # ---------------------------------------------------------------------------
-PRODUCT_JS = r"""
-() => {
-  const T = document.body.innerText;
-  const parse = (v) => {
-    const f = parseFloat(String(v).replace(/\s/g, '').replace(',', '.'));
-    return isNaN(f) ? null : f;
-  };
-  // Явный ноль отзывов из state-JSON виджета webReviewProductScore
-  // (блок «Отзывы о товаре 0» машинно отдаёт reviewsCount/totalScore=0).
-  const reviewZero = () => {
-    const st = document.querySelector('[id^="state-webReviewProductScore"]');
-    if (!st) return false;
-    try {
-      const state = JSON.parse(st.getAttribute('data-state'));
-      const rcVal = state && (state.reviewsCount ?? state.totalScore);
-      return typeof rcVal === 'number' && rcVal <= 0;
-    } catch (e) {
-      return false;
-    }
-  };
-  const title = () => {
-    const h1 = document.querySelector('h1');
-    if (h1) return h1.innerText.trim();
-    const m = T.match(/(?:\n|^)([^\n]{15,160})\n/);
-    return m ? m[1].trim() : null;
-  };
-  const SCORE_WIDGETS = ["webProductScore", "webSingleProductScore", "webReviewProductScore"];
-  const rating = () => {
-    if (reviewZero()) return { value: 0, source: "no_reviews_widget" };
-    for (const wname of SCORE_WIDGETS) {
-      const w = document.querySelector('[data-widget="' + wname + '"]');
-      if (!w) continue;
-      const text = String(w.innerText);
-      let m = text.match(/([\d.,]+)\s*\/\s*5/);
-      if (m) {
-        const v = parseFloat(m[1].replace(',', '.'));
-        if (v > 0 && v <= 5) return { value: v, source: wname };
-      }
-      m = text.match(/([\d.,]+)\s*[•·]/);
-      if (m) {
-        const v = parseFloat(m[1].replace(',', '.'));
-        if (v > 0 && v <= 5) return { value: v, source: wname };
-      }
-    }
-    const m = T.match(/([\d.,]+)\s*\/\s*5\s*зв[её]зд/);
-    if (m) {
-      const v = parseFloat(m[1].replace(',', '.'));
-      if (v > 0 && v <= 5) return { value: v, source: 'fallback_text' };
-    }
-    return null;
-  };
-  const ratingCount = () => {
-    if (reviewZero()) return 0;
-    for (const wname of SCORE_WIDGETS) {
-      const w = document.querySelector('[data-widget="' + wname + '"]');
-      if (!w) continue;
-      const text = String(w.innerText);
-      let m = text.match(/([\d\s\u00a0]+)\s*(?:оцен(?:ка|ок|ки))/i);
-      if (m) return parse(m[1]);
-      m = text.match(/([\d\s\u00a0]+)\s*отзыв/i);
-      if (m) return parse(m[1]);
-      const nums = [];
-      const re = /\d+(?:[\s\u00a0]\d+)*/g;
-      let mm;
-      while ((mm = re.exec(text)) !== null) {
-        const digits = mm[0].replace(/[\s\u00a0]/g, '');
-        const num = parseInt(digits, 10);
-        if (num > 5 && digits.length >= 2) nums.push(num);
-      }
-      if (nums.length) return Math.max(...nums);
-    }
-    const m = T.match(/([\d\s]+)\s*оцен(?:ка|ок|ки)/);
-    return m ? parse(m[1]) : null;
-  };
-  const CHAR_WIDGETS = ["webCharacteristics", "webShortCharacteristics"];
-  const characteristics = () => {
-    const out = {};
-    const grab = (dl) => {
-      const dt = dl.querySelector('dt');
-      const dd = dl.querySelector('dd');
-      if (dt && dd) {
-        const k = dt.innerText.trim();
-        const v = dd.innerText.trim();
-        if (k && v && !out[k]) out[k] = v;
-      }
-    };
-    for (const wname of CHAR_WIDGETS) {
-      const w = document.querySelector('[data-widget="' + wname + '"]');
-      if (!w) continue;
-      w.querySelectorAll('dl').forEach(grab);
-      if (Object.keys(out).length > 0) return out;
-    }
-    document.querySelectorAll('dl.tsBodyMBold').forEach(grab);
-    if (Object.keys(out).length > 0) return out;
-    document.querySelectorAll('dl').forEach((dl) => {
-      const dt = dl.querySelector(':scope > dt');
-      const dd = dl.querySelector(':scope > dd');
-      if (dt && dd) {
-        const k = dt.innerText.trim();
-        const v = dd.innerText.trim();
-        if (k && v && !out[k]) out[k] = v;
-      }
-    });
-    if (Object.keys(out).length >= 5) return out;
-    for (const wname of CHAR_WIDGETS) {
-      const w = document.querySelector('[data-widget="' + wname + '"]');
-      if (!w) continue;
-      w.querySelectorAll('[class*="Row"]').forEach((r) => {
-        const t = r.innerText.split('\n');
-        if (t.length >= 2) {
-          const k = t[0].trim();
-          const v = t[t.length - 1].trim();
-          if (k && v && !out[k]) out[k] = v;
-        }
-      });
-    }
-    return out;
-  };
-  const gallery = () => {
-    const out = [];
-    const push = (i) => {
-      const s = i.currentSrc || i.src || '';
-      if (s && !out.includes(s) && !/\/video-[^/]+\/[^/]+\/cover\//.test(s)) out.push(s);
-    };
-    const GALLERY_WIDGETS = ['webGallery', 'webDescription', 'webProductDescription'];
-    let found = 0;
-    for (const wname of GALLERY_WIDGETS) {
-      const w = document.querySelector('[data-widget="' + wname + '"]');
-      if (!w) continue;
-      w.querySelectorAll('img').forEach(push);
-      found++;
-    }
-    if (found === 0) {
-      document.querySelectorAll('img[src*="cdn1.ozone.ru"], img[src*="ir.ozone.ru"]')
-        .forEach(push);
-    }
-    return out;
-  };
-
-  const DESC_WIDGETS = ["webProductDescription", "webDescription"];
-  const descriptions = () => {
-    const out = [];
-    for (const wname of DESC_WIDGETS) {
-      const w = document.querySelector('[data-widget="' + wname + '"]');
-      if (!w) continue;
-      const t = w.innerText.trim();
-      if (t) out.push(t);
-      if (out.length) return out;
-    }
-    document.querySelectorAll('[class*="ProductDescription"], [class*="description"]').forEach((n) => {
-      const t = n.innerText.trim();
-      if (t && t.length > 60) out.push(t);
-    });
-    if (out.length) return out;
-    const charWidget = document.querySelector('[data-widget="webCharacteristics"]');
-    if (charWidget) {
-      let next = charWidget.nextElementSibling;
-      while (next) {
-        const t = next.innerText.trim();
-        if (t.length > 100) {
-          out.push(t);
-          break;
-        }
-        next = next.nextElementSibling;
-      }
-    }
-    return out;
-  };
-
-  const infographics = () => {
-    const out = [];
-    const GALLERY_WIDGETS = ['webMediaViewer', 'webGallery', 'webDescription', 'webProductDescription'];
-    for (const wname of GALLERY_WIDGETS) {
-      const w = document.querySelector('[data-widget="' + wname + '"]');
-      if (!w) continue;
-      w.querySelectorAll('img[src*="info"], img[src*="schema"]').forEach((i) => {
-        const s = i.currentSrc || i.src || '';
-        if (s) out.push(s);
-      });
-    }
-    return out;
-  };
-
-  // ---- price: структурированная цена (TreeWalker по текстовым узлам) ----
-  const priceParts = () => {
-    const parts = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let n;
-    while ((n = walker.nextNode())) {
-      const t = (n.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!t) continue;
-      const p = n.parentElement;
-      if (!p) continue;
-      const st = p.getBoundingClientRect ? p.getBoundingClientRect() : null;
-      let fs = 0;
-      const cs = p && window.getComputedStyle ? window.getComputedStyle(p) : null;
-      if (cs && cs.fontSize) fs = parseFloat(cs.fontSize) || 0;
-      let weight = 0;
-      if (cs && cs.fontWeight) weight = parseInt(cs.fontWeight, 10) || 0;
-      const strike = !!(p.classList && (p.classList.contains('_8mQ_f') || (cs && cs.textDecorationLine && cs.textDecorationLine.includes('line-through'))));
-      if (/[₽]|руб|р\.\s*$/.test(t) && t.length < 25) {
-        parts.push({ t, y: st ? st.y : 0, x: st ? st.x : 0, fs, weight, strike });
-      }
-    }
-    parts.sort((a, b) => (b.fs * (b.weight ? 2 : 1)) - (a.fs * (a.weight ? 2 : 1)));
-    return parts.slice(0, 8);
-  };
-
-  const priceParsed = () => {
-    const els = Array.from(document.querySelectorAll('[data-widget="webPrice"] [class*="mainPrice"], [class*="tsHeadline500Medium"]'));
-    const seen = new Set();
-    const out = [];
-    els.forEach((e) => {
-      const t = (e.innerText || '').replace(/\s+/g, ' ').trim();
-      if (!t || seen.has(t)) return;
-      seen.add(t);
-      const n = parse(t);
-      if (n) out.push({ raw: t, value: n });
-    });
-    return out;
-  };
-
-  const price_text = () => {
-    const m = T.match(/[\d\s]{3,}\s*[₽р]/);
-    return m ? m[0].trim() : null;
-  };
-
-  // ---- price: точная цена из виджета webPrice ----
-  // current — крупная не-кнопочная цена (fs 20, bold); old — зачёркнутая/меньшая
-  // рядом; bank — цена в кнопке банка («С банками»); рассрочки/аксессуары вне
-  // виджета webPrice не попадают вовсе.
-  const priceExtract = () => {
-    const w = document.querySelector('[data-widget="webPrice"]');
-    const res = { current: null, old: null, bank: null, confidence: 0, source: null };
-    if (!w) return res;
-    const priceRe = /^\s*[\d\s\u2009\u00a0]{1,12}\s*[₽р]\s*$/;
-    const items = [];
-    const walk = (el, depth) => {
-      if (!el || depth > 14) return;
-      const direct = el.childNodes.length === 1 && el.childNodes[0].nodeType === 3;
-      const txt = direct ? (el.textContent || '').trim() : '';
-      if (txt && priceRe.test(txt)) {
-        const cs = getComputedStyle(el);
-        let node = el, inBtn = false;
-        for (let i = 0; i < 8 && node; i++, node = node.parentElement) {
-          if (node.tagName === 'BUTTON') { inBtn = true; break; }
-        }
-        items.push({ txt, fs: parseFloat(cs.fontSize) || 0, w: parseInt(cs.fontWeight, 10) || 0,
-          strike: (cs.textDecorationLine || '').includes('line-through'), inBtn });
-      }
-      for (const c of el.children) walk(c, depth + 1);
-    };
-    walk(w, 0);
-    const num = (s) => parseInt(String(s || '').replace(/[\s\u2009\u00a0]/g, '').replace(/[₽р]/g, ''), 10);
-    const main = items.filter((i) => !i.inBtn).sort((a, b) => (b.fs * 100 + b.w) - (a.fs * 100 + a.w));
-    const cur = main[0];
-    if (!cur) return res;
-    res.current = num(cur.txt);
-    res.source = 'webPrice';
-    const oldCand = main.slice(1).filter((i) => i.strike || i.fs < cur.fs);
-    if (oldCand.length) res.old = num(oldCand[0].txt);
-    const bank = items.find((i) => i.inBtn);
-    if (bank) res.bank = num(bank.txt);
-    res.confidence = cur.fs >= 16 ? 0.97 : 0.85;
-    return res;
-  };
-
-  const ratingData = rating();
-
-  // ---- «По мнению покупателей»: % рекомендуют + разбивка оценок по звёздам ----
-  const customerOpinion = () => {
-    const out = { recommend_percent: null, stars: {}, counts: {}, text: null };
-    const starRe = /^([1-5])\s*зв[её]зд[а-я]*$/i;
-    const rows = [];
-    for (const el of document.querySelectorAll('div, span')) {
-      const t = (el.innerText || '').trim();
-      const m = starRe.exec(t);
-      if (m && t.length <= 20) {
-        const row = el.parentElement;
-        if (row) rows.push([parseInt(m[1], 10), row]);
-      }
-    }
-    rows.forEach(([star, row]) => {
-      // процент из style="width: N%" внутри строки гистограммы
-      const wEl = row.querySelector('[style*="width"]');
-      const wm = wEl && (wEl.getAttribute('style') || '').match(/width:\s*([\d.]+)%/);
-      if (wm) out.stars[star] = parseFloat(wm[1]);
-      // количество отзывов — число в конце текста строки
-      const t2 = (row.innerText || '').replace(/\s+/g, ' ').trim();
-      const cm = t2.match(/(\d[\d\s\u00a0]*)$/);
-      if (cm) out.counts[star] = parseInt(cm[1].replace(/[\s\u00a0]/g, ''), 10);
-    });
-    // «N% покупателей рекомендуют» / «N% рекомендуют» по всей странице
-    if (!Object.keys(out.stars).length || out.recommend_percent === null) {
-      const pageTxt = document.body ? (document.body.innerText || '') : '';
-      const rec = pageTxt.match(/(\d{1,3})\s*%\s*покупател/i)
-              || pageTxt.match(/покупател[^\n%]{0,25}\s*(\d{1,3})\s*%/i)
-              || pageTxt.match(/(\d{1,3})\s*%\s*рекомендуют/i);
-      if (rec) out.recommend_percent = parseInt(rec[1], 10);
-    }
-    // fallback: пары «N» + «M%» подряд (гистограмма без слов «звезда»)
-    if (!Object.keys(out.stars).length) {
-      const allEls = Array.from(document.querySelectorAll(
-        'span, div, [class*="score"], [class*="bar"], [class*="percent"]'));
-      const texts = allEls.map((n) => (n.innerText || '').trim()).filter(Boolean);
-      for (let i = 0; i + 1 < texts.length; i++) {
-        const star = /^([1-5])$/.exec(texts[i]);
-        const pct = /^(\d{1,3})\s*%$/.exec(texts[i + 1]);
-        if (star && pct) out.stars[parseInt(star[1], 10)] = parseInt(pct[1], 10);
-      }
-    }
-    out.text = (document.body ? (document.body.innerText || '') : '')
-      .match(/По\s+мнению\s+покупателей[\s\S]{0,1200}/)?.[0]
-      || '';
-    return out;
-  };
-
-  return {
-    title: title(),
-    rating: ratingData ? ratingData.value : null,
-    rating_source: ratingData ? ratingData.source : null,
-    rating_count: ratingCount(),
-    price_text: price_text(),
-    price_parts: priceParts(),
-    price_parsed: priceParsed(),
-    price: priceExtract(),
-    characteristics: characteristics(),
-    gallery: gallery(),
-    descriptions: descriptions(),
-    infographics: infographics(),
-    customer_opinion: customerOpinion(),
-  };
-}
-"""
+PRODUCT_JS = _load_js("product.js")
 
 # ---------------------------------------------------------------------------
 # JS-извлечение отзывов текущей страницы
 # ---------------------------------------------------------------------------
-REVIEWS_JS = r"""
-() => {
-  const lists = Array.from(document.querySelectorAll('div[data-widget="webListReviews"]'));
-  const cards = Array.from(document.querySelectorAll('[data-review-uuid]'));
-  const RE_DATE = /(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})/;
-  const RE_ASPECT = /^[^:\n]{1,40}:\s*\S/;
-  const blockIsAspects = (t) =>
-    t.split('\n').filter((l) => l.trim()).every((l) => RE_ASPECT.test(l.trim()));
-  const isStale = (el) => {
-    if (el.getAttribute?.('title') === 'Отзыв устарел') return true;
-    const t = el.querySelector?.('[title="Отзыв устарел"], [title*="устарел"]');
-    if (t) return true;
-    for (const n of el.querySelectorAll('div, span')) {
-      const s = (n.innerText || '').trim();
-      if (s && /^Отзыв\s+устарел$/i.test(s)) return true;
-    }
-    return false;
-  };
-  const extract = (card) => {
-    const wrapper = card.querySelector('div[data-review-uuid]') || card;
-    const uuid = wrapper.getAttribute('data-review-uuid');
-    const publishedAt = wrapper.getAttribute('publishedat');
-    const fullText = (wrapper.innerText || '');
-    const dateMatch = fullText.match(RE_DATE);
-    const date = dateMatch ? dateMatch[1] : '';
-    const spans = Array.from(wrapper.querySelectorAll('span.tsCompactControl500Medium'));
-    let author = (spans[0]?.innerText || '').trim();
-    let author2 = (spans[1]?.innerText || '').trim();
-    if (!author) {
-      const alt = wrapper.querySelector('span[class*="tsCompact"]');
-      if (alt) author = (alt.innerText || '').trim();
-    }
-    if (author2 && author2 === author) author2 = '';
-    let variant = '';
-    let aspectsEl = null;
-    let bestLen = -1;
-    Array.from(wrapper.querySelectorAll('a[href*="/product/"]')).forEach((a) => {
-      const t = (a.innerText || '').trim();
-      if (!RE_ASPECT.test(t)) return;
-      let cur = a;
-      while (cur && cur !== wrapper) {
-        const inner = (cur.innerText || '').trim();
-        if (inner.length <= 600 && cur.children.length <= 3 && blockIsAspects(inner)) {
-          if (inner.length >= bestLen) {
-            bestLen = inner.length;
-            variant = inner;
-            aspectsEl = cur;
-          }
-        }
-        cur = cur.parentElement;
-      }
-    });
-    let text = '';
-    if (aspectsEl && aspectsEl.parentElement) {
-      let bestT = '';
-      let bestTlen = -1;
-      Array.from(aspectsEl.parentElement.children).forEach((c) => {
-        if (c === aspectsEl) return;
-        const t = (c.innerText || '').trim();
-        if (t.length > bestTlen) { bestTlen = t.length; bestT = t; }
-      });
-      text = bestT;
-    }
-    if (!text) {
-      text = fullText
-        .replace(/^[^\n]*\n/, '')
-        .split('\n').filter((l) => !RE_ASPECT.test(l.trim())).join('\n');
-    }
-    text = text
-      .replace(RE_DATE, '')
-      .replace(/\n\s*(?:Вам помог этот отзыв\?.*|[\d\s]+\s*комментар.*)$/s, '')
-      .replace(/\s*Да \d+\s*Нет \d+/, '')
-      .replace(/\s*\d+\s*комментар\S*/, '')
-      .replace(/\n\s*(?:Читать полностью|Читать дальше|Развернуть|Свернуть)\s*$/g, '')
-      .trim();
-    // имя автора дублируется первой строкой тела текста (DOM: имя отзыва
-    // попадает в innerText карточки из-за наложения блока заголовка) — срезаем
-    // ведущую строку, если она совпадает с именем автора.
-    if (author) {
-      const firstLine = (text.split('\n')[0] || '').trim();
-      if (firstLine && firstLine === author) {
-        text = text.split('\n').slice(1).join('\n').trim();
-      }
-    }
-    const svgs = Array.from(wrapper.querySelectorAll('svg'));
-    let stars = 0;
-    svgs.forEach((s) => {
-      const cls = s.getAttribute('class') || '';
-      if (cls.includes('a9')) stars++;
-    });
-    if (!stars && svgs.length === 5) stars = 0;
-    const helpful = fullText.match(/Да (\d+)\s*Нет (\d+)/);
-    const comments = fullText.match(/(\d+)\s*комментар\S*/);
-    return {
-      uuid, publishedAt, author, author2, date, variant, stars,
-      stale: isStale(wrapper),
-      text: text.slice(0, 20000),
-      helpful_yes: helpful ? parseInt(helpful[1], 10) : 0,
-      helpful_no: helpful ? parseInt(helpful[2], 10) : 0,
-      comments_count: comments ? parseInt(comments[1], 10) : 0,
-      comments: parseComments(card),
-    };
-  };
-  const parseComments = (card) => {
-    const parent = card.parentElement;
-    const out = [];
-    if (!parent) return out;
-    Array.from(parent.querySelectorAll('[data-comment-uuid]')).forEach((cm) => {
-      const author = (cm.querySelector('span.tsCompactControl500Medium')?.innerText || '').trim();
-      const replyEl = cm.querySelector('a.rpProduct_c4a') || cm.querySelector('a.l9j_25');
-      let replyTo = replyEl ? (replyEl.innerText || '').trim() : '';
-      if (/^в ответ/i.test(replyTo)) replyTo = replyTo.replace(/^в ответ\s*/i, '').trim();
-      const date = (cm.querySelector('div.rpProduct_a4c')?.innerText || cm.querySelector('div.j9l_25')?.innerText || '').trim();
-      const text = (cm.querySelector('span.rpProduct_ca5')?.innerText || cm.querySelector('span.jm0_25')?.innerText || '').trim();
-      const votes = Array.from(cm.querySelectorAll('div.tsBodyControl400Small'))
-        .map((v) => parseInt((v.innerText || '').trim().replace(/\D/g, ''), 10) || 0);
-      out.push({
-        uuid: cm.getAttribute('data-comment-uuid'),
-        author, reply_to: replyTo, date,
-        text: text.slice(0, 20000),
-        like: votes[0] || 0,
-        dislike: votes[1] || 0,
-      });
-    });
-    return out;
-  };
-  const reviews = cards.map(extract).filter((r) => r.uuid);
-  let pag = null;
-  for (let i = lists.length - 1; i >= 0 && !pag; i--) {
-    const c = lists[i].children[2];
-    if (c && (c.innerText || '').trim()) pag = c;
-  }
-  let pages = 1;
-  if (pag) {
-    const txt = (pag.innerText || '');
-    const m = txt.match(/(\d+)/);
-    if (m && /страниц/i.test(txt)) pages = parseInt(m[1], 10);
-  }
-  const total = document.querySelector('[data-widget="webReviewProductScore"]');
-  return {
-    ok: reviews.length > 0,
-    reviews,
-    pages,
-    totalText: total ? total.innerText.trim() : null,
-  };
-}
-"""
+REVIEWS_JS = _load_js("reviews.js")
 
 
-REVIEW_IDS_JS = r"""
-() => {
-  return Array.from(document.querySelectorAll('[data-review-uuid]'))
-    .map((c) => (c.getAttribute('data-review-uuid') || '').trim())
-    .filter(Boolean);
-}
-"""
+REVIEW_IDS_JS = _load_js("review_ids.js")
 
 
-SCROLL_TO_LAST_REVIEW_JS = r"""
-() => {
-  const els = document.querySelectorAll('[data-review-uuid]');
-  if (els.length) {
-    els[els.length - 1].scrollIntoView({ block: 'center' });
-  } else {
-    window.scrollBy(0, 1500);
-  }
-}
-"""
+SCROLL_TO_LAST_REVIEW_JS = _load_js("scroll_to_last_review.js")
 
 
 # ВАЖНО: маркер `step-up`/`step-down` живёт ВНУТРИ тела функции, а не перед
@@ -767,110 +307,19 @@ SCROLL_TO_LAST_REVIEW_JS = r"""
 # («FakePage») не добирал отзывы молча. Маркер при этом остаётся в строке
 # (docs/architecture/architecture.md, FakePage-подмены и тесты ищут его
 # подстрокой), так что идентификация не пострадала.
-SCROLL_STEP_UP_JS = r"""
-() => {
-  /*step-up*/
-  const before = window.scrollY;
-  window.scrollBy({ top: -Math.round(window.innerHeight * 2.2), behavior: 'instant' });
-  return window.scrollY <= 0 || window.scrollY === before;
-}
-"""
+SCROLL_STEP_UP_JS = _load_js("scroll_step_up.js")
 
 
-SCROLL_STEP_DOWN_JS = r"""
-() => {
-  /*step-down*/
-  const before = window.scrollY;
-  window.scrollBy({ top: Math.round(window.innerHeight * 2.2), behavior: 'instant' });
-  return window.scrollY === before
-      || window.scrollY + window.innerHeight
-      >= document.documentElement.scrollHeight - 2;
-}
-"""
+SCROLL_STEP_DOWN_JS = _load_js("scroll_step_down.js")
 
 
-EXPAND_REVIEWS_JS = r"""
-() => {
-  const RE = /^(Читать полностью|Читать дальше|Развернуть)$/;
-  const clicked = new Set();
-  let total = 0;
-  for (let pass = 0; pass < 20; pass++) {
-    let got = 0;
-    const btns = Array.from(document.querySelectorAll('[data-review-uuid] *'))
-      .filter((el) => {
-        const t = (el.innerText || '').trim();
-        if (!RE.test(t)) return false;
-        if (clicked.has(el)) return false;
-        const kids = Array.from(el.children);
-        return !kids.some((k) => RE.test((k.innerText || '').trim()));
-      });
-    for (const b of btns) {
-      clicked.add(b);
-      try { b.click(); got++; } catch (e) {}
-    }
-    if (!got) break;
-    total += got;
-  }
-  return total;
-}
-"""
+EXPAND_REVIEWS_JS = _load_js("expand_reviews.js")
 
 
-MARK_COMMENT_CARDS_JS = r"""
-() => {
-  // Помечает карточки отзывов, у которых есть нераскрытая кнопка
-  // «N комментарий» (N>=1). Сами клики делает Playwright (trusted) —
-  // untrusted dispatchEvent игнорируется React (A/B-эксперимент 6/62 vs 31/31).
-  const RE = /^\s*(\d+)\s*комментар/i;
-  let total = 0;
-  for (const b of document.querySelectorAll('button')) {
-    const m = (b.innerText || '').trim().match(RE);
-    if (!m || parseInt(m[1], 10) < 1) continue;
-    const card = b.closest('[data-review-uuid]');
-    if (!card || card.hasAttribute('data-comments-expanded')) continue;
-    if (card.querySelector('[data-comment-uuid]')) continue;
-    card.setAttribute('data-comments-expanded', '1');
-    total++;
-  }
-  return total;
-}
-"""
+MARK_COMMENT_CARDS_JS = _load_js("mark_comment_cards.js")
 
 
-VARIANT_MODE_JS = r"""
-() => {
-  const w = document.querySelector('[data-widget="webReviewsVariantMode"]');
-  const totalEl = document.querySelector('[data-widget="webReviewProductScore"]');
-  const tm = (totalEl ? (totalEl.innerText || '') : '').match(/(\d[\d\s]*)/);
-  const total_count = tm ? parseInt(tm[1].replace(/\s/g, ''), 10) : null;
-  if (!w) {
-    return { found: false, options: [], variant_present: false,
-             variant_count: null, active: null, total_count };
-  }
-  const activeByClass = (cls) => /(?:^|\s)[\w\d-]*-a8(?:\s|$)/.test(cls);
-  const opts = Array.from(w.querySelectorAll('div[tabindex="0"]')).map((o) => {
-    const text = (o.innerText || '').replace(/\s+/g, ' ').trim();
-    const cls = String(o.className || '');
-    const bg = getComputedStyle(o).backgroundColor;
-    const active = activeByClass(cls)
-      || (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent');
-    return { text, active };
-  });
-  const variantOpt = opts.find((o) => /^Этот вариант товара/.test(o.text));
-  const variant_count = variantOpt
-    ? (variantOpt.text.match(/\((\d+)\)/) ? parseInt(variantOpt.text.match(/\((\d+)\)/)[1], 10) : null)
-    : null;
-  const activeOpt = opts.find((o) => o.active);
-  return {
-    found: true,
-    options: opts.map((o) => o.text),
-    variant_present: !!variantOpt,
-    variant_count,
-    active: activeOpt ? activeOpt.text.split(' (')[0] : null,
-    total_count,
-  };
-}
-"""
+VARIANT_MODE_JS = _load_js("variant_mode.js")
 
 
 def normalize_text(s: str) -> str:
@@ -1005,18 +454,7 @@ FAB_RELOAD_JITTER = 0.15       # ±15% к паузе reload (антибот-ри
 CHALLENGE_RECHECKS = 4
 CHALLENGE_RECHECK_DELAY_S = 1.5
 
-_CHALLENGE_LOOKS_JS = (
-    "() => {"
-    " const u = location.href || '';"
-    " if (/__rr|abt_att|captcha|antibot/i.test(u)) return true;"
-    " const h1 = document.querySelector('h1');"
-    " const h1t = h1 ? (h1.innerText || '').trim() : '';"
-    " if (h1t && h1t.length >= 5) return false;"
-    " const body = document.body ? (document.body.innerText || '') : '';"
-    " if (body.length >= 300) return false;"
-    " return true;"
-    "}"
-)
+_CHALLENGE_LOOKS_JS = _load_js("challenge_looks.js")
 
 
 def _looks_like_challenge(page) -> bool:
@@ -1205,17 +643,11 @@ def check_challenge(page, where: str, reload_on_fab: bool = True) -> None:
                                     f" | {_puzzle.puzzle_summary()}")
 
 
-_AGE_GATE_PROBE_JS = (
-    "() => /Подтвердите возраст/.test(document.body.innerText || '')"
-)
+_AGE_GATE_PROBE_JS = _load_js("age_gate_probe.js")
 
 # Готовность карточки: если виджеты цены/рейтинга/отзывов уже на месте, страница
 # отрисовалась и модалки 18+ не будет — значит, ждать нечего.
-_PAGE_READY_JS = (
-    "() => !!document.querySelector("
-    "'[data-widget=\"webPrice\"],[data-widget=\"webRating\"],"
-    "[data-widget=\"webReviews\"],a[href*=\"tab=reviews\"]')"
-)
+_PAGE_READY_JS = _load_js("page_ready.js")
 
 # Ждать появления модалки (замер 2026-10-03). Проба была ОДНОКРАТНОЙ, сразу
 # после check_challenge, а модалка 18+ рендерится позже загрузки. Из-за этого
@@ -1239,24 +671,9 @@ _AGE_GATE_POLL_MS = 250
 # Гейт считается пройденным, когда модалка УШЛА или на странице появились
 # виджеты товара. Второе нужно потому, что после подтверждения Ozon перерисовывает
 # страницу и текст модалки может ещё какое-то время оставаться в DOM.
-_AGE_GATE_STATE_JS = """() => {
-  const b = (document.body && document.body.innerText) || '';
-  const gate = /Подтвердите возраст/.test(b);
-  const ready = !!document.querySelector(
-    '[data-widget="webPrice"],[data-widget="webRating"],'
-    + '[data-widget="webReviews"],a[href*="tab=reviews"]');
-  return {gate: gate, ready: ready};
-}"""
+_AGE_GATE_STATE_JS = _load_js("age_gate_state.js")
 
-_AGE_GATE_CONFIRM_JS = """() => {
-  const m = document.querySelector('[data-widget="userAdultModal"]');
-  if (!m) return null;
-  const inp = m.querySelector('input');
-  const btn = [...m.querySelectorAll('button')]
-    .find(b => /Подтвердить/.test(b.innerText || ''));
-  return {hasModal: true, hasInput: !!inp, hasBtn: !!btn,
-          value: inp ? (inp.value || '') : null};
-}"""
+_AGE_GATE_CONFIRM_JS = _load_js("age_gate_confirm.js")
 
 # Дата рождения в маске ##.##.#### — вводим с разделителями. Прежний ввод
 # «01011990» без точек опирался на то, что маска расставит их сама; на части
@@ -1440,14 +857,7 @@ def _pass_age_gate(page, wait_ms: int = _AGE_GATE_WAIT_MS,
 
 
 _AUTH_COOKIE_NAME = "_ozon_sat"
-_AUTH_DOM_JS = r"""() => {
-    const q = (sel) => !!document.querySelector(sel);
-    const hasAccount = q('a[href*="/my/"]') || q('[data-widget*="webHeaderUser"]')
-        || /Мой Ozon|Выйти/i.test((document.body && document.body.innerText) || '');
-    const hasLogin = q('a[href*="/auth/"]') || q('[data-widget*="webLogin"]')
-        || /(^|\n)\s*Войти\s*(\n|$)/.test((document.body && document.body.innerText) || '');
-    return {hasLogin: hasLogin, hasAccount: hasAccount};
-}"""
+_AUTH_DOM_JS = _load_js("auth_dom.js")
 
 
 def _page_cookies(page) -> Optional[list]:
@@ -2350,7 +1760,7 @@ def _activate_variant_mode(page, timeout_s: float = 8.0) -> dict:
     return {**final, "used": True, "clicked": True, "reason": "click_ok"}
 
 
-_CARDS_COUNT_JS = "() => document.querySelectorAll('[data-review-uuid]').length"
+_CARDS_COUNT_JS = _load_js("cards_count.js")
 
 
 def _count_review_cards(page):
@@ -2363,17 +1773,7 @@ def _count_review_cards(page):
         return None
 
 
-_PAGE_GEOM_JS = """
-() => ({
-  ready: document.readyState,
-  y: Math.round(window.scrollY),
-  h: document.documentElement.scrollHeight,
-  ih: window.innerHeight,
-  body: document.body ? document.body.innerText.length : 0,
-  widgets: document.querySelectorAll('div[data-widget]').length,
-  scripts: document.scripts.length,
-})
-"""
+_PAGE_GEOM_JS = _load_js("page_geom.js")
 
 
 def _page_geom(page) -> dict:

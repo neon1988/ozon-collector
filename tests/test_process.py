@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 
@@ -387,3 +388,74 @@ def test_linux_pidfd_open_self():
     fd = P._pidfd_open(os.getpid())
     assert fd is not None
     os.close(fd)
+
+
+# ---- CIM name parser (D3), pid_alive guard (D4), env_bool (D5) -------------
+
+def test_win_iter_cim_named_processes_parses_and_filters(monkeypatch):
+    """D3: the single CIM parser yields (pid, argv, ppid) for an arbitrary
+    name; rows without pid/command line are skipped; empty output yields an
+    empty result."""
+    payload = json.dumps([
+        {"ProcessId": 10, "ParentProcessId": 1, "CommandLine": "np.exe -x"},
+        {"ProcessId": 11, "ParentProcessId": 1, "CommandLine": ""},
+        {"ParentProcessId": 1, "CommandLine": "no-pid.exe"},
+    ])
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=payload,
+                                           stderr="")
+
+    monkeypatch.setattr(P.subprocess, "run", fake_run)
+    assert list(P._win_iter_cim_named_processes("np")) == [
+        (10, ["np.exe", "-x"], 1)]
+    assert "'np.exe'" in seen[0][-1]          # name filter in the CIM query
+
+    monkeypatch.setattr(
+        P.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="",
+                                                      stderr=""))
+    assert list(P._win_iter_cim_named_processes("np")) == []
+
+
+def test_win_iter_wrappers_delegate_to_generic(monkeypatch):
+    """D3: chrome/firefox wrappers and the nt branch of _iter_named_processes
+    are thin delegates to the shared parser, not copies of its body."""
+    seen = []
+
+    def fake_iter(exe_name):
+        seen.append(exe_name)
+        yield (7, ["x"], 1)
+
+    monkeypatch.setattr(P, "_win_iter_cim_named_processes", fake_iter)
+    assert list(P._win_iter_chromium_processes()) == [(7, ["x"], 1)]
+    assert list(P._win_iter_firefox_processes()) == [(7, ["x"], 1)]
+    if IS_WINDOWS:
+        assert list(P._iter_named_processes("np")) == [(7, ["x"], 1)]
+    assert seen == (["chrome", "firefox", "np"] if IS_WINDOWS
+                    else ["chrome", "firefox"])
+
+
+def test_pid_alive_rejects_unrealistic_and_non_int():
+    """D4: guard 2**24 (same as key_daemon._alive) + isinstance: a string or
+    an unrealistic PID is not alive (no hung OS query)."""
+    assert P.pid_alive(0) is False
+    assert P.pid_alive(-5) is False
+    assert P.pid_alive(2 ** 24) is False
+    assert P.pid_alive("123") is False        # type: ignore[arg-type]
+
+
+def test_env_bool_semantics(monkeypatch):
+    """D5: 1/true/yes/on (any case) → True; empty/other → default; semantics
+    match launch_chrome.ps1 ^(1|true|yes|on)$."""
+    monkeypatch.delenv("OZON_TEST_EB", raising=False)
+    assert P.env_bool("OZON_TEST_EB") is False
+    assert P.env_bool("OZON_TEST_EB", default=True) is True
+    for truthy in ("1", "true", "TRUE", "Yes", "on", " On "):
+        monkeypatch.setenv("OZON_TEST_EB", truthy)
+        assert P.env_bool("OZON_TEST_EB") is True, truthy
+    for falsy in ("0", "false", "no", "off", "2", "да"):
+        monkeypatch.setenv("OZON_TEST_EB", falsy)
+        assert P.env_bool("OZON_TEST_EB") is False, falsy

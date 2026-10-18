@@ -86,6 +86,35 @@ def test_search_js_ignores_recommendation_blocks(browser):
     assert [l["pid"] for l in links] == ["11111111"]
 
 
+def test_search_js_ignores_reco_grids_with_heading(browser):
+    """Карусели рекомендаций — САМИ tileGridDesktop, заголовок внутри виджета.
+
+    Живой дамп category-страницы 2026-10-17: «Вы смотрели» и «Возможно, вам
+    понравится» рендерятся отдельными tileGridDesktop с заголовком раздела
+    в начале текста; ссылки из них (чужие товары) собирать нельзя.
+    """
+    html = ('<div data-widget="tileGridDesktop">'
+            '<div>Кабель переходник SATA USB 3.0</div>'
+            '<a href="/product/kabel-11111111">товар по запросу</a>'
+            '</div>'
+            '<div data-widget="tileGridDesktop">'
+            '<div>Вы смотрели</div>'
+            '<a href="/product/viewed-22222222">чужой товар</a>'
+            '</div>'
+            '<div data-widget="tileGridDesktop">'
+            '<span>Возможно, вам понравится</span>'
+            '<a href="/product/reco-33333333">чужой товар</a>'
+            '</div>')
+    page = browser.new_page()
+    page.route("**/*", lambda route: route.abort())
+    try:
+        page.set_content(html, wait_until="domcontentloaded")
+        links = page.evaluate(SEARCH_JS)
+    finally:
+        page.close()
+    assert [l["pid"] for l in links] == ["11111111"]
+
+
 # ---- search_url ------------------------------------------------------------
 
 def test_search_url():
@@ -872,6 +901,8 @@ def test_session_budget_challenge_exhausted(monkeypatch):
     assert c["products"][0]["ok"] is True
     assert c["products"][1]["error_kind"] == "session_exhausted"
     assert c["products"][1]["failure_type"] == "session_failure"
+    assert c["products"][1]["new_tab_attempts"] == 0    # B8 field contract
+    assert c["products"][1]["recovery_kind"] is None
     assert c["aborted"]["reason"] == "session_exhausted"
 
 
@@ -896,6 +927,27 @@ def test_session_budget_new_tab_exhausted(monkeypatch):
     assert c["products"][1]["error_kind"] == "session_exhausted"
     assert c["recovery"]["session_used"]["new_tab"] == 2  # 1 + попытка на 2-м
     assert c["recovery"]["session_used"]["browser_recycle"] == 0
+
+
+def test_wall_clock_tail_abort_carries_field_contract(monkeypatch):
+    """B8 contract: an exhausted wall_clock marks the whole tail
+    session_exhausted and carries new_tab_attempts/recovery_kind, like normal
+    product results."""
+    import time as _t
+
+    import ozon_collector.search as _S
+
+    _budget(monkeypatch, wall_clock_s=5)
+    items = [(1, "1", "u1"), (2, "2", "u2")]
+    sess = _FakeSess([{"pid": "1", "url": "u1"}, {"pid": "2", "url": "u2"}])
+    products = _S._collect_shard(
+        sess, None, items, {}, 2, {"session_started_ts": _t.time() - 10})
+    assert [p["error_kind"] for p in products] == \
+        ["session_exhausted", "session_exhausted"]
+    for p in products:
+        assert p["ok"] is False
+        assert p["new_tab_attempts"] == 0
+        assert p["recovery_kind"] is None
 
 
 def test_session_budget_wall_clock_param_override(monkeypatch):
@@ -1125,6 +1177,8 @@ def test_canary_challenge_blocks_session(monkeypatch):
     # товар2 (ещё не начат) aborted как session_blocked
     assert c["products"][1]["error_kind"] == "session_blocked"
     assert c["products"][1]["failure_type"] == "session_failure"
+    assert c["products"][1]["new_tab_attempts"] == 0    # B8 field contract
+    assert c["products"][1]["recovery_kind"] is None
     assert c["recovery"]["canary_fails"] == 1
     assert c["aborted"]["reason"] == "session_blocked"
 
@@ -1420,10 +1474,34 @@ def test_collect_links_graceful_stop_returns_partial_links():
     except CollectionInterrupted as exc:
         collected = exc.links
         assert not exc.forced
+        assert exc.skipped_no_reviews == []
     else:
         raise AssertionError("ожидали CollectionInterrupted (graceful)")
     pids = [l["pid"] for l in collected]
     assert pids == ["111", "222"]     # частичные ссылки сохранены
+
+
+def test_collect_links_graceful_stop_keeps_tile_no_reviews():
+    """stop_event → CollectionInterrupted also carries the tile-skipped
+    products (skipped_no_reviews) so the daemon's partial result does not
+    lose them (audit 2026-10-18, B6)."""
+    import threading as _t
+    stop = _t.Event()
+    step = {"n": 0}
+    def _snap():
+        step["n"] += 1
+        if step["n"] == 1:
+            stop.set()
+    sess = _InterruptSess([{"pid": "111", "url": "u111"},
+                           {"pid": "222", "url": "u222",
+                            "tile_no_reviews": True}], stop, _snap)
+    try:
+        _collect_links(sess, limit=10, stop_event=stop)
+    except CollectionInterrupted as exc:
+        assert not exc.forced
+        assert exc.skipped_no_reviews == [{"pid": "222", "url": "u222"}]
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (graceful)")
 
 
 def test_collect_links_force_stop_raises_forced():

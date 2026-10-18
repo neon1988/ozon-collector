@@ -1221,6 +1221,27 @@ def test_reader_loop_done_sets_payload():
     assert wctx.payload == {"worker_idx": 1, "x": 1}
 
 
+def test_reader_loop_done_batch_indexes_kept():
+    """done_batch indexes from the reader thread reach wctx.batch_completed
+    intact (batch queue under wctx.batch_lock, audit 2026-10-18, B3)."""
+    import multiprocessing
+    parent, child = multiprocessing.Pipe(duplex=False)
+    wctx = PL.WorkerContext({"worker_id": "1"}, proc=object(), conn=parent)
+    t = threading.Thread(target=PL._reader_loop, args=(wctx,), daemon=True)
+    t.start()
+    n = 50
+    for i in range(n):
+        child.send({"t": "done_batch",
+                    "payload": {"processed_indexes": [i],
+                                "failed_indexes": []}})
+    child.close()
+    t.join(5)
+    assert t.is_alive() is False
+    with wctx.batch_lock:
+        drained = set(wctx.batch_completed)
+    assert drained == set(range(n))
+
+
 # ---- preflight: ветви profile_path и makedirs ---------------------------------
 
 def test_preflight_profile_path_collision(monkeypatch, profile_base):
@@ -1276,7 +1297,8 @@ def test_collect_parallel_graceful_link_stop_returns_partial(monkeypatch):
                     stop_event=None, force_event=None, skip_no_reviews=True):
         raise CollectionInterrupted(
             [{"pid": "111", "url": "u111"},
-             {"pid": "222", "url": "u222"}], forced=False)
+             {"pid": "222", "url": "u222"}], forced=False,
+            skipped_no_reviews=[{"pid": "333", "url": "u333"}])
 
     monkeypatch.setattr(PL.S, "_collect_links_with_recovery", _fake_links)
 
@@ -1290,6 +1312,8 @@ def test_collect_parallel_graceful_link_stop_returns_partial(monkeypatch):
     assert out["collected"] == 0
     assert out["discovered_pids"] == ["111", "222"]   # частичные ссылки
     assert out["interrupted"] is True
+    assert out["skipped_no_reviews"] == 1             # tile: no reviews
+    assert out["skipped_no_reviews_pids"] == ["333"]
     assert out["products"] == []
     assert spawned == []                               # воркеры НЕ запускались
     assert stopped == [1]                              # main-браузер остановлен

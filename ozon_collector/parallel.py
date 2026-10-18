@@ -360,6 +360,12 @@ class WorkerContext:
         # completed_indexes. Отдельная очередь — чтобы не было гонки reader
         # thread ↔ основной цикл по модификации общих completed_indexes.
         self.batch_completed: list[int] = []
+        # The queue above still crosses two threads: the reader appends here
+        # while the main loop drains it in _drain_completed. Without a shared
+        # lock the reader can extend the list object right after the main loop
+        # rebinds the attribute to a fresh [] and that index is lost
+        # (audit 2026-10-18, B3). Guard both sides with this lock.
+        self.batch_lock = threading.Lock()
         # ВСЕ products, пришедшие от воркера (progress + done_batch), без дублей
         # по индексу. Нужно потому, что done_batch несёт products ТОЛЬКО за
         # текущую выдачу, а wctx.payload перезаписывается каждым сообщением:
@@ -408,9 +414,10 @@ def _reader_loop(wctx: WorkerContext, on_event=None):
                 wctx.payload = pl
                 _absorb_products(wctx, pl)
                 _update_pending(wctx)
-                wctx.batch_completed.extend(
-                    list(pl.get("processed_indexes") or [])
-                    + list(pl.get("failed_indexes") or []))
+                with wctx.batch_lock:
+                    wctx.batch_completed.extend(
+                        list(pl.get("processed_indexes") or [])
+                        + list(pl.get("failed_indexes") or []))
                 # воркер сразу обязан отослать следующий task_request, но
                 # страхуемся: после done_batch тоже готовы к выдаче пачки.
                 wctx.waiting_for_batch = True
@@ -1507,7 +1514,9 @@ def _await_workers(wctxs: list, deadline: float,
         if not dynamic:
             return
         for wctx in all_wctxs:
-            if wctx.batch_completed:
+            with wctx.batch_lock:
+                if not wctx.batch_completed:
+                    continue
                 completed_indexes.update(wctx.batch_completed)
                 wctx.batch_completed = []
 
@@ -1828,7 +1837,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
             log.warning("collection: докрутка ссылок прервана Ctrl+C — возвращаю "
                         f"частично найденные ссылки ({len(exc.links)})")
             discovered = [it["pid"] for it in exc.links]
-            return {
+            partial = {
                 "schema_version": SCHEMA_VERSION,
                 "collector_version": VERSION,
                 "collected_at_utc": _now(),
@@ -1843,6 +1852,14 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                 "interrupted": True,
                 "parallel": {"workers": [], "shards": []},
             }
+            # Tile-skipped products collected before the interrupt: the
+            # partial result must carry them exactly like the normal path
+            # does below (audit 2026-10-18, B6).
+            if exc.skipped_no_reviews:
+                partial["skipped_no_reviews"] = len(exc.skipped_no_reviews)
+                partial["skipped_no_reviews_pids"] = [
+                    it["pid"] for it in exc.skipped_no_reviews]
+            return partial
         finally:
             try:
                 sess.close()
@@ -1867,7 +1884,6 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         for k, st in bs.items():
             log.info(f"[parallel] bootstrap worker-{k}: {st}")
 
-    shards = shard_items(items, parallel)
     specs = [worker_spec(k) for k in range(1, parallel + 1)]
     errs = preflight_check(specs)
     if errs:
@@ -1919,11 +1935,11 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
         owner=owner, pid_by_idx=pid_by_idx, url_by_idx=url_by_idx,
         batch_size=batch_size, canary_url=canary_target)
 
-    # После завершения динамической раздачи пересобираем shards из актуального
-    # owner (полные кортежи (idx,pid,url)) — совместимый формат для
-    # merge_shard_results/QA/digest. Записи без владельца (ни разу не выданы)
-    # остаются в своих статически-назначенных шардах (см. shard_items-отработал
-    # как fallback-владелец для подсчёта).
+    # Once the dynamic dispatch is over, shards are rebuilt from the current
+    # owner (full (idx,pid,url) tuples) — the format merge_shard_results/QA/
+    # digest expect. Records without an owner (never dispatched) keep their
+    # statically assigned shard (fallback idx % parallel inside
+    # _rebuild_shards).
     shards = _rebuild_shards(
         owner, pid_by_idx, url_by_idx, items, parallel)
 

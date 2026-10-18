@@ -49,6 +49,46 @@ def _test_build_cli_args(progress, run_id, mode, targets=None):
 k.build_cli_args = _test_build_cli_args
 
 
+# --- apply_window_mode ---
+
+def test_apply_window_mode_sets_env(monkeypatch):
+    """CLI --window-mode → OZON_KEEP_WINDOW (находка ревью 2026-10-17).
+
+    Раньше visible только писался в run_cfg манифеста, а сентинел и сторожа
+    продолжали прятать окна: обещание справки --window-mode не выполнялось.
+    None (аргумент не задан) режим не трогает — env остаётся как был.
+    """
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "0")
+    k.apply_window_mode("visible")
+    assert os.environ["OZON_KEEP_WINDOW"] == "1"
+    k.apply_window_mode("hidden")
+    assert os.environ["OZON_KEEP_WINDOW"] == ""
+    k.apply_window_mode(None)
+    assert os.environ["OZON_KEEP_WINDOW"] == "", "None режим не трогает"
+
+
+def test_window_mode_from_manifest(tmp_path, monkeypatch):
+    """Resume без --window-mode: режим кампании читается из run_cfg.
+
+    Регресс ревью 2026-10-17: visible-кампания после resume получала
+    keep_window воркерам из манифеста, а env демона оставался пуст —
+    сентинел гасил видимые окна кампании.
+    """
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
+    camp = tmp_path / "camp1"
+    camp.mkdir()
+    (camp / "progress.json").write_text(
+        json.dumps({"run_cfg": {"window_mode": "visible"}}), encoding="utf-8")
+    assert k.window_mode_from_manifest("camp1") == "visible"
+    assert k.window_mode_from_manifest("no-such-campaign") is None
+    (camp / "progress.json").write_text("{не json", encoding="utf-8")
+    assert k.window_mode_from_manifest("camp1") is None
+    (camp / "progress.json").write_text(
+        json.dumps({"run_cfg": {"window_mode": None}}), encoding="utf-8")
+    assert k.window_mode_from_manifest("camp1") is None, \
+        "None/мусор в манифесте — режим не трогаем"
+
+
 # --- classify_status ---
 
 def test_classify_challenge_storm():
@@ -1380,6 +1420,35 @@ def _run_campaign_integration(tmp_path, monkeypatch, target, min_valid,
         campaign="testcamp", url=kw.pop("url", "u"), target=target, min_valid=min_valid,
         out=kw.pop("out", str(data_dir / "digest.md")), data_dir=str(data_dir), max_no_progress_runs=max_no_progress_runs,
         qa_fn=qa_fn, **kw)
+
+
+def test_integration_postprocess_crash_marks_needs_attention(tmp_path,
+                                                             monkeypatch):
+    """A post-processing crash (finalize_campaign / digest) must not kill the
+    daemon: run_campaign returns progress with NEEDS_ATTENTION and saves it to
+    disk (audit 2026-10-18, B1)."""
+    def fac(argv):
+        return {"products": [{"pid": 0, "ok": True, "excluded": None}],
+                "found": 1}
+
+    def qa(batch):
+        return {"products": len(batch), "ok": len(batch), "warn": 0, "fail": 0,
+                "per_pid": {p: "OK" for p in batch}}
+
+    def boom(*a, **kw):
+        raise RuntimeError("digest boom")
+
+    monkeypatch.setattr(k, "finalize_campaign", boom)
+    prog = _run_campaign_integration(
+        tmp_path, monkeypatch, target=2, min_valid=1,
+        combined_factory=fac, qa_fn=qa, n_pids=1, max_no_progress_runs=3)
+    assert prog is not None
+    assert prog["final_state"] == "NEEDS_ATTENTION"
+    assert prog["final_reason"] == "unhandled_RuntimeError"
+    assert "digest boom" in prog["final_note"]
+    pf = tmp_path / "campaigns" / "testcamp" / "progress.json"
+    assert _json.loads(pf.read_text(encoding="utf-8"))["final_state"] \
+        == "NEEDS_ATTENTION"
 
 
 def test_integration_target_reached_completed(tmp_path, monkeypatch):
@@ -2777,6 +2846,37 @@ def test_pidlock_missing_pid_field_treated_stale(tmp_path):
     assert lock.acquire("new_camp") is True
 
 
+def test_pidlock_empty_file_window_not_stolen(tmp_path):
+    """An empty pid file (the winner created it with O_EXCL but has not
+    written the JSON yet) is not treated as stale: the second acquire must
+    WAIT for the write and not steal a live lock (audit 2026-10-18, B4)."""
+    import os as _os
+    import threading as _t
+    import time as _time
+    pf = tmp_path / "key_daemon.pid"
+    pf.write_text("", encoding="utf-8")   # window between O_EXCL and JSON write
+
+    def _late_write():
+        _time.sleep(0.05)
+        k.save_json(pf, {"pid": _os.getpid(), "campaign": "live"})
+
+    t = _t.Thread(target=_late_write, daemon=True)
+    t.start()
+    lock = k.PidLock(pf)
+    assert lock.acquire("new_camp") is False   # live lock not stolen
+    t.join(3)
+    assert k.load_json(pf)["campaign"] == "live"
+
+
+def test_pidlock_empty_file_stays_stale(tmp_path):
+    """An empty file that stays empty through the grace period is genuinely
+    broken → treated as stale (behavior preserved)."""
+    pf = tmp_path / "key_daemon.pid"
+    pf.write_text("", encoding="utf-8")
+    lock = k.PidLock(pf)
+    assert lock.acquire("new_camp") is True
+
+
 # ============================================================================
 # ТЕСТЫ: валидность требует raw (П1) + immutable snapshot при target_reached
 # ============================================================================
@@ -3213,6 +3313,30 @@ def test_parse_qa_json_report_missing_returns_none(tmp_path):
     p = tmp_path / "bad.json"
     p.write_text("{not json", encoding="utf-8")
     assert k._parse_qa_json_report(str(p)) is None
+
+
+def test_parse_qa_json_report_broken_product_row_returns_none(tmp_path):
+    """A products row without pid/verdict/issues → None (fallback to stdout)
+    instead of a KeyError up into run_campaign (audit 2026-10-18, B2)."""
+    payload = _qa_payload([
+        {"pid": "101", "verdict": "OK", "issues": []},
+        {"pid": "102", "issues": []},          # no "verdict"
+    ])
+    p = tmp_path / "qa.json"
+    p.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert k._parse_qa_json_report(str(p)) is None
+
+
+def test_parse_qa_json_report_scalar_or_non_dict_summary_returns_none(tmp_path):
+    """B2 follow-up: a scalar payload or a non-dict summary → None (stdout
+    fallback), not TypeError/AttributeError."""
+    scal = tmp_path / "scalar.json"
+    scal.write_text("5", encoding="utf-8")
+    assert k._parse_qa_json_report(str(scal)) is None
+    bad = tmp_path / "bad_summary.json"
+    bad.write_text(_json.dumps({"summary": [1, 2], "products": []}),
+                   encoding="utf-8")
+    assert k._parse_qa_json_report(str(bad)) is None
 
 
 # --- fail_reason_seq: повторный идентичный FAIL учитывается ---

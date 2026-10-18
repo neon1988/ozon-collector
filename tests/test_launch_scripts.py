@@ -302,3 +302,28 @@ def test_ps1_rehides_window_until_cdp_ready():
         "окно не перепрятывается"
     assert "$minimized = $minimized -or $finalHide" in ps1, \
         "финальный проход потерял объединение статуса ($finalHide)"
+
+
+def test_ps1_keeps_guard_duty_until_daemon_connect():
+    """Караул окон после готовности CDP: щель до регистрации в сторожe демона.
+
+    Живой замер 2026-10-17 (.tmp/repro_owner.py): между «CDP готов» (на этом
+    лаунчер завершался) и guard.watch демона проходят секунды (поиск
+    browser_pid, connect, 8 воркеров) — показанное Chrome окно (при создании
+    вкладки через CDP) некому погасить, вспышка жила 0.73 с. Лаунчер теперь
+    остаётся караульным OZON_LAUNCHER_DUTY_S секунд (дефолт 30; 0 —
+    выключить) и пере-скрывает окно каждые ~50 мс.
+    """
+    ps1 = _text(PS1)
+    assert "OZON_LAUNCHER_DUTY_S" in ps1, "караул окон потерян (env-ручка)"
+    duty = ps1.index("OZON_LAUNCHER_DUTY_S")
+    assert duty > ps1.index(
+        "$finalHide = Invoke-MinimizeNoActivate $targetPid 3000"), \
+        "караул обязан идти после финального скрытия"
+    assert duty > ps1.rindex("Restore-Focus -PrevFg $prevFg"), \
+        "караул обязан идти после возврата фокуса"
+    tail = ps1[duty:]
+    assert "Invoke-MinimizeNoActivate $targetPid 20" in tail, \
+        "караул не пере-скрывает окно в цикле"
+    assert "Start-Sleep -Milliseconds 50" in tail, \
+        "караул обязан быть с тиком 50 мс, а не ждать весь таймаут"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import os
 import unittest.mock as mock
 
 import pytest
@@ -213,6 +214,55 @@ class TestLaunchBrowser:
         with pytest.raises(RuntimeError) as e:
             cdp._launch_browser("http://127.0.0.1:9999")
         assert "launch_chrome" in str(e.value)
+
+    def test_create_no_window_flag(self, monkeypatch):
+        """Лаунчер не должен открывать окно терминала при демоне без консоли.
+
+        Живой кейс 2026-10-17: без CREATE_NO_WINDOW Windows открывает
+        лаунчеру НОВУЮ консоль (видимое окно Windows Terminal) на каждый
+        старт сбора, если у родителя консоли нет (WMI/шедулер). Тот же флаг
+        трея: key_daemon._start_tray_companion.
+        """
+        captured = {}
+
+        def fake_popen(cmd, **kw):
+            captured.update(kw)
+            return None
+
+        monkeypatch.setattr(cdp.subprocess, "Popen", fake_popen)
+        cdp._launch_browser("http://127.0.0.1:12345")
+        if os.name == "nt":
+            assert captured.get("creationflags") == 0x08000000
+        else:
+            assert "creationflags" not in captured
+
+    def test_delegates_to_browser_launch_with_injected_helpers(
+            self, monkeypatch, tmp_path):
+        """D1: cdp._launch_browser is an alias of browser._launch_script with
+        ITS own _launch_script_path/_launch_script_name passed as arguments:
+        those names are what test and caller monkeypatches rely on."""
+        sentinel = tmp_path / "sentinel-launcher.ps1"
+        captured = {}
+
+        def fake_launch(cdp_url, profile_path=None, profile_token=None, **kw):
+            captured.update(cdp_url=cdp_url, profile_path=profile_path,
+                            profile_token=profile_token, **kw)
+            return "RUN"
+
+        monkeypatch.setattr(cdp, "_launch_script_path", lambda: sentinel)
+        monkeypatch.setattr(cdp, "_launch_script_name",
+                            lambda: "sentinel-launcher.ps1")
+        monkeypatch.setattr(cdp.B, "_launch_script", fake_launch)
+        result = cdp._launch_browser("http://127.0.0.1:9333",
+                                     profile_path="pp", profile_token="tt")
+        assert result == "RUN"
+        assert captured == {
+            "cdp_url": "http://127.0.0.1:9333",
+            "profile_path": "pp",
+            "profile_token": "tt",
+            "script_path": sentinel,
+            "script_name": "sentinel-launcher.ps1",
+        }
 
 
 class TestSessionAutoLaunch:
@@ -809,3 +859,42 @@ def test_visibility_telemetry_survives_broken_eval():
     s.fingerprint = None
     s._capture_fingerprint_once()          # не бросает
     assert s.fingerprint is None
+
+
+def test_chrome_pids_for_port_prefers_socket_table(monkeypatch):
+    """PID порта — из сокет-таблицы ядра (~1 мс), без wmic (~0.5-2 с).
+
+    Живой замер 2026-10-17: показ окна при new_page гасился через native
+    minimize по pid из wmic — до 2 с окно оставалось видимым.
+    """
+    from ozon_collector import window_policy as wp
+    monkeypatch.setattr(wp, "port_owner_pids", lambda port: {10, 20})
+    monkeypatch.setattr(wp, "process_image_basename",
+                        lambda pid: {10: "chrome.exe",
+                                     20: "notepad.exe"}[pid])
+    assert cdp._chrome_pids_for_port(9222) == {10}, \
+        "чужой процесс на порту не должен попасть в сворачивание"
+
+
+def test_chrome_pids_for_port_falls_back_to_wmic(monkeypatch):
+    """Таблица недоступна ИЛИ пуста → исторический wmic-fallback не потерян.
+
+    Пустая таблица на живом порту — аномалия (LISTEN ещё не встал, необычный
+    bind), но терять держателя порта нельзя: окно осталось бы видимым.
+    """
+    from ozon_collector import window_policy as wp
+    called = []
+
+    def _wmic(port):
+        called.append(port)
+        return {7}
+
+    monkeypatch.setattr(cdp, "_chrome_pids_for_port_wmic", _wmic)
+    monkeypatch.setattr(wp, "port_owner_pids", lambda port: None)
+    assert cdp._chrome_pids_for_port(9222) == {7}
+    assert called == [9222]
+
+    called.clear()
+    monkeypatch.setattr(wp, "port_owner_pids", lambda port: set())
+    assert cdp._chrome_pids_for_port(9223) == {7}
+    assert called == [9223], "пустая таблица обязана упасть на wmic, а не в 0 pid"

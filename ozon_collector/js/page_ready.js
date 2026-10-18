@@ -1,0 +1,1 @@
+() => !!document.querySelector('[data-widget="webPrice"],[data-widget="webRating"],[data-widget="webReviews"],a[href*="tab=reviews"]')

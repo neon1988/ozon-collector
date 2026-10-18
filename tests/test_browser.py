@@ -129,6 +129,35 @@ def test_launch_script_keeps_predefined_chrome(monkeypatch, tmp_path):
     assert captured["env"]["CHROME"] == r"C:\my\chrome.exe"
 
 
+@pytest.mark.allow_browser_launch
+def test_launch_script_create_no_window_flag(monkeypatch, tmp_path):
+    """Recycle-путь лаунчера тоже без окна терминала (CREATE_NO_WINDOW).
+
+    Тот же живой кейс 2026-10-17, что в cdp._launch_browser: консоль-родителя
+    нет → Windows открывает лаунчеру новую консоль видимым окном.
+    """
+    import os
+    import subprocess
+
+    script = tmp_path / "launch_chrome.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    captured = {}
+
+    def fake_popen(cmd, **kw):
+        captured.update(kw)
+        return mock.Mock()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(B, "_launch_script_path", lambda: script)
+
+    B._launch_script("http://127.0.0.1:9277", profile_path=r"C:\prof\ozon")
+
+    if os.name == "nt":
+        assert captured.get("creationflags") == 0x08000000
+    else:
+        assert "creationflags" not in captured
+
+
 def test_chrome_override_parses_env(monkeypatch):
     monkeypatch.delenv("OZON_CHROME_PATH", raising=False)
     assert B._chrome_override() is None

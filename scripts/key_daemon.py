@@ -49,6 +49,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -801,6 +802,17 @@ class PidLock:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
                 data = load_json(self.path)
+                if data is None:
+                    # The winner created the file with O_EXCL and writes the
+                    # JSON a tick later. Treating the empty-file window as
+                    # stale would let a second daemon unlink a live lock and
+                    # acquire it (audit 2026-10-18, B4). Re-read briefly before
+                    # declaring the file stale.
+                    for _try in range(4):
+                        time.sleep(0.05)
+                        data = load_json(self.path)
+                        if data is not None:
+                            break
                 pid = data.get("pid") if data else None
                 # pid обязан быть int; иначе файл битый → трактуем как stale
                 if isinstance(pid, int) and _alive(pid):
@@ -1252,9 +1264,14 @@ def _parse_qa_json_report(path: str) -> Optional[dict]:
     или None, если файла/контракта нет (тогда fallback — парсинг stdout).
     """
     payload = load_json(path)
-    if not payload or "summary" not in payload or "products" not in payload:
+    if not isinstance(payload, dict) or "summary" not in payload \
+            or "products" not in payload:
         return None
     s = payload["summary"]
+    if not isinstance(s, dict):
+        # Broken/partial qa_raw JSON: fall back to stdout parsing instead of
+        # raising AttributeError below (audit 2026-10-18, B2 follow-up).
+        return None
     parsed = {
         "products": s.get("products", 0),
         "ok": s.get("ok", 0),
@@ -1262,12 +1279,21 @@ def _parse_qa_json_report(path: str) -> Optional[dict]:
         "fail": s.get("fail", 0),
         "wall_limited": s.get("wall_limited_count", 0),
     }
-    parsed["per_pid"] = {r["pid"]: r["verdict"] for r in payload["products"]}
-    # причины FAIL/WARN (коды issues) — для детекта детерминированного брака
-    parsed["per_pid_issues"] = {
-        r["pid"]: [i["code"] for i in r["issues"]]
-        for r in payload["products"]
-    }
+    try:
+        parsed["per_pid"] = {r["pid"]: r["verdict"]
+                             for r in payload["products"]}
+        # причины FAIL/WARN (коды issues) — для детекта детерминированного брака
+        parsed["per_pid_issues"] = {
+            r["pid"]: [i["code"] for i in r["issues"]]
+            for r in payload["products"]
+        }
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        # Contract violation in a products row (partial/evolved qa_raw JSON):
+        # return None so run_campaign falls back to stdout parsing instead of
+        # crashing with KeyError (audit 2026-10-18, B2).
+        log.warning(f"_parse_qa_json_report: битая строка products "
+                    f"({type(exc).__name__}: {exc}) → fallback на stdout")
+        return None
     return parsed
 
 
@@ -1284,7 +1310,11 @@ def run_qa_batch(pids: Iterable[str]) -> dict:
         cmd = [PYTHON, "-u", "-X", "utf8", QA_RAW, "--pids", ",".join(pids),
                "--report-json", report]
         res = subprocess.run(cmd, capture_output=True, text=True,
-                             encoding="utf-8", timeout=900)
+                             encoding="utf-8", timeout=900,
+                             creationflags=(getattr(subprocess,
+                                                    "CREATE_NO_WINDOW",
+                                                    0x08000000)
+                                            if os.name == "nt" else 0))
         parsed = _parse_qa_json_report(report)
         if parsed is None:
             parsed = parse_qa_stdout(res.stdout)
@@ -2489,6 +2519,29 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         notify(progress, msg)
         return progress
 
+    except CollectionInterrupted:
+        # Graceful/forced Ctrl+C keeps its existing semantics (partial save /
+        # emergency shutdown) — decisions were made in the loop above; this
+        # exception must still propagate out of run_campaign as before.
+        raise
+    except Exception as exc:
+        # Post-processing crash (QA timeout, malformed QA JSON, digest render)
+        # must not kill the daemon process with a traceback: mark the campaign
+        # NEEDS_ATTENTION so it stays resumable (audit 2026-10-18, B1).
+        # SystemExit/KeyboardInterrupt are BaseException and propagate as-is.
+        log.error(f"кампания: необработанная ошибка прогона: "
+                  f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        try:
+            progress["final_state"] = "NEEDS_ATTENTION"
+            progress["final_reason"] = f"unhandled_{type(exc).__name__}"
+            progress["final_note"] = str(exc)
+            notify(progress, f"NEEDS_ATTENTION: {type(exc).__name__}: {exc}")
+            save_json(progress_path, progress)
+        except Exception:
+            # The fallback itself must never escape: the daemon has to survive.
+            pass
+        return progress
+
     finally:
         lock.release()
 
@@ -2933,6 +2986,46 @@ def _validated_url(args, attr: str, flag: Optional[str] = None) -> str:
     return fixed
 
 
+def apply_window_mode(window_mode: Optional[str]) -> None:
+    """CLI --window-mode → env OZON_KEEP_WINDOW; None — режим не трогаем.
+
+    Два канала режима окон: трей («Развернуть окна сбора») пишет флаг
+    data/window_visible.flag, который key_daemon сбрасывает при старте сбора;
+    CLI-режим идёт отдельным каналом — env, чтобы флаг-файл остался при
+    трее. visible → OZON_KEEP_WINDOW=1 (сентинел и сторожа молчат: окна
+    видимы, как обещает справка --window-mode); hidden → переменная пуста.
+    Дочерние процессы (воркеры collect_parallel, cdp-сторожа, лаунчеры)
+    наследуют env. Находка ревью 2026-10-17: раньше --window-mode visible
+    только писался в run_cfg манифеста, а окна всё равно прятались.
+    """
+    if window_mode == "visible":
+        os.environ["OZON_KEEP_WINDOW"] = "1"
+        log.info("режим окна: visible (--window-mode) → OZON_KEEP_WINDOW=1")
+    elif window_mode == "hidden":
+        os.environ["OZON_KEEP_WINDOW"] = ""
+        log.info("режим окна: hidden (--window-mode) → OZON_KEEP_WINDOW снят")
+
+
+def window_mode_from_manifest(campaign: str) -> Optional[str]:
+    """Режим окна resume-кампании из run_cfg манифеста (инвариант 4).
+
+    Находка ревью 2026-10-17: при resume без --window-mode in-process
+    воркеры получают keep_window=True из run_cfg видимой кампании, а env
+    демона пуст — сентинел гасил их окна вопреки режиму кампании.
+    """
+    try:
+        prog = load_json(CAMPAIGNS_DIR / campaign / "progress.json")
+    except Exception:
+        return None
+    if not isinstance(prog, dict):
+        return None
+    rc = prog.get("run_cfg")
+    if not isinstance(rc, dict):
+        return None
+    mode = rc.get("window_mode")
+    return mode if mode in ("visible", "hidden") else None
+
+
 def main(argv=None):
     # Перекодировать stdout/stderr в UTF-8 ДО argparse: иначе help/usage
     # (с кириллицей и стрелками) падают с UnicodeEncodeError в cp1251-консоли
@@ -2968,9 +3061,29 @@ def main(argv=None):
         campaign, name_source, name_source_value = args.campaign, "explicit", None
     else:
         campaign, name_source, name_source_value = campaign_from_url(args.url or "")
+    # CLI-режим окна ДО трея и сентинела: они и воркеры читают env. Без
+    # --window-mode при resume режим берётся из run_cfg манифеста
+    # (инвариант 4): иначе visible-кампания после resume получает
+    # keep_window воркерам из run_cfg, а env демона пуст — сентинел гасит
+    # их окна вопреки режиму кампании (находка ревью 2026-10-17).
+    # Эффективный режим уходит и в run_campaign: при --reset на visible-
+    # кампании старый манифест удаляется, и новый обязан сохранить режим
+    # (иначе следующий resume снова спрячет окна — находка раунда 2).
+    eff_window_mode = args.window_mode
+    if eff_window_mode is None:
+        eff_window_mode = window_mode_from_manifest(campaign)
+    apply_window_mode(eff_window_mode)
     # Трей-пульт: рождается вместе со сбором, сам выходит после смерти демона
     # (см. _start_tray_companion) — отдельный резидент больше не нужен.
     _start_tray_companion(disabled=args.no_tray)
+    # Сентинел показов: в скрытом режиме ни одно окно сбора не должно
+    # появиться на экране (требование владельца 2026-10-17) — глобальный
+    # WinEvent-хук + проход по окнам каждые 200 мс, живёт в процессе демона.
+    try:
+        from ozon_collector import window_policy as _window_policy
+        _window_policy.sentinel_start()
+    except Exception as exc:  # noqa: BLE001 — сентинел не роняет кампанию
+        log.warning(f"сентинел показов не запустился: {exc}")
     out = args.out or f"docs/digests/{campaign}.md"
     progress = run_campaign(
         campaign=campaign, url=args.url or "", target=args.limit,
@@ -2985,7 +3098,7 @@ def main(argv=None):
         max_transient_retries=args.max_transient_retries,
         max_worker_restarts=args.max_worker_restarts,
         session_budget_wall_clock=args.session_budget_wall_clock,
-        window_mode=args.window_mode,
+        window_mode=eff_window_mode,
         match_title=args.match_title,
         write_digest=not args.no_digest,
         compact=args.compact,

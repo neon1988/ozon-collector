@@ -223,7 +223,9 @@ def _apply_worker_proxy_env(env: dict, profile_token: str | None) -> None:
 
 
 def _launch_script(cdp_url: str, profile_path: str | None = None,
-                   profile_token: str | None = None) -> LaunchRun:
+                   profile_token: str | None = None,
+                   script_path: Path | None = None,
+                   script_name: str | None = None) -> LaunchRun:
     """Запуск живого Chromium через scripts/launch_chrome (порт из cdp_url).
 
     profile_path — полный путь --user-data-dir (для воркеров передаёт PROFILE
@@ -233,14 +235,18 @@ def _launch_script(cdp_url: str, profile_path: str | None = None,
     CHROME env (из OZON_CHROME_PATH или уже заданной CHROME) выбирает
     исполняемый файл браузера: системный Chrome по умолчанию, либо автономный
     Chrome-for-Testing/Edge (см. scripts/setup_bundled_chrome.py).
+    script_path/script_name — injection point for the cdp._launch_browser
+    alias: it passes ITS helpers so monkeypatched cdp._launch_script_* names
+    keep working in tests (None → this module's own helpers).
     """
-    script = _launch_script_path()
+    script = script_path if script_path is not None else _launch_script_path()
+    name = script_name if script_name is not None else _launch_script_name()
     if not script.exists():
         hint = ("powershell -ExecutionPolicy Bypass -File "
                 "scripts/launch_chrome.ps1" if os.name == "nt"
                 else "sh scripts/launch_chrome.sh")
         raise RuntimeError(
-            f"{_launch_script_name()} не найден: {script}\n"
+            f"{name} не найден: {script}\n"
             f"Запустите браузер вручную: {hint}")
     env = dict(os.environ)
     env["PORT"] = str(P.cdp_port(cdp_url))
@@ -257,11 +263,21 @@ def _launch_script(cdp_url: str, profile_path: str | None = None,
     logf = _LL.launcher_log_path(P.cdp_port(cdp_url))
     try:
         with open(logf, "wb") as fh:     # truncate: лог всегда от THIS запуска
+            # CREATE_NO_WINDOW (Windows): the parent has no console (daemon
+            # started from a shortcut/scheduler) — without the flag Windows
+            # would open a new terminal window for the launcher on every
+            # collection start. Same approach as the tray
+            # (key_daemon._start_tray_companion); cdp._launch_browser delegates
+            # here since audit 2026-10-18 (D1), so this is the only Popen.
+            kw = {}
+            if os.name == "nt":
+                kw["creationflags"] = getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0x08000000)
             proc = subprocess.Popen(cmd, env=env,
                                     stdin=subprocess.DEVNULL,
-                                    stdout=fh, stderr=subprocess.STDOUT)
+                                    stdout=fh, stderr=subprocess.STDOUT, **kw)
     except OSError as e:
-        raise RuntimeError(f"не удалось запустить {_launch_script_name()}: "
+        raise RuntimeError(f"не удалось запустить {name}: "
                            f"{type(e).__name__}: {e}") from e
     return LaunchRun(logf, proc)
 

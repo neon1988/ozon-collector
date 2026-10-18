@@ -42,6 +42,12 @@ if os.name == "nt":
         _fields_ = [("dwLowDateTime", ctypes.c_uint32),
                     ("dwHighDateTime", ctypes.c_uint32)]
 
+# PS-спавны модуля без флага открывали НОВУЮ консоль при безконсольном
+# родителе (ярлык/шедулер/WMI) — видимое окно терминала в «скрытом» режиме
+# сбора (та же находка 2026-10-17, что и Popen лаунчеров в cdp/browser).
+_NO_WINDOW = (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+              if os.name == "nt" else 0)
+
 PROFILE_TOKEN = "ozon-profile"
 
 
@@ -583,7 +589,9 @@ def pid_alive(pid: int) -> bool:
     здесь не критичен (родитель умирает редко и его PID не переиспользуется
     мгновенно), а дешёвая OpenProcess-проверка на Windows не требует прав.
     """
-    if pid is None or pid <= 0:
+    if not isinstance(pid, int) or pid <= 0 or pid >= 2 ** 24:
+        # 2**24 guard (same as key_daemon._alive): unrealistic PIDs can hang
+        # the query or give a false positive (audit 2026-10-18, D4).
         return False
     if os.name == "nt":
         # OpenProcess на недавно завершившийся процесс на Windows может
@@ -608,6 +616,19 @@ def pid_alive(pid: int) -> bool:
         return bool(data)
     except (OSError, ValueError):
         return False
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """Boolean-env truthiness: 1/true/yes/on (case-insensitive).
+
+    Single semantics for Python paths (cdp OZON_KEEP_WINDOW, window_policy) —
+    matches launch_chrome.ps1 (`^(1|true|yes|on)$`; audit 2026-10-18, D5).
+    Empty/unset → default.
+    """
+    flag = (os.environ.get(name) or "").strip().lower()
+    if not flag:
+        return default
+    return flag in {"1", "true", "yes", "on"}
 
 
 # ---- RSS (диагностика воркеров; без новых зависимостей) -------------------
@@ -829,15 +850,22 @@ def _linux_ppid(pid: int) -> int | None:
         return None
 
 
-def _win_iter_chromium_processes():
+def _win_iter_cim_named_processes(exe_name: str):
+    """(pid, argv, ppid) of `{exe_name}.exe` processes via CIM (Windows).
+
+    Single parser for chrome/firefox/arbitrary names: the body used to be
+    duplicated three times (audit 2026-10-18, D3). CIM failure/empty output →
+    empty generator.
+    """
     cmd = [
         "powershell", "-NoProfile", "-Command",
-        ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+        (f"Get-CimInstance Win32_Process -Filter \"Name='{exe_name}.exe'\" | "
          "Select-Object ProcessId,ParentProcessId,CommandLine | "
          "ConvertTo-Json -Compress"),
     ]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                             creationflags=_NO_WINDOW)
     except Exception:
         return
     if out.returncode != 0 or not out.stdout.strip():
@@ -855,6 +883,10 @@ def _win_iter_chromium_processes():
             continue
         yield int(pid), _tokenize_cmdline(cmdline), (
             int(ppid) if ppid is not None else None)
+
+
+def _win_iter_chromium_processes():
+    yield from _win_iter_cim_named_processes("chrome")
 
 
 def _iter_chromium_processes():
@@ -960,31 +992,7 @@ def _linux_iter_firefox_processes():
 
 
 def _win_iter_firefox_processes():
-    cmd = [
-        "powershell", "-NoProfile", "-Command",
-        ("Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" | "
-         "Select-Object ProcessId,ParentProcessId,CommandLine | "
-         "ConvertTo-Json -Compress"),
-    ]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except Exception:
-        return
-    if out.returncode != 0 or not out.stdout.strip():
-        return
-    try:
-        data = json.loads(out.stdout)
-    except ValueError:
-        return
-    items = data if isinstance(data, list) else [data]
-    for it in items:
-        pid = it.get("ProcessId")
-        ppid = it.get("ParentProcessId")
-        cmdline = it.get("CommandLine")
-        if pid is None or not cmdline:
-            continue
-        yield int(pid), _tokenize_cmdline(cmdline), (
-            int(ppid) if ppid is not None else None)
+    yield from _win_iter_cim_named_processes("firefox")
 
 
 def _iter_firefox_processes():
@@ -1016,31 +1024,7 @@ def _iter_named_processes(name: str):
                 yield pid, argv, _linux_ppid(pid)
         return
 
-    cmd = [
-        "powershell", "-NoProfile", "-Command",
-        ("Get-CimInstance Win32_Process -Filter \"Name='%s.exe'\" | "
-         "Select-Object ProcessId,ParentProcessId,CommandLine | "
-         "ConvertTo-Json -Compress" % name),
-    ]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except Exception:
-        return
-    if out.returncode != 0 or not out.stdout.strip():
-        return
-    try:
-        data = json.loads(out.stdout)
-    except ValueError:
-        return
-    items = data if isinstance(data, list) else [data]
-    for it in items:
-        pid = it.get("ProcessId")
-        ppid = it.get("ParentProcessId")
-        cmdline = it.get("CommandLine")
-        if pid is None or not cmdline:
-            continue
-        yield int(pid), _tokenize_cmdline(cmdline), (
-            int(ppid) if ppid is not None else None)
+    yield from _win_iter_cim_named_processes(name)
 
 
 def command_line_processes(name: str, token: str) -> list[ProcessIdentity]:
@@ -1248,7 +1232,7 @@ def _parent_owner_alive(ppid: int | None) -> bool:
                  f"\"ProcessId={int(ppid)}\").Name"),
             ]
             out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=15)
+                                 timeout=15, creationflags=_NO_WINDOW)
             if out.returncode != 0 or not out.stdout.strip():
                 return False
             name = out.stdout.strip().lower()

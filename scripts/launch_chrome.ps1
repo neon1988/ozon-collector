@@ -426,6 +426,13 @@ function Restore-Focus {
     }
 }
 
+# Окна хотят видимыми: режим keep_window (env) или развёрнуто из трея (флаг
+# window_policy.USER_VISIBLE_FLAG). Тогда циклы пере-скрытия молчат — иначе
+# лаунчер боролся бы с треем (пере-скрытие раз в 50 мс против показа треем;
+# находка ревью 2026-10-17).
+$keepWindowMode = $env:OZON_KEEP_WINDOW -match '^(1|true|yes|on)$'
+$windowVisibleFlag = Join-Path (Split-Path -Parent $PSScriptRoot) "data\window_visible.flag"
+
 # Первый проход: находим окно и ставим WS_EX_NOACTIVATE как можно раньше,
 # НЕ показывая его (оно скрыто с рождения — SW_HIDE).
 $minimized = Invoke-MinimizeNoActivate $targetPid 10000
@@ -448,7 +455,10 @@ for ($i = 0; $i -lt 200; $i++) {
         break        # Chromium умер (например, профиль уже открыт) — ждать порт бессмысленно
     }
     # Пере-скрытие: NO-OP, если окно уже скрыто (стиль не переставляется).
-    $null = Invoke-MinimizeNoActivate $targetPid 20
+    # Пользователь развернул окна (флаг) / режим visible — не боремся с ним.
+    if (-not ($keepWindowMode -or (Test-Path $windowVisibleFlag))) {
+        $null = Invoke-MinimizeNoActivate $targetPid 20
+    }
     try {
         $ver = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
         $ready = $true
@@ -510,6 +520,39 @@ if ($minimized) {
     Write-Host "OK: окно PID $targetPid скрыто, стиль TOOLWINDOW|NOACTIVATE применён"
 } else {
     Write-Warning "не удалось найти окно PID $targetPid для применения стиля"
+}
+
+# КАРАУЛ ОКОН (OZON_LAUNCHER_DUTY_S секунд, дефолт 30; 0 — выключить): щель
+# между «CDP готов» (здесь) и регистрацией в сторожe демона (browser_pid +
+# connect занимают секунды, на 8 воркеров — тем более). В этой щели окно некому
+# прятать, а Chrome умеет показать его сам (живой замер 2026-10-17: показ при
+# создании вкладки; репро — окно жило видимым 0.73 с). Лаунчер остаётся
+# караульным: пере-скрытие каждые ~50 мс, пока демон не подключился.
+# Выйти из караула раньше срока: Chromium умер, пользователь развернул окна
+# из трея (флаг) или включён режим visible.
+# 2026-10-17: дефолт поднят 10→30 с — показ браузера при шторме перезапусков
+# случался на 10-15-й секунде, когда караул уже ушёл, а сторож ещё не встал.
+$dutyS = 30
+$parsedDuty = 0
+if ($env:OZON_LAUNCHER_DUTY_S) {
+    if ([int]::TryParse($env:OZON_LAUNCHER_DUTY_S, [ref]$parsedDuty)) {
+        $dutyS = $parsedDuty
+    } else {
+        Write-Warning "OZON_LAUNCHER_DUTY_S='$($env:OZON_LAUNCHER_DUTY_S)' не число — беру дефолт $dutyS с"
+    }
+}
+if ($dutyS -gt 0) {
+    $dutyUntil = (Get-Date).AddSeconds($dutyS)
+    while ((Get-Date) -lt $dutyUntil) {
+        Start-Sleep -Milliseconds 50
+        if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
+            break        # Chromium закрылся — караулить больше нечего
+        }
+        if ($keepWindowMode -or (Test-Path $windowVisibleFlag)) {
+            break        # окна хотят видимыми: не боремся с треем/режимом
+        }
+        $null = Invoke-MinimizeNoActivate $targetPid 20
+    }
 }
 Write-Host "LAUNCHER-DIAG: chrome=$Chrome profile=$Profile port=$Port proxy=$proxyNote pid=$targetPid"
 exit 0

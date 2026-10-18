@@ -1,0 +1,1 @@
+() => { const u = location.href || ''; if (/__rr|abt_att|captcha|antibot/i.test(u)) return true; const h1 = document.querySelector('h1'); const h1t = h1 ? (h1.innerText || '').trim() : ''; if (h1t && h1t.length >= 5) return false; const body = document.body ? (document.body.innerText || '') : ''; if (body.length >= 300) return false; return true;}

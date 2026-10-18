@@ -29,6 +29,16 @@
 `data/window_visible.flag`: его ставит трей, когда пользователь сам развернул
 окна сбора («Развернуть окна сбора»); пока флаг есть, сторож спит.
 
+Обновление 2026-10-17 (живой репро `.tmp/repro_owner.py`, замер показов 10-мс
+пробником): Chrome показывает окно САМ при создании вкладки через CDP
+(`PUT /json/new` → окно vis=True уже через ~20 мс), поэтому тик 150 мс не
+успевал — добавлен WinEvent-хук EVENT_OBJECT_SHOW (гашение за миллисекунды).
+Identity-сверка переведена с PowerShell (0.5-1 с блокировки первого тика —
+первая вспышка жила 0.73 с) на сокет-таблицу ядра (~1 мс: `port_owner_pids`).
+Щель «CDP готов → сторож зарегистрирован» (поиск browser_pid и connect
+занимают секунды на воркер) закрывает караул лаунчера
+(`scripts/launch_chrome.ps1`, `OZON_LAUNCHER_DUTY_S`, дефолт 30 с).
+
 Что guard НЕ делает (намеренно):
 - не трогает окна чужих браузеров: фильтр по pid, зарегистрированным Session
   с `browser_owner == "collector"`; чужой Chrome пользователя не сворачивается;
@@ -49,9 +59,10 @@ import threading
 import time
 from ctypes import wintypes
 from pathlib import Path
-from typing import Dict, Iterable, NamedTuple, Optional
+from typing import Callable, Dict, Iterable, NamedTuple, Optional
 
 from . import log as plog
+from . import process as _proc
 
 
 class _ProjectLogBridge(logging.Handler):
@@ -96,9 +107,20 @@ MIN_GUARD_H = 300
 FOCUS_RETRY_S = 3.0
 
 # Как часто сверять, что охраняемый pid всё ещё держит наш CDP-порт. Живость
-# проверяется каждый тик (дёшево), эта сверка поднимает PowerShell — поэтому
-# редко.
+# проверяется каждый тик (дёшево). Сверка с 2026-10-17 тоже дешёвая
+# (сокет-таблица ядра вместо PowerShell — замер: ~1 мс против ~0.5-1 с), но
+# каденция остаётся редкой: pid-реюзы редки, а суетиться и спамить лог нечего.
 IDENTITY_RECHECK_S = 15.0
+
+# WinEvent-хук мгновенного гашения показа (замер 2026-10-17): Chrome ПОКАЗЫВАЕТ
+# окно сам при создании вкладки через CDP (`PUT /json/new`, Target.createTarget):
+# окно vis=True уже через ~20 мс после запроса. Тик сторожа (150 мс) на такое
+# опаздывает, и окно успевает мигнуть; EVENT_OBJECT_SHOW приходит в момент
+# показа — прячем, не дожидаясь тика.
+EVENT_OBJECT_SHOW = 0x8002
+OBJID_WINDOW = 0
+WINEVENT_OUTOFCONTEXT = 0x0000
+WM_QUIT = 0x0012
 
 # «Пользователь смотрит окна сбора»: флаг-файл ставит/снимает трей-пульт
 # («Развернуть окна сбора» / «Свернуть окна сбора»), а при старте сбора его
@@ -213,6 +235,8 @@ def _setup_api(user32) -> None:
     user32.GetWindowLongW.restype = L
     user32.SetWindowLongW.argtypes = [HWND, I, L]
     user32.SetWindowLongW.restype = L
+    user32.SetWindowPos.argtypes = [HWND, HWND, I, I, I, I, U]
+    user32.SetWindowPos.restype = wintypes.BOOL
     user32.GetWindowThreadProcessId.argtypes = [HWND, P(U)]
     user32.GetWindowThreadProcessId.restype = U
     user32.AttachThreadInput.argtypes = [U, U, wintypes.BOOL]
@@ -230,6 +254,32 @@ def _setup_api(user32) -> None:
     user32.GetWindowRect.restype = wintypes.BOOL
     user32.EnumWindows.argtypes = [_ENUMPROC, L]
     user32.EnumWindows.restype = wintypes.BOOL
+    # WinEvent-хук показа окон (мгновенное гашение) + насос сообщений потока.
+    if _WINEVENTPROC is not None:
+        user32.SetWinEventHook.argtypes = [
+            ctypes.c_ulong, ctypes.c_ulong, wintypes.HWND, _WINEVENTPROC,
+            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        user32.SetWinEventHook.restype = wintypes.HANDLE
+        # HANDLE/хук без явного restype обрезается до 32 бит на x64 (находка
+        # ревью 2026-10-17): UnhookWinEvent тихо фейлился — хук тёк до конца
+        # процесса и держал колбэк сентинела.
+        user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+        user32.UnhookWinEvent.restype = wintypes.BOOL
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                       wintypes.HWND, ctypes.c_uint,
+                                       ctypes.c_uint]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                        wintypes.HWND, ctypes.c_uint,
+                                        ctypes.c_uint, ctypes.c_uint]
+        user32.PeekMessageW.restype = wintypes.BOOL
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.TranslateMessage.restype = wintypes.BOOL
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = ctypes.c_size_t
+        user32.PostThreadMessageW.argtypes = [
+            wintypes.DWORD, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostThreadMessageW.restype = wintypes.BOOL
     k32 = _kernel32()
     if k32 is not None:
         k32.GetCurrentThreadId.argtypes = []
@@ -239,6 +289,12 @@ def _setup_api(user32) -> None:
 
 _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
                                wintypes.LPARAM) if os.name == "nt" else None
+
+# WinEventProc: (HWINEVENTHOOK, DWORD event, HWND, LONG idObject, LONG idChild,
+# DWORD idEventThread, DWORD dwmsEventTime).
+_WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None, ctypes.c_void_p, wintypes.DWORD, wintypes.HWND, wintypes.LONG,
+    wintypes.LONG, wintypes.DWORD, wintypes.DWORD) if os.name == "nt" else None
 
 
 def _window_text(user32, hwnd) -> str:
@@ -413,6 +469,34 @@ def minimize_hwnd(hwnd: int) -> bool:
         return False
 
 
+def show_hwnd(hwnd: int) -> bool:
+    """user32: SW_RESTORE + TOPMOST — the single show canon (same as Session).
+
+    A window hidden with SW_HIDE at start is shown only by SW_RESTORE +
+    SetWindowPos(HWND_TOPMOST, SWP_SHOWWINDOW). NOACTIVATE keeps the user
+    focus; TOOLWINDOW stays — the taskbar stays clean. The taskbar button is
+    removed explicitly: a style change does not remove an already created
+    button (finding 2026-10-16). Same contract as the show path in
+    launch_chrome.ps1 and collector_tray.ps1 (audit 2026-10-18, D2).
+    """
+    user32 = _user32()
+    if user32 is None:
+        return False
+    _setup_api(user32)
+    try:
+        style = user32.GetWindowLongW(hwnd, -20)       # GWL_EXSTYLE
+        user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x00000080)
+        user32.ShowWindow(hwnd, 9)                    # SW_RESTORE
+        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0,     # HWND_TOPMOST
+                            0x0002 | 0x0001 | 0x0010 | 0x0040)
+        # SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW
+        delete_taskbar_tab(int(hwnd))
+        return True
+    except Exception as e:
+        log.debug(f"window_policy: show_hwnd err {type(e).__name__}: {e}")
+        return False
+
+
 def window_exists(hwnd: int) -> bool:
     user32 = _user32()
     if user32 is None:
@@ -480,53 +564,160 @@ def _kernel32():
 
 
 def _pid_alive(pid: int) -> bool:
-    """Жив ли процесс (быстро: OpenProcess + код выхода, без WMI)."""
+    """Process liveness — shared process.pid_alive implementation.
+
+    This used to be a third OpenProcess+GetExitCodeProcess duplicate without a
+    guard for unrealistic PIDs; now one code path project-wide
+    (audit 2026-10-18, D4).
+    """
+    return _proc.pid_alive(pid)
+
+
+def port_owner_pids(port: int):
+    """PIDs, держащие LISTEN-сокет порта (сокет-таблица ядра, без WMI).
+
+    Раньше «держит ли pid наш порт» выяснялось через PowerShell + WMI —
+    живой замер 2026-10-17: один вызов ~0.5-1 с, и всё это время показанное
+    Chrome окно оставалось не погашенным (первый тик сторожа блокировался на
+    этой проверке: вспышка 0.73 с в репро). GetExtendedTcpTable отвечает за
+    ~1 мс. Возвращает None, если таблицу получить не удалось (вызывающий
+    решает сам — у _pid_owns_port есть fallback на старый путь).
+    """
+    if os.name != "nt":
+        return None
+    try:
+        iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+        AF_INET = 2
+        TCP_TABLE_OWNER_PID_LISTENER = 3
+        ERROR_INSUFFICIENT_BUFFER = 122
+        iphlpapi.GetExtendedTcpTable.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), wintypes.BOOL,
+            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        iphlpapi.GetExtendedTcpTable.restype = ctypes.c_ulong
+        # Таблица TCP между запросом размера и заполнением может вырасти —
+        # ERROR_INSUFFICIENT_BUFFER на втором вызове ретраим (до 3 попыток):
+        # возврат None увёл бы identity на медленный PowerShell (0.5-1 с на
+        # вызов, замер 2026-10-17), а это и есть окно вспышки.
+        buf = None
+        for _attempt in range(3):
+            size = ctypes.c_ulong(0)
+            rc = iphlpapi.GetExtendedTcpTable(
+                None, ctypes.byref(size), False, AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER, 0)
+            if rc != ERROR_INSUFFICIENT_BUFFER or not size.value:
+                return None
+            buf = ctypes.create_string_buffer(size.value)
+            rc = iphlpapi.GetExtendedTcpTable(
+                buf, ctypes.byref(size), False, AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER, 0)
+            if rc == 0:
+                break
+            if rc != ERROR_INSUFFICIENT_BUFFER:
+                return None
+        else:
+            return None
+        count = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong)).contents.value
+        row = ctypes.c_ulong * 6          # MIB_TCPROW_OWNER_PID
+        rows = ctypes.cast(ctypes.byref(buf, 4), ctypes.POINTER(row))
+        pids = set()
+        for i in range(count):
+            _state, _la, lport, _ra, _rp, pid = rows[i]
+            # dwLocalPort — в сетевом порядке байт в младшем слове
+            if (((lport & 0xFF) << 8) | ((lport >> 8) & 0xFF)) == int(port):
+                pids.add(int(pid))
+        return pids
+    except Exception as e:
+        log.debug(f"window_policy: port_owner_pids err {type(e).__name__}: {e}")
+        return None
+
+
+def process_image_basename(pid: int):
+    """Имя исполняемого файла процесса (QueryFullProcessImageNameW, без WMI)."""
     k32 = _kernel32()
     if k32 is None:
-        return False
-    STILL_ACTIVE = 259
+        return None
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    k32.OpenProcess.argtypes = [ctypes.c_uint, wintypes.BOOL, wintypes.DWORD]
-    k32.OpenProcess.restype = wintypes.HANDLE
-    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
-                                      ctypes.POINTER(wintypes.DWORD)]
-    k32.GetExitCodeProcess.restype = wintypes.BOOL
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
-                        int(pid))
-    if not h:
-        return False
     try:
-        code = wintypes.DWORD()
-        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
-            return False
-        return code.value == STILL_ACTIVE
-    finally:
-        k32.CloseHandle(h)
+        k32.OpenProcess.argtypes = [ctypes.c_uint, wintypes.BOOL,
+                                    wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, ctypes.c_ulong, ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_ulong)]
+        k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                            int(pid))
+        if not h:
+            return None
+        try:
+            size = ctypes.c_ulong(1024)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not k32.QueryFullProcessImageNameW(h, 0, buf,
+                                                  ctypes.byref(size)):
+                return None
+            return buf.value.rsplit("\\", 1)[-1]
+        finally:
+            k32.CloseHandle(h)
+    except Exception as e:
+        log.debug(f"window_policy: process_image_basename err "
+                  f"{type(e).__name__}: {e}")
+        return None
 
 
 def _pid_owns_port(pid: int, port) -> bool:
-    """Ровно ли этот PID держит CDP-порт (полная identity-сверка, дорогая).
+    """Ровно ли этот PID держит CDP-порт (identity-сверка).
 
     Требуется правилом проекта: трогать можно только процесс, который держит
-    наш порт. Вызывается редко (раз в IDENTITY_RECHECK_S на каждый pid), потому
-    что поднимает PowerShell.
+    наш порт. Быстрый путь — сокет-таблица ядра (port_owner_pids). Fallback —
+    командная строка процесса через PowerShell (историческая проверка),
+    только если таблицу получить не удалось.
     """
-    import subprocess
     if not port:
         return False
+    try:
+        owners = port_owner_pids(int(port))
+    except Exception:
+        owners = None
+    if owners is not None:
+        return int(pid) in owners
+    return _pid_owns_port_via_cmdline(pid, port)
+
+
+def _pid_owns_port_via_cmdline(pid: int, port) -> bool:
+    """Fallback identity: cmdline содержит --remote-debugging-port=port."""
+    import subprocess
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              f"(Get-CimInstance Win32_Process -Filter "
              f"\"ProcessId={int(pid)}\").CommandLine"],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=20)
+            errors="replace", timeout=20,
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW",
+                                   0x08000000) if os.name == "nt" else 0))
         cmdline = (out.stdout or "").strip()
     except Exception as e:
         log.debug(f"window_policy: cmdline не прочитан: {type(e).__name__}: {e}")
         return False
     return f"--remote-debugging-port={port}" in cmdline
+
+
+def should_hide_show_event(pid: int, class_name: str, width: int, height: int,
+                           watched: Dict[int, str], uv: bool) -> bool:
+    """Прятать ли окно, показавшееся по EVENT_OBJECT_SHOW (чистое решение).
+
+    Тот же фильтр, что у тика: наш pid, класс Chromium, главное окно (мелкие
+    попапы/инфобары не трогаем), пользователь не разворачивал окна из трея.
+    Отдельная функция — чтобы тест проверял решение, не трогая живой Windows.
+    """
+    return (
+        not uv
+        and pid in watched
+        and class_name.startswith(CHROME_WINDOW_CLASS_PREFIX)
+        and width >= MIN_GUARD_W
+        and height >= MIN_GUARD_H
+    )
 
 
 class WindowGuard:
@@ -550,6 +741,10 @@ class WindowGuard:
         self._identity_checked: Dict[int, float] = {}  # pid -> когда сверяли порт
         self._fixed = 0                           # счётчик для телеметрии
         self._focus_fixed = 0
+        self._hook_thread: Optional[threading.Thread] = None
+        self._hook_tid: Optional[int] = None      # поток с насосом сообщений
+        self._hook_proc = (_WINEVENTPROC(self._on_win_event)
+                           if _WINEVENTPROC is not None else None)
 
     # ---- реестр -----------------------------------------------------------
     def watch(self, pid: Optional[int], port: object = None,
@@ -585,10 +780,108 @@ class WindowGuard:
         self._thread = threading.Thread(target=self._loop,
                                         name="ozon-window-guard", daemon=True)
         self._thread.start()
+        # Хук показа окон: мгновенное гашение (см. _hook_loop). Отдельный
+        # поток: SetWinEventHook требует насос сообщений, а тик должен идти
+        # своей каденцией.
+        self._hook_thread = threading.Thread(target=self._hook_loop,
+                                             name="ozon-window-guard-hook",
+                                             daemon=True)
+        self._hook_thread.start()
         log.debug("window_policy: сторож окон стартовал")
 
     def stop(self) -> None:
         self._stop.set()
+        tid = self._hook_tid
+        if tid:
+            try:
+                user32 = _user32()
+                if user32 is not None:
+                    _setup_api(user32)
+                    user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+            except Exception:
+                pass
+
+    # ---- WinEvent-хук показа ----------------------------------------------
+    def _hook_loop(self) -> None:
+        """Поток EVENT_OBJECT_SHOW: показалось окно — прячем сразу.
+
+        WINEVENT_OUTOFCONTEXT: система кладёт событие в очередь ЭТОГО потока,
+        колбэк вызывается при прокачке сообщений. GetMessageW блокирующий, но
+        WM_QUIT (из stop()) его будит. Хук поднимает только сокет-фильтр:
+        EI-подписок нет, лишнего CPU не тратит.
+        """
+        user32 = _user32()
+        k32 = _kernel32()
+        if user32 is None or k32 is None or _WINEVENTPROC is None:
+            return
+        _setup_api(user32)
+        msg = wintypes.MSG()
+        try:
+            # Насос очереди нужен ДО PostThreadMessage из stop().
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+            self._hook_tid = int(k32.GetCurrentThreadId())
+            hook = user32.SetWinEventHook(
+                EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, self._hook_proc,
+                0, 0, WINEVENT_OUTOFCONTEXT)
+            if not hook:
+                log.debug("window_policy: WinEvent-хук не встал — показы "
+                          "гасятся только тиками (150 мс)")
+                return
+            if self._stop.is_set():
+                # stop() пришёл раньше публикации _hook_tid: WM_QUIT не был
+                # отправлен (очереди ещё не существовало) — выходим сами, иначе
+                # поток зависнет в GetMessageW навсегда (находка ревью
+                # 2026-10-17: утечка потока в 27 из 30 циклов start/stop).
+                user32.UnhookWinEvent(hook)
+                return
+            log.debug("window_policy: WinEvent-хук показа окон активен "
+                      "(мгновенное гашение)")
+            try:
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+            finally:
+                user32.UnhookWinEvent(hook)
+        except Exception as e:
+            log.debug(f"window_policy: hook err {type(e).__name__}: {e}")
+        finally:
+            self._hook_tid = None
+
+    def _on_win_event(self, _hook, event, hwnd, id_object, id_child,
+                      _event_thread, _event_ms) -> None:
+        """Колбэк показа окна: скрыть немедленно, не дожидаясь тика."""
+        try:
+            if (event != EVENT_OBJECT_SHOW or id_object != OBJID_WINDOW
+                    or id_child or not hwnd):
+                return
+            watched = self.watched_pids()
+            if not watched:
+                return
+            user32 = _user32()
+            if user32 is None:
+                return
+            _setup_api(user32)
+            pid = _window_pid(user32, hwnd)
+            if pid not in watched:
+                return
+            uv = user_visible()
+            class_name = _window_class(user32, hwnd)
+            rect = wintypes.RECT()
+            width = height = 0
+            if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+            if not should_hide_show_event(pid, class_name, width, height,
+                                          watched, uv):
+                return
+            if minimize_hwnd(int(hwnd)):
+                with self._lock:
+                    self._fixed += 1
+                log.info(f"window_policy: окно pid={pid} показалось "
+                         f"({width}x{height}, {class_name}) — прячу немедленно "
+                         f"(WinEvent)")
+        except Exception as e:
+            log.debug(f"window_policy: hook cb err {type(e).__name__}: {e}")
 
     @property
     def alive(self) -> bool:
@@ -610,8 +903,8 @@ class WindowGuard:
         этой проверки упавший воркер-браузер оставляет pid в реестре, Windows
         переиспользует pid — и `tick()` сворачивает уже ЧУЖОЕ окно (ревью
         2026-10-06). Живость проверяется каждый тик (дёшево, без WMI), полная
-        сверка «процесс держит наш порт» — раз в IDENTITY_RECHECK_S (дорого:
-        поднимает PowerShell).
+        сверка «процесс держит наш порт» — раз в IDENTITY_RECHECK_S (дёшево:
+        сокет-таблица ядра, PowerShell — только fallback).
         """
         now = time.monotonic()
         stale = []
@@ -673,7 +966,8 @@ class WindowGuard:
             # мерцание рендера.
             if minimize_hwnd(row.hwnd):
                 unminimized += 1
-                self._fixed += 1
+                with self._lock:
+                    self._fixed += 1
                 ghost = " («мини-плитка-призрак»)" if row.iconic else ""
                 log.info(
                     f"window_policy: окно браузера pid={row.pid} "
@@ -755,3 +1049,500 @@ def guard() -> Optional[WindowGuard]:
         if _GUARD is None:
             _GUARD = WindowGuard()
         return _GUARD
+
+
+# ---- сплошной свип: наши Chromium вне реестров (сторожа-слои дырявые) ------
+
+STRAY_GRACE_S = 45.0
+_stray_first_seen: Dict[int, float] = {}     # порт → monotonic первого «CDP молчит»
+
+
+def _our_profile_chromium_stat() -> tuple:
+    """(ряды наших Chromium, сколько chrome.exe вообще увидел перечислитель).
+
+    Ряды: (pid, token, port|None, is_main). Матч НЕ по порту и НЕ по реестрам
+    (они и теряют процессы): профиль из `--user-data-dir` строго под базой
+    профилей и имя каталога начинается с 'ozon-profile'.
+
+    raw-счётчик нужен сентинелу: `process._win_iter_chromium_processes`
+    глотает сбой PowerShell молча (пустой результат при исключении/rc≠0) —
+    «успешный» пустой скан без счётчика отравил бы alien-кэш нашему свежему
+    pid (review-skeptic 2026-10-17). raw>0 = перечислитель видел хоть один
+    chrome.exe.
+    """
+    from . import process as proc
+    base = os.path.normcase(os.path.normpath(proc.profile_base_dir()))
+    out = []
+    raw = 0
+    for pid, argv, _ppid in proc._iter_chromium_processes():
+        raw += 1
+        data_dir = None
+        port = None
+        is_main = True
+        for a in argv:
+            if a.startswith("--user-data-dir="):
+                data_dir = a.split("=", 1)[1].strip("\"'")
+            elif a.startswith("--remote-debugging-port="):
+                try:
+                    port = int(a.split("=", 1)[1])
+                except ValueError:
+                    port = None
+            elif a.startswith("--type="):
+                is_main = False
+        if not data_dir:
+            continue
+        name = os.path.basename(data_dir.rstrip("/\\"))
+        if not name.startswith(proc.PROFILE_TOKEN):
+            continue
+        path = os.path.normcase(os.path.normpath(data_dir))
+        if not path.startswith(base + os.sep):
+            continue
+        out.append((pid, name, port, is_main))
+    return out, raw
+
+
+def _our_profile_chromium() -> list:
+    """Ряды наших Chromium (см. `_our_profile_chromium_stat`)."""
+    return _our_profile_chromium_stat()[0]
+
+
+def sweep_stray_browsers(*, grace_s: float = STRAY_GRACE_S,
+                         now: Optional[float] = None) -> dict:
+    """Сплошной обход: спрятать видимые окна наших Chromium, убить зависшие.
+
+    Зачем шире WindowGuard: окна и процессы коллектора выпадали из всех
+    реестров (воркер умирал вместе с реестром; identity-сверка «не держит
+    порт» ошибочно отбрасывала ЖИВОГО pid; старый cdp_url смотрел на старую
+    базу портов). Свип не зависит ни от реестров Session, ни от портовых
+    матчей — только профиль под profile_base_dir().
+
+    Два прохода:
+    1) любое ВИДИМОЕ главное окно любого нашего Chromium — minimize_hwnd
+       (SW_HIDE); работает даже для окон процессов вне реестров;
+    2) main-процесс с `--remote-debugging-port`, чей CDP молчит дольше
+       grace_s — убивается вместе с группой процессов своего профиля
+       (identity-проверка kill_records, исключение PID-reuse).
+
+    В режиме visible (флаг трея) не трогаем ничего. Проход по окнам уважает
+    OZON_WINDOW_GUARD=0; уборка зависших — всегда (это мусор, а не окна).
+    """
+    res = {"ours": 0, "visible": 0, "hidden": 0, "mains": 0, "killed": 0,
+           "killed_pids": [], "skipped": ""}
+    if os.name != "nt":
+        res["skipped"] = "non-windows"
+        return res
+    if user_visible():
+        res["skipped"] = "user_visible"
+        return res
+    from . import process as proc
+    ours = _our_profile_chromium()
+    res["ours"] = len(ours)
+    our_pids = {pid for pid, _t, _p, _m in ours}
+    if enabled_by_env():
+        for row in list_chrome_windows():
+            if not (row.pid in our_pids and row.visible
+                    and row.is_main_window):
+                continue
+            res["visible"] += 1
+            if minimize_hwnd(row.hwnd):
+                res["hidden"] += 1
+                log.info(f"свип: спрятал окно pid={row.pid} hwnd={row.hwnd} "
+                         f"'{row.title}' {row.width}x{row.height}")
+    if now is None:
+        now = time.monotonic()
+    alive_ports = set()
+    for pid, token, port, is_main in ours:
+        if not is_main or not port:
+            continue
+        alive_ports.add(port)
+        res["mains"] += 1
+        if proc.cdp_responds(f"http://127.0.0.1:{port}", timeout_s=1.0):
+            _stray_first_seen.pop(port, None)
+            continue
+        t0 = _stray_first_seen.setdefault(port, now)
+        age = now - t0
+        if age < grace_s:
+            continue
+        group = [p for p, tk, _pt, _m in ours if tk == token]
+        records = []
+        for p in group:
+            ident = proc.process_identity(p)
+            if ident is not None:
+                records.append(proc.ProcessRecord(
+                    launch_id=f"sweep:{token}", identity=ident))
+        killed = proc.kill_records(records, wait_s=3.0)
+        pids = [r.identity.pid for r in killed]
+        res["killed"] += len(pids)
+        res["killed_pids"].extend(pids)
+        log.warning(f"свип: убит зависший браузер token={token} port={port} "
+                    f"(CDP молчал {age:.0f}с): pids={pids}")
+        _stray_first_seen.pop(port, None)
+    for port in list(_stray_first_seen):
+        if port not in alive_ports:
+            _stray_first_seen.pop(port, None)
+    return res
+
+
+# ---- сентинел показов: глобальный WinEvent-хук + частый проход -------------
+#
+# Требование владельца 2026-10-17: в скрытом режиме окна сбора НЕ ДОЛЖНЫ
+# появляться вообще (ни на старте воркера, ни при шторме перезапусков, ни у
+# осиротевших браузеров). Слои-сторожа прячут в миллисекунды ТОЛЬКО свои
+# зарегистрированные окна: щель «браузер стартовал — воркер ещё не подключил
+# сторож» (нормализация геометрии при connect сама ПОКАЗЫВАЕТ окно) закрывает
+# сентинел. sweep_stray_browsers ниже — задел на случай отказа от сентинела;
+# в прод он НЕ подключён (review 2026-10-17), «каденс ~3 с» — не действующий
+# механизм. Сентинел живёт в процессе демона и закрывает обе
+# дыры сразу для всего рабочего стола:
+#   - out-of-context WinEvent-хук на EVENT_OBJECT_SHOW: любое наше окно,
+#     показавшееся на экране, гасится за миллисекунды (включая осиротевшие
+#     браузеры, о которых воркер уже забыл);
+#   - проход list_chrome_windows() каждые 200 мс: страховка к хуку (показы
+#     без EVENT_OBJECT_SHOW: бесшовный показ, смена владельца).
+# Чужих окон не трогаем: pid обязан быть нашим Chromium по профилю под
+# profile_base_dir() (как в свипе); в режиме visible (флаг трея) молчим.
+#
+# Шторм-защита (находка ревью 2026-10-17): скан профилей — PowerShell
+# Get-CimInstance, живой замер ~0.8 с. Без защиты каждое показавшееся ЧУЖОЕ
+# окно (терминал, редактор, браузер пользователя) тянуло полный скан, а
+# пустой результат кэша вообще не кэшировался. Слои: (1) префильтр по имени
+# образа процесса (QueryFullProcessImageName, ~0.05 мс) — не-chrome.exe до
+# скана не доходит; (2) пустой кэш живёт TTL как любой другой; (3) refresh
+# не чаще _SENTINEL_REFRESH_MIN_S; (4) скан под single-flight: параллельный
+# вызов получает текущий кэш, а не второй скан; (5) alien-кэш — чужой
+# chrome.exe не пересканируется _SENTINEL_ALIEN_TTL_S; (6) метка «чужой» —
+# только по скану, ЗАВЕРШИВШЕМУСЯ после показа (pids_ts ≥ t_call) И
+# видевшему хоть один chrome.exe (scan_raw > 0): троттлинг и летящий скан
+# отдают кэш, снятый ДО спавна браузера, а тихий отказ PowerShell (пустой
+# результат при сбое перечислителя) не считается состоявшимся сканом —
+# иначе наш свежий pid уходил бы в alien на 60 с (review-skeptic
+# 2026-10-17); (7) тик пред-фильтрует кандидатов (имя процесса +
+# alien-кэш) ДО скана и сам кладёт чужих chrome.exe в alien; (8) alien-кэш
+# мутируется под своим локом (alien_lock) — запись из хука/тика не рвёт
+# итерацию само-лечения в скане.
+
+_SENTINEL: Optional[dict] = None
+_SENTINEL_LOCK = threading.Lock()
+_SENTINEL_PIDS_TTL_S = 2.0
+_SENTINEL_REFRESH_MIN_S = 0.5     # минимальный интервал фактического скана
+_SENTINEL_ALIEN_TTL_S = 60.0      # чужой chrome.exe: не пересканировать
+_SENTINEL_ALIEN_MAX = 32
+_CHROME_IMAGE_NAMES = ("chrome.exe", "chromium.exe")
+_SENTINEL_TICK_S = 0.2
+_WINEVENT_SKIPOWNPROCESS = 0x0002
+
+
+def _keep_window_env() -> bool:
+    """OZON_KEEP_WINDOW=1 (сессии осознанно держат окно видимым) — не мешаем."""
+    return _proc.env_bool("OZON_KEEP_WINDOW")
+
+
+def _hwnd_pid(hwnd: int) -> Optional[int]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pid = wintypes.DWORD(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            wintypes.HWND(hwnd), ctypes.byref(pid))
+        return int(pid.value) or None
+    except Exception:
+        return None
+
+
+def _sentinel_alien_prune(st: dict) -> None:
+    """Убрать из alien-кэша записи старше TTL (вызывается по переполнению)."""
+    now = time.monotonic()
+    alien = st.get("alien") or {}
+    for pid in [p for p, ts in alien.items()
+                if now - ts >= _SENTINEL_ALIEN_TTL_S]:
+        alien.pop(pid, None)
+
+
+def _sentinel_pids(refresh: bool = False) -> Dict[int, str]:
+    """Наши Chromium (pid → token); TTL-кэш, включая ПУСТОЙ результат.
+
+    refresh=True — «свежие данные сейчас», но не чаще _SENTINEL_REFRESH_MIN_S
+    (шторм-защита). Скан — под single-flight: если его уже делает другой
+    поток, отдаём текущий кэш вместо второго скана (0.8 с × события всего
+    рабочего стола — это блокировка хука и нагрузка на CPU).
+    """
+    st = _SENTINEL
+    if st is None:
+        return {}
+    now = time.monotonic()
+    ts = st.get("pids_ts", 0.0)
+    if ts:
+        if refresh:
+            if now - st.get("scan_ts", 0.0) < _SENTINEL_REFRESH_MIN_S:
+                return st["pids"]
+        elif now - ts < _SENTINEL_PIDS_TTL_S:
+            return st["pids"]
+    elif now - st.get("scan_ts", 0.0) < _SENTINEL_REFRESH_MIN_S:
+        # Успешного скана ещё не было (ts=0), но попытка была только что —
+        # в т.ч. неудачная (упавший/пустой скан): не штормим PS-спавнами
+        # каждое событие показа (review-skeptic 2026-10-17).
+        return st["pids"]
+    lock = st.get("lock")
+    if lock is None or not lock.acquire(blocking=False):
+        return st.get("pids", {})
+    try:
+        now = time.monotonic()
+        ts = st.get("pids_ts", 0.0)
+        if ts:
+            if refresh:
+                if now - st.get("scan_ts", 0.0) < _SENTINEL_REFRESH_MIN_S:
+                    return st["pids"]
+            elif now - ts < _SENTINEL_PIDS_TTL_S:
+                return st["pids"]
+        elif now - st.get("scan_ts", 0.0) < _SENTINEL_REFRESH_MIN_S:
+            return st["pids"]
+        st["scan_start"] = time.monotonic()
+        try:
+            rows, raw = _our_profile_chromium_stat()
+        except Exception as e:  # noqa: BLE001 — сентинел не должен падать
+            # Попытка была (scan_ts), но данных нет: pids_ts НЕ бампаем —
+            # упавший скан не должен выглядеть свежим/успешным (находка
+            # ревью 2026-10-17, раунд 2: битый PowerShell → наш pid уходил
+            # в alien по «свежему» пустому кэшу).
+            log.debug(f"сентинел: скан профилей не удался: {e}")
+            st.setdefault("pids", {})
+            st["scan_ts"] = time.monotonic()
+            return st["pids"]
+        if raw == 0:
+            # Перечислитель не увидел НИ ОДНОГО chrome.exe, хотя событие
+            # показа пришло от живого chrome.exe (префильтр по имени образа
+            # уже пройден) — это признак ТИХОГО отказа PowerShell: process.
+            # _win_iter_chromium_processes молча возвращает [] на сбое, и
+            # пустой «успешный» кэш выглядел бы свежее события → наш pid
+            # уходил в alien на 60 с (review-skeptic 2026-10-17). Скан не
+            # состоялся: только scan_ts, кэш не трогаем.
+            log.debug("сентинел: скан пуст при видимом chrome.exe — "
+                      "перечислитель молчит, кэш не обновляем")
+            st.setdefault("pids", {})
+            st["scan_ts"] = time.monotonic()
+            return st["pids"]
+        st["pids"] = {pid: token for pid, token, _p, _m in rows}
+        st["scan_raw"] = raw
+        st["pids_ts"] = time.monotonic()
+        st["scan_ts"] = st["pids_ts"]
+        alien = st.get("alien")
+        if alien:
+            # Само-лечение: pid, найденный нашим свежим сканом, не чужой —
+            # снимаем застрявшую метку (pid-reuse, гонка кэша).
+            with st["alien_lock"]:
+                for pid in [p for p in alien if p in st["pids"]]:
+                    alien.pop(pid, None)
+        return st["pids"]
+    finally:
+        lock.release()
+
+
+def sentinel_on_show(hwnd: int, *, hide=None, pids=None,
+                     uv: Optional[Callable[[], bool]] = None) -> bool:
+    """Погасить показавшееся НАШЕ окно (вызов из WinEvent-хука)."""
+    if os.name != "nt" or not enabled_by_env() or _keep_window_env():
+        return False
+    if (uv or user_visible)():
+        return False
+    pid = _hwnd_pid(int(hwnd))
+    if pid is None:
+        return False
+    t_call = time.monotonic()
+    if pids is None:
+        # Дешёвый префильтр до скана профилей: показавшееся окно не-chrome
+        # процесса не может быть нашим Chromium. Без него каждое чужое окно
+        # тянуло полный PS-скан (~0.8 с) — шторм на живом столе.
+        name = (process_image_basename(pid) or "").lower()
+        if name and name not in _CHROME_IMAGE_NAMES:
+            return False
+        st = _SENTINEL
+        if st is not None:
+            seen = (st.get("alien") or {}).get(pid)
+            if seen and time.monotonic() - seen < _SENTINEL_ALIEN_TTL_S:
+                return False
+        ours = _sentinel_pids()            # быстрый путь: TTL-кэш без скана
+        if pid not in ours:
+            ours = _sentinel_pids(refresh=True)   # скан, с троттлингом
+            if pid not in ours:
+                # Метка «чужой» — только по скану, ЗАВЕРШИВШЕМУСЯ после
+                # показа (pids_ts ≥ t_call). Начало скана (scan_start) не
+                # годится: летящий скан в другом потоке отдаёт СТАРЫЙ pids,
+                # хотя scan_start уже ≥ t_call (находка ревью 2026-10-17,
+                # раунд 2); троттлинг/упавший скан тоже не бампают pids_ts.
+                trusted = (st is not None and
+                           st.get("pids_ts", 0.0) >= t_call and
+                           st.get("scan_raw", 0) > 0)
+                if not name or not trusted:
+                    return False
+                alien = st.setdefault("alien", {})
+                with st["alien_lock"]:
+                    alien[pid] = time.monotonic()
+                    if len(alien) > _SENTINEL_ALIEN_MAX:
+                        _sentinel_alien_prune(st)
+                return False
+    else:
+        ours = pids
+        if pid not in ours:
+            ours = _sentinel_pids(refresh=True)
+            if pid not in ours:
+                return False
+    ok = bool((hide or minimize_hwnd)(int(hwnd)))
+    if ok:
+        log.info(f"сентинел(хук): спрятал окно hwnd={int(hwnd)} pid={pid}")
+    return ok
+
+
+def sentinel_tick(*, hide=None, rows=None, pids=None,
+                  uv: Optional[Callable[[], bool]] = None) -> dict:
+    """Один быстрый проход: спрятать видимые главные окна наших Chromium."""
+    res = {"ours": 0, "visible": 0, "hidden": 0, "skipped": ""}
+    if os.name != "nt":
+        res["skipped"] = "non-windows"
+        return res
+    if not enabled_by_env():
+        res["skipped"] = "guard_off"
+        return res
+    if _keep_window_env():
+        res["skipped"] = "keep_window"
+        return res
+    if (uv or user_visible)():
+        res["skipped"] = "user_visible"
+        return res
+    hide = hide or minimize_hwnd
+    t_obs = time.monotonic()
+    row_list = rows if rows is not None else list_chrome_windows()
+    cand = [r for r in row_list if r.visible and r.is_main_window]
+    names: Dict[int, str] = {}
+    if pids is None:
+        if not cand:
+            # Нечего решать — не сканируем профили (иначе скан каждые 2 с
+            # даже при пустом рабочем столе; холостая нагрузка демона,
+            # ревью 2026-10-17).
+            return res
+        # Пред-фильтр до скана (как в хуке): чужие chrome.exe из alien-кэша и
+        # не-chrome процессы нашими быть не могут. Без него тик сканировал
+        # профили каждые ~2 с, пока на экране висело ЛЮБОЕ окно chrome.exe —
+        # например, личный Chrome владельца (находка ревью 2026-10-17).
+        st = _SENTINEL
+        alien = (st.get("alien") or {}) if st is not None else {}
+        now = time.monotonic()
+        need = []
+        for r in cand:
+            seen = alien.get(r.pid)
+            if seen and now - seen < _SENTINEL_ALIEN_TTL_S:
+                continue
+            nm = (process_image_basename(r.pid) or "").lower()
+            names[r.pid] = nm
+            if nm and nm not in _CHROME_IMAGE_NAMES:
+                continue
+            need.append(r)
+        cand = need
+        if not cand:
+            return res
+    ours = pids if pids is not None else _sentinel_pids()
+    res["ours"] = len(ours)
+    for row in cand:
+        if row.pid not in ours:
+            # Чужой chrome.exe — в alien-кэш: следующие тики не сканируют
+            # профили ради него. Метка — только если скан ЗАВЕРШИЛСЯ после
+            # наблюдения окна (pids_ts ≥ t_obs) и перечислитель что-то видел
+            # (scan_raw > 0 — тихий пустой скан PS метку не даёт, см.
+            # MAJOR-1 review-skeptic 2026-10-17); иначе `ours` — устаревший
+            # кэш, снятый до спавна нашего браузера, и свежий НАШ pid
+            # застрянет «чужим» на 60 с (находка ревью 2026-10-17, раунд 2).
+            # Без refresh: проход идёт каждые 200 мс, состав обновит TTL-кэш
+            # сам (≤2 с); мгновенный путь — хук.
+            if pids is None and st is not None \
+                    and names.get(row.pid, "") in _CHROME_IMAGE_NAMES \
+                    and st.get("pids_ts", 0.0) >= t_obs \
+                    and st.get("scan_raw", 0) > 0:
+                alien = st.setdefault("alien", {})
+                with st["alien_lock"]:
+                    alien[row.pid] = time.monotonic()
+                    if len(alien) > _SENTINEL_ALIEN_MAX:
+                        _sentinel_alien_prune(st)
+            continue
+        res["visible"] += 1
+        if hide(row.hwnd):
+            res["hidden"] += 1
+            log.info(f"сентинел: спрятал окно pid={row.pid} hwnd={row.hwnd} "
+                     f"'{row.title}' {row.width}x{row.height}")
+    return res
+
+
+def _sentinel_hook_loop(stop: threading.Event) -> None:
+    """Поток хука: EVENT_OBJECT_SHOW со всего рабочего стола → sentinel_on_show."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = _user32()
+    if user32 is None or _WINEVENTPROC is None:
+        return
+    # Типы объявляем ИМЕННО нашему дескриптору (канон _hook_loop): на
+    # глобальном ctypes.windll.user32 restype по умолчанию c_int обрезал
+    # HANDLE хука на x64 — UnhookWinEvent молча не срабатывал.
+    _setup_api(user32)
+
+    def _cb(_hook, event, hwnd, idobject, _idchild, _thread, _ms):
+        try:
+            if event == EVENT_OBJECT_SHOW and idobject == OBJID_WINDOW:
+                sentinel_on_show(int(hwnd))
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"сентинел(хук): {type(e).__name__}: {e}")
+
+    cb = _WINEVENTPROC(_cb)
+    hook = user32.SetWinEventHook(
+        EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, cb, 0, 0,
+        WINEVENT_OUTOFCONTEXT | _WINEVENT_SKIPOWNPROCESS)
+    if not hook:
+        log.warning("сентинел: SetWinEventHook не удался — только быстрый проход")
+        return
+    msg = wintypes.MSG()
+    try:
+        while not stop.is_set():
+            got = user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1)
+            if got:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            else:
+                stop.wait(0.05)
+    finally:
+        user32.UnhookWinEvent(hook)
+
+
+def _sentinel_fast_loop(stop: threading.Event) -> None:
+    while not stop.is_set():
+        try:
+            sentinel_tick()
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"сентинел(проход): {type(e).__name__}: {e}")
+        stop.wait(_SENTINEL_TICK_S)
+
+
+def sentinel_start() -> bool:
+    """Запустить сентинел в текущем процессе (идемпотентно). False — выключен."""
+    global _SENTINEL
+    if os.name != "nt" or not enabled_by_env() or _keep_window_env():
+        return False
+    with _SENTINEL_LOCK:
+        if _SENTINEL is not None:
+            return True
+        stop = threading.Event()
+        _SENTINEL = {"stop": stop, "pids": {}, "pids_ts": 0.0,
+                     "scan_ts": 0.0, "scan_start": 0.0, "scan_raw": 0,
+                     "alien": {}, "alien_lock": threading.Lock(),
+                     "lock": threading.Lock()}
+        threading.Thread(target=_sentinel_hook_loop, args=(stop,),
+                         name="wp-sentinel-hook", daemon=True).start()
+        threading.Thread(target=_sentinel_fast_loop, args=(stop,),
+                         name="wp-sentinel-tick", daemon=True).start()
+        log.info("сентинел показов запущен (хук + проход 200мс)")
+        return True
+
+
+def sentinel_stop() -> None:
+    """Остановить сентинел (тесты / переиспользование процесса)."""
+    global _SENTINEL
+    with _SENTINEL_LOCK:
+        if _SENTINEL is not None:
+            _SENTINEL["stop"].set()
+            _SENTINEL = None

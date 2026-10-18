@@ -99,7 +99,8 @@ class _FakeTesseract:
         self.texts = texts      # {psm: {"text": [...], "conf": [...]}}
         self.calls: list[int] = []
 
-    def __call__(self, img, lang=None, config="", output_type=None):
+    def __call__(self, img, lang=None, config="", output_type=None,
+                 timeout=0):
         parts = config.split()
         psm = int(parts[parts.index("--psm") + 1])
         self.calls.append(psm)
@@ -136,6 +137,40 @@ def test_psm_fallback_when_primary_weak(monkeypatch, img_dir, tmp_path):
     assert rec["mean_conf"] == 85.0
     assert fake.calls == [3, 11]
     assert rec["cache_hit"] is False
+
+
+def test_ocr_one_tesseract_timeout_returns_failed_record(monkeypatch, img_dir,
+                                                         tmp_path):
+    """RuntimeError('Tesseract process timeout') → the file is marked
+    ocr_error and failed=1; the batch neither crashes nor hangs
+    (audit 2026-10-18, B5)."""
+    def _timeout_fake(img, lang=None, config="", output_type=None,
+                      timeout=0):
+        raise RuntimeError("Tesseract process timeout")
+
+    monkeypatch.setattr(O.pytesseract, "image_to_data", _timeout_fake)
+    rec, failed = O._ocr_one(
+        img_dir, str(tmp_path / "cache"), "rus", 3,
+        preproc=False, tessdata_dir=None, tessdata_ver="sys",
+        preproc_ver=O.PREPROC_NONE)
+    assert failed == 1
+    assert rec["ocr_error"] is True
+    assert rec["ocr_error_kind"] == "tesseract_timeout"
+
+
+def test_ocr_one_other_runtime_error_propagates(monkeypatch, img_dir,
+                                                tmp_path):
+    """Other RuntimeErrors (not timeout) propagate as before — a negative
+    fixture for the timeout isolation (audit 2026-10-18, B5)."""
+    def _boom(img, lang=None, config="", output_type=None, timeout=0):
+        raise RuntimeError("tesseract crashed")
+
+    monkeypatch.setattr(O.pytesseract, "image_to_data", _boom)
+    with pytest.raises(RuntimeError):
+        O._ocr_one(
+            img_dir, str(tmp_path / "cache"), "rus", 3,
+            preproc=False, tessdata_dir=None, tessdata_ver="sys",
+            preproc_ver=O.PREPROC_NONE)
 
 
 def test_no_fallback_when_primary_strong(monkeypatch, img_dir, tmp_path):

@@ -5,9 +5,11 @@ search — тонкий оркестратор поверх существующ
 дедуплицирует по pid, собирает каждый товар в ОДНОЙ CDP-сессии, результат —
 структурированный combined-объект для render_search_digest и --out-raw.
 
-Выдача докручивается прокруткой (infiniteVirtualPaginator): товары берутся ТОЛЬКО
-из виджета tileGridDesktop; блоки рекомендаций («Вы смотрели» island, «Возможно,
-вам понравится» skuGrid) в выборку не попадают.
+Выдача докручивается прокруткой (infiniteVirtualPaginator): товары берутся
+только из чанков tileGridDesktop главной сетки; карусели рекомендаций
+(«Вы смотрели», «Возможно, вам понравится») — это СВОИ tileGridDesktop-
+виджеты с заголовком раздела внутри, такие сетки пропускаются (живой дамп
+category-страницы 2026-10-17: до правила собирались чужие товары).
 """
 from __future__ import annotations
 
@@ -88,9 +90,22 @@ SEARCH_JS = r"""
     return sig;
   };
 
+  // Карусели рекомендаций («Вы смотрели», «Возможно, вам понравится») — это
+  // СВОИ виджеты tileGridDesktop, заголовок раздела лежит ВНУТРИ них (живой
+  // дамп category-страницы 2026-10-17: роутер отдавал плитки с чужими
+  // товарами — стиральные гели, краски). Отличаем по заголовку в начале
+  // текста виджета; у главных чанков первым идёт текст первой карточки.
+  const RECO_MARKERS = ['Вы смотрели', 'Возможно, вам понравится',
+                        'Вам может понравиться'];
+  const isRecoGrid = (g) => {
+    const head = (g.textContent || '').replace(/\s+/g, ' ').trim()
+        .slice(0, 160);
+    return RECO_MARKERS.some((m) => head.includes(m));
+  };
   const out = [];
   const seen = new Set();
   for (const g of document.querySelectorAll('[data-widget="tileGridDesktop"]')) {
+    if (isRecoGrid(g)) continue;
     for (const a of g.querySelectorAll('a[href*="/product/"]')) {
       const href = a.getAttribute('href') || '';
       if (!href.startsWith('/product/') && !/^https?:\/\/(www\.)?ozon\.ru\/product\//.test(href)) {
@@ -128,10 +143,17 @@ class CollectionInterrupted(Exception):
     Низкоуровневые search.py/parallel.py никогда не вызывают os._exit() — только
     поднимают/пробрасывают это исключение.
     """
-    def __init__(self, links=None, forced: bool = False):
+    def __init__(self, links=None, forced: bool = False,
+                 skipped_no_reviews=None):
         super().__init__("collection interrupted (forced=%s)" % forced)
         self.links = list(links) if links else []
         self.forced = bool(forced)
+        # Products skipped by the tile signal (tile_no_reviews) at interrupt
+        # time; carried on the exception so a graceful partial result keeps
+        # them in the same shape as the normal _collect_links return
+        # (audit 2026-10-18, B6).
+        self.skipped_no_reviews = (list(skipped_no_reviews)
+                                   if skipped_no_reviews else [])
 
 
 def search_url(query: str) -> str:
@@ -229,12 +251,16 @@ def _collect_links(sess, limit: int, scan_limit: Optional[int] = None,
     for i in range(max_scrolls + 1):
         if force_event is not None and force_event.is_set():
             raise CollectionInterrupted(
-                [{"pid": p, "url": u} for p, u in seen.items()], forced=True)
+                [{"pid": p, "url": u} for p, u in seen.items()], forced=True,
+                skipped_no_reviews=[{"pid": p, "url": u}
+                                    for p, u in no_reviews.items()])
         if stop_event is not None and stop_event.is_set():
             log.info("[stop] прерывание докрутки выдачи (Ctrl+C) — сохраняю "
                      f"частично найденные ссылки ({len(seen)})")
             raise CollectionInterrupted(
-                [{"pid": p, "url": u} for p, u in seen.items()], forced=False)
+                [{"pid": p, "url": u} for p, u in seen.items()], forced=False,
+                skipped_no_reviews=[{"pid": p, "url": u}
+                                    for p, u in no_reviews.items()])
         for item in sess.eval(SEARCH_JS):
             if skip_no_reviews and item.get("tile_no_reviews"):
                 # Видно в плитке, что отзывов нет: заход не тратим.
@@ -866,6 +892,10 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
                     "raw": None, "markdown": "", "cache": "off",
                     "ocr": "off", "recyclable": False,
                     "recycle_attempts": 0,
+                    # Same field contract as normal results (docstring above):
+                    # recovery/QA consumers must not hit KeyError on the
+                    # aborted tail (audit 2026-10-18, B8).
+                    "new_tab_attempts": 0, "recovery_kind": None,
                 })
             return products
         tag = f"[{label}] товар {n}/{total}"
@@ -1107,8 +1137,10 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
         res["recycle_attempts"] = attempts
         nt_used = INCIDENT_NEW_TAB_MAX - incident_new_tab
         res["new_tab_attempts"] = nt_used
-        if last_recovery is not None:
-            res["recovery_kind"] = last_recovery
+        # Uniform contract for every result row (docstring above): the aborted
+        # tail and recovery/QA consumers rely on the key being present even
+        # when no recovery happened (audit 2026-10-18, B8 review follow-up).
+        res["recovery_kind"] = last_recovery
         if res["ok"] and last_recovery == "new_tab":
             recovery["new_tab_successes"] = (
                 recovery.get("new_tab_successes", 0) + 1)
@@ -1157,6 +1189,10 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
                     "raw": None, "markdown": "", "cache": "off",
                     "ocr": "off", "recyclable": False,
                     "recycle_attempts": 0,
+                    # Same field contract as normal results (docstring above):
+                    # recovery/QA consumers must not hit KeyError on the
+                    # aborted tail (audit 2026-10-18, B8).
+                    "new_tab_attempts": 0, "recovery_kind": None,
                 })
             break
         mr = gather_cfg.get("min_rating")
@@ -1219,6 +1255,10 @@ def _collect_shard(sess, manager, items, gather_cfg: dict,
                         "raw": None, "markdown": "", "cache": "off",
                         "ocr": "off", "recyclable": False,
                         "recycle_attempts": 0,
+                        # Same field contract as normal results (docstring
+                        # above): no KeyError for recovery/QA consumers on the
+                        # aborted tail (audit 2026-10-18, B8).
+                        "new_tab_attempts": 0, "recovery_kind": None,
                     })
                 recovery.setdefault("session_blocked", 0)
                 recovery["session_blocked"] += 1

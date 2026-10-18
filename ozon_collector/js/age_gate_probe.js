@@ -1,0 +1,1 @@
+() => /Подтвердите возраст/.test(document.body.innerText || '')

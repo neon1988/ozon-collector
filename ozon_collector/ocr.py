@@ -55,6 +55,12 @@ PREPROC_CLIP_LIMIT = 2.0
 PSM_FALLBACK = 11
 CONF_MIN = 60.0
 TEXT_LEN_MIN = 10
+# Per-image tesseract timeout (seconds); a hung process must not freeze the
+# whole OCR batch (audit 2026-10-18, B5). Env override: OZON_OCR_TIMEOUT_S.
+try:
+    TESSERACT_TIMEOUT_S = int(os.environ.get("OZON_OCR_TIMEOUT_S", "60"))
+except ValueError:
+    TESSERACT_TIMEOUT_S = 60
 
 TESSDATA_BEST_URL = "https://github.com/tesseract-ocr/tessdata_best/raw/main/{lang}.traineddata"
 
@@ -165,6 +171,7 @@ def _run_tesseract(fp: str, lang: str, psm: int, preproc: bool,
         d = pytesseract.image_to_data(
             img, lang=lang, config=config,
             output_type=pytesseract.Output.DICT,
+            timeout=TESSERACT_TIMEOUT_S,
         )
     words, confs = [], []
     for i, w in enumerate(d["text"]):
@@ -273,17 +280,30 @@ def _ocr_one(fp: str, cache_dir: str, lang: str, psm: int, preproc: bool,
                  "cache_hit": False, "ocr_error": True, **meta}, 1)
 
     ran = False
-    text, conf, from_cache = _ocr_psm(fp, md5, cache_dir, lang, psm,
-                                      preproc_ver, preproc, tessdata_dir,
-                                      tessdata_ver)
-    ran = ran or not from_cache
-    if not _accepted(text, conf) and psm != PSM_FALLBACK:
-        text_fb, conf_fb, from_cache_fb = _ocr_psm(
-            fp, md5, cache_dir, lang, PSM_FALLBACK,
-            preproc_ver, preproc, tessdata_dir, tessdata_ver)
-        ran = ran or not from_cache_fb
-        if _better(text, conf, text_fb, conf_fb):
-            text, conf = text_fb, conf_fb
+    try:
+        text, conf, from_cache = _ocr_psm(fp, md5, cache_dir, lang, psm,
+                                          preproc_ver, preproc, tessdata_dir,
+                                          tessdata_ver)
+        ran = ran or not from_cache
+        if not _accepted(text, conf) and psm != PSM_FALLBACK:
+            text_fb, conf_fb, from_cache_fb = _ocr_psm(
+                fp, md5, cache_dir, lang, PSM_FALLBACK,
+                preproc_ver, preproc, tessdata_dir, tessdata_ver)
+            ran = ran or not from_cache_fb
+            if _better(text, conf, text_fb, conf_fb):
+                text, conf = text_fb, conf_fb
+    except RuntimeError as exc:
+        # pytesseract raises RuntimeError('Tesseract process timeout') when
+        # the timeout (passed to image_to_data) expires; a hung tesseract
+        # must fail this image only, not freeze the whole OCR batch
+        # (audit 2026-10-18, B5). Other RuntimeErrors propagate as before.
+        if "timeout" not in str(exc).lower():
+            raise
+        log.warning(f"[ocr] tesseract timeout на {base} "
+                    f"(> {TESSERACT_TIMEOUT_S}s) — пропускаю файл")
+        return ({"path": base, "text": "", "mean_conf": 0.0,
+                 "cache_hit": False, "ocr_error": True,
+                 "ocr_error_kind": "tesseract_timeout", **meta}, 1)
     rec = {"path": base, "text": text, "mean_conf": conf,
            "cache_hit": not ran, **meta}
     return rec, 0
