@@ -1933,8 +1933,18 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
     # Единый логгер демона: оркестратор — владелец файла кампании и ротации.
     # Воркеры (collect_parallel) получают тот же путь через task["worker_log"]
     # и пишут в него в append-режиме без ротации.
-    log.attach_file(LOGS_DIR / f"{campaign}_daemon.log", mode="a",
-                    rotate_max_bytes=5 * 1024 * 1024)
+    # attach идемпотентен ПО ПУТИ: main() подключает тот же файл РАНЬШЕ (до
+    # apply_window_mode/sentinel_start) — до 2026-10-18 стартовые строки
+    # терялись в слепой зоне (файл не подключён — log.py::_write_file роняет
+    # строку), и в логе демона не было ни одного упоминания сентинела.
+    # Сверка именно с путём, а не has_file(): глобальный _fh мог остаться от
+    # другой кампании или прошлого теста — has_file()-guard пропускал attach,
+    # файл не создавался (3 интеграционных теста падали FileNotFoundError,
+    # 2026-10-18).
+    _log_path = LOGS_DIR / f"{campaign}_daemon.log"
+    if log.current_path() != str(_log_path):
+        log.attach_file(_log_path, mode="a",
+                        rotate_max_bytes=5 * 1024 * 1024)
     log.set_context("orchestrator")
 
     camp_dir = CAMPAIGNS_DIR / campaign
@@ -3061,6 +3071,16 @@ def main(argv=None):
         campaign, name_source, name_source_value = args.campaign, "explicit", None
     else:
         campaign, name_source, name_source_value = campaign_from_url(args.url or "")
+    # Лог — ДО трея, apply_window_mode и sentinel_start: до 2026-10-18 attach
+    # жил только в run_campaign (ниже), и все строки старта («режим окна»,
+    # «сентинел запущен», «сентинел НЕ запущен: …») пропадали — _write_file
+    # при неподключённом файле молча роняет строку. run_campaign повторно не
+    # аттачит, если путь совпал (log.current_path()), ротация та же — 5 МБ.
+    # Дубликат запуска дописывает эти стартовые строки в лог живой кампании до
+    # падения на PidLock — ожидаемая диагностика, не молчание.
+    log.attach_file(LOGS_DIR / f"{campaign}_daemon.log", mode="a",
+                    rotate_max_bytes=5 * 1024 * 1024)
+    log.set_context("orchestrator")
     # CLI-режим окна ДО трея и сентинела: они и воркеры читают env. Без
     # --window-mode при resume режим берётся из run_cfg манифеста
     # (инвариант 4): иначе visible-кампания после resume получает

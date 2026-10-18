@@ -83,6 +83,25 @@ def _redirect_launch_logs(tmp_path, monkeypatch):
     monkeypatch.setenv("OZON_LAUNCH_LOG_DIR", str(logs))
 
 
+@pytest.fixture(autouse=True)
+def _mute_early_window_watch(request, monkeypatch):
+    """Ранняя охрана окна не спавнит поток в тестах.
+
+    cdp._watch_launcher_window поднимает daemon-поток на каждый запуск: в
+    наборе поток переживает свой тест и ломает захват вывода pytest (замер
+    2026-10-18: INTERNALERROR «Bad file descriptor» на 3-м тесте
+    test_cdp_launch.py; со снятой веткой кода тот же файл зелёный — 51
+    passed, эксперимент git stash). Логика покрыта напрямую (start=False,
+    test_cdp_launch, маркер allow_early_window_watch), проводка
+    launch_and_wait → функция — тестом с рекордером. Прод не трогается.
+    """
+    if request.node.get_closest_marker("allow_early_window_watch"):
+        return
+    from ozon_collector import cdp as _C
+
+    monkeypatch.setattr(_C, "_watch_launcher_window", lambda *a, **kw: None)
+
+
 ALLOW_LAUNCH_MARK = "allow_browser_launch"
 
 
@@ -91,6 +110,11 @@ def pytest_configure(config):
         "markers",
         f"{ALLOW_LAUNCH_MARK}: тесту разрешён реальный вызов "
         f"_launch_script (лаунчер/Popen замоканы в самом тесте)")
+    config.addinivalue_line(
+        "markers",
+        "allow_early_window_watch: тесту нужна настоящая реализация "
+        "cdp._watch_launcher_window (в наборе глушится "
+        "conftest._mute_early_window_watch)")
     config.addinivalue_line(
         "markers",
         "manual: ручной/демо-прогон, не запускать в обычном наборе "

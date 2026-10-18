@@ -602,6 +602,76 @@ def test_identity_recheck_is_throttled(monkeypatch):
     assert calls["n"] == first + 1, "после паузы сверка повторяется"
 
 
+def test_early_watch_grace_keeps_pid_until_identity_recheck(monkeypatch):
+    """Ранняя регистрация (watch_launcher_pid) не выбрасывается первым тиком.
+
+    Chromium занимает CDP-порт через секунды после CreateProcess, а окно может
+    показаться раньше: мгновенная сверка identity выбрасывала живой pid
+    («не держит порт») и показ никто не гасил — живой замер 2026-10-18,
+    .tmp/gap_harness.py: окно висело 4152 мс. С grace-отметкой первый тик пид
+    не трогает; мёртвый процесс и так отсекает _pid_alive.
+    """
+    fake = FakeWin32(windows=[_win(13, 500, iconic=False)])
+    fake.install(monkeypatch)
+    checked = []
+    monkeypatch.setattr(wp, "_pid_owns_port",
+                        lambda pid, port: checked.append(pid) or False)
+    # Герметично: символ процесса — chrome (в grace каждый тик сверяет образ,
+    # а pid 500 на живой машине мог бы существовать с чужим образом).
+    monkeypatch.setattr(wp, "process_image_basename",
+                        lambda pid: "chrome.exe")
+    g = wp.WindowGuard()
+    g.watch(500, "9222", autostart=False, identity_grace=True)
+    g.tick()
+    assert 500 in g.watched_pids(), "живой pid с grace обязан остаться"
+    assert checked == [], "в grace-окне сверка порта не запускается"
+    assert fake.minimized == [13], "окно обязано сворачиваться в том же тике"
+    g._identity_checked[500] -= (wp.EARLY_WATCH_GRACE_S + 1)
+    g.tick()
+    assert 500 not in g.watched_pids(), "после grace сверка обязана вернуться"
+
+
+def test_early_watch_grace_drops_pid_reused_by_other_process(monkeypatch):
+    """В grace pid, переиспользованный чужим процессом, обязан выпасть.
+
+    До привязки порта идентичность держит только образ процесса: иначе смерть
+    Chrome + реюз pid на чужой процесс свернули бы чужие окна до порт-сверки
+    (находка ревью 2026-10-18).
+    """
+    fake = FakeWin32(windows=[_win(14, 501, iconic=False)])
+    fake.install(monkeypatch)
+    monkeypatch.setattr(wp, "process_image_basename",
+                        lambda pid: "notepad.exe")
+    g = wp.WindowGuard()
+    g.watch(501, "9222", autostart=False, identity_grace=True)
+    g.tick()
+    assert 501 not in g.watched_pids(), "чужой образ обязан снять охрану"
+    assert fake.minimized == [], "чужие окна не трогаем"
+
+
+def test_watch_launcher_pid_gates_hidden_mode(monkeypatch, caplog):
+    """Ранняя охрана: hidden+сторож → watch с identity_grace; иначе — нет."""
+    monkeypatch.setenv("OZON_WINDOW_GUARD", "1")
+    monkeypatch.delenv("OZON_KEEP_WINDOW", raising=False)
+    g = _guard_with(monkeypatch)
+    calls = []
+    monkeypatch.setattr(g, "watch",
+                        lambda pid, port, **kw: calls.append((pid, port, kw)))
+    assert wp.watch_launcher_pid(1234, 9222) is True, \
+        "hidden-режим обязан регистрировать раннего сторожа"
+    assert calls == [(1234, 9222, {"identity_grace": True})], \
+        "ранний watch обязан идти с identity_grace (порт ещё не занят)"
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+    with caplog.at_level("DEBUG", logger="ozon_collector.window_policy"):
+        assert wp.watch_launcher_pid(1234, 9222) is False and len(calls) == 1, \
+            "visible-режим не трогаем (окно должно остаться видимым)"
+    assert "видимы" in caplog.text, "причина отказа обязана попасть в лог"
+    monkeypatch.delenv("OZON_KEEP_WINDOW", raising=False)
+    monkeypatch.setenv("OZON_WINDOW_GUARD", "0")
+    assert wp.watch_launcher_pid(1234, 9222) is False and len(calls) == 1, \
+        "выключенный сторож не регистрируем"
+
+
 @pytest.mark.skipif(wp.os.name != "nt", reason="Windows-only (iphlpapi)")
 def test_port_owner_pids_finds_listener():
     """Сокет-таблица ядра отдаёт pid держателя LISTEN-сокета (без WMI).
@@ -1045,6 +1115,31 @@ class TestSentinel:
                                pids=dict(self._OURS), uv=lambda: False)
         assert hidden == [] and res["skipped"] == "keep_window", \
             "visible-режим (env) обязан отличаться от выключенного гейта"
+
+    def test_sentinel_start_logs_reason(self, monkeypatch, caplog):
+        """False у sentinel_start обязан быть с причиной в логе.
+
+        До 2026-10-18 выход был молчаливым, а стартовая строка терялась в
+        слепой зоне логов демона (attach_file вызывался позже, в
+        run_campaign) — в logs/*_daemon.log ноль упоминаний сентинела при
+        любом исходе (замер 18.10).
+        """
+        import logging
+        monkeypatch.setenv("OZON_WINDOW_GUARD", "0")
+        monkeypatch.delenv("OZON_KEEP_WINDOW", raising=False)
+        with caplog.at_level(logging.WARNING,
+                             logger="ozon_collector.window_policy"):
+            assert wp.sentinel_start() is False
+        assert any("НЕ запущен" in r.getMessage() for r in caplog.records), \
+            "выключенный сторож обязан объяснить отказ в логе"
+        monkeypatch.setenv("OZON_WINDOW_GUARD", "1")
+        monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+        caplog.clear()
+        with caplog.at_level(logging.INFO,
+                             logger="ozon_collector.window_policy"):
+            assert wp.sentinel_start() is False
+        assert any("visible" in r.getMessage() for r in caplog.records), \
+            "visible-режим обязан логировать, почему сентинел не нужен"
 
     def test_on_show_hides_our_window(self, monkeypatch):
         hidden = []

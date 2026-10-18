@@ -365,6 +365,12 @@ if ($targetPid -lt 0) {
     exit 1
 }
 
+# Ранний маркер для коллектора: cdp.launch_and_wait ловит LAUNCHER-PID из лога
+# и берёт окно под охрану ДО connect (щель launch→connect, живой замер
+# 2026-10-18: окно владельца жило видимым ~4 с — скрин в щели). Печатается
+# сразу после CreateProcess, до всех остальных шагов; маркер ASCII.
+Write-Host "LAUNCHER-PID: $targetPid"
+
 function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
     # Применяет к окну WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW, НЕ показывая его:
     # показ даже свёрнутым рождает над панелью задач «мини-плитку-призрак» с
@@ -392,7 +398,13 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
             }
             # SW_HIDE безусловно: если окно всё-таки успело показаться, смена
             # стилей его не прячет и оно остаётся видимым до сторожа (2-7 с).
-            [LaunchChromeMin]::ShowWindow($h, 0) | Out-Null
+            # ShowWindow возвращает ПРЕЖНЮЮ видимость (MS docs) — это датчик
+            # показа в щели (диагностика для прогонов владельца; один раз).
+            $wasVisible = [LaunchChromeMin]::ShowWindow($h, 0)
+            if ($wasVisible -and -not $script:showCaughtLogged) {
+                $script:showCaughtLogged = $true
+                Write-Host "LAUNCHER-DIAG: window pid=$PidToWatch WAS VISIBLE before hide (gap catch)"
+            }
             [void][TaskbarTab]::Delete($h)   # снять кнопку панели задач: смена TOOLWINDOW уже созданную не убирает
             return $true
         }
@@ -437,11 +449,13 @@ $windowVisibleFlag = Join-Path (Split-Path -Parent $PSScriptRoot) "data\window_v
 # НЕ показывая его (оно скрыто с рождения — SW_HIDE).
 $minimized = Invoke-MinimizeNoActivate $targetPid 10000
 
-# Chrome крадёт фокус через 0.3-0.4 с после старта (замер 2026-10-06). Даём
-# краже случиться и сразу возвращаем фокус на место: иначе окно пользователя
-# стоит без фокуса все ~6 с ожидания порта и до connect демона.
-Start-Sleep -Milliseconds 500
-Restore-Focus -PrevFg $prevFg
+# Фокус: Chrome крадёт его через 0.3-0.4 с после старта (замер 2026-10-06).
+# Слепых 500 мс здесь больше НЕТ: они вместе с поздним первым проходом
+# составляли щель, в которой владелец сфотографировал показанное окно (замер
+# 2026-10-18, репро .tmp/gap_harness.py: окно видимо 4014 мс). Возврат фокуса
+# стал отложенным действием CDP-цикла ниже ($focusDone, тик цикла 50 мс).
+$focusDone = $false
+$loopT0 = Get-Date
 
 # Ждём, пока CDP-порт ответит: к этому моменту Chrome закончил старт.
 # Тик 50 мс (а не 500): каждый тик окно перепрятывается — Chrome может
@@ -459,12 +473,28 @@ for ($i = 0; $i -lt 200; $i++) {
     if (-not ($keepWindowMode -or (Test-Path $windowVisibleFlag))) {
         $null = Invoke-MinimizeNoActivate $targetPid 20
     }
+    if (-not $focusDone -and ((Get-Date) - $loopT0).TotalMilliseconds -ge 450) {
+        Restore-Focus -PrevFg $prevFg
+        $focusDone = $true
+    }
+    # Таймаут пробы 1 с, а не 2: при привязанном, но ещё не отвечающем порте
+    # время пробы — слепой слот цикла без пере-скрытия (замер 2026-10-18).
+    # Дробный TimeoutSec НЕЛЬЗЯ: параметр Int32, 0.3 сконвертировался бы в 0
+    # (= бесконечное ожидание, docs: Invoke-RestMethod -ConnectionTimeoutSeconds).
     try {
-        $ver = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 2
+        $ver = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 1
         $ready = $true
         Write-Host "OK: $($ver.Browser) на порту $Port" -ForegroundColor Green
         break
     } catch { }
+}
+if (-not $focusDone) {
+    # Мгновенный успех порта (break на первых итерациях): возврат фокуса
+    # случился бы ДО кражи (Chrome крадёт его на 0.3-0.4 с) — досыпаем
+    # остаток до 450 мс, как в цикле (находка ревью 2026-10-18).
+    $focusLeft = 450 - ((Get-Date) - $loopT0).TotalMilliseconds
+    if ($focusLeft -gt 0) { Start-Sleep -Milliseconds ([int]$focusLeft + 1) }
+    Restore-Focus -PrevFg $prevFg
 }
 # Прокси маскируем (в выводе лаунчера не должно быть пароля).
 $proxyNote = if ($Proxy) {

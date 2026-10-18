@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 from typing import Optional
 
@@ -273,6 +274,49 @@ def _launcher_says_browser_alive(path: str) -> bool:
     return ("is alive" in low) or ("жив" in low)
 
 
+def _watch_launcher_window(cdp_url: str, run, budget_s: float = 20.0,
+                           start: bool = True) -> None:
+    """Ранняя охрана окна: LAUNCHER-PID из лога лаунчера → сторож ДО connect.
+
+    Щель launch→connect не покрыта ничем (живой замер 2026-10-18: окно
+    владельца жило видимым ~4 с — скрин в щели; репро .tmp/gap_harness.py дало
+    hidden_ms=4014 на коде до фикса): WindowGuard появляется лишь в
+    Session._sync_window_guard после connect. Лаунчер печатает LAUNCHER-PID
+    сразу после CreateProcess — ловим в фоне и отдаём pid сторожу немедленно
+    (watch_launcher_pid сам гейтит visible-режим и выключенный сторож). Поток
+    фоновый: путь запуска не тормозим; start=False — синхронный прогон
+    (тесты; в наборе поток глушится conftest._mute_early_window_watch).
+    """
+    def _poll():
+        try:
+            port = P.cdp_port(cdp_url)
+            deadline = time.monotonic() + budget_s
+            while time.monotonic() < deadline:
+                for line in (_launcher_log_tail(run, 60) or "").splitlines():
+                    if "LAUNCHER-PID:" not in line:
+                        continue
+                    try:
+                        pid = int(line.split("LAUNCHER-PID:")[1]
+                                  .strip().split()[0])
+                    except (IndexError, ValueError):
+                        continue
+                    if _WP.watch_launcher_pid(pid, port):
+                        log.info(f"[cdp] ранний сторож окна: pid={pid} "
+                                 f"(LAUNCHER-PID) под охраной до connect")
+                    return
+                time.sleep(0.1)
+            log.debug("[cdp] ранний сторож окна: LAUNCHER-PID не найден в "
+                      "логе лаунчера за %d с" % int(budget_s))
+        except Exception as e:  # noqa: BLE001 — фоновый помощник, не роняем
+            log.debug(f"[cdp] ранний сторож окна: {type(e).__name__}: {e}")
+
+    if not start:
+        _poll()
+        return
+    threading.Thread(target=_poll, name="ozon-launch-watch",
+                     daemon=True).start()
+
+
 def _await_browser(cdp_url: str, run: LaunchRun, deadline: float,
                    grace_s: float = _LAUNCHER_EXIT_GRACE_S) -> bool:
     """Ждать готовности CDP до deadline. False — не дождались.
@@ -504,6 +548,7 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
     run = _launch_browser(cdp_url, profile_path=profile_path,
                           profile_token=profile_token)
     logf = run.path
+    _watch_launcher_window(cdp_url, run)
     ok = _await_browser(cdp_url, run, time.monotonic() + wait_s)
     freed: list[int] = []
     if not ok:
@@ -511,6 +556,7 @@ def launch_and_wait(cdp_url: str = "http://127.0.0.1:9222",
         if freed:
             run = _launch_browser(cdp_url, profile_path=profile_path,
                                   profile_token=profile_token)
+            _watch_launcher_window(cdp_url, run)
             ok = _await_browser(cdp_url, run, time.monotonic() + wait_s)
     try:
         if not ok:

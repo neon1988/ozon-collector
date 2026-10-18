@@ -1,6 +1,10 @@
 # Текущее состояние — ozon-collector
 
-Обновлено 2026-10-17 (8): восьмой заход — код-аудит трёх субагентов по
+Обновлено 2026-10-18 (10): десятый заход — «окно снова видно при старте
+сбора» (скрин владельца 18.10 13:09): щель лаунчер→connect была слепа для
+сторожа, а сверка порта могла выбросить ЖИВОЙ pid до его привязки — фон
+4014 мс, финал 5 мс, verify ALL GREEN. Ранее (9): выполнен план аудита
+`docs/audit_2026-10-18.md` — 10/10, коммит 865bef8. Ранее (8): восьмой заход — код-аудит трёх субагентов по
 жалобе «серые окна с крестиком»: два корня — живые браузеры вне реестра
 сторожа и пустая поверхность окна (occlusion). Ранее (7): седьмой заход —
 «окна открываются при старте
@@ -70,9 +74,82 @@ match_golden_hashes`/`test_golden_hashes_cover_the_whole_registry` — фикс�
 
 **Не проверено вживую:** все окна/браузерные пути (запуски запрещены);
 флеш wincheck1018, видимые консоли воркеров wincheck1019 — ждут команды
-владельца. **Коммит:** владелец подтвердил («комит»); risk-gate требует
-свежий review-skeptic на высокорисковый `ozon_collector/js/auth_dom.js` —
-перезапуск скептика после последних правок.
+владельца. **Коммит:** `865bef8` (master, 42 файла, +3808/−928) — после
+reviewer (round 1+2) и review-skeptic (17/17 staged-blob == HEAD-литералы,
+golden-тест независим — доказано мутацией); risk-gate пропустил.
+
+## Десятый заход (2026-10-18): окно снова видно при старте сбора — щель лаунчер→connect
+
+**Запрос владельца:** скрин 13:09:56–13:10:07 (run2 кампании
+`kabel_perekhodnik_adapter_usb_3_0_sata_lll_dlya_hd`): окно Chromium видимо
+~11 с при старте hidden-сбора.
+
+**Корни (два, оба доказаны живым стендом `.tmp/gap_harness.py`):**
+1. Окно показывает сам Chrome (создание/навигация), гасит его только сторож
+   `WindowGuard`, но guard появляется в `Session._sync_window_guard` ПОСЛЕ
+   connect — отрезок «лаунчер вышел из ожидания CDP → connect» не охранялся
+   никем. У лаунчера при этом были слепые слоты: `Start-Sleep -Milliseconds 500`
+   и REST-проба `-TimeoutSec 2` (Int32: дробная доля молча стала бы 0 =
+   бесконечность).
+2. `_drop_dead_browsers` мог выбросить ЖИВОЙ pid: сверка «pid держит наш
+   CDP-порт» до привязки порта (Chromium занимает 9222 через 7-9 с после
+   CreateProcess; шторм из 8 браузеров — дольше) → guard терял pid, и показ
+   никто не гасил (фон-замер: окно висело 4014 мс).
+
+**Фикс:**
+- `cdp._watch_launcher_window(cdp_url, run, budget_s, start=True)` — ранний
+  пере-навес сторожа на pid лаунчера (маркер `LAUNCHER-PID:` из stdout
+  лаунчера) сразу после CreateProcess; вызовы в обеих ветках launch (:546,
+  :554). `start=False` — синхронный `_poll()` для тестов.
+- `window_policy`: `watch(..., identity_grace=True)` — регистрация ДО привязки
+  порта; первая сверка порта не раньше `EARLY_WATCH_GRACE_S=45.0` от
+  регистрации (метка = `monotonic()+45-IDENTITY_RECHECK_S`, запись под
+  `self._lock`). Контракт `_drop_dead_browsers` (троттлинг 15 с) не тронут.
+  `watch_launcher_pid`/`sentinel_start` логируют reason.
+- `launch_chrome.ps1`: маркер `LAUNCHER-PID:` сразу после
+  `[ChromeLaunch]::Launch`; убран 500-мс sleep; проба `-TimeoutSec 1`;
+  показ-в-catch логируется `LAUNCHER-DIAG ... WAS VISIBLE before hide`;
+  focus-restore ≥450 мс после старта и перед выходом.
+- `log.py` + `key_daemon.py`: `current_path()` вместо `has_file()`; main()
+  аттачит лог рано; `run_campaign` — сверка пути (глобальный `_fh` от прошлой
+  кампании/теста пропускал attach → файл лога не создавался; поймано полным
+  verify: 3 интеграционных теста падали FileNotFoundError).
+
+**Живой замер** (реальные launch→connect, окно-пробник, порог 0.3 с):
+negative со снятым сторожем (`HARNESS_NO_EARLY_WATCH=1`) — `hidden_ms=4014`
+(фон) и `4026` (финал); positive — **`hidden_ms=5`**, в логе
+`[cdp] ранний сторож окна: pid=… под охраной до connect`.
+
+**Тесты (+7):** `test_cdp_launch` — вызов сторожа на обеих ветках launch,
+парсинг `LAUNCHER-PID`, тишина без маркера; `test_window_policy` — grace держит
+pid и не сверяет порт, `watch_launcher_pid` гейтит hidden, reason в логе;
+`test_launch_scripts` — маркер PID и «нет слепых слотов» (≤1 `-TimeoutSec 2`,
+и только до CreateProcess). Ловушка pytest: daemon-тред сторожа ломает
+fd-capture (`OSError: Bad file descriptor` → INTERNALERROR; доказано
+stash-экспериментом) — `tests/conftest.py` autouse-глушилка + маркер
+`allow_early_window_watch`.
+
+**Ревью (medium, субагент), 2 раунда:** BLOCKER/MAJOR нет. Round 1 закрыт:
+запись grace-метки под локом, `EARLY_WATCH_GRACE_S=45`, комментарий про
+дубликат-запуск в логе, тест retry-ветки, `has_file()` удалён, строже
+контракт `-TimeoutSec 2`. Round 2 закрыт: в grace каждый тик сверяется ОБРАЗ
+процесса (`process_image_basename` ∉ chrome — смерть Chrome + реюз pid на
+чужой процесс не попадёт под сворачивание чужих окон; +тест на notepad.exe);
+при мгновенном успехе порта focus-restore ждёт остаток до 450 мс (прежде
+возврат случался ДО кражи фокуса Chrome и был бесполезен); причины False в
+`watch_launcher_pid` пишутся в лог (debug) + проверка в тесте.
+**Не закрыто (сужение scope):** recycle-путь `BrowserProcessManager.launch`
+без ранней охраны — следующий шаг вместе с порт-независимым свипом сирот
+(8-й заход).
+
+**Verify:** `scripts/verify.ps1` — **ALL GREEN** ×2 на финальном коде (run4:
+1794 passed, 304 с; run5 после правок round-2: **1796 passed, 6 skipped,
+1 xfailed, 297 с**). Флейк `test_extract_live_markup[xiaomi]` (`chars=0`) падал
+2 полных прогона из 4 (run1/run3; run2/run4 зелёные; изолированно и файлом
+всегда зелёный) — известный флейк 7-8 заходов, к правкам отношения не имеет
+(файл не тронут). Гипотеза прежняя: гонка `set_content`→`evaluate` в фикстуре
+`evaluate` под нагрузкой (`tests/conftest.py:308`). Следующий шаг: ожидание
+`readyState`/маркера после `set_content`.
 
 ## Восьмой заход (2026-10-17): «серые окна с крестиком» — код-аудит субагентами
 

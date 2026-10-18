@@ -130,6 +130,11 @@ def attach_file(path, mode: str = "a", prefix: str = "",
                  f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
+def current_path() -> str | None:
+    """Путь подключённого файла лога (None — файл не подключён)."""
+    return str(_fh.name) if _fh is not None else None
+
+
 def _write_file(level: str, module: str, msg: str, extra: dict | None = None):
     if _fh is None:
         return

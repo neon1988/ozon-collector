@@ -327,3 +327,43 @@ def test_ps1_keeps_guard_duty_until_daemon_connect():
         "караул не пере-скрывает окно в цикле"
     assert "Start-Sleep -Milliseconds 50" in tail, \
         "караул обязан быть с тиком 50 мс, а не ждать весь таймаут"
+
+
+def test_ps1_prints_launcher_pid_marker():
+    """LAUNCHER-PID печатается сразу после CreateProcess.
+
+    На маркере стоит ранняя регистрация окна в сторожe (cdp._watch_launcher_window):
+    с ним щель launch→connect закрыта, без него окно владельца жило видимым
+    ~4 с (замер 2026-10-18, .tmp/gap_harness.py).
+    """
+    ps1 = _text(PS1)
+    assert "LAUNCHER-PID:" in ps1, "маркер ранней охраны окна потерян"
+    launch = ps1.index("[ChromeLaunch]::Launch($cmdLine)")
+    marker = ps1.index("LAUNCHER-PID:")
+    assert launch < marker, "маркер обязан идти после CreateProcess"
+    assert marker < ps1.index("function Invoke-MinimizeNoActivate"), \
+        "маркер обязан печататься до первого прохода скрытия"
+    assert marker < ps1.index("$focusDone = $false")
+
+
+def test_ps1_no_blind_slots_before_daemon_connect():
+    """Слепые слоты пути запуска закрыты: 500-мс sleep убран, проба 1 с.
+
+    Замер 2026-10-18 (.tmp/gap_harness.py): окно владельца жило видимым
+    4014 мс в щели launch→connect; 500-мс sleep и REST-проба -TimeoutSec 2
+    (Int32-параметр — дробный сконвертировался бы в 0 = бесконечность)
+    блокировали пере-скрытие.
+    """
+    ps1 = _text(PS1)
+    assert "Start-Sleep -Milliseconds 500" not in ps1, \
+        "слепой 500-мс sleep вернулся в путь запуска"
+    assert ps1.count("-TimeoutSec 2") <= 1, \
+        "двухсекундная REST-проба вернулась (в цикле ожидания ей не место)"
+    t2 = ps1.find("-TimeoutSec 2")
+    if t2 != -1:
+        assert t2 < ps1.index("[ChromeLaunch]::Launch($cmdLine)"), \
+            "-TimeoutSec 2 допустим только в pre-start гейте свободного порта"
+    assert ("Invoke-RestMethod -Uri \"http://127.0.0.1:$Port/json/version\" "
+            "-TimeoutSec 1" in ps1), "проба обязана быть 1 с (Int32)"
+    assert "WAS VISIBLE before hide" in ps1, "датчик показа в щели потерян"
+    assert "LAUNCHER-DIAG: window pid=" in ps1

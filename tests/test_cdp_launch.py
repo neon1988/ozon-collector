@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import os
+import time
+import types
 import unittest.mock as mock
 
 import pytest
@@ -47,6 +49,84 @@ class TestLaunchAndWait:
             s.enter_context(p_popen)
             assert cdp.launch_and_wait("http://127.0.0.1:9999", wait_s=5) is True
             m_launch.assert_called_once()
+
+    def test_launch_path_calls_early_window_watch(self):
+        """launch_and_wait обязан звать раннюю охрану окна сразу после запуска.
+
+        Щель launch→connect: живой замер 2026-10-18 (.tmp/gap_harness.py) —
+        окно владельца жило видимым ~4 с, пока его никто не стерёг.
+        """
+        seen = []
+        with ExitStack() as s:
+            p_alive, p_launch, p_popen = _patch_alive([False, True])
+            m_launch = s.enter_context(p_launch)
+            s.enter_context(p_alive)
+            s.enter_context(p_popen)
+            s.enter_context(mock.patch.object(
+                cdp, "_watch_launcher_window",
+                lambda url, run, **kw: seen.append((url, run))))
+            assert cdp.launch_and_wait("http://127.0.0.1:9222",
+                                       wait_s=5) is True
+        assert len(seen) == 1, "ранний сторож обязан подниматься ровно раз"
+        url, run = seen[0]
+        assert url == "http://127.0.0.1:9222"
+        assert run is m_launch.return_value, \
+            "сторожу обязан уходить объект запуска (в нём путь лога)"
+
+    def test_retry_launch_also_under_early_window_watch(self):
+        """Вторая попытка запуска (после освобождения профиля) — под охраной.
+
+        Пока был покрыт только первый вызов: удаление вызова в retry-ветке
+        осталось бы незамеченным (находка ревью 2026-10-18).
+        """
+        seen = []
+        with ExitStack() as s:
+            p_alive, p_launch, p_popen = _patch_alive([False])
+            s.enter_context(p_launch)
+            s.enter_context(p_alive)
+            s.enter_context(p_popen)
+            s.enter_context(mock.patch.object(cdp, "_free_stale_profile",
+                                              return_value=[777]))
+            s.enter_context(mock.patch.object(
+                cdp, "_watch_launcher_window",
+                lambda url, run, **kw: seen.append(url)))
+            with pytest.raises(RuntimeError):
+                cdp.launch_and_wait("http://127.0.0.1:9222", wait_s=0.1)
+        assert seen == ["http://127.0.0.1:9222"] * 2, \
+            "обе попытки запуска обязаны попасть под раннюю охрану"
+
+    @pytest.mark.allow_early_window_watch
+    def test_early_window_watch_from_launcher_log(self, tmp_path):
+        """LAUNCHER-PID из лога лаунчера уходит в сторож ДО connect.
+
+        Прогон синхронный (start=False): поток в наборе глушит
+        conftest._mute_early_window_watch, здесь проверяется сама логика
+        поиска маркера и разбора pid.
+        """
+        logfile = tmp_path / "launch_9222.log"
+        logfile.write_text("text\nLAUNCHER-PID: 4242\n", encoding="utf-8")
+        calls = []
+        with mock.patch.object(
+                cdp._WP, "watch_launcher_pid",
+                lambda pid, port: calls.append((pid, port)) or True):
+            cdp._watch_launcher_window(
+                "http://127.0.0.1:9222",
+                types.SimpleNamespace(path=str(logfile)), start=False)
+        assert calls == [(4242, 9222)], "LAUNCHER-PID не дошёл до сторожа"
+
+    @pytest.mark.allow_early_window_watch
+    def test_early_window_watch_missing_marker_is_silent(self, tmp_path):
+        """Лог без маркера — сторож не зовётся, путь запуска не падает."""
+        logfile = tmp_path / "launch_9222.log"
+        logfile.write_text("no marker here\n", encoding="utf-8")
+        calls = []
+        with mock.patch.object(cdp._WP, "watch_launcher_pid",
+                               lambda *a: calls.append(a)):
+            cdp._watch_launcher_window(
+                "http://127.0.0.1:9222",
+                types.SimpleNamespace(path=str(logfile)), budget_s=0.3,
+                start=False)
+        assert calls == [], "без LAUNCHER-PID сторож не трогается"
 
     def test_timeout_raises(self):
         with ExitStack() as s:

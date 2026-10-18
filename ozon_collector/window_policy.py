@@ -112,6 +112,13 @@ FOCUS_RETRY_S = 3.0
 # каденция остаётся редкой: pid-реюзы редки, а суетиться и спамить лог нечего.
 IDENTITY_RECHECK_S = 15.0
 
+# Ранняя регистрация (watch_launcher_pid) держит pid без сверки порта дольше
+# обычного троттлинга: Chromium занимает CDP-порт через секунды после
+# CreateProcess (замер: 7-9 с; шторм из 8 браузеров — дольше), а сверка «не
+# держит порт» до привязки выбросила бы ЖИВОЙ pid, оставив щель launch→connect
+# без охраны (находка ревью 2026-10-18).
+EARLY_WATCH_GRACE_S = 45.0
+
 # WinEvent-хук мгновенного гашения показа (замер 2026-10-17): Chrome ПОКАЗЫВАЕТ
 # окно сам при создании вкладки через CDP (`PUT /json/new`, Target.createTarget):
 # окно vis=True уже через ~20 мс после запроса. Тик сторожа (150 мс) на такое
@@ -748,17 +755,32 @@ class WindowGuard:
 
     # ---- реестр -----------------------------------------------------------
     def watch(self, pid: Optional[int], port: object = None,
-              autostart: bool = True) -> None:
+              autostart: bool = True, identity_grace: bool = False) -> None:
         """Начать охранять окна браузера pid (идемпотентно).
 
         autostart=False — только зарегистрировать, поток не поднимать:
         используется в тестах решения (tick), чтобы фоновой тик не сработал
         раньше проверки.
+        identity_grace=True — пометить запись свежей: первая плановая сверка
+        «держи ли pid наш CDP-порт» отложится до EARLY_WATCH_GRACE_S от
+        регистрации. Нужно ранней регистрации (watch_launcher_pid): Chromium
+        занимает порт через секунды после CreateProcess (замер: 7-9 с; шторм
+        из 8 браузеров — дольше), а окно может показаться раньше — без grace
+        первый же тик выбрасывал живой pid («не держит порт») и показ никто не
+        гасил (замер 2026-10-18, .tmp/gap_harness.py: окно висело 4152 мс).
         """
         if not pid or os.name != "nt":
             return
         with self._lock:
             self._pids[int(pid)] = str(port or "?")
+            if identity_grace:
+                # Поле значит «когда сверяли»; сверка идёт при
+                # now - last >= IDENTITY_RECHECK_S (см. _drop_dead_browsers).
+                # Сдвинутая метка = первая сверка не раньше
+                # EARLY_WATCH_GRACE_S от регистрации. Запись под локом: тик
+                # сторожа читает поле из другого потока.
+                self._identity_checked[int(pid)] = (
+                    time.monotonic() + EARLY_WATCH_GRACE_S - IDENTITY_RECHECK_S)
         if autostart:
             self.start()
 
@@ -905,6 +927,10 @@ class WindowGuard:
         2026-10-06). Живость проверяется каждый тик (дёшево, без WMI), полная
         сверка «процесс держит наш порт» — раз в IDENTITY_RECHECK_S (дёшево:
         сокет-таблица ядра, PowerShell — только fallback).
+        В grace-окне (ранняя регистрация, порт ещё не привязан) каждый тик
+        сверяется хотя бы образ процесса: нужен для случая «Chrome умер,
+        pid-реюз на чужой процесс» — иначе чужие окна сворачивались бы до 45 с
+        (находка ревью 2026-10-18).
         """
         now = time.monotonic()
         stale = []
@@ -913,6 +939,14 @@ class WindowGuard:
                 stale.append((pid, "процесс мёртв"))
                 continue
             last = self._identity_checked.get(pid, 0.0)
+            if last > now:
+                # grace: метка сдвинута вперёд, порт ещё не наш — проверяем
+                # образ (QueryFullProcessImageNameW, ~мс)
+                image = process_image_basename(pid)
+                if image is not None \
+                        and image.lower() not in _CHROME_IMAGE_NAMES:
+                    stale.append((pid, f"не Chrome ({image})"))
+                    continue
             if now - last < IDENTITY_RECHECK_S:
                 continue
             self._identity_checked[pid] = now
@@ -1518,10 +1552,47 @@ def _sentinel_fast_loop(stop: threading.Event) -> None:
         stop.wait(_SENTINEL_TICK_S)
 
 
+def watch_launcher_pid(pid, port) -> bool:
+    """Взять под охрану окно браузера, только что запущенного лаунчером.
+
+    Закрывает щель launch→connect (2-7 с), где окно некому прятать: WindowGuard
+    регистрируется лишь в Session._sync_window_guard после connect, а у караула
+    лаунчера есть слепые слоты (REST-проба порта). Живой замер 2026-10-18:
+    окно владельца жило видимым ~4 с в этой щели (репро .tmp/gap_harness.py:
+    hidden_ms=4014 на коде до фикса). Гейт — как у sentinel_start: hidden-режим
+    и включённый сторож; видимый режим (трей/keep_window) не трогаем.
+    """
+    if _keep_window_env():
+        log.debug("ранняя охрана не нужна: окна видимы (OZON_KEEP_WINDOW)")
+        return False
+    if not enabled_by_env():
+        log.debug("ранняя охрана выключена: OZON_WINDOW_GUARD=off")
+        return False
+    g = guard()
+    if g is None:
+        log.debug("ранняя охрана не встала: сторож не запущен в процессе")
+        return False
+    g.watch(pid, port, identity_grace=True)
+    return True
+
+
 def sentinel_start() -> bool:
-    """Запустить сентинел в текущем процессе (идемпотентно). False — выключен."""
+    """Запустить сентинел в текущем процессе (идемпотентно). False — выключен.
+
+    Причины False пишутся в лог: до 2026-10-18 выход был МОЛЧАЛИВЫМ, а
+    стартовая строка терялась ещё и в слепой зоне лога демона (attach_file
+    вызывался позже, внутри run_campaign) — в файле не оставалось ни одного
+    упоминания сентинела при любом исходе.
+    """
     global _SENTINEL
-    if os.name != "nt" or not enabled_by_env() or _keep_window_env():
+    if os.name != "nt":
+        log.warning("сентинел показов НЕ запущен: не Windows")
+        return False
+    if not enabled_by_env():
+        log.warning("сентинел показов НЕ запущен: OZON_WINDOW_GUARD выключен")
+        return False
+    if _keep_window_env():
+        log.info("сентинел показов не нужен: режим visible (OZON_KEEP_WINDOW)")
         return False
     with _SENTINEL_LOCK:
         if _SENTINEL is not None:
