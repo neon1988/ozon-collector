@@ -1,6 +1,11 @@
 # Текущее состояние — ozon-collector
 
-Обновлено 2026-10-18 (10): десятый заход — «окно снова видно при старте
+Обновлено 2026-10-18 (11): одиннадцатый заход — «серое окно с крестиком»:
+источник — сам Chrome (`Target.createTarget` показывает окно, фон-флаг не
+помогает), гашение опаздывало на 10-30 мс, и окно успевало мигнуть серым
+пустым прямоугольником. Фикс: скрытое окно паркуется за краем виртуального
+рабочего стола (`park_offscreen`), показ возвращает на экран
+(`bring_onscreen`); живой замер OK. Ранее (10): «окно снова видно при старте
 сбора» (скрин владельца 18.10 13:09): щель лаунчер→connect была слепа для
 сторожа, а сверка порта могла выбросить ЖИВОЙ pid до его привязки — фон
 4014 мс, финал 5 мс, verify ALL GREEN. Ранее (9): выполнен план аудита
@@ -23,6 +28,57 @@ visible, трей — переключатель), «Выход» в трее о
 корень «плитки» — свёрнутое TOOLWINDOW-окно — устранён (только SW_HIDE).
 Ранее: третий заход (GUID DeleteTab, патруль панели задач, balloon); трей-пульт
 («Правка 8»); 15.10 — BLOCKER + все 15 MAJOR аудита починены, verify ALL GREEN.
+
+## Одиннадцатый заход (2026-10-18): «серое окно с крестиком» — показ Chrome на новой вкладке
+
+**Запрос владельца:** окно появляется «одновременно с `[cdp] ранний сторож
+окна`», его нельзя закрыть и сдвинуть, потом исчезает само.
+
+**Живой замер (пассивный монитор рабочего стола, 20 мс, прогон 19:23).**
+`SHOW hwnd=1444244 pid=31276 chrome.exe class=Chrome_WidgetWin_1
+ex=0x08200180 rect=[431,62,1871,962] title='Без имени - Google Chrome'` →
+`HIDE` через **30 мс**; в daemon-логе тот же момент — `access_challenge →
+новая вкладка` и `окно показалось (1440x900) — прячу немедленно (WinEvent)`.
+Окно висит внизу z-порядка (rank 99), поэтому «уходит позади всех окон»,
+а пустое оно потому, что рождено `SW_HIDE` → Chrome считает его occluded и
+не рисует (видна только рамка `#202020` + ×).
+
+**Корень:** окно показывает сам Chrome при `Target.createTarget`
+(`ctx.new_page()`); это не наш код. Проверено живыми стендами:
+`Target.createTarget(background=True)` — окно ВСЁ РАВНО показывается, а
+Playwright не видит «сырой» таргет (pages не растёт). `DWMWA_CLOAK` —
+`DwmSetWindowAttribute` возвращает `E_ACCESSDENIED` (атрибут read-only).
+Единственный рабочий уровень — позиция окна: **скрытое окно parking-ается за
+краем виртуального рабочего стола**. Живой стенд: `SetWindowPos(-3000,100)` →
+`Browser.getWindowBounds` показывает `left=-3000` (CDP-модель синхронна,
+`_assert_geometry_ok` OK), `page.screenshot` работает, `visibilityState=visible`,
+`new_page()` окно на экран не возвращает.
+
+**Фикс:**
+- `window_policy.park_offscreen/bring_onscreen` (`SM_*VIRTUALSCREEN`):
+  `minimize_hwnd` паркует окно ПОСЛЕ `SW_HIDE`, `show_hwnd` возвращает на
+  экран ДО `SW_RESTORE`. Все слои (CDP, сторож, сентинел, свип) наследуют.
+- `scripts/launch_chrome.ps1`: `LaunchChromeMin.ParkOffscreen` в
+  `Invoke-MinimizeNoActivate` после скрытия (первый проход — за миллисекунды
+  после создания окна).
+- `scripts/collector_tray.ps1`: `Minimize` паркует, `Restore`/
+  `RestoreBackground` возвращают на экран (иначе «Развернуть» показал бы
+  пустоту).
+- `cdp._normalize_window_geometry` больше не ставит `left/top=0` (это
+  возвращало окно на экран и серую вспышку): чинится только размер, позиция
+  остаётся текущей.
+
+**Живая проверка нового кода** (стенд на прод-пути
+launch→connect→new_page): после connect `rect=[-1540,100,-100,1000]`,
+CDP bounds `[-1540,100,1440,900]`, geometry OK, screenshot 4888 байт,
+после `new_page()` окно по-прежнему за экраном и скрыто,
+`visibilityState=visible`. Процессы сняты по identity.
+
+**Тесты (+5):** `test_window_policy` — парковка после SW_HIDE, пропуск
+парковки уже за экраном, возврат на экран до SW_RESTORE;
+`test_launch_scripts` — `ParkOffscreen` после `ShowWindow($h,0)`;
+`test_collector_tray` — Minimize паркует, Restore/RestoreBackground
+возвращают. Набор файлов: 140 passed.
 
 ## Девятый заход (2026-10-18): выполнение плана аудита `docs/audit_2026-10-18.md`
 
@@ -129,22 +185,30 @@ fd-capture (`OSError: Bad file descriptor` → INTERNALERROR; доказано
 stash-экспериментом) — `tests/conftest.py` autouse-глушилка + маркер
 `allow_early_window_watch`.
 
-**Ревью (medium, субагент), 2 раунда:** BLOCKER/MAJOR нет. Round 1 закрыт:
+**Ревью (medium, субагент), 3 раунда:** BLOCKER/MAJOR нет. Round 1 закрыт:
 запись grace-метки под локом, `EARLY_WATCH_GRACE_S=45`, комментарий про
 дубликат-запуск в логе, тест retry-ветки, `has_file()` удалён, строже
 контракт `-TimeoutSec 2`. Round 2 закрыт: в grace каждый тик сверяется ОБРАЗ
-процесса (`process_image_basename` ∉ chrome — смерть Chrome + реюз pid на
-чужой процесс не попадёт под сворачивание чужих окон; +тест на notepad.exe);
+процесса (`process_image_basename` ∉ chrome; +тест на notepad.exe);
 при мгновенном успехе порта focus-restore ждёт остаток до 450 мс (прежде
 возврат случался ДО кражи фокуса Chrome и был бесполезен); причины False в
-`watch_launcher_pid` пишутся в лог (debug) + проверка в тесте.
+`watch_launcher_pid` пишутся в лог (debug) + проверка в тесте. Round 3
+(PROBE-пробы ревьюера): образ сверялся лишь 30 из 45 с — дыра t0+30..t0+45
+без любой identity доказана пробой (PROBE2); введён явный `_grace_until`
+(образ каждый тик до первой порт-сверки, метки реестра под локом); тесты
+пинят 15-с границу grace (PROBE1) и хвост grace; PS1-досып до 450 мс добит
+пере-скрытием окна + контракт-тест; сообщение `guard()=None` уточнено.
+Round 4 (мутационная матрица ревьюера): BLOCKER/MAJOR нет; гейт
+visible-режима у PS1-пере-скрытия не был запинен — запинен; `forget()` сажает
+все три словаря под лок; тест режет PS1-блок по границе, не по длине.
 **Не закрыто (сужение scope):** recycle-путь `BrowserProcessManager.launch`
 без ранней охраны — следующий шаг вместе с порт-независимым свипом сирот
 (8-й заход).
 
-**Verify:** `scripts/verify.ps1` — **ALL GREEN** ×2 на финальном коде (run4:
-1794 passed, 304 с; run5 после правок round-2: **1796 passed, 6 skipped,
-1 xfailed, 297 с**). Флейк `test_extract_live_markup[xiaomi]` (`chars=0`) падал
+**Verify:** `scripts/verify.ps1` — **ALL GREEN** ×4 (run4: 1794 passed, 304 с;
+run5 после round-2: 1796, 297 с; run6 после round-3: 1798, 311 с; финальный
+run7 после round-4: **1798 passed, 6 skipped, 1 xfailed, 300 с**). Флейк
+`test_extract_live_markup[xiaomi]` (`chars=0`) падал
 2 полных прогона из 4 (run1/run3; run2/run4 зелёные; изолированно и файлом
 всегда зелёный) — известный флейк 7-8 заходов, к правкам отношения не имеет
 (файл не тронут). Гипотеза прежняя: гонка `set_content`→`evaluate` в фикстуре

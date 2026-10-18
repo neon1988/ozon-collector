@@ -959,9 +959,13 @@ class Session:
                     continue
                 res = sess.send("Browser.getWindowForTarget",
                                 {"targetId": t["targetId"]})
+                # Keep the position: the hidden window is parked beyond the
+                # screen edge (window_policy.park_offscreen) and setWindowBounds
+                # shows it. left/top=0 would bring it back on screen and revive
+                # the grey flash; only the size is fixed here.
                 sess.send("Browser.setWindowBounds", {
                     "windowId": res["windowId"],
-                    "bounds": {"left": 0, "top": 0,
+                    "bounds": {"left": int(phys[0]), "top": int(phys[1]),
                                "width": width, "height": height,
                                "windowState": "normal"},
                 })

@@ -365,5 +365,48 @@ def test_ps1_no_blind_slots_before_daemon_connect():
             "-TimeoutSec 2 допустим только в pre-start гейте свободного порта"
     assert ("Invoke-RestMethod -Uri \"http://127.0.0.1:$Port/json/version\" "
             "-TimeoutSec 1" in ps1), "проба обязана быть 1 с (Int32)"
+
+
+def test_ps1_parks_hidden_window_offscreen():
+    """Скрытое окно уводится за край экрана (серое мигание при старте сбора).
+
+    Chrome показывает своё окно сам (старт/новая вкладка/пазл), гашение
+    опаздывает на миллисекунды — окно успевает мигнуть серым пустым
+    прямоугольником (живой замер 2026-10-18: show→hide 30 мс). За краем
+    виртуального рабочего стола его не видно; CDP-модель следует за позицией.
+    Парковка — строго ПОСЛЕ SW_HIDE.
+    """
+    ps1 = _text(PS1)
+    i = ps1.index("function Invoke-MinimizeNoActivate")
+    block = ps1[i:ps1.index("# Возвращаем фокус окну", i)]
+    assert "ParkOffscreen($h)" in block, "пере-скрытие не паркует окно за экран"
+    assert block.index("ShowWindow($h, 0)") < block.index("ParkOffscreen($h)"), \
+        "парковка обязана идти после SW_HIDE"
+    assert "GetSystemMetrics(78)" in ps1 and "GetSystemMetrics(79)" in ps1, \
+        "ParkOffscreen потерял размеры виртуального экрана"
+    assert "GetWindowRect" in ps1, "ParkOffscreen потерял проверку позиции окна"
+
+
+def test_ps1_focus_restore_waits_out_theft_window():
+    """Мгновенный успех порта: возврат фокуса ждёт 450 мс и перепрятывает окно.
+
+    Chrome крадёт фокус через 0.3-0.4 с после старта: возврат раньше кражи
+    бесполезен, а досып до 450 мс — слепой слот без пере-скрытия (находки
+    ревью 2026-10-18, раунд 3). Гейт visible-режима у пере-скрытия обязателен
+    (иначе лаунчер спрячет развёрнутое пользователем окно — раунд 4).
+    """
+    ps1 = _text(PS1)
+    i = ps1.index("if (-not $focusDone) {")
+    block = ps1[i:ps1.index("\n}", i)]
+    assert ("$focusLeft = 450 - ((Get-Date) - $loopT0).TotalMilliseconds"
+            in block), "досып до 450 мс потерян (возврат фокуса раньше кражи)"
+    assert ("if (-not ($keepWindowMode -or (Test-Path $windowVisibleFlag))) {"
+            in block), "гейт visible-режима у пере-скрытия потерян"
+    order = [block.index("$focusLeft"), block.index("Start-Sleep"),
+             block.index("$keepWindowMode"),
+             block.index("Invoke-MinimizeNoActivate"),
+             block.index("Restore-Focus")]
+    assert order == sorted(order), \
+        "порядок: остаток -> сон -> гейт -> пере-скрытие -> возврат фокуса"
     assert "WAS VISIBLE before hide" in ps1, "датчик показа в щели потерян"
     assert "LAUNCHER-DIAG: window pid=" in ps1

@@ -101,6 +101,24 @@ CHROME_WINDOW_CLASS_PREFIX = "Chrome_WidgetWin_"
 MIN_GUARD_W = 400
 MIN_GUARD_H = 300
 
+# A hidden window is parked beyond the VIRTUAL desktop edge (all monitors):
+# Chrome shows its window by itself (new tab, start, puzzle), and the WinEvent
+# hook suppresses it only after milliseconds — long enough for an empty grey
+# rectangle to flash (live measurement 2026-10-18: show->hide 30 ms, the owner
+# saw it at collection start). A window beyond the screen edge is invisible even
+# then; the CDP model follows the position (Browser.getWindowBounds reports the
+# same left/top), screenshots and visibilityState=visible keep working — proven
+# live. SWP: NOSIZE|NOZORDER|NOACTIVATE.
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+PARK_MARGIN = 100
+ONSCREEN_MARGIN = 100
+_SWP_NOSIZE = 0x0001
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+
 # Пауза между попытками вернуть фокус. Нужна потому, что «лечение» фокуса
 # опирается на синтетический Alt: если не помогло, повтор каждые 150 мс —
 # это уже помеха пользователю, а не помощь.
@@ -259,6 +277,8 @@ def _setup_api(user32) -> None:
     user32.GetClassNameW.restype = I
     user32.GetWindowRect.argtypes = [HWND, P(wintypes.RECT)]
     user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetSystemMetrics.argtypes = [I]
+    user32.GetSystemMetrics.restype = I
     user32.EnumWindows.argtypes = [_ENUMPROC, L]
     user32.EnumWindows.restype = wintypes.BOOL
     # WinEvent-хук показа окон (мгновенное гашение) + насос сообщений потока.
@@ -453,6 +473,90 @@ def delete_taskbar_tab(hwnd: int) -> bool:
         return False
 
 
+def _virtual_screen(user32):
+    """(x, y, w, h) of the virtual desktop (all monitors), or None."""
+    x = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    y = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    w = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    h = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    if w <= 0 or h <= 0:
+        return None
+    return x, y, w, h
+
+
+def _window_rect(user32, hwnd):
+    """(left, top, width, height) of a window, or None."""
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return (rect.left, rect.top, rect.right - rect.left,
+            rect.bottom - rect.top)
+
+
+def _on_screen(rect, screen) -> bool:
+    """Whether the window rectangle intersects the virtual desktop."""
+    x, y, w, h = rect
+    sx, sy, sw, sh = screen
+    return not (x + w <= sx or x >= sx + sw or y + h <= sy or y >= sy + sh)
+
+
+def park_offscreen(hwnd: int) -> bool:
+    """Move a hidden window beyond the virtual desktop edge.
+
+    Chrome SHOWS its window by itself (new tab, start, puzzle); the WinEvent
+    hook suppresses the show within milliseconds, but an empty grey rectangle
+    still flashes (live measurement 2026-10-18: show->hide 30 ms — what the
+    owner saw at collection start). Beyond the screen edge it is invisible even
+    then. Size and z-order are preserved (SWP_NOSIZE|NOZORDER|NOACTIVATE), the
+    CDP model follows the position — geometry and screenshots are unaffected
+    (live stand). True when the window was on screen and got parked.
+    """
+    user32 = _user32()
+    if user32 is None:
+        return False
+    _setup_api(user32)
+    try:
+        screen = _virtual_screen(user32)
+        rect = _window_rect(user32, hwnd)
+        if screen is None or rect is None or not _on_screen(rect, screen):
+            return False
+        _x, _y, w, _h = rect
+        sx, sy, _sw, _sh = screen
+        user32.SetWindowPos(hwnd, 0, sx - w - PARK_MARGIN,
+                            sy + ONSCREEN_MARGIN, 0, 0,
+                            _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
+        return True
+    except Exception as e:
+        log.debug(f"window_policy: park_offscreen err {type(e).__name__}: {e}")
+        return False
+
+
+def bring_onscreen(hwnd: int) -> bool:
+    """Bring a parked window back into the visible area (tray / keep_window).
+
+    A window parked beyond the screen edge stays invisible even when Chrome
+    shows it, so every legitimate show must first return it to the desktop.
+    True when the window was off screen and got moved back.
+    """
+    user32 = _user32()
+    if user32 is None:
+        return False
+    _setup_api(user32)
+    try:
+        screen = _virtual_screen(user32)
+        rect = _window_rect(user32, hwnd)
+        if screen is None or rect is None or _on_screen(rect, screen):
+            return False
+        sx, sy, _sw, _sh = screen
+        user32.SetWindowPos(hwnd, 0, sx + ONSCREEN_MARGIN,
+                            sy + ONSCREEN_MARGIN, 0, 0,
+                            _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
+        return True
+    except Exception as e:
+        log.debug(f"window_policy: bring_onscreen err {type(e).__name__}: {e}")
+        return False
+
+
 def minimize_hwnd(hwnd: int) -> bool:
     """user32: WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW + SW_HIDE — как Session.
 
@@ -469,6 +573,9 @@ def minimize_hwnd(hwnd: int) -> bool:
         # NOACTIVATE — не крадёт фокус; TOOLWINDOW — нет кнопки на панели задач
         user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x00000080)
         user32.ShowWindow(hwnd, 0)                    # SW_HIDE
+        # Park AFTER hiding: Chrome may show the window at any moment, and
+        # beyond the screen edge it is invisible even then.
+        park_offscreen(int(hwnd))
         delete_taskbar_tab(int(hwnd))
         return True
     except Exception as e:
@@ -493,6 +600,9 @@ def show_hwnd(hwnd: int) -> bool:
     try:
         style = user32.GetWindowLongW(hwnd, -20)       # GWL_EXSTYLE
         user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x00000080)
+        # The window may have been parked beyond the screen edge when hidden —
+        # return it to the desktop BEFORE showing, or the user sees nothing.
+        bring_onscreen(int(hwnd))
         user32.ShowWindow(hwnd, 9)                    # SW_RESTORE
         user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0,     # HWND_TOPMOST
                             0x0002 | 0x0001 | 0x0010 | 0x0040)
@@ -746,6 +856,7 @@ class WindowGuard:
         self._last_focus_try: float = 0.0
         self._uv_logged = False                    # «сторож спит» в лог один раз
         self._identity_checked: Dict[int, float] = {}  # pid -> когда сверяли порт
+        self._grace_until: Dict[int, float] = {}       # pid -> конец grace-окна (watch)
         self._fixed = 0                           # счётчик для телеметрии
         self._focus_fixed = 0
         self._hook_thread: Optional[threading.Thread] = None
@@ -777,10 +888,16 @@ class WindowGuard:
                 # Поле значит «когда сверяли»; сверка идёт при
                 # now - last >= IDENTITY_RECHECK_S (см. _drop_dead_browsers).
                 # Сдвинутая метка = первая сверка не раньше
-                # EARLY_WATCH_GRACE_S от регистрации. Запись под локом: тик
-                # сторожа читает поле из другого потока.
+                # EARLY_WATCH_GRACE_S от регистрации. Запись под локом:
+                # тик сторожа читает метку из другого потока.
                 self._identity_checked[int(pid)] = (
                     time.monotonic() + EARLY_WATCH_GRACE_S - IDENTITY_RECHECK_S)
+                # Конец grace-окна: пока не наступил, тик сверяет ОБРАЗ
+                # процесса каждый тик до первой порт-сверки. Между сдвинутой
+                # меткой и порт-сверкой иначе нет identity вообще (дыра
+                # t0+30..t0+45, PROBE2 ревью 2026-10-18).
+                self._grace_until[int(pid)] = (
+                    time.monotonic() + EARLY_WATCH_GRACE_S)
         if autostart:
             self.start()
 
@@ -789,7 +906,8 @@ class WindowGuard:
             return
         with self._lock:
             self._pids.pop(int(pid), None)
-        self._identity_checked.pop(int(pid), None)
+            self._identity_checked.pop(int(pid), None)
+            self._grace_until.pop(int(pid), None)
 
     def watched_pids(self) -> Dict[int, str]:
         with self._lock:
@@ -928,9 +1046,9 @@ class WindowGuard:
         сверка «процесс держит наш порт» — раз в IDENTITY_RECHECK_S (дёшево:
         сокет-таблица ядра, PowerShell — только fallback).
         В grace-окне (ранняя регистрация, порт ещё не привязан) каждый тик
-        сверяется хотя бы образ процесса: нужен для случая «Chrome умер,
+        сверяется образ процесса (_grace_until): случай «Chrome умер,
         pid-реюз на чужой процесс» — иначе чужие окна сворачивались бы до 45 с
-        (находка ревью 2026-10-18).
+        (находки ревью 2026-10-18, раунды 2-3).
         """
         now = time.monotonic()
         stale = []
@@ -938,10 +1056,14 @@ class WindowGuard:
             if not _pid_alive(pid):
                 stale.append((pid, "процесс мёртв"))
                 continue
-            last = self._identity_checked.get(pid, 0.0)
-            if last > now:
-                # grace: метка сдвинута вперёд, порт ещё не наш — проверяем
-                # образ (QueryFullProcessImageNameW, ~мс)
+            with self._lock:
+                last = self._identity_checked.get(pid, 0.0)
+                grace_until = self._grace_until.get(pid, 0.0)
+            if now < grace_until:
+                # grace: порт ещё не сверен — identity держит ОБРАЗ процесса
+                # (QueryFullProcessImageNameW, ~мс) каждый тик, а не только
+                # первые 30 с: иначе реюз pid на чужой процесс свернул бы
+                # чужие окна в хвосте grace-окна (PROBE2 ревью 2026-10-18).
                 image = process_image_basename(pid)
                 if image is not None \
                         and image.lower() not in _CHROME_IMAGE_NAMES:
@@ -949,12 +1071,13 @@ class WindowGuard:
                     continue
             if now - last < IDENTITY_RECHECK_S:
                 continue
-            self._identity_checked[pid] = now
+            with self._lock:
+                self._identity_checked[pid] = now
+                self._grace_until.pop(pid, None)   # порт-сверка состоялась
             if not _pid_owns_port(pid, port):
                 stale.append((pid, f"не держит порт {port}"))
         for pid, why in stale:
-            self.forget(pid)
-            self._identity_checked.pop(pid, None)
+            self.forget(pid)   # снимает pids, метку и grace под локом
             log.info(f"window_policy: pid={pid} убран из охраны ({why}) — "
                      f"окна этого процесса не трогаем")
         return [p for p, _ in stale]
@@ -1570,7 +1693,7 @@ def watch_launcher_pid(pid, port) -> bool:
         return False
     g = guard()
     if g is None:
-        log.debug("ранняя охрана не встала: сторож не запущен в процессе")
+        log.debug("ранняя охрана не встала: guard()=None при включённом стороже (аномалия)")
         return False
     g.watch(pid, port, identity_grace=True)
     return True

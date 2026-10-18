@@ -235,11 +235,35 @@ public class LaunchChromeMin {
 
     [DllImport("user32.dll")] public static extern bool SetWindowPos(
         IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(
+        IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int L, T, R, B; }
 
     // Прижать окно поверх всех (HWND_TOPMOST), не активируя (SWP_NOACTIVATE).
     public static bool SetTopmost(IntPtr hWnd) {
         return SetWindowPos(hWnd, new IntPtr(-1), 0, 0, 0, 0,
                             0x0002 | 0x0001 | 0x0010);  // NOMOVE|NOSIZE|NOACTIVATE
+    }
+
+    // Увести СКРЫТОЕ окно за край виртуального рабочего стола. Chrome
+    // показывает окно сам (старт/новая вкладка/пазл), и пере-скрытие опаздывает
+    // на миллисекунды — окно успевает мигнуть серым пустым прямоугольником
+    // (живой замер 2026-10-18: show->hide 30 мс). За краем экрана его не видно
+    // даже в этот миг; размер и z-порядок не меняются. CDP-модель следует за
+    // позицией, скриншоты/visibility не страдают (живой стенд).
+    public static bool ParkOffscreen(IntPtr hWnd) {
+        RECT r;
+        if (!GetWindowRect(hWnd, out r)) return false;
+        int sw = GetSystemMetrics(78), sh = GetSystemMetrics(79);  // CXV/CYV
+        int sx = GetSystemMetrics(76), sy = GetSystemMetrics(77);  // XV/XYV
+        if (sw <= 0 || sh <= 0) return false;
+        int w = r.R - r.L, h = r.B - r.T;
+        if (r.R <= sx || r.L >= sx + sw || r.B <= sy || r.T >= sy + sh) return false;
+        return SetWindowPos(hWnd, IntPtr.Zero, sx - w - 100, sy + 100, 0, 0,
+                            0x0001 | 0x0004 | 0x0010);  // NOSIZE|NOZORDER|NOACTIVATE
     }
 }
 "@
@@ -401,6 +425,10 @@ function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
             # ShowWindow возвращает ПРЕЖНЮЮ видимость (MS docs) — это датчик
             # показа в щели (диагностика для прогонов владельца; один раз).
             $wasVisible = [LaunchChromeMin]::ShowWindow($h, 0)
+            # Парковка ПОСЛЕ скрытия: показ Chrome (старт/новая вкладка) гасится
+            # хуком/пере-скрытием через миллисекунды, но это ещё видимый миг;
+            # за краем экрана окно не видно даже тогда (замер 2026-10-18).
+            [void][LaunchChromeMin]::ParkOffscreen($h)
             if ($wasVisible -and -not $script:showCaughtLogged) {
                 $script:showCaughtLogged = $true
                 Write-Host "LAUNCHER-DIAG: window pid=$PidToWatch WAS VISIBLE before hide (gap catch)"
@@ -491,9 +519,13 @@ for ($i = 0; $i -lt 200; $i++) {
 if (-not $focusDone) {
     # Мгновенный успех порта (break на первых итерациях): возврат фокуса
     # случился бы ДО кражи (Chrome крадёт его на 0.3-0.4 с) — досыпаем
-    # остаток до 450 мс, как в цикле (находка ревью 2026-10-18).
+    # остаток до 450 мс, как в цикле. Досып — слепой слот: после него один
+    # проход пере-скрытия, и только потом фокус (находки ревью 2026-10-18).
     $focusLeft = 450 - ((Get-Date) - $loopT0).TotalMilliseconds
     if ($focusLeft -gt 0) { Start-Sleep -Milliseconds ([int]$focusLeft + 1) }
+    if (-not ($keepWindowMode -or (Test-Path $windowVisibleFlag))) {
+        $null = Invoke-MinimizeNoActivate $targetPid 20
+    }
     Restore-Focus -PrevFg $prevFg
 }
 # Прокси маскируем (в выводе лаунчера не должно быть пароля).

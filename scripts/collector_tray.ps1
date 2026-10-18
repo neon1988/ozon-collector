@@ -78,6 +78,13 @@ public class CollectorTrayWin {
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError=true)] public static extern int GetWindowLong(IntPtr hWnd, int idx);
     [DllImport("user32.dll", SetLastError=true)] public static extern int SetWindowLong(IntPtr hWnd, int idx, int val);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(
+        IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int L, T, R, B; }
 
     public const int GWL_EXSTYLE = -20;
     public const int WS_EX_NOACTIVATE = 0x08000000;
@@ -115,6 +122,34 @@ public class CollectorTrayWin {
         return IsWindowVisible(h) && !IsIconic(h);
     }
 
+    // Скрытые окна паркуются за краем ВИРТУАЛЬНОГО рабочего стола: Chrome
+    // показывает окно сам (старт/новая вкладка/пазл) и успевает мигнуть серым
+    // прямоугольником до гашения (живой замер 2026-10-18: show->hide 30 мс).
+    // За краем экрана мигания не видно; размер/z-порядок не меняются, CDP
+    // следует за позицией. Показ обязан вернуть окно на экран (BringOnScreen).
+    public static bool ParkOffscreen(IntPtr h) {
+        RECT r;
+        if (!GetWindowRect(h, out r)) return false;
+        int sw = GetSystemMetrics(78), sh = GetSystemMetrics(79);
+        int sx = GetSystemMetrics(76), sy = GetSystemMetrics(77);
+        if (sw <= 0 || sh <= 0) return false;
+        int w = r.R - r.L;
+        if (r.R <= sx || r.L >= sx + sw || r.B <= sy || r.T >= sy + sh) return false;
+        return SetWindowPos(h, IntPtr.Zero, sx - w - 100, sy + 100, 0, 0,
+                            0x0001 | 0x0004 | 0x0010);  // NOSIZE|NOZORDER|NOACTIVATE
+    }
+
+    public static bool BringOnScreen(IntPtr h) {
+        RECT r;
+        if (!GetWindowRect(h, out r)) return false;
+        int sw = GetSystemMetrics(78), sh = GetSystemMetrics(79);
+        int sx = GetSystemMetrics(76), sy = GetSystemMetrics(77);
+        if (sw <= 0 || sh <= 0) return false;
+        if (!(r.R <= sx || r.L >= sx + sw || r.B <= sy || r.T >= sy + sh)) return false;
+        return SetWindowPos(h, IntPtr.Zero, sx + 100, sy + 100, 0, 0,
+                            0x0001 | 0x0004 | 0x0010);
+    }
+
     // Restore = «окно снова обычное»: панель задач + взаимодействие. Оба
     // EX-стиля снимаются (TOOLWINDOW давал «toolbox» — жалоба владельца),
     // кнопку создаём явно: Explorer сам её не создаёт для окна, которое уже
@@ -122,6 +157,7 @@ public class CollectorTrayWin {
     public static void Restore(IntPtr h) {
         int st = GetWindowLong(h, GWL_EXSTYLE);
         SetWindowLong(h, GWL_EXSTYLE, st & ~WS_EX_NOACTIVATE & ~WS_EX_TOOLWINDOW);
+        BringOnScreen(h);
         ShowWindow(h, SW_RESTORE);
         TaskbarTab.Add(h);
         SetForegroundWindow(h);
@@ -133,6 +169,7 @@ public class CollectorTrayWin {
     public static void RestoreBackground(IntPtr h) {
         int st = GetWindowLong(h, GWL_EXSTYLE);
         SetWindowLong(h, GWL_EXSTYLE, st & ~WS_EX_NOACTIVATE & ~WS_EX_TOOLWINDOW);
+        BringOnScreen(h);
         ShowWindow(h, SW_RESTORE);
         TaskbarTab.Add(h);
     }
@@ -144,6 +181,7 @@ public class CollectorTrayWin {
         // Только SW_HIDE: SW_MINIMIZE/SW_SHOWMINNOACTIVE рисуют над панелью
         // задач «мини-плитку-призрак» с крестиком (живой замер 2026-10-16).
         ShowWindow(h, SW_HIDE);
+        ParkOffscreen(h);
     }
 
     public static void EnsureNoTaskbar(IntPtr h) {

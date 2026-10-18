@@ -28,8 +28,15 @@
   показанное и затем скрытое — снова через ~9с. `SW_MINIMIZE` /
   `SW_SHOWMINNOACTIVE` в коде коллектора запрещены (стерегут
   `test_launch_scripts` / `test_collector_tray` / `test_window_policy`).
-  Offscreen-парковка `SetWindowPos(-32000)` кадры и CDP-ввод не рвёт вовсе
-  (замер) — запасной путь, bring-back не доведён.
+  Offscreen-парковка кадры и CDP-ввод не рвёт вовсе (замер 2026-10-16;
+  повторно 2026-10-18: `park_offscreen` + `bring_onscreen` — рабочий канон,
+  CDP bounds следует за позицией, `visibilityState=visible`, screenshot OK).
+  **Chrome показывает окно сам на `Target.createTarget`** (`ctx.new_page()` →
+  серый пустой прямоугольник `#202020` с × на 10-30 мс, пока WinEvent-хук не
+  погасит; замер 2026-10-18). `background:true` НЕ помогает (окно всё равно
+  показывается, а Playwright не видит «сырой» таргет), `DWMWA_CLOAK` —
+  `DwmSetWindowAttribute` = `E_ACCESSDENIED`. Лечится только парковкой окна за
+  краем виртуального рабочего стола; любой показ обязан вернуть его на экран.
   **Основание:** live-замеры 2026-10-16; `docs/tasks/current.md` «Четвёртый
   заход». **Цена ошибки:** два захода мимо (охота на «тосты» и «сторонние
   процессы»), повисший пазл при `drops=0`.

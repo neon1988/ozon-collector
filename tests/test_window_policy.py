@@ -626,6 +626,13 @@ def test_early_watch_grace_keeps_pid_until_identity_recheck(monkeypatch):
     assert 500 in g.watched_pids(), "живой pid с grace обязан остаться"
     assert checked == [], "в grace-окне сверка порта не запускается"
     assert fake.minimized == [13], "окно обязано сворачиваться в том же тике"
+    # Середина grace-окна: за 15-й меткой порт-сверка НЕ запускается —
+    # регресс «grace сжался до IDENTITY_RECHECK_S» ловится именно здесь
+    # (PROBE1 ревью 2026-10-18, раунд 3).
+    g._identity_checked[500] -= (wp.IDENTITY_RECHECK_S + 1)
+    g.tick()
+    assert 500 in g.watched_pids(), "grace держится и после 15-й секунды"
+    assert checked == [], "порт-сверка до EARLY_WATCH_GRACE_S запрещена"
     g._identity_checked[500] -= (wp.EARLY_WATCH_GRACE_S + 1)
     g.tick()
     assert 500 not in g.watched_pids(), "после grace сверка обязана вернуться"
@@ -646,6 +653,27 @@ def test_early_watch_grace_drops_pid_reused_by_other_process(monkeypatch):
     g.watch(501, "9222", autostart=False, identity_grace=True)
     g.tick()
     assert 501 not in g.watched_pids(), "чужой образ обязан снять охрану"
+    assert fake.minimized == [], "чужие окна не трогаем"
+
+
+def test_early_watch_grace_tail_checks_image(monkeypatch):
+    """Хвост grace (порт-сверка ещё не наступила): образ всё ещё сверяется.
+
+    Дыра t0+30..t0+45: сдвинутая метка уже в прошлом, порт-сверка ещё не
+    наступила — без _grace_until этот интервал был без identity вовсе
+    (PROBE2 ревью 2026-10-18, раунд 3).
+    """
+    fake = FakeWin32(windows=[_win(15, 502, iconic=False)])
+    fake.install(monkeypatch)
+    monkeypatch.setattr(wp, "process_image_basename", lambda pid: "notepad.exe")
+    g = wp.WindowGuard()
+    g.watch(502, "9222", autostart=False, identity_grace=True)
+    # Состояние на t0+31: grace-сдвиг метки уже прошёл (метка на секунду в
+    # прошлом), порт-сверка (now - last >= 15) ещё не наступила
+    g._identity_checked[502] -= (wp.EARLY_WATCH_GRACE_S - 14)
+    g.tick()
+    assert 502 not in g.watched_pids(), \
+        "в хвосте grace образ обязан снимать охрану"
     assert fake.minimized == [], "чужие окна не трогаем"
 
 
@@ -997,6 +1025,90 @@ def test_show_hwnd_restores_with_show_window_flag(monkeypatch):
     assert pos_calls == [(-1, 0x0002 | 0x0001 | 0x0010 | 0x0040)], \
         "SetWindowPos: TOPMOST + NOMOVE|NOSIZE|NOACTIVATE|SHOWWINDOW"
     assert deleted == [0x1234], "кнопка панели задач не снята при показе"
+
+
+class _ParkUser32:
+    """Minimal user32 fake: only the calls park/bring need."""
+
+    def __init__(self):
+        self.events = []
+
+    def GetWindowLongW(self, hwnd, idx):
+        return 0
+
+    def SetWindowLongW(self, hwnd, idx, val):
+        return 0
+
+    def ShowWindow(self, hwnd, cmd):
+        self.events.append(("show", cmd))
+        return True
+
+    def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+        self.events.append(("pos", x, y, flags))
+        return True
+
+
+def test_minimize_hwnd_parks_window_offscreen(monkeypatch):
+    """SW_HIDE parks the window beyond the screen edge: Chrome's show is invisible.
+
+    Chrome shows its window by itself (start/new tab/puzzle) and suppression
+    arrives milliseconds late — an empty grey rectangle flashes (live
+    measurement 2026-10-18: show->hide 30 ms). Beyond the virtual desktop edge
+    it is invisible; the CDP model follows the position and screenshots keep
+    working (live stand). Parking goes AFTER the hide.
+    """
+    fake = _ParkUser32()
+    monkeypatch.setattr(wp, "_user32", lambda: fake)
+    monkeypatch.setattr(wp, "_setup_api", lambda user32: None)
+    monkeypatch.setattr(wp, "delete_taskbar_tab", lambda hwnd: True)
+    monkeypatch.setattr(wp, "_virtual_screen", lambda user32: (0, 0, 1920, 1080))
+    monkeypatch.setattr(wp, "_window_rect", lambda user32, hwnd:
+                        (431, 62, 1440, 900))
+    assert wp.minimize_hwnd(0x1234) is True
+    assert ("show", 0) in fake.events, "окно не скрыто (SW_HIDE)"
+    pos = [e for e in fake.events if e[0] == "pos"]
+    assert pos == [("pos", -wp.PARK_MARGIN - 1440, wp.ONSCREEN_MARGIN,
+                    wp._SWP_NOSIZE | wp._SWP_NOZORDER | wp._SWP_NOACTIVATE)], \
+        f"окно не запарковано за краем экрана: {pos}"
+    assert fake.events.index(("show", 0)) < fake.events.index(pos[0]), \
+        "парковка обязана идти ПОСЛЕ скрытия (иначе окно мелькнёт при переносе)"
+
+
+def test_minimize_hwnd_skips_park_when_already_offscreen(monkeypatch):
+    """An already parked window is not moved again (no flash, no extra calls)."""
+    fake = _ParkUser32()
+    monkeypatch.setattr(wp, "_user32", lambda: fake)
+    monkeypatch.setattr(wp, "_setup_api", lambda user32: None)
+    monkeypatch.setattr(wp, "delete_taskbar_tab", lambda hwnd: True)
+    monkeypatch.setattr(wp, "_virtual_screen", lambda user32: (0, 0, 1920, 1080))
+    monkeypatch.setattr(wp, "_window_rect", lambda user32, hwnd:
+                        (-wp.PARK_MARGIN - 1440, wp.ONSCREEN_MARGIN, 1440, 900))
+    assert wp.minimize_hwnd(0x1234) is True
+    assert [e for e in fake.events if e[0] == "pos"] == []
+
+
+def test_show_hwnd_brings_parked_window_onscreen(monkeypatch):
+    """Showing a parked window must first bring it back to the desktop.
+
+    Otherwise the tray ("Развернуть окна сбора") and keep_window would show a
+    window beyond the screen edge — the user would see nothing.
+    """
+    fake = _ParkUser32()
+    monkeypatch.setattr(wp, "_user32", lambda: fake)
+    monkeypatch.setattr(wp, "_setup_api", lambda user32: None)
+    monkeypatch.setattr(wp, "delete_taskbar_tab", lambda hwnd: True)
+    monkeypatch.setattr(wp, "_virtual_screen", lambda user32: (0, 0, 1920, 1080))
+    monkeypatch.setattr(wp, "_window_rect", lambda user32, hwnd:
+                        (-wp.PARK_MARGIN - 1440, wp.ONSCREEN_MARGIN, 1440, 900))
+    assert wp.show_hwnd(0x1234) is True
+    pos = [e for e in fake.events if e[0] == "pos"]
+    assert pos == [
+        ("pos", wp.ONSCREEN_MARGIN, wp.ONSCREEN_MARGIN,
+         wp._SWP_NOSIZE | wp._SWP_NOZORDER | wp._SWP_NOACTIVATE),
+        ("pos", 0, 0, 0x0002 | 0x0001 | 0x0010 | 0x0040),
+    ], f"показ: сначала на экран, затем TOPMOST без сдвига; получено {pos}"
+    assert fake.events.index(pos[0]) < fake.events.index(("show", 9)), \
+        "вернуть на экран нужно ДО SW_RESTORE"
 
 
 def test_cdp_minimize_native_delegates_to_canon():

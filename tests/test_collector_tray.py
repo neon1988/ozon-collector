@@ -203,6 +203,33 @@ def test_tray_hide_uses_sw_hide_not_show_minimized():
     assert "ShowWindow(h, SW_HIDE)" in code, "трей не прячет окно через SW_HIDE"
 
 
+def test_tray_parks_hidden_and_brings_shown_window_onscreen():
+    """Скрытие паркует окно за край экрана, показ возвращает его обратно.
+
+    Chrome показывает окно сам (старт/новая вкладка/пазл) и успевает мигнуть
+    серым прямоугольником до гашения (живой замер 2026-10-18: show→hide 30 мс).
+    За краем экрана показ не виден; любой штатный показ обязан вернуть окно на
+    рабочий стол, иначе «Развернуть окна сбора» покажет пустоту.
+    """
+    t = _text(TRAY)
+    assert "ParkOffscreen" in t and "BringOnScreen" in t, \
+        "трей не паркует/не возвращает окно"
+    mini = t[t.index("public static void Minimize"):]
+    mini = mini[:mini.index("public static void EnsureNoTaskbar")]
+    assert "ShowWindow(h, SW_HIDE)" in mini and "ParkOffscreen(h)" in mini, \
+        "Minimize обязан парковать окно после SW_HIDE"
+    assert mini.index("ShowWindow(h, SW_HIDE)") < mini.index("ParkOffscreen(h)"), \
+        "парковка обязана идти после SW_HIDE"
+    restore = t[t.index("public static void Restore(IntPtr h)"):]
+    restore = restore[:restore.index("public static void RestoreBackground")]
+    assert restore.index("BringOnScreen(h)") < restore.index("ShowWindow(h, SW_RESTORE)"), \
+        "Restore обязан вернуть окно на экран до SW_RESTORE"
+    bg = t[t.index("public static void RestoreBackground"):]
+    bg = bg[:bg.index("public static void Minimize")]
+    assert bg.index("BringOnScreen(h)") < bg.index("ShowWindow(h, SW_RESTORE)"), \
+        "RestoreBackground обязан вернуть окно на экран до SW_RESTORE"
+
+
 def test_tray_restore_makes_normal_taskbar_window():
     """«Развернуть окна сбора» → обычное окно на панели задач, не «toolbox».
 
