@@ -74,11 +74,27 @@ CDP bounds `[-1540,100,1440,900]`, geometry OK, screenshot 4888 байт,
 после `new_page()` окно по-прежнему за экраном и скрыто,
 `visibilityState=visible`. Процессы сняты по identity.
 
-**Тесты (+5):** `test_window_policy` — парковка после SW_HIDE, пропуск
+**Довесок: окно рождается за экраном (запрос владельца «даже на миллисекунду
+не моргало»).** Парковка закрывала показы, но оставалась щель «Chrome создал
+окно на дефолтной позиции → первый проход лаунчера его запарковал». Лечение —
+`--window-position` с координатой за краем виртуального рабочего стола
+(`GetSystemMetrics(76/78)`, ширина окна — один источник с `--window-size`).
+Живой замер с флагом (опрос 5 мс, без сторожа): скрыто на экране в 140 мс,
+переехало за экран в 250 мс, первый показ в 343 мс — уже за экраном.
+Прод-путь launch→connect→new_page с монитором 5 мс: **ноль видимых
+on-screen кадров** у нашего pid (единственный `vis=True` — уже на
+`left=-1540`). Тест `test_ps1_window_is_born_offscreen`.
+
+**Тесты (+6):** `test_window_policy` — парковка после SW_HIDE, пропуск
 парковки уже за экраном, возврат на экран до SW_RESTORE;
-`test_launch_scripts` — `ParkOffscreen` после `ShowWindow($h,0)`;
+`test_launch_scripts` — `ParkOffscreen` после `ShowWindow($h,0)` и
+`--window-position` до CreateProcess;
 `test_collector_tray` — Minimize паркует, Restore/RestoreBackground
-возвращают. Набор файлов: 140 passed.
+возвращают. Набор файлов: 141 passed.
+
+**Verify:** первый полный прогон — 1 падение на известном флейке
+`test_extract_live_markup[xiaomi]` (`chars=0`; файл отдельно 13 passed),
+повторный полный — **1804 passed, 6 skipped, 1 xfailed — ALL GREEN**.
 
 ## Девятый заход (2026-10-18): выполнение плана аудита `docs/audit_2026-10-18.md`
 

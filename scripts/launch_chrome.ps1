@@ -18,6 +18,11 @@ param(
 if (-not $Port) { $Port = "9222" }
 if (-not $Profile) { $Profile = Join-Path $env:LOCALAPPDATA "opencode\ozon-profile" }
 
+# Browser window size (Chromium model + --window-size). The parked off-screen
+# position is computed from it, so the two must stay one constant.
+$winW = 1440
+$winH = 900
+
 # Потолок дискового кеша Chromium. Живой замер 2026-10-07: профиль озона
 # раздувался до 880 МБ, из них Default/Cache 448 МБ + Code Cache 138 МБ — 92%
 # мусора, воспроизводимого заново; состояние сессии (Cookies/Local Storage/
@@ -87,7 +92,7 @@ $chromeArgs = @(
     # профиля. Система сейчас ru-RU, поэтому поведение не меняется, но при
     # смене локали ОС браузер не уедет в en-US (антибот это видит).
     "--lang=ru-RU",
-    "--window-size=1440,900",
+    "--window-size=$winW,$winH",
     # Не показывать баббл «Восстановить страницы?» после насильственного
     # завершения Chrome (kill коллектором) и инфобар WebDriver — они мешают.
     "--disable-session-crashed-bubble",
@@ -376,8 +381,26 @@ if ($listener -or $httpBusy) {
     exit 1
 }
 
+# Окно РОЖДАЕТСЯ за краем виртуального рабочего стола. Chrome сначала создаёт
+# окно с дефолтной позицией, и только потом применяет --window-position; первый
+# проход лаунчера паркует его через миллисекунды, но в этой щели окно может
+# показаться. Живой замер 2026-10-18 (опрос 5 мс): окно скрыто на экране в
+# 140 мс, переехало за экран в 250 мс, первый показ в 343 мс — уже за экраном;
+# ни одного видимого кадра на экране. Позиция — по границам всех мониторов;
+# страховка снизу — ParkOffscreen после каждого скрытия, а любой штатный показ
+# возвращает окно на экран (window_policy.bring_onscreen, трей — BringOnScreen).
+$virtW = [LaunchChromeMin]::GetSystemMetrics(78)
+if ($virtW -le 0) {
+    $parkX = -3000 - $winW
+    $parkY = 100
+} else {
+    $parkX = [LaunchChromeMin]::GetSystemMetrics(76) - $winW - 100
+    $parkY = [LaunchChromeMin]::GetSystemMetrics(77) + 100
+}
+$windowPosArg = "--window-position=$parkX,$parkY"
+
 # Полная командная строка: chrome.exe + аргументы (CreateProcessW, Unicode).
-$allArgs = @($chromeArgs) + @($proxyArg)
+$allArgs = @($chromeArgs) + @($windowPosArg) + @($proxyArg)
 $cmdLine = "`"$Chrome`" " + (($allArgs | Where-Object { $_ }) -join " ")
 # Фокус запоминаем ДО запуска: Chrome крадёт его через 0.3-0.4 с после
 # CreateProcess (замер 2026-10-06), и поздний захват сделал бы «предыдущим»

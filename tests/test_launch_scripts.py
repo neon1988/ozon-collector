@@ -387,6 +387,27 @@ def test_ps1_parks_hidden_window_offscreen():
     assert "GetWindowRect" in ps1, "ParkOffscreen потерял проверку позиции окна"
 
 
+def test_ps1_window_is_born_offscreen():
+    """The window is born beyond the screen edge: no "created -> parked" gap.
+
+    Chrome first creates the window at its default position and applies
+    --window-position right after; the launcher's first pass parks it a few
+    milliseconds later, and in that gap a show could reach the screen (live
+    measurement 2026-10-18, 5 ms sampling: hidden on screen at 140 ms -> moved
+    off screen at 250 ms -> first show at 343 ms already off screen). The
+    position is computed from the virtual desktop of all monitors and must hit
+    the command line BEFORE CreateProcess.
+    """
+    ps1 = _text(PS1)
+    assert "--window-position=" in ps1, "окно не рождается за экраном"
+    assert "[LaunchChromeMin]::GetSystemMetrics(76) - $winW - 100" in ps1, \
+        "позиция не привязана к левому краю виртуального рабочего стола"
+    assert "--window-size=$winW,$winH" in ps1, \
+        "размер окна и парковочная позиция разъехались (один источник)"
+    assert ps1.index("$windowPosArg") < ps1.index("[ChromeLaunch]::Launch"), \
+        "--window-position должен попасть в командную строку до CreateProcess"
+
+
 def test_ps1_focus_restore_waits_out_theft_window():
     """Мгновенный успех порта: возврат фокуса ждёт 450 мс и перепрятывает окно.
 
