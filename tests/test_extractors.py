@@ -50,6 +50,30 @@ def test_extract_live_markup(evaluate, name):
         assert "/cms/" not in u, f"{name}: служебный файл в gallery: {u}"
 
 
+def test_characteristics_not_culled_by_content_visibility(evaluate):
+    """Regression for the xiaomi flake (2026-10-18): content-visibility wrapper.
+
+    Chromium culls layout of a `content-visibility: auto` subtree that is far
+    below the viewport; innerText then returns "" for it and characteristics()
+    yielded {} while rating (outside the wrapper) stayed intact. Fixtures lift
+    the culling via CV_UNSKIP_CSS, so this page must keep its characteristics.
+    """
+    html = (
+        "<html><body>"
+        "<div style='height:9000px'></div>"
+        '<div data-widget="paginator" style="content-visibility:auto">'
+        '<div data-widget="webCharacteristics">'
+        "<dl><dt>Артикул</dt><dd>12345</dd></dl>"
+        "<dl><dt>Бренд</dt><dd>TestBrand</dd></dl>"
+        "</div></div></body></html>")
+    d = evaluate(html=html)
+    chars = d.get("characteristics") or {}
+    assert chars.get("Артикул") == "12345", \
+        f"culling обнулил characteristics: {chars!r}"
+    assert chars.get("Бренд") == "TestBrand", \
+        f"culling обнулил characteristics: {chars!r}"
+
+
 def test_empty_page_no_crash(evaluate):
     d = evaluate(html="<html><body><p>товара нет</p></body></html>")
     assert isinstance(d, dict)

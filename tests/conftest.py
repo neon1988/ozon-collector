@@ -246,6 +246,15 @@ def _redirect_log_dirs(tmp_path, monkeypatch):
 
 
 
+# Chromium culls layout of `content-visibility: auto` subtrees far below the
+# viewport; innerText then returns "" for the whole skipped tree and
+# PRODUCT_JS yields empty characteristics (live xiaomi flake 2026-10-18:
+# chars={} while rating — outside the paginator wrapper — stayed intact).
+# Saved pages keep that wrapper inline, so fixtures force it visible: layout
+# cost is negligible, extraction becomes deterministic.
+CV_UNSKIP_CSS = "[data-widget=paginator]{content-visibility:visible !important}"
+
+
 FIXTURES = {
     "xiaomi": os.path.join(TESTS_DIR, "product_pages", "xiaomi.html.gz"),
     "roborock": os.path.join(TESTS_DIR, "product_pages", "roborock.html.gz"),
@@ -306,6 +315,7 @@ def evaluate(browser):
         page.route("**/*", lambda route: route.abort())
         try:
             page.set_content(html, wait_until="domcontentloaded")
+            page.add_style_tag(content=CV_UNSKIP_CSS)
             return page.evaluate(PRODUCT_JS)
         finally:
             page.close()
@@ -325,6 +335,7 @@ def evaluate_reviews(browser):
         page.route("**/*", lambda route: route.abort())
         try:
             page.set_content(html, wait_until="domcontentloaded")
+            page.add_style_tag(content=CV_UNSKIP_CSS)
             return page.evaluate(REVIEWS_JS)
         finally:
             page.close()
@@ -344,6 +355,7 @@ def evaluate_variant_mode(browser):
         page.route("**/*", lambda route: route.abort())
         try:
             page.set_content(html, wait_until="domcontentloaded")
+            page.add_style_tag(content=CV_UNSKIP_CSS)
             return page.evaluate(VARIANT_MODE_JS)
         finally:
             page.close()
