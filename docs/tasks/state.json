@@ -1,0 +1,13 @@
+{
+  "task": "13th wave: characteristics Ozon 2026-10, window mode, tray exit, hook NIT",
+  "updated_at": "2026-10-19",
+  "verify": "ALL GREEN 1847 passed, 6 skipped, 1 xfailed (303s)",
+  "commits": ["6d3b9e3", "9b4a700"],
+  "next": [
+    "Live check missing: full product collect with the new parser on a real campaign (validated only by live DOM dump and tests) - run a short collect/QA and compare characteristics",
+    "MINOR: internal early-return of _normalize_window_geometry for external is not covered (cdp.py:956) - add a test with a failing fake CDP session",
+    "NIT: launch_chrome.ps1:631 log wording when first hide happened and tray flipped visible before the final snapshot",
+    "NIT: defense-in-depth owner guard in _keep_window_visible (cdp.py:1159-1184)"
+  ],
+  "failed": []
+}
