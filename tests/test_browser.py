@@ -697,6 +697,38 @@ def test_launch_no_process_returns_none(monkeypatch):
     assert m.launch("R1") is None
 
 
+def test_launch_guards_launcher_window_early(monkeypatch):
+    """launch() hands the launcher pid to the early window watcher at once.
+
+    Audit regression 2026-10-19: on the recycle path (restart -> launch) the
+    new pid stayed unguarded until _await_launch returned — the window could
+    flash in the gap.
+    """
+    import types
+    from ozon_collector import cdp as cdp_mod
+    seen, order = [], []
+    monkeypatch.setattr(
+        cdp_mod, "_watch_launcher_window",
+        lambda url, run, **kw: (order.append("watch"),
+                                seen.append((url, run))))
+    m = _patch_manager(monkeypatch, processes=[], cdp_ready=False)
+    sentinel = types.SimpleNamespace(
+        path="t.log", proc=types.SimpleNamespace(poll=lambda: None))
+    monkeypatch.setattr(B, "_launch_script",
+                        lambda cdp_url, profile_path=None,
+                        profile_token=None: sentinel)
+
+    def _rec_await(self, *a, **kw):
+        order.append("await")
+        return None
+
+    monkeypatch.setattr(B.BrowserProcessManager, "_await_launch", _rec_await)
+    assert m.launch("R1") is None
+    assert seen == [("http://127.0.0.1:9222", sentinel)]
+    assert order == ["watch", "await"], \
+        "сторож обязан навешиваться ДО ожидания CDP"
+
+
 def test_launch_multiple_matches_raises(monkeypatch):
     m = _patch_manager(monkeypatch,
                        processes=[_identity(1000), _identity(1001)],

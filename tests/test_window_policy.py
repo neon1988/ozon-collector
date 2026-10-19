@@ -576,6 +576,80 @@ def test_pid_that_stopped_owning_port_is_dropped(monkeypatch):
     assert fake.minimized == []
 
 
+def test_unknown_port_ownership_keeps_pid_watched(monkeypatch):
+    """Unverifiable identity (both checks failed) must NOT evict the pid.
+
+    Audit regression 2026-10-19: _pid_owns_port returned False when the check
+    could not be performed, so a live collector browser fell out of the watch
+    list and its flashing window stayed on screen.
+    """
+    fake = FakeWin32(windows=[_win(13, 500, iconic=False)])
+    fake.install(monkeypatch)
+    monkeypatch.setattr(wp, "_pid_owns_port", lambda pid, port: None)
+    # Детерминизм: на хосте с читаемым pid 500 image-check выкинул бы pid до
+    # probe, и ассерт ниже стал бы вакуумным (review 2026-10-19, pass 4).
+    monkeypatch.setattr(wp, "process_image_basename", lambda pid: None)
+    g = wp.WindowGuard()
+    g.watch(500, "9222", autostart=False)
+    g.tick()
+    assert 500 in g.watched_pids(), \
+        "неизвестная identity выкинула живой pid из охраны"
+    assert fake.minimized == [13], "живой pid продолжает охраняться и гасится"
+
+
+def test_unknown_ownership_backoff_counts_from_probe_end(monkeypatch):
+    """Backoff после недоказуемой identity — от конца probe, не от начала тика.
+
+    Fallback PS-probe штатно может жечь ~20 с (sick WMI); если штамп ставить
+    по `now` начала тика, к следующему тику `now - last` уже превышает
+    IDENTITY_RECHECK_S и probe повторяется каждый тик — backoff не работает
+    (review 2026-10-19, pass 3).
+    """
+    calls = {"n": 0}
+    clock = [1000.0]
+
+    def _owns(pid, port):
+        calls["n"] += 1
+        clock[0] += 21.0           # имитация 20-с таймаута PS-probe
+        return None
+
+    FakeWin32(windows=[_win(13, 500, iconic=False)]).install(monkeypatch)
+    monkeypatch.setattr(wp, "_pid_owns_port", _owns)
+    monkeypatch.setattr(wp, "process_image_basename", lambda pid: None)
+    monkeypatch.setattr(wp.time, "monotonic", lambda: clock[0])
+    g = wp.WindowGuard()
+    g.watch(500, "9222", autostart=False)
+    g.tick()
+    assert calls["n"] == 1
+    clock[0] += 0.2                # следующий тик сразу после probe
+    g.tick()
+    assert calls["n"] == 1, \
+        "probe повторился сразу после медленного — backoff считался не от конца"
+    clock[0] += 2.1                # backoff истёк — probe обязан повториться
+    g.tick()
+    assert calls["n"] == 2, \
+        "backoff навсегда: probe не повторился после ~2 с"
+
+
+def test_unknown_ownership_drops_foreign_image(monkeypatch):
+    """Неизвестная identity + чужой образ → pid уходит из охраны.
+
+    Порт-сверка недоступна, но дешёвый образ процесса решает: pid переиспользован
+    не-Chrome процессом, окна которого гасить нельзя (ревью 2026-10-19, pass 5).
+    """
+    fake = FakeWin32(windows=[_win(13, 500, iconic=False)])
+    fake.install(monkeypatch)
+    monkeypatch.setattr(wp, "_pid_owns_port", lambda pid, port: None)
+    monkeypatch.setattr(wp, "process_image_basename", lambda pid: "notepad.exe")
+    g = wp.WindowGuard()
+    g.watch(500, "9222", autostart=False)
+    g._grace_until[500] = 0.0      # grace истёк — решает только None-ветка
+    g.tick()
+    assert 500 not in g.watched_pids(), \
+        "чужой образ при неизвестной identity остался под охраной"
+    assert fake.minimized == [], "окно чужого процесса не сворачиваем"
+
+
 def test_identity_recheck_is_throttled(monkeypatch):
     """Полная сверка порта — раз в IDENTITY_RECHECK_S, не каждый тик.
 
@@ -742,6 +816,14 @@ def test_pid_owns_port_falls_back_to_cmdline(monkeypatch):
     assert called == [(42, "9222")]
 
 
+def test_pid_owns_port_none_when_unverifiable(monkeypatch):
+    """Both checks unavailable -> None ("unknown"), never False ("not owning")."""
+    monkeypatch.setattr(wp, "port_owner_pids", lambda port: None)
+    monkeypatch.setattr(wp, "_pid_owns_port_via_cmdline",
+                        lambda pid, port: None)
+    assert wp._pid_owns_port(42, "9222") is None
+
+
 def test_should_hide_show_event_matrix():
     """Решение хука показа: фильтр тот же, что у тика (наши окна, не попапы)."""
     base = dict(pid=500, class_name="Chrome_WidgetWin_1", width=1440,
@@ -833,6 +915,28 @@ def test_event_hook_stop_immediately_after_start():
         g._thread.join(timeout=5)
         assert not g._hook_thread.is_alive(), \
             "поток хука пережил stop() — гонка публикации _hook_tid вернулась"
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="поток хука: нужен Windows")
+def test_event_hook_restart_after_stop():
+    """stop() -> start() spawns a fresh pair of guard threads (restartable).
+
+    Audit regression 2026-10-19: the second start() early-returned on the
+    stale _thread (never reset, _stop never re-cleared), so the guard silently
+    stayed down after any stop/start cycle.
+    """
+    g = wp.WindowGuard(poll_s=0.01)
+    g.start()
+    first = g._thread
+    g.stop()
+    assert not first.is_alive(), "первый поток обязан завершиться по stop()"
+    g.start()
+    try:
+        assert g._thread is not None and g._thread.is_alive()
+        assert g._thread is not first
+        assert g._hook_thread is not None and g._hook_thread.is_alive()
+    finally:
+        g.stop()
 
 
 @pytest.mark.skipif(wp.os.name != "nt", reason="kernel32: нужен Windows")

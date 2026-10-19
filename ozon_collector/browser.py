@@ -727,6 +727,13 @@ class BrowserProcessManager:
         wait_s = wait_s or self.launch_wait_s
         run = _launch_script(self.cdp_url, profile_path=self.profile_path,
                              profile_token=self.profile_token)
+        if run is not None:
+            # Recycle path (restart -> launch) used to leave the new pid
+            # unguarded until _await_launch returned: the window could flash
+            # in the gap (audit 2026-10-19). Hand it to the early watcher
+            # right now; late import — cdp imports browser at module level.
+            from . import cdp as _cdp
+            _cdp._watch_launcher_window(self.cdp_url, run)
         return self._await_launch(launch_id, wait_s, run)
 
     def _await_launch(self, launch_id: str, wait_s: float,

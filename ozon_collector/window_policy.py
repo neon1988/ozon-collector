@@ -782,13 +782,16 @@ def process_image_basename(pid: int):
         return None
 
 
-def _pid_owns_port(pid: int, port) -> bool:
+def _pid_owns_port(pid: int, port) -> Optional[bool]:
     """Ровно ли этот PID держит CDP-порт (identity-сверка).
 
     Требуется правилом проекта: трогать можно только процесс, который держит
     наш порт. Быстрый путь — сокет-таблица ядра (port_owner_pids). Fallback —
     командная строка процесса через PowerShell (историческая проверка),
     только если таблицу получить не удалось.
+    None = the check could not be performed at all ("identity unknown");
+    callers must not treat it as "does not own the port" (audit 2026-10-19:
+    a failing check evicted a live pid from the watch list).
     """
     if not port:
         return False
@@ -801,8 +804,12 @@ def _pid_owns_port(pid: int, port) -> bool:
     return _pid_owns_port_via_cmdline(pid, port)
 
 
-def _pid_owns_port_via_cmdline(pid: int, port) -> bool:
-    """Fallback identity: cmdline содержит --remote-debugging-port=port."""
+def _pid_owns_port_via_cmdline(pid: int, port) -> Optional[bool]:
+    """Fallback identity: cmdline содержит --remote-debugging-port=port.
+
+    Returns None when the command line could not be retrieved (query failed
+    or the process vanished mid-check) — unknown, not "does not own the port".
+    """
     import subprocess
     try:
         out = subprocess.run(
@@ -813,10 +820,14 @@ def _pid_owns_port_via_cmdline(pid: int, port) -> bool:
             errors="replace", timeout=20,
             creationflags=(getattr(subprocess, "CREATE_NO_WINDOW",
                                    0x08000000) if os.name == "nt" else 0))
-        cmdline = (out.stdout or "").strip()
     except Exception as e:
         log.debug(f"window_policy: cmdline не прочитан: {type(e).__name__}: {e}")
-        return False
+        return None
+    cmdline = (out.stdout or "").strip()
+    if out.returncode != 0 or not cmdline:
+        # Query failed / process not found: identity неизвестна. Живость
+        # и так проверяется каждым тиком (_pid_alive).
+        return None
     return f"--remote-debugging-port={port}" in cmdline
 
 
@@ -850,6 +861,7 @@ class WindowGuard:
         self.poll_s = poll_s
         self._pids: Dict[int, str] = {}          # pid -> порт (для лога)
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()   # сериализует start()/stop()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_fg: Optional[int] = None       # последнее «пользовательское» окно
@@ -915,31 +927,75 @@ class WindowGuard:
 
     # ---- поток ------------------------------------------------------------
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._loop,
-                                        name="ozon-window-guard", daemon=True)
-        self._thread.start()
-        # Хук показа окон: мгновенное гашение (см. _hook_loop). Отдельный
-        # поток: SetWinEventHook требует насос сообщений, а тик должен идти
-        # своей каденцией.
-        self._hook_thread = threading.Thread(target=self._hook_loop,
-                                             name="ozon-window-guard-hook",
-                                             daemon=True)
-        self._hook_thread.start()
-        log.debug("window_policy: сторож окон стартовал")
+        # Lock-guarded + restartable: racing start() calls (watch() with
+        # autostart from several worker threads) must not spawn duplicate
+        # threads. The lifecycle lock serializes start() against stop() so a
+        # restart cannot resurrect the pair mid-stop (audit 2026-10-19).
+        with self._lifecycle_lock:
+            # A stop() whose join timed out can leave live survivors holding
+            # their handles; join them boundedly BEFORE clearing _stop so a
+            # survivor is not overwritten by a fresh spawn — an unreachable
+            # old hook thread would leak forever (review 2026-10-19, pass 3).
+            # Gated on _stop: only a stop() can leave it set, so a redundant
+            # start() of the running singleton stays instant — joining live
+            # threads unconditionally costs 10 s on the worker connect path
+            # (review 2026-10-19, pass 4).
+            if self._stop.is_set():
+                cur = threading.current_thread()
+                for th in (self._hook_thread, self._thread):
+                    if th is not None and th is not cur and th.is_alive():
+                        th.join(timeout=5.0)
+            with self._lock:
+                self._stop.clear()
+                # Each thread is spawned by its own liveness: a dead hook
+                # next to a live guard must not block the restart, and a
+                # live handle is never overwritten (review 2026-10-19, pass 3).
+                spawned = False
+                if self._thread is None or not self._thread.is_alive():
+                    self._thread = threading.Thread(target=self._loop,
+                                                    name="ozon-window-guard",
+                                                    daemon=True)
+                    self._thread.start()
+                    spawned = True
+                if self._hook_thread is None \
+                        or not self._hook_thread.is_alive():
+                    # Хук показа окон: мгновенное гашение (см. _hook_loop).
+                    # Отдельный поток: SetWinEventHook требует насос сообщений,
+                    # а тик должен идти своей каденцией.
+                    self._hook_thread = threading.Thread(
+                        target=self._hook_loop,
+                        name="ozon-window-guard-hook",
+                        daemon=True)
+                    self._hook_thread.start()
+                    spawned = True
+        if spawned:
+            log.debug("window_policy: сторож окон стартовал")
 
     def stop(self) -> None:
-        self._stop.set()
-        tid = self._hook_tid
-        if tid:
-            try:
-                user32 = _user32()
-                if user32 is not None:
-                    _setup_api(user32)
-                    user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
-            except Exception:
-                pass
+        # Restartable: start() re-clears _stop before spawning. State is read
+        # under self._lock; the lifecycle lock serializes the whole stop()
+        # (including the bounded joins) against start() so a concurrent
+        # restart cannot resurrect _stop or race the thread handles
+        # (review 2026-10-19, pass 2). Joining the current thread would raise,
+        # so a call from a guard thread skips only its own join.
+        with self._lifecycle_lock:
+            with self._lock:
+                self._stop.set()
+                hook_tid = self._hook_tid
+                thread = self._thread
+                hook_thread = self._hook_thread
+            if hook_tid:
+                try:
+                    user32 = _user32()
+                    if user32 is not None:
+                        _setup_api(user32)
+                        user32.PostThreadMessageW(hook_tid, WM_QUIT, 0, 0)
+                except Exception:
+                    pass
+            cur = threading.current_thread()
+            for th in (hook_thread, thread):
+                if th is not None and th is not cur and th.is_alive():
+                    th.join(timeout=5.0)
 
     # ---- WinEvent-хук показа ----------------------------------------------
     def _hook_loop(self) -> None:
@@ -955,11 +1011,13 @@ class WindowGuard:
         if user32 is None or k32 is None or _WINEVENTPROC is None:
             return
         _setup_api(user32)
+        own_tid = int(k32.GetCurrentThreadId())
         msg = wintypes.MSG()
         try:
             # Насос очереди нужен ДО PostThreadMessage из stop().
             user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
-            self._hook_tid = int(k32.GetCurrentThreadId())
+            with self._lock:
+                self._hook_tid = own_tid
             hook = user32.SetWinEventHook(
                 EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, self._hook_proc,
                 0, 0, WINEVENT_OUTOFCONTEXT)
@@ -985,7 +1043,9 @@ class WindowGuard:
         except Exception as e:
             log.debug(f"window_policy: hook err {type(e).__name__}: {e}")
         finally:
-            self._hook_tid = None
+            with self._lock:
+                if self._hook_tid == own_tid:
+                    self._hook_tid = None   # не затираем tid нового потока
 
     def _on_win_event(self, _hook, event, hwnd, id_object, id_child,
                       _event_thread, _event_ms) -> None:
@@ -1071,10 +1131,33 @@ class WindowGuard:
                     continue
             if now - last < IDENTITY_RECHECK_S:
                 continue
+            owns = _pid_owns_port(pid, port)
+            if owns is None:
+                # Unverifiable identity is not proof of innocence: run the
+                # cheap image check even beyond the grace window, otherwise a
+                # pid reused by a foreign non-Chrome process keeps its window
+                # suppressed (review 2026-10-19, pass 3).
+                image = process_image_basename(pid)
+                if image is not None \
+                        and image.lower() not in _CHROME_IMAGE_NAMES:
+                    stale.append((pid, f"не Chrome ({image})"))
+                    continue
+                # Both checks failed, the fallback PS-probe is slow: keep pid
+                # and grace, but back off ~2 s so a sick socket table / WMI
+                # does not spawn a probe every tick. The stamp counts from
+                # the END of the probe: the probe itself can burn up to 20 s,
+                # and a start-of-tick stamp would re-probe every tick
+                # (review 2026-10-19, pass 2 + pass 3).
+                with self._lock:
+                    self._identity_checked[pid] = (
+                        time.monotonic() - IDENTITY_RECHECK_S + 2.0)
+                log.debug(f"window_policy: порт {port} не проверен для "
+                          f"pid={pid} — оставляю под охраной")
+                continue
             with self._lock:
                 self._identity_checked[pid] = now
                 self._grace_until.pop(pid, None)   # порт-сверка состоялась
-            if not _pid_owns_port(pid, port):
+            if owns is False:
                 stale.append((pid, f"не держит порт {port}"))
         for pid, why in stale:
             self.forget(pid)   # снимает pids, метку и grace под локом
