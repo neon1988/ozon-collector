@@ -1545,7 +1545,10 @@ def _await_workers(wctxs: list, deadline: float,
     def _force_stop():
         log.warning("stop: force (Ctrl+C ×2) — принудительно завершаю всех "
                     "воркеров (без респавна)")
-        for wctx in list(wctxs):
+        # all_wctxs, not wctxs: respawned replacements must die too, otherwise
+        # a live replacement keeps running until the daemon's os._exit
+        # (audit 2026-10-19).
+        for wctx in list(all_wctxs):
             if wctx.proc.is_alive() and not wctx.done:
                 _terminate_worker(wctx, "force: 2-й Ctrl+C, emergency stop")
             else:
@@ -1604,7 +1607,10 @@ def _await_workers(wctxs: list, deadline: float,
     while active:
         if force_event is not None and force_event.is_set():
             _force_stop()
-            finalized = [wctx for wctx in wctxs]
+            # Last wins per worker_idx: force must cover respawned
+            # replacements, while dead originals must not duplicate their
+            # payloads in the report (review 2026-10-19).
+            finalized = list({w.worker_idx: w for w in all_wctxs}.values())
             break
         if stop_event is not None and stop_event.is_set():
             log.warning("stop: user interrupt (Ctrl+C) — сворачиваю воркеров, "

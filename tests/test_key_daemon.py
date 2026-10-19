@@ -470,6 +470,67 @@ def test_classify_no_candidates(tmp_path):
     assert r["valid_add"] == [] and r["checked"] == []
 
 
+def test_run_data_dir_reads_run_cfg():
+    """Run data_dir comes from run_cfg; when absent it stays None."""
+    assert k._run_data_dir({"run_cfg": {"data_dir": "X"}}) == "X"
+    assert k._run_data_dir({}) is None
+
+
+def test_classify_null_data_dir_falls_back_to_default(tmp_path, monkeypatch):
+    """data_dir=null must fall back to DEFAULT_DATA_DIR, not reach Path(None).
+
+    Review 2026-10-19: the inline .get() returned None for an explicit null,
+    so classify_new_pids lost the raw dir (or crashed on Path(None)).
+    """
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(k, "DEFAULT_DATA_DIR", tmp_path)
+    prog = _manifest(tmp_path)
+    prog["run_cfg"]["data_dir"] = None
+    calls = []
+
+    def qa(batch):
+        calls.append(tuple(batch))
+        return _make_qa(products=len(batch), ok=len(batch), warn=0, fail=0,
+                        per_pid={p: "OK" for p in batch})
+
+    r = k.classify_new_pids(prog, ["101"], qa_fn=qa)
+    assert calls == [("101",)], \
+        "data_dir=null обязан падать на DEFAULT_DATA_DIR, а не на None"
+    assert r["valid_add"] == ["101"]
+
+
+def test_classify_checks_force_before_qa_batches(tmp_path, monkeypatch):
+    """FORCE (2nd Ctrl+C) is checked before every QA batch call.
+
+    Audit regression 2026-10-19: force exit during a QA phase waited for all
+    batches to finish (minutes). _emergency_shutdown is mocked here (os._exit
+    is impossible in-process); the pinned fact is the order guard -> qa.
+    """
+    import threading as _threading
+    pid = "101"
+    (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")
+    prog = _manifest(tmp_path)
+    order = []
+
+    def _fake_exit(progress_path=None, force=""):
+        order.append(("exit", force))
+
+    monkeypatch.setattr(k, "_emergency_shutdown", _fake_exit)
+    force_ev = _threading.Event()
+    force_ev.set()
+    monkeypatch.setattr(k, "_FORCE_EXIT", force_ev)
+
+    def qa(batch):
+        order.append(("qa", tuple(batch)))
+        return _make_qa(products=len(batch), ok=len(batch), warn=0, fail=0,
+                        per_pid={p: "OK" for p in batch})
+
+    k.classify_new_pids(prog, [pid], qa_fn=qa)
+    assert order and order[0] == ("exit", "qa"), \
+        "guard обязан сработать ДО первого QA-батча"
+    assert ("qa", (pid,)) in order
+
+
 def test_classify_inconsistent_summary_parse_error(tmp_path):
     pid = "101"
     (tmp_path / f"{pid}_raw.json").write_text("{}", encoding="utf-8")

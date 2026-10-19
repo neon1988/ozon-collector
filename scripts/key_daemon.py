@@ -677,6 +677,16 @@ def compute_final(progress: dict, exhausted: bool) -> str:
     return "ABANDONED" if valid < min_valid else None
 
 
+def _run_data_dir(progress: dict) -> Optional[str]:
+    """Run's data_dir from run_cfg (single source of truth for resume).
+
+    Callers must not trust CLI defaults: split_done_pending/pending_pids read
+    raw files from here (audit 2026-10-19 — calls passed no data_dir, so a
+    non-default run dir would look in the wrong place).
+    """
+    return (progress.get("run_cfg") or {}).get("data_dir")
+
+
 def summarize(progress: dict) -> dict:
     return {
         "campaign": progress.get("campaign"),
@@ -686,7 +696,7 @@ def summarize(progress: dict) -> dict:
         "discovered": len(set(progress.get("discovered_pids", []))),
         "failed": len(set(progress.get("failed_pids", []))),
         "permanently_failed": len(set(progress.get("permanently_failed_pids", []))),
-        "pending": len(pending_pids(progress)),
+        "pending": len(pending_pids(progress, _run_data_dir(progress))),
         "runs": len(progress.get("runs", [])),
         "final_state": progress.get("final_state"),
         "final_reason": progress.get("final_reason"),
@@ -1373,7 +1383,7 @@ def classify_new_pids(progress: dict, candidates: Iterable[str],
         получить fallback OK → parse_error=True.
     """
     qa_fn = qa_fn or run_qa_batch
-    data_dir = progress.get("run_cfg", {}).get("data_dir", DEFAULT_DATA_DIR)
+    data_dir = _run_data_dir(progress) or DEFAULT_DATA_DIR
     base_verdicts = dict(progress.get("verdicts", {}))
     verdicts = dict(base_verdicts)
     verdict_meta = dict(progress.get("verdict_meta", {}))
@@ -1397,6 +1407,7 @@ def classify_new_pids(progress: dict, candidates: Iterable[str],
     new_meta: dict[str, dict] = {}
     per_pid_issues: dict[str, list[str]] = {}
     for batch in batch_pids(need, QA_BATCH_SIZE):
+        _force_exit_guard()   # 2nd Ctrl+C: do not wait for the rest of batches
         # fingerprint ДО QA — для race-детекта изменения raw во время чтения
         fp_before = {p: raw_fingerprint(data_dir, p) for p in batch}
         qa = qa_fn(batch)
@@ -1536,7 +1547,7 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
         # дошли (SESSION_EXHAUSTED / BROWSER_DEAD / конец прогона), выкидались
         # из очереди навсегда — в логе «пропущено 336 уже обработанных (осталось
         # 0)» при 66 raw.json на диске. Разбор — в split_done_pending.
-        _done, _retry = split_done_pending(progress)
+        _done, _retry = split_done_pending(progress, _run_data_dir(progress))
         skip_pids = sorted(_done) or None
         # Счётчик попыток для товаров без результата. Без него починка
         # «discovered ≠ собранные» превратилась бы в свой антипаттерн: товар,
@@ -1891,7 +1902,7 @@ def _commit_run_results(progress, progress_path, run_id, mode, targets,
     # без результата — иначе «нормально завершил» выглядит как успех
     # (жалоба 2026-10-06: три запуска подряд 21 → 37 → 58 valid, а демон
     # рапортовал нормальное завершение).
-    _pending = pending_pids(progress)
+    _pending = pending_pids(progress, _run_data_dir(progress))
     log.info(f"[{run_id}] status={status}: discovered "
         f"{len(progress.get('discovered_pids', []))} "
         f"valid {len(progress.get('valid_pids', []))} "
@@ -2631,6 +2642,7 @@ def finalize_campaign(progress: dict, progress_path: Path,
         batches = batch_pids(pids, QA_BATCH_SIZE)
         n = len(batches)
         for bi, batch in enumerate(batches, 1):
+            _force_exit_guard()   # 2nd Ctrl+C: do not wait for the rest
             qa = qa_fn(batch)
             per_pid = qa.get("per_pid") or {}
             if not qa_summary_consistent(qa, len(batch)):
@@ -2759,7 +2771,7 @@ def finalize_campaign(progress: dict, progress_path: Path,
     # из выдачи так и не получила результата, это входит в итог (жалоба
     # 2026-10-06: кампания отчиталась о нормальном завершении, не собрав даже
     # пятой части товаров).
-    _pending_final = pending_pids(progress)
+    _pending_final = pending_pids(progress, _run_data_dir(progress))
     if _pending_final:
         _note = progress.get("final_note") or ""
         _extra = (f"без результата {len(_pending_final)} товаров из выдачи "
@@ -2953,7 +2965,8 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
-def _emergency_shutdown(progress_path: Path, force: str = ""):
+def _emergency_shutdown(progress_path: Optional[Path] = None,
+                        force: str = ""):
     """ЕДИНСТВЕННАЯ точка физического (принудительного) завершения демона.
 
     Вызывается по 2-му Ctrl+C (FORCE) из точек, где замечен _FORCE_EXIT:
@@ -2977,6 +2990,17 @@ def _emergency_shutdown(progress_path: Path, force: str = ""):
         pass
     import os as _os
     _os._exit(1)
+
+
+def _force_exit_guard() -> None:
+    """FORCE (2nd Ctrl+C) during long QA phases: exit immediately.
+
+    QA batches run for minutes; without a check inside the batch loops the
+    force semantics ("exit now") waited for the whole phase to finish (audit
+    2026-10-19). _emergency_shutdown never returns (os._exit).
+    """
+    if _FORCE_EXIT.is_set():
+        _emergency_shutdown(force="qa")
 
 
 def _validated_url(args, attr: str, flag: Optional[str] = None) -> str:

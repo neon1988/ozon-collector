@@ -535,6 +535,36 @@ def test_await_force_priority_over_stop(monkeypatch):
     assert len(out) == 1 and out[0] is w
 
 
+def test_await_force_stop_covers_restarted_replacement(monkeypatch):
+    """Force stop must also terminate a respawned replacement.
+
+    Audit regression 2026-10-19: _force_stop iterated the original wctxs list
+    only, so a live replacement kept running until the daemon's os._exit.
+    """
+    import threading as _t
+    dead = _mk_worker(worker_id=1, done=True, exitcode=1,
+                      payload={"fatal_error": "boom"}, pending=[1, 3])
+    repl = _mk_worker(worker_id=1, done=False, alive=True, pending=[1, 3])
+    repl.last_activity = time.monotonic()
+    force = _t.Event()
+
+    def fake_respawn(*a, **k):
+        _t.Timer(0.2, force.set).start()
+        return repl
+
+    monkeypatch.setattr(PL, "_respawn", fake_respawn)
+    out = PL._await_workers([dead], deadline=time.monotonic() + 30,
+                            max_worker_restarts=2,
+                            items_by_index={1: ("1001", "u")},
+                            gather_cfg={}, max_recycles=2,
+                            session_budget=None, poll=0.01,
+                            force_event=force)
+    assert not repl.proc.is_alive(), \
+        "замена пережила форс-стоп — сила не покрыла респавн"
+    assert out == [repl], \
+        "финализация: только замена (дедуп по worker_idx), без дублей"
+
+
 # ---- _collect_worker_payloads (регрессия dc9edcd, аудит 2026-10-15) ----------
 
 def test_collect_payloads_no_keyerror_on_terminate_done_batch():
