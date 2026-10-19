@@ -49,9 +49,13 @@
    2026-10-16). hidden (по умолчанию): ни одно окно сбора не показывается.
    visible («Развернуть окна сбора»): все окна сбора показаны обычными окнами
    с кнопками панели задач; сторож и пазл-съёмка не перечат пользователю.
-   Режим — файл `data/window_visible.flag` (`window_policy.USER_VISIBLE_FLAG`);
-   пишет только трей, сбрасывает `key_daemon` при старте сбора. «Выход» в
-   трее останавливает и сбор (Ctrl+C демону; `collector_tray.ps1 -SendCtrlC`).
+   Режим — файл `data/window_visible.flag` (`window_policy.USER_VISIBLE_FLAG`):
+   `1` — visible, `0` — hidden, нет файла — решает env. Консольный env задаёт
+   стартовый режим, после старта главный трей: явный `0` сильнее
+   `OZON_KEEP_WINDOW` (решение владельца 2026-10-19). Пишет только трей,
+   сбрасывает `key_daemon` при старте сбора. «Выход» в трее останавливает и
+   сбор (Ctrl+C демону; `collector_tray.ps1 -SendCtrlC`), а при сбое WMI
+   проверяет демона по `data/key_daemon.pid` (pid + started_at).
 
 Формулировки и основания: `docs/architecture/invariants.md`.
 

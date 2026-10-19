@@ -51,7 +51,7 @@
   },
   "run_cfg_hash": "sha256...", // fingerprint run_cfg; ручная правка → run_cfg_modified
 
-  "qa_version": "1.5",          // версия QA-логики; инвалидирует verdict_meta при изменении
+  "qa_version": "1.8",          // версия QA-логики (key_daemon.QA_VERSION); инвалидирует verdict_meta при изменении
 
   "campaign_identity": {        // идентичность кампании (защита от смены категории при resume)
     "url_sha256": "sha256...",
@@ -70,7 +70,7 @@
   "verdict_meta": {           // fingerprint QA-кэша пида (инвалидация вердикта)
     "123": {"verdict": "OK", "raw_mtime_ns": 1725100800123456789,
             "raw_sha256": "ab12...", "raw_size": 2048,
-            "qa_version": "1.5", "qa_at": "2026-08-31T10:01:00+00:00"}
+            "qa_version": "1.8", "qa_at": "2026-08-31T10:01:00+00:00"}
   },
 
   "running_rescans": {"789": 1},           // PID → число попыток rescan

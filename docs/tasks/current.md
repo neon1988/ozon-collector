@@ -1,6 +1,23 @@
 # Текущее состояние — ozon-collector
 
-Обновлено 2026-10-19 (12): двенадцатый заход — аудит трёх субагентов (зоны:
+Обновлено 2026-10-19 (13): тринадцатый заход — ответы владельца на 5 вопросов
+ревью: (1) production-потеря характеристик починена под новую разметку Ozon
+2026-10 (хешированные классы, строки из двух DIV, `dl=0`): структурный парсер
++ text-pair fallback под env-флагом + скролл виджета при пустом первом
+извлечении + `EMPTY_CHARACTERISTICS` WARN в QA; (2) режим окон: консольный env —
+стартовый, после старта главный трей (флаг `1`/`0`, явный `0` сильнее env);
+(3) «Выход» в трее останавливает демона и при сбое WMI (pidfile + StartTime);
+(4) NIT рестарта hook-потока закрыт (`_hook_quit_sent`); (5) ревью-раунд 2:
+BLOCKER visible-режима (трей гасил окна при `--window-mode visible`) + 3 MAJOR
++ MINOR закрыты: сентинел стартует и в visible и перепроверяет режим перед
+каждым скрытием, частичные characteristics ретраятся (`char_meta.full_empty`
+или `full_rows=0`), QA-кэш 1.8, stale-трей снимается до сброса флага, пустой
+флаг = env везде; (6) повторное ревью: чужой Chrome (`external`) не трогается
+даже при tray-`"1"`; реальный `content-visibility:auto` ниже фолда даёт
+`full_rows=0` (доказано пробой и тестом).
+Verify: **ALL GREEN — 1847 passed, 6 skipped, 1 xfailed** (303 с); порт-тесты
+прошли после завершения кампании владельца. Ранее (12):
+двенадцатый заход — аудит трёх субагентов (зоны:
 экстракторы/тесты, окно-лаунчер-сторож, демон/оркестрация) + 8 фиксов (A–H):
 флейк xiaomi — `content-visibility`, а не гонка; трей читал сбой WMI как
 «демона нет»; `WindowGuard` не перезапускался; живой pid выкидывался на
@@ -39,6 +56,102 @@ visible, трей — переключатель), «Выход» в трее о
 корень «плитки» — свёрнутое TOOLWINDOW-окно — устранён (только SW_HIDE).
 Ранее: третий заход (GUID DeleteTab, патруль панели задач, balloon); трей-пульт
 («Правка 8»); 15.10 — BLOCKER + все 15 MAJOR аудита починены, verify ALL GREEN.
+
+## Тринадцатый заход (2026-10-19): характеристики под новую разметку + решения владельца
+
+**Запрос владельца (ответы на 5 открытых вопросов):** характеристики «нужно
+исправлять срочно»; режим окон — главный параметр в консоли при запуске, дальше
+меняется иконкой в трее; textContent-fallback — «ладно»; «трей должен убивать
+демона»; NIT хука — «чини». Кампанию владелец запускает сам.
+
+**Разметка (доказано live-снапшотом `data/1000750402/dom/2026-10-02.html.gz`):**
+`dl=0`, `pdp_bp=7`, `webShortCharacteristics` есть. Строка — `div.pdp_bp` с
+ровно двумя DIV-детьми (ключ `pdp_o6b`, значение `pdp_ob7`; бренд — внутри
+`<a>`); шапка `pdp_ob9` (span + div) структурой отсекается. Старый парсер
+(`dl`/`[class*="Row"]`) возвращал `{}` — потеря тихая.
+
+**Фиксы:**
+- `product.js`: `charRows()` — структурный скан строк (2 DIV-ребёнка, ключ ≤60,
+  значение ≤300, дедуп, blocklist шапки «О товаре/Перейти к описанию»), после
+  `dl` и ДО глобальных fallback; строки из обоих виджетов сливаются, любая
+  непустая строка важнее глобального `dl`; `char_meta` (full_present/
+  full_rows/full_empty/source) — сигнал для ретрая; text-pair fallback только
+  при `opts.char_text_fallback`, шапка вырезается ДО спаривания (сдвиг пар).
+- `collect.py`: opts в `page.evaluate`; ретрай при пустых ИЛИ при неполном
+  полном виджете (`char_meta.full_empty` ИЛИ `full_rows=0` — заголовок без
+  строк); short-подмножество сохраняется, если полный виджет так и остался
+  без строк; `scrollIntoView` — `webCharacteristics`, иначе short
+  (content-visibility).
+- `qa_raw.py`: `EMPTY_CHARACTERISTICS` WARN (потеря видна, но не бракует);
+  `QA_VERSION` 1.7→1.8 — старые verdict_meta перепроверяются.
+- Окна: `user_visible()` = файл есть, непустой и ≠ `"0"`; `user_hidden()` =
+  `"0"`; пустой файл = отсутствие, решает env (Python/трей/лаунчер
+  согласованы); `_keep_window_env()` и `cdp` уважают `"0"`, а трей-`"1"`
+  включает keep поверх env=0 (effective keep); сентинел стартует и в стартовом
+  visible и перепроверяет режим перед каждым скрытием (тик и хук); лаунчер:
+  `Test-ShowAnyway` перечитывает флаг в стартовом цикле, первом/финальном
+  скрытии и карауле; `_minimize_window` не зовёт native-hide при tray `"1"`;
+  `browser_owner="external"` → политика окна не применяется вовсе.
+- Трей: absent/пустой флаг → env (иначе патруль гасил `--window-mode visible`);
+  `Test-DaemonIdentity` (`data/key_daemon.pid`: pid + started_at vs
+  `Get-Process StartTime`, допуск 30 с) — при сбое WMI «Выход» продолжает
+  каскад; stale-треи снимаются ДО сброса флага и до early-return `--no-tray`.
+- Hook: `_hook_quit_sent` — `start()` не переиспользует поток с отправленным
+  WM_QUIT; `finally` сбрасывает флаг только при совпадении своего tid.
+
+**Пины:** `test_characteristics_new_hashed_markup`,
+`test_characteristics_text_fallback_opt_in`,
+`test_characteristics_two_structural_rows_beat_global_dl`,
+`test_characteristics_char_meta_marks_culled_full_widget`,
+`test_characteristics_text_fallback_filters_single_header_line`
+(`test_extractors.py`); `test_collect_product_retries_culled_full_widget`,
+`test_collect_product_short_only_no_retry` (`test_challenge_guard.py`);
+`test_empty_characteristics_warn` (`test_qa_raw.py`);
+`test_hidden_flag_overrides_keep_window_env`,
+`test_empty_visible_flag_means_no_opinion`,
+`test_sentinel_start_logs_reason` (visible → старт),
+`test_tick_rechecks_user_visible_before_hide`,
+`test_on_show_rechecks_user_visible_before_hide`,
+`test_apply_window_policy_honors_tray_hidden`,
+`test_session_keep_window_yields_to_tray_hidden`,
+`test_hook_is_replaced_after_quit_was_posted` (`test_window_policy.py`);
+`test_tray_daemon_identity_uses_pidfile_without_wmi` + behavior-harness,
+`test_tray_visible_flag_behavior`,
+`test_disabled_tray_still_clears_stale_flag`,
+`test_stale_tray_killed_before_flag_clear`
+(`test_collector_tray.py`); `test_ps1_tray_hidden_beats_keep_window_env`,
+гейты первого/финального hide (`test_launch_scripts.py`);
+`test_apply_window_policy_tray_visible_beats_env_hidden`,
+`test_sync_window_guard_tray_visible_not_watched`,
+`test_minimize_window_skips_native_when_tray_visible`
+(`test_window_policy.py`); `test_collect_product_retries_full_without_rows`,
+`test_collect_product_keeps_short_when_retry_full_still_empty`
+(`test_challenge_guard.py`);
+`test_characteristics_real_content_visibility_culls_full_widget`
+(`test_extractors.py`); `test_apply_window_policy_never_touches_external`,
+`test_geometry_guard_never_normalizes_external`
+(`test_window_policy.py`); глобальная autouse-изоляция флага окна
+(`tests/conftest.py`, живая кампания владельца больше не валит решения);
+class-autouse `_stale_tray_processes → []` (тесты не убивают живой трей) +
+golden-хеш `product.js`.
+
+**Финальное ревью (2026-10-19):** 1 BLOCKER — тесты снимали
+`PYTEST_CURRENT_TEST` и звали реальный `_kill_stale_trays` (могли убить трей
+владельца), закрыт autouse-моком; 3 MAJOR — финальный hide лаунчера игнорировал
+visible (теперь под гейтом), `cdp` при env=0 + tray `"1"` всё равно сворачивал
+(теперь effective keep), ретрай не срабатывал при `full_rows=0`
+(`full_empty=False`) — закрыты; MINOR/NIT (docstring, scroll-семантика,
+ретрай-кейсы) закрыты. Повторное ревью нашло ещё 1 MAJOR: tray-`"1"` через
+`user_visible` доходил до чужого Chrome (`external`); закрыт early-return в
+`_apply_window_policy` + тест; тем же правилом закрыты `_geometry_guard` и
+`_normalize_window_geometry` (не двигать чужое окно при рассинхроне); NIT лога
+закрыт фиксацией `$showNow`; MINOR реального culling закрыт тестом с
+`content-visibility:auto` без unskip-CSS. Живая кампания владельца завершилась сама:
+`COMPLETED_MIN`, valid=200, QA FAIL=0, wall_limited=121.
+
+**Прогоны:** focused — 71 + 120 + 465 + 542 + 646 + 199 + 523 + 215 + 305
+зелёные; полный `verify.ps1` — **ALL GREEN, 1847 passed, 6 skipped,
+1 xfailed** (303 с).
 
 ## Двенадцатый заход (2026-10-19): аудит трёх субагентов — 8 фиксов (A–H)
 
@@ -108,6 +221,10 @@ textContent-fallback в `product.js`. **Бэклог:** (b) `sweep_stray_browser
 выживших, backoff от конца probe, image-check в None-ветке) → 1815 (309.69 с,
 ревью-4: join-гейт по `_stop`, избыточный `start()` снова мгновенный — живой
 замер 0.00 с) → **1816 (318.53 с, ревью-5: пины чужого образа и повтора probe)**.
+
+**Закрыто тринадцатым заходом (2026-10-19):** production-потеря характеристик
+(парсер `charRows` + пины), WMI-free identity демона в трее (B-dop), NIT рестарта
+hook-потока. Ниже — исходная запись для истории.
 
 **Открыто после ревью (2026-10-19):** production-потеря характеристик — не в
 этом диффе и глубже тестового фикса: у свежих raw `product.characteristics`

@@ -214,8 +214,13 @@ fingerprint — грубый отпечаток сессии; полный probe
   инвариант 6): hidden (дефолт) — ни одно окно не показывается; visible — все
   окна сбора показаны обычными окнами с кнопками панели задач (оба EX-стиля
   сняты, `TaskbarTab.AddTab`). Режим — файл `data/window_visible.flag`
-  (`window_policy.USER_VISIBLE_FLAG`); в visible сторож и `ensure_render_window`
-  окна не трогают. Разворот под пазл не нужен: кадры идут со скрытого
+  (`window_policy.USER_VISIBLE_FLAG`): `1` — visible, `0` — hidden, нет
+  файла — решает env. Явный `0` сильнее `OZON_KEEP_WINDOW` после старта
+  (owner 2026-10-19: консоль задаёт стартовый режим, дальше главный трей).
+  В visible сторож и `ensure_render_window` окна не трогают. «Выход» и
+  watchdog трея проверяют демона через WMI, а при его сбое — по
+  `data/key_daemon.pid` (pid + started_at vs `Get-Process StartTime`);
+  непроверенный pid не сигналится. Разворот под пазл не нужен: кадры идут со скрытого
   `SW_HIDE`-окна (матрица 2026-10-16 — в `docs/tasks/current.md`).
 - **Оговорка, измеренная 2026-10-06:** «фокус возвращается» выполняется не
   всегда. Когда фокус уже сидит на окне Chromium, ни `AttachThreadInput`
