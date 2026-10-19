@@ -59,6 +59,30 @@ def test_tray_watchdog_contract():
     assert "Close-Tray" in t, "выход по watchdog не закрывает иконку"
 
 
+def test_tray_distinguishes_wmi_failure_from_missing_process():
+    """WMI failure must not be treated as "daemon is gone".
+
+    Audit regression 2026-10-19: Get-CimInstance with -ErrorAction
+    SilentlyContinue yielded $null on a WMI error too, and both the watchdog
+    and the exit item closed the tray while the daemon was still alive.
+    """
+    t = _text(TRAY)
+    assert t.count("$cimOk = $false") == 2, \
+        "обе проверки демона обязаны различать сбой WMI"
+    assert t.count("if (-not $cimOk)") == 1, \
+        "в «Выходе» сбой WMI обязан отменять остановку до эскалации"
+    assert t.index("if (-not $cimOk)") < t.index("$script:stopStage++"), \
+        "эскалация Ctrl+C/Stop-Process недостижима при сбое WMI"
+    assert t.count("$cimOk -and (-not $proc") == 1, \
+        "watchdog обязан решать по $cimOk"
+    import re
+    loud = re.findall(
+        r'Get-CimInstance Win32_Process -Filter "ProcessId = \$WatchPid"'
+        r'[\s`]*?-ErrorAction Stop', t)
+    assert len(loud) == 2, \
+        "оба запроса демона обязаны падать громко (-ErrorAction Stop)"
+
+
 def test_tray_script_matches_daemon_constant():
     assert os.path.isfile(TRAY)
     assert k.TRAY_SCRIPT.name == "collector_tray.ps1"

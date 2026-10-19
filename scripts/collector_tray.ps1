@@ -446,8 +446,25 @@ function Stop-Daemon {
     # браузеры через parent watchdog). Ctrl+C послать некуда (у демона нет
     # консоли / ошибка) — жёсткий путь сразу.
     if ($WatchPid -le 0) { Close-Tray; return }   # отладочный режим без демона
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $WatchPid" `
-        -ErrorAction SilentlyContinue
+    # WMI failure is NOT "daemon gone": a silent $null used to Close-Tray
+    # while the daemon was still alive ("Выход" закрывал трей до
+    # Send-TrayCtrlC — сбор продолжался). -ErrorAction Stop + explicit catch
+    # keeps "process not found" (close tray) apart from "could not query"
+    # (keep tray AND cancel the stop — review 2026-10-19: PID-reuse makes
+    # Ctrl+C/Stop-Process on an unverified pid unsafe).
+    $proc = $null
+    $cimOk = $true
+    try {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $WatchPid" `
+            -ErrorAction Stop
+    }
+    catch { $cimOk = $false }
+    if (-not $cimOk) {
+        $notify.ShowBalloonTip(3000, "ozon-collector",
+            "Не удалось проверить демона (WMI). Остановка отменена — повторите «Выход».",
+            [System.Windows.Forms.ToolTipIcon]::Warning)
+        return
+    }
     if (-not $proc -or $proc.CommandLine -notlike "*key_daemon*") {
         Close-Tray                                # демона уже нет
         return
@@ -488,9 +505,16 @@ if ($WatchPid -gt 0) {
     $watch = New-Object System.Windows.Forms.Timer
     $watch.Interval = 2000
     $watch.add_Tick({
-            $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $WatchPid" `
-                -ErrorAction SilentlyContinue
-            if (-not $proc -or $proc.CommandLine -notlike "*key_daemon*") {
+            # Same WMI-failure guard as in Stop-Daemon: a failed query is not
+            # "daemon gone" — keep the icon and retry on the next tick.
+            $proc = $null
+            $cimOk = $true
+            try {
+                $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $WatchPid" `
+                    -ErrorAction Stop
+            }
+            catch { $cimOk = $false }
+            if ($cimOk -and (-not $proc -or $proc.CommandLine -notlike "*key_daemon*")) {
                 $watch.Stop()
                 Close-Tray
             }
