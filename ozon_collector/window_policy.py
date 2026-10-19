@@ -161,11 +161,36 @@ USER_VISIBLE_FLAG = (Path(__file__).resolve().parent.parent
                      / "data" / "window_visible.flag")
 
 
-def user_visible() -> bool:
-    """Пользователь развернул окна сбора из трея (флаг активен)."""
+def _flag_text() -> str:
     try:
-        return USER_VISIBLE_FLAG.exists()
+        return USER_VISIBLE_FLAG.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return ""
+
+
+def user_visible() -> bool:
+    """Пользователь развернул окна сбора из трея (флаг активен).
+
+    Explicit "0" is the tray's "hidden" verdict; it must beat
+    OZON_KEEP_WINDOW after start (owner 2026-10-19: the console sets the
+    initial mode, the tray is authoritative afterwards). Absent = no opinion.
+    """
+    try:
+        if not USER_VISIBLE_FLAG.exists():
+            return False
+        text = _flag_text()
+        # Empty file = interrupted write / manual edit: same as absent, the
+        # env decides (consistent with tray and launcher; review 2026-10-19).
+        return bool(text) and text != "0"
     except OSError:            # сбой ФС — не повод падать и не повод молчать
+        return False
+
+
+def user_hidden() -> bool:
+    """Трей явно свернул окна: флаг содержит "0" (сильнее env-дефолта)."""
+    try:
+        return USER_VISIBLE_FLAG.exists() and _flag_text() == "0"
+    except OSError:
         return False
 
 
@@ -873,6 +898,7 @@ class WindowGuard:
         self._focus_fixed = 0
         self._hook_thread: Optional[threading.Thread] = None
         self._hook_tid: Optional[int] = None      # поток с насосом сообщений
+        self._hook_quit_sent = False              # stop() отправил WM_QUIT
         self._hook_proc = (_WINEVENTPROC(self._on_win_event)
                            if _WINEVENTPROC is not None else None)
 
@@ -958,7 +984,12 @@ class WindowGuard:
                     self._thread.start()
                     spawned = True
                 if self._hook_thread is None \
-                        or not self._hook_thread.is_alive():
+                        or not self._hook_thread.is_alive() \
+                        or self._hook_quit_sent:
+                    # A hook that survived stop() (join timeout) already has
+                    # WM_QUIT in its queue: it is not a working pump anymore
+                    # (NIT review 2026-10-19). Spawn a fresh one.
+                    self._hook_quit_sent = False
                     # Хук показа окон: мгновенное гашение (см. _hook_loop).
                     # Отдельный поток: SetWinEventHook требует насос сообщений,
                     # а тик должен идти своей каденцией.
@@ -985,13 +1016,21 @@ class WindowGuard:
                 thread = self._thread
                 hook_thread = self._hook_thread
             if hook_tid:
+                posted = False
                 try:
                     user32 = _user32()
                     if user32 is not None:
                         _setup_api(user32)
-                        user32.PostThreadMessageW(hook_tid, WM_QUIT, 0, 0)
+                        posted = bool(user32.PostThreadMessageW(
+                            hook_tid, WM_QUIT, 0, 0))
                 except Exception:
-                    pass
+                    posted = False
+                if posted:
+                    # Remember the quit: a hook that survives the join has a
+                    # WM_QUIT in its queue and must not be reused (start()
+                    # spawns a fresh pump).
+                    with self._lock:
+                        self._hook_quit_sent = True
             cur = threading.current_thread()
             for th in (hook_thread, thread):
                 if th is not None and th is not cur and th.is_alive():
@@ -1046,6 +1085,7 @@ class WindowGuard:
             with self._lock:
                 if self._hook_tid == own_tid:
                     self._hook_tid = None   # не затираем tid нового потока
+                    self._hook_quit_sent = False
 
     def _on_win_event(self, _hook, event, hwnd, id_object, id_child,
                       _event_thread, _event_ms) -> None:
@@ -1473,7 +1513,9 @@ _WINEVENT_SKIPOWNPROCESS = 0x0002
 
 
 def _keep_window_env() -> bool:
-    """OZON_KEEP_WINDOW=1 (сессии осознанно держат окно видимым) — не мешаем."""
+    """OZON_KEEP_WINDOW=1 — начальный режим; явный "0" из трея сильнее."""
+    if user_hidden():
+        return False
     return _proc.env_bool("OZON_KEEP_WINDOW")
 
 
@@ -1626,6 +1668,10 @@ def sentinel_on_show(hwnd: int, *, hide=None, pids=None,
             ours = _sentinel_pids(refresh=True)
             if pid not in ours:
                 return False
+    # Re-check right before hiding: the tray may have switched to visible
+    # while we were scanning profiles (review 2026-10-19).
+    if _keep_window_env() or (uv or user_visible)():
+        return False
     ok = bool((hide or minimize_hwnd)(int(hwnd)))
     if ok:
         log.info(f"сентинел(хук): спрятал окно hwnd={int(hwnd)} pid={pid}")
@@ -1702,6 +1748,14 @@ def sentinel_tick(*, hide=None, rows=None, pids=None,
                     if len(alien) > _SENTINEL_ALIEN_MAX:
                         _sentinel_alien_prune(st)
             continue
+        # Re-check per row: a scan can take ~0.8 s and the tray may have
+        # flipped to visible mid-tick (review 2026-10-19).
+        if _keep_window_env():
+            res["skipped"] = "keep_window"
+            break
+        if (uv or user_visible)():
+            res["skipped"] = "user_visible"
+            break
         res["visible"] += 1
         if hide(row.hwnd):
             res["hidden"] += 1
@@ -1798,8 +1852,10 @@ def sentinel_start() -> bool:
         log.warning("сентинел показов НЕ запущен: OZON_WINDOW_GUARD выключен")
         return False
     if _keep_window_env():
-        log.info("сентинел показов не нужен: режим visible (OZON_KEEP_WINDOW)")
-        return False
+        # Стартовый visible не повод не запускать сторожа: трей может явно
+        # свернуть окна позже (флаг "0"), и тогда он обязан работать даже
+        # если сам трей убьют. Хук и тик спят под _keep_window_env сами.
+        log.info("сентинел показов: старт в visible — ждёт явного hidden из трея")
     with _SENTINEL_LOCK:
         if _SENTINEL is not None:
             return True

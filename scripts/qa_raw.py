@@ -188,6 +188,15 @@ def qa_product(raw, pid):
     if challenge:
         add("CHALLENGE_PAGE", "FAIL", f"title: {title[:60]!r}")
 
+    if isinstance(product.get("characteristics"), dict) \
+            and not product["characteristics"]:
+        # Ozon 2026-10 switched to hashed classes and the dl-based extractor
+        # went empty: characteristics were silently lost in production (owner:
+        # fix urgently 2026-10-19). WARN, not FAIL: an empty block can be
+        # legitimate, but it must stay visible in the report.
+        add("EMPTY_CHARACTERISTICS", "WARN",
+            "characteristics пусты — возможна смена разметки карточки")
+
     if skipped:
         # Режим --no-reviews: смысл raw — только карточка. Если цена и рейтинг
         # не извлечены, «успешный» product-only сбор эквивалентен сломанному:

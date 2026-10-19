@@ -125,7 +125,7 @@ DAEMON_STATES = {
 }
 # Версия QA-логики. Входит в ключ QA-кэша (verdict_meta.qa_version): улучшение
 # QA (новый FAIL/WARN) инвалидирует старые вердикты даже если raw не менялся.
-QA_VERSION = "1.7"
+QA_VERSION = "1.8"
 
 # Сколько раз товар из выдачи может вернуться в очередь без результата, прежде
 # чем признаётся безнадёжным. Обратная сторона починки «discovered ≠ собранные»:
@@ -895,30 +895,36 @@ def _start_tray_companion(disabled: bool = False):
     Старые треи (в т.ч. запущенные руками) сначала снимаются по identity —
     иначе после «трей живёт со сбором» на панели копилась бы вторая иконка.
     """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    if os.name == "nt":
+        # Снимаем старые треи ДО сброса флага: иначе живой трей прошлого
+        # прогона увидит отсутствие флага и вернёт окна по своему env
+        # (MINOR ревью 2026-10-19).
+        try:
+            gone = _kill_stale_trays()
+            if gone:
+                log.info(f"трей: снят прошлый экземпляр (pid={gone})")
+        except Exception as exc:
+            # Трей — удобство, а не часть сбора: его проблемы не роняют кампанию.
+            log.warning(f"трей: чистка прошлых экземпляров не удалась: {exc}")
+    # Залипший флаг «пользователь смотрит окна» (трей убили taskkill'ом, не
+    # через «Выход») блокировал бы сторож на весь прогон: снимаем на каждом
+    # старте сбора, даже когда трей отключён (--no-tray) — иначе старый "0"
+    # отменял бы --window-mode visible.
+    try:
+        from ozon_collector import window_policy
+        window_policy.clear_user_visible()
+    except Exception as exc:
+        log.warning(f"трей: сброс флага user-visible не удался: {exc}")
     if disabled or os.name != "nt":
         return None
     flag = (os.environ.get("OZON_TRAY") or "").strip().lower()
     if flag in {"0", "off", "false", "no"}:
         return None
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        return None
     if not TRAY_SCRIPT.exists():
         log.warning(f"трей: скрипт не найден: {TRAY_SCRIPT}")
         return None
-    try:
-        # Залипший флаг «пользователь смотрит окна» (трей убили taskkill'ом, не
-        # через «Выход») блокировал бы сторож на весь прогон: снимаем до старта.
-        from ozon_collector import window_policy
-        window_policy.clear_user_visible()
-    except Exception as exc:
-        log.warning(f"трей: сброс флага user-visible не удался: {exc}")
-    try:
-        gone = _kill_stale_trays()
-        if gone:
-            log.info(f"трей: снят прошлый экземпляр (pid={gone})")
-    except Exception as exc:
-        # Трей — удобство, а не часть сбора: его проблемы не роняют кампанию.
-        log.warning(f"трей: чистка прошлых экземпляров не удалась: {exc}")
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
            "-File", str(TRAY_SCRIPT), "-WatchPid", str(os.getpid())]
     try:

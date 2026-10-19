@@ -66,6 +66,9 @@ def _product_page(product):
         def evaluate(self, js, *a, **kw):
             return product
 
+        def wait_for_timeout(self, _ms):
+            return None
+
     return _Eval()
 
 
@@ -370,6 +373,94 @@ def test_collect_product_normal_title_ok():
                           "https://www.ozon.ru/product/12345", category="Техника")
     assert out["title"] == "Робот-пылесос Xiaomi X"
     assert out["category"] == "Техника"
+
+
+class _RetryPage:
+    """First evaluate returns `first`, retry returns `second`; scroll → True."""
+
+    def __init__(self, first, second):
+        self.first = first
+        self.second = second
+        self.calls = 0
+        self.scrolled = 0
+
+    def evaluate(self, js, *a, **kw):
+        if "scrollIntoView" in js:
+            self.scrolled += 1
+            return True
+        self.calls += 1
+        return self.first if self.calls == 1 else self.second
+
+    def wait_for_timeout(self, _ms):
+        return None
+
+
+def test_collect_product_retries_culled_full_widget():
+    """Short subset + culled full widget → retry and take the full rows."""
+    first = {"title": "Робот-пылесос Xiaomi X",
+             "characteristics": {"Короткий": "1"},
+             "char_meta": {"full_present": True, "full_rows": 0,
+                           "full_empty": True, "short_present": True,
+                           "short_rows": 1, "source": "short"}}
+    second = {"title": "Робот-пылесос Xiaomi X",
+              "characteristics": {"Тип": "Пылесос", "Бренд": "Xiaomi",
+                                  "Мощность": "500 Вт"},
+              "char_meta": {"full_present": True, "full_rows": 3,
+                            "full_empty": False, "short_present": True,
+                            "short_rows": 1, "source": "full"}}
+    page = _RetryPage(first, second)
+    out = collect_product(page, "https://www.ozon.ru/product/12345")
+    assert out["characteristics"] == second["characteristics"]
+    assert page.scrolled == 1, "полный виджет не прокручен"
+    assert page.calls == 2
+
+
+def test_collect_product_retries_full_without_rows():
+    """Full widget present but not rendered: full_rows=0 must trigger retry.
+
+    `full_empty` may be False while the widget has no rows at all (header
+    only / culled text) — review 2026-10-19.
+    """
+    first = {"title": "Робот-пылесос Xiaomi X",
+             "characteristics": {"Короткий": "1"},
+             "char_meta": {"full_present": True, "full_rows": 0,
+                           "full_empty": False, "short_present": True,
+                           "short_rows": 1, "source": "short"}}
+    second = {"title": "Робот-пылесос Xiaomi X",
+              "characteristics": {"Тип": "Пылесос", "Бренд": "Xiaomi"},
+              "char_meta": {"full_present": True, "full_rows": 2,
+                            "full_empty": False, "short_present": True,
+                            "short_rows": 1, "source": "full"}}
+    page = _RetryPage(first, second)
+    out = collect_product(page, "https://www.ozon.ru/product/12345")
+    assert out["characteristics"] == second["characteristics"]
+    assert page.scrolled == 1 and page.calls == 2
+
+
+def test_collect_product_keeps_short_when_retry_full_still_empty():
+    """Retry that cannot render the full widget must not lose the short rows."""
+    short = {"title": "Робот-пылесос Xiaomi X",
+             "characteristics": {"Тип": "Пылесос"},
+             "char_meta": {"full_present": True, "full_rows": 0,
+                           "full_empty": True, "short_present": True,
+                           "short_rows": 1, "source": "short"}}
+    page = _RetryPage(short, short)
+    out = collect_product(page, "https://www.ozon.ru/product/12345")
+    assert out["characteristics"] == {"Тип": "Пылесос"}
+    assert page.scrolled == 1 and page.calls == 2
+
+
+def test_collect_product_short_only_no_retry():
+    """Short-only page: no full widget → no extra scroll/retry."""
+    only = {"title": "Робот-пылесос Xiaomi X",
+            "characteristics": {"Тип": "Пылесос"},
+            "char_meta": {"full_present": False, "full_rows": 0,
+                          "full_empty": False, "short_present": True,
+                          "short_rows": 1, "source": "short"}}
+    page = _RetryPage(only, only)
+    out = collect_product(page, "https://www.ozon.ru/product/12345")
+    assert out["characteristics"] == {"Тип": "Пылесос"}
+    assert page.scrolled == 0 and page.calls == 1
 
 
 def test_collect_product_none_raises_runtime():

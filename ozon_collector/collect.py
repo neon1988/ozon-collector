@@ -43,6 +43,7 @@ from . import browser as B
 from . import cache as K
 from . import log
 from . import ozon_fetch
+from . import process as P
 from . import puzzle as _puzzle
 from .constants import CHALLENGE_TITLE_MARKERS, title_challenge_marker
 from .cdp import Session
@@ -918,8 +919,61 @@ def detect_auth_state(page) -> dict:
     return out
 
 
+def _product_js_opts() -> dict:
+    # Text-pair fallback for characteristics is the last resort and opt-in:
+    # generic page text can look like key/value pairs (owner 2026-10-19).
+    return {"char_text_fallback": P.env_bool("OZON_CHAR_TEXT_FALLBACK")}
+
+
+def _ensure_char_widget_visible(page) -> bool:
+    """Scroll the characteristics widget into view (content-visibility unskip).
+
+    Ozon 2026-10 hashed markup may place the widget deep below the fold where
+    Chromium culls an innerText of a content-visibility:auto subtree. Called
+    when the first extraction came back empty or the full widget was present
+    but yielded no rows. Scrolls the full widget first; the short widget is
+    the fallback when the full one is absent.
+    """
+    try:
+        return bool(page.evaluate(
+            """() => {
+              const sel = (n) => document.querySelector(
+                '[data-widget="' + n + '"]');
+              const w = sel('webCharacteristics')
+                || sel('webShortCharacteristics');
+              if (!w) return false;
+              w.scrollIntoView({block: 'center'});
+              return true;
+            }"""))
+    except Exception as e:
+        log.debug(f"[collect] ensure_char_widget_visible: "
+                  f"{type(e).__name__}: {e}")
+        return False
+
+
 def collect_product(page, product_url: str, category: str | None = None) -> dict:
-    product = page.evaluate(PRODUCT_JS)
+    product = page.evaluate(PRODUCT_JS, _product_js_opts())
+    chars = (product or {}).get("characteristics") or {}
+    meta = (product or {}).get("char_meta") or {}
+    # Retry not only on empty: a culled full widget yields 1-2 rows from the
+    # short widget, and accepting that subset silently loses data (review
+    # 2026-10-19). A present-but-unrendered full widget may report
+    # full_empty=False with full_rows=0, so both signals trigger the retry.
+    # Keep the short subset if the full widget still yields no rows.
+    full_unfinished = (meta.get("full_present")
+                       and (meta.get("full_empty")
+                            or not meta.get("full_rows")))
+    if product and (not chars or full_unfinished) \
+            and _ensure_char_widget_visible(page):
+        page.wait_for_timeout(250)
+        retry = page.evaluate(PRODUCT_JS, _product_js_opts())
+        if retry:
+            rchars = retry.get("characteristics") or {}
+            rmeta = retry.get("char_meta") or {}
+            full_still_empty = (rmeta.get("full_present")
+                                and not rmeta.get("full_rows"))
+            if rchars and (not chars or not full_still_empty):
+                product = retry
     if not product:
         raise RuntimeError("JS-извлечение карточки вернуло None (антибот?)")
     title = (product.get("title") or "").strip().lower()

@@ -92,6 +92,22 @@ def _codes(rep):
     return {i["code"] for i in rep["issues"]}
 
 
+def test_empty_characteristics_warn():
+    """Пустые характеристики видны в отчёте (потеря из-за новой разметки 2026-10)."""
+    raw = _raw(vc=5)
+    raw["product"]["characteristics"] = {}
+    rep = qa_product(raw, "42")
+    assert rep["verdict"] == "WARN"
+    assert "EMPTY_CHARACTERISTICS" in _codes(rep)
+
+
+def test_characteristics_present_no_warn():
+    raw = _raw(vc=5)
+    raw["product"]["characteristics"] = {"Тип": "Спрей"}
+    rep = qa_product(raw, "42")
+    assert "EMPTY_CHARACTERISTICS" not in _codes(rep)
+
+
 def test_full_mode_ok():
     rep = qa_product(_raw(vc=5), "42")
     assert rep["verdict"] == "OK"

@@ -289,12 +289,14 @@ def test_ps1_rehides_window_until_cdp_ready():
     Chrome может ПОКАЗАТЬ окно в любой момент старта (живой замер 2026-10-16:
     вспышка vis=True ~100 мс при тике 100 мс; при опоздании первого прохода —
     секунды, пока не подключится сторож). Поэтому тик ожидания CDP — 50 мс
-    с пере-скрытием, а финальный проход БЕЗУСЛОВНЫЙ: иначе показанное ПОСЛЕ
-    первого прохода окно остаётся видимым до сторожа (2-7 с) или до connect.
+    с пере-скрытием, а финальный проход безусловный в hidden-режиме: иначе
+    показанное ПОСЛЕ первого прохода окно остаётся видимым до сторожа
+    (2-7 с) или до connect. В visible-режиме первый и финальный проходы
+    обязаны молчать (ревью 2026-10-19).
     """
     ps1 = _text(PS1)
     assert ps1.count("Invoke-MinimizeNoActivate $targetPid") >= 3, (
-        "меньше трёх проходов скрытия: первый + тики CDP + безусловный финал")
+        "меньше трёх проходов скрытия: первый + тики CDP + финал")
     assert "for ($i = 0; $i -lt 200; $i++) {" in ps1, \
         "ожидание CDP снова с тиком 500 мс (пере-скрытие в тике потеряно)"
     assert "if (-not $minimized) {" not in ps1, \
@@ -302,6 +304,20 @@ def test_ps1_rehides_window_until_cdp_ready():
         "окно не перепрятывается"
     assert "$minimized = $minimized -or $finalHide" in ps1, \
         "финальный проход потерял объединение статуса ($finalHide)"
+    assert "$showNow = Test-ShowAnyway" in ps1, \
+        "финальный гейт обязан фиксировать состояние один раз (лог не врёт)"
+    gates = (
+        ("$minimized = Invoke-MinimizeNoActivate $targetPid 10000",
+         "if (-not (Test-ShowAnyway)) {"),
+        ("$finalHide = Invoke-MinimizeNoActivate $targetPid 3000",
+         "if (-not $showNow) {"),
+    )
+    for call, gate in gates:
+        at = ps1.index(call)
+        gate_at = ps1.rindex(gate, 0, at)
+        assert at - gate_at < 120, (
+            f"{call!r} не под гейтом {gate!r}: лаунчер прячет окно "
+            f"в visible-режиме")
 
 
 def test_ps1_keeps_guard_duty_until_daemon_connect():
@@ -421,13 +437,36 @@ def test_ps1_focus_restore_waits_out_theft_window():
     block = ps1[i:ps1.index("\n}", i)]
     assert ("$focusLeft = 450 - ((Get-Date) - $loopT0).TotalMilliseconds"
             in block), "досып до 450 мс потерян (возврат фокуса раньше кражи)"
-    assert ("if (-not ($keepWindowMode -or (Test-Path $windowVisibleFlag))) {"
-            in block), "гейт visible-режима у пере-скрытия потерян"
+    assert "if (-not (Test-ShowAnyway)) {" in block, \
+        "гейт visible-режима у пере-скрытия потерян"
     order = [block.index("$focusLeft"), block.index("Start-Sleep"),
-             block.index("$keepWindowMode"),
+             block.index("Test-ShowAnyway"),
              block.index("Invoke-MinimizeNoActivate"),
              block.index("Restore-Focus")]
     assert order == sorted(order), \
         "порядок: остаток -> сон -> гейт -> пере-скрытие -> возврат фокуса"
     assert "WAS VISIBLE before hide" in ps1, "датчик показа в щели потерян"
     assert "LAUNCHER-DIAG: window pid=" in ps1
+
+
+def test_ps1_tray_hidden_beats_keep_window_env():
+    """Explicit tray "0" beats OZON_KEEP_WINDOW (owner 2026-10-19).
+
+    The console/env sets the initial mode; after start the tray is
+    authoritative, so the launcher must re-read the flag (the owner can hide
+    the windows during the 30 s duty loop) and never treat "0" as visible.
+    """
+    ps1 = _text(PS1)
+    fn = ps1[ps1.index("function Test-ShowAnyway"):]
+    fn = fn[:fn.index("$minimized = Invoke-MinimizeNoActivate")]
+    assert "Test-Path $windowVisibleFlag" in fn
+    assert '$state -eq "0"' in fn and "return $false" in fn, \
+        'явный "0" из трея не побеждает env-дефолт'
+    assert '$state -eq "1"' in fn and "return $true" in fn
+    assert "return $keepWindowMode" in fn, \
+        "без файла режим обязан решаться env (owner 2026-10-19)"
+    startup = ps1[ps1.index("for ($i = 0; $i -lt 200"):]
+    assert "Test-ShowAnyway" in startup, \
+        "стартовый цикл не перечитывает трей (флаг может появиться за 10 с)"
+    duty = ps1[ps1.index("while ((Get-Date) -lt $dutyUntil)"):]
+    assert "Test-ShowAnyway" in duty, "караул не перечитывает состояние трея"

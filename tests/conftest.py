@@ -70,6 +70,21 @@ def _pin_browser_kind_chrome(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_window_visible_flag(request, tmp_path, monkeypatch):
+    """A live campaign's data/window_visible.flag must not leak into tests.
+
+    The owner often runs a campaign in parallel; its tray writes the real
+    flag, and decision tests flipped to visible/hidden mid-run (2026-10-19).
+    The path-contract test checks the real constant and opts out.
+    """
+    if request.node.name == "test_user_visible_flag_lives_in_data_dir":
+        return
+    from ozon_collector import window_policy
+    monkeypatch.setattr(window_policy, "USER_VISIBLE_FLAG",
+                        tmp_path / "absent_window_visible.flag")
+
+
+@pytest.fixture(autouse=True)
 def _redirect_launch_logs(tmp_path, monkeypatch):
     """Логи автозапуска браузера — в tmp_path, а не в реальный %TEMP%.
 
@@ -308,7 +323,8 @@ def evaluate(browser):
     """evaluate(name=...) — извлечь данные PRODUCT_JS с фикстуры;
     evaluate(html=...) — из произвольного HTML (негативные тесты)."""
 
-    def _eval(name: str | None = None, html: str | None = None) -> dict:
+    def _eval(name: str | None = None, html: str | None = None,
+              opts: dict | None = None) -> dict:
         if html is None:
             html = load_html(name)
         page = browser.new_page()
@@ -316,7 +332,7 @@ def evaluate(browser):
         try:
             page.set_content(html, wait_until="domcontentloaded")
             page.add_style_tag(content=CV_UNSKIP_CSS)
-            return page.evaluate(PRODUCT_JS)
+            return page.evaluate(PRODUCT_JS, opts)
         finally:
             page.close()
 

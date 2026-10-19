@@ -1,5 +1,5 @@
 
-() => {
+(opts) => {
   const T = document.body.innerText;
   const parse = (v) => {
     const f = parseFloat(String(v).replace(/\s/g, '').replace(',', '.'));
@@ -73,6 +73,26 @@
     return m ? parse(m[1]) : null;
   };
   const CHAR_WIDGETS = ["webCharacteristics", "webShortCharacteristics"];
+  // Ozon 2026-10: hashed classes, no dl. A row is a div with exactly two DIV
+  // children — the key cell and the value cell (brand is wrapped in <a>).
+  const CHAR_HEADER = ['О товаре', 'Перейти к описанию'];
+  const charRows = (w) => {
+    const out = {};
+    for (const row of w.querySelectorAll('div')) {
+      const cells = [];
+      for (const ch of row.children) {
+        if (ch.tagName === 'DIV') cells.push(ch);
+      }
+      if (cells.length !== 2) continue;
+      const k = cells[0].innerText.trim();
+      const v = cells[1].innerText.trim();
+      if (!k || !v || k.includes('\n')) continue;
+      if (CHAR_HEADER.indexOf(k) !== -1) continue;
+      if (k.length > 60 || v.length > 300) continue;
+      if (!out[k]) out[k] = v;
+    }
+    return out;
+  };
   const characteristics = () => {
     const out = {};
     const grab = (dl) => {
@@ -84,12 +104,26 @@
         if (k && v && !out[k]) out[k] = v;
       }
     };
+    const merge = (src) => {
+      for (const k in src) {
+        if (src[k] && !out[k]) out[k] = src[k];
+      }
+    };
     for (const wname of CHAR_WIDGETS) {
       const w = document.querySelector('[data-widget="' + wname + '"]');
       if (!w) continue;
       w.querySelectorAll('dl').forEach(grab);
       if (Object.keys(out).length > 0) return out;
     }
+    // Structural rows beat the global dl/Row fallbacks: those can pick up
+    // unrelated lists (nav/footer) and return junk before we ever look here.
+    // Even one scoped row wins: the widget is scoped, a global dl is not.
+    for (const wname of CHAR_WIDGETS) {
+      const w = document.querySelector('[data-widget="' + wname + '"]');
+      if (!w) continue;
+      merge(charRows(w));
+    }
+    if (Object.keys(out).length > 0) return out;
     document.querySelectorAll('dl.tsBodyMBold').forEach(grab);
     if (Object.keys(out).length > 0) return out;
     document.querySelectorAll('dl').forEach((dl) => {
@@ -114,7 +148,45 @@
         }
       });
     }
+    // Last resort, opt-in only (owner 2026-10-19): pair consecutive lines of
+    // the widget text. Generic text can look like a key/value pair, so this
+    // never runs unless OZON_CHAR_TEXT_FALLBACK is set.
+    if (opts && opts.char_text_fallback) {
+      for (const wname of CHAR_WIDGETS) {
+        const w = document.querySelector('[data-widget="' + wname + '"]');
+        if (!w) continue;
+        // Drop header lines BEFORE pairing: one leftover line shifts every
+        // pair and invents rows (review 2026-10-19).
+        const lines = String(w.innerText).split('\n')
+          .map((s) => s.trim()).filter((s) => s)
+          .filter((s) => CHAR_HEADER.indexOf(s) === -1);
+        for (let i = 0; i + 1 < lines.length; i += 2) {
+          const k = lines[i];
+          const v = lines[i + 1];
+          if (k.length > 60 || v.length > 300) continue;
+          if (!out[k]) out[k] = v;
+        }
+        if (Object.keys(out).length >= 3) return out;
+      }
+    }
     return out;
+  };
+  // Metadata for the retry decision: a culled full widget returns {} while
+  // the short widget may still yield 1-2 rows. Without this the collector
+  // accepted the short subset as final (review 2026-10-19).
+  const charMeta = () => {
+    const full = document.querySelector('[data-widget="webCharacteristics"]');
+    const short = document.querySelector('[data-widget="webShortCharacteristics"]');
+    const fullRows = full ? Object.keys(charRows(full)).length : 0;
+    const shortRows = short ? Object.keys(charRows(short)).length : 0;
+    return {
+      full_present: !!full,
+      full_rows: fullRows,
+      full_empty: !!full && !String(full.innerText || '').trim(),
+      short_present: !!short,
+      short_rows: shortRows,
+      source: fullRows ? 'full' : (shortRows ? 'short' : ''),
+    };
   };
   const gallery = () => {
     const out = [];
@@ -325,6 +397,7 @@
     price_parsed: priceParsed(),
     price: priceExtract(),
     characteristics: characteristics(),
+    char_meta: charMeta(),
     gallery: gallery(),
     descriptions: descriptions(),
     infographics: infographics(),

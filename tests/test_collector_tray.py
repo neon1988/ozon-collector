@@ -65,16 +65,16 @@ def test_tray_distinguishes_wmi_failure_from_missing_process():
     Audit regression 2026-10-19: Get-CimInstance with -ErrorAction
     SilentlyContinue yielded $null on a WMI error too, and both the watchdog
     and the exit item closed the tray while the daemon was still alive.
+    Owner 2026-10-19: the tray must still stop the daemon when WMI is down —
+    the pidfile + process start time prove identity without WMI.
     """
     t = _text(TRAY)
     assert t.count("$cimOk = $false") == 2, \
         "обе проверки демона обязаны различать сбой WMI"
-    assert t.count("if (-not $cimOk)") == 1, \
-        "в «Выходе» сбой WMI обязан отменять остановку до эскалации"
+    assert t.count("Test-DaemonIdentity") >= 2, \
+        "нет WMI-free проверки личности демона"
     assert t.index("if (-not $cimOk)") < t.index("$script:stopStage++"), \
         "эскалация Ctrl+C/Stop-Process недостижима при сбое WMI"
-    assert t.count("$cimOk -and (-not $proc") == 1, \
-        "watchdog обязан решать по $cimOk"
     import re
     loud = re.findall(
         r'Get-CimInstance Win32_Process -Filter "ProcessId = \$WatchPid"'
@@ -91,6 +91,18 @@ def test_tray_script_matches_daemon_constant():
 
 class TestDaemonTrayLifecycle:
     """key_daemon: трей спавнится с демоном, отключается флагами, не лезет в тесты."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_flag_writes(self, monkeypatch):
+        """Тесты не трогают живые флаг и трей кампании владельца.
+
+        `_start_tray_companion` снимает stale-треи до early-return; тесты,
+        которые убирают PYTEST_CURRENT_TEST, иначе убили бы настоящий
+        collector_tray.ps1 (BLOCKER ревью 2026-10-19).
+        """
+        from ozon_collector import window_policy
+        monkeypatch.setattr(window_policy, "clear_user_visible", lambda: None)
+        monkeypatch.setattr(k, "_stale_tray_processes", lambda: [])
 
     def test_skipped_under_pytest(self, monkeypatch):
         monkeypatch.delenv("OZON_TRAY", raising=False)
@@ -165,6 +177,29 @@ class TestDaemonTrayLifecycle:
         monkeypatch.setattr(k.subprocess, "Popen", lambda *a, **kw: FakeProc())
         assert k._start_tray_companion() is not None
         assert called, "key_daemon не снял залипший флаг user-visible"
+
+    def test_disabled_tray_still_clears_stale_flag(self, monkeypatch):
+        """--no-tray не должен оживлять старый "0" в visible-прогоне."""
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        from ozon_collector import window_policy
+        called = []
+        monkeypatch.setattr(window_policy, "clear_user_visible",
+                            lambda: called.append(1))
+        assert k._start_tray_companion(disabled=True) is None
+        assert called, "залипший hidden-флаг пережил старт сбора без трея"
+
+    @pytest.mark.skipif(os.name != "nt", reason="kill трея — Windows-only")
+    def test_stale_tray_killed_before_flag_clear(self, monkeypatch):
+        """Old tray must not see the cleared flag and resurrect windows."""
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        order = []
+        monkeypatch.setattr(k, "_kill_stale_trays",
+                            lambda: order.append("kill") or [])
+        from ozon_collector import window_policy
+        monkeypatch.setattr(window_policy, "clear_user_visible",
+                            lambda: order.append("clear"))
+        assert k._start_tray_companion(disabled=True) is None
+        assert order == ["kill", "clear"], order
 
     def test_main_passes_no_tray_flag(self, monkeypatch):
         monkeypatch.setattr(k, "run_campaign", lambda **kw: {
@@ -286,6 +321,118 @@ def test_tray_user_visible_flag_contract():
     show_body = t[show:hide]
     assert show_body.index("Set-UserVisibleFlag") < show_body.index("Restore($h)"), \
         "флаг ставится после показа (сторож успеет спрятать окно)"
+    assert "Set-UserHiddenFlag" in t, "трей не различает явный hidden"
+    hide_body = t[hide:t.index("function Reconcile-CollectorWindows")]
+    assert "Set-UserHiddenFlag" in hide_body, \
+        "«Свернуть» не пишет явный hidden (env-дефолт воскресит окна)"
+    fn = t[t.index("function Test-UserVisibleFlag"):]
+    fn = fn[:fn.index("function Send-TrayCtrlC")]
+    assert "OZON_KEEP_WINDOW" in fn, \
+        ("без файла трей не чтит стартовый --window-mode visible "
+         "(BLOCKER ревью 2026-10-19)")
+
+
+def test_tray_daemon_identity_uses_pidfile_without_wmi():
+    """WMI-free identity: data/key_daemon.pid (pid + started_at) + StartTime.
+
+    PidLock writes those fields atomically (scripts/key_daemon.py); this keeps
+    the tray able to stop the daemon when WMI is unavailable, without ever
+    signalling an unverified pid.
+    """
+    t = _text(TRAY)
+    fn = t[t.index("function Test-DaemonIdentity"):]
+    fn = fn[:fn.index("function Stop-Daemon")]
+    assert "key_daemon.pid" in fn
+    assert "started_at" in fn
+    assert "Get-Process -Id $TargetPid" in fn
+    assert "Get-CimInstance" not in fn, \
+        "identity-проверка не должна зависеть от WMI"
+    assert "-le 30" in fn, "нет допуска между стартом процесса и pid-файлом"
+
+
+def test_tray_daemon_identity_behavior(tmp_path):
+    """Runs the extracted Test-DaemonIdentity under PowerShell 5.1.
+
+    Source-text pins alone would accept a typo in the datetime parse; this
+    harness writes a real pidfile for the current PowerShell process and
+    checks match/mismatch behavior (review 2026-10-19).
+    """
+    if os.name != "nt":
+        pytest.skip("PowerShell: Windows-only")
+    ps = shutil.which("powershell") or shutil.which("pwsh")
+    assert ps, "не найден powershell/pwsh"
+    t = _text(TRAY)
+    fn = t[t.index("function Test-DaemonIdentity"):]
+    fn = fn[:fn.index("function Stop-Daemon")]
+    work = tmp_path / "scripts"
+    work.mkdir()
+    (tmp_path / "data").mkdir()
+    harness = work / "identity.ps1"
+    harness.write_text(fn + '''
+
+$me = $PID
+$pf = Join-Path (Split-Path -Parent $PSScriptRoot) "data\\key_daemon.pid"
+$start = (Get-Process -Id $me).StartTime.ToUniversalTime().ToString("o")
+@{ pid = $me; campaign = "t"; started_at = $start } | ConvertTo-Json |
+    Set-Content -LiteralPath $pf -Encoding UTF8
+$okSame = Test-DaemonIdentity -TargetPid $me
+$old = (Get-Date).ToUniversalTime().AddHours(-1).ToString("o")
+@{ pid = $me; campaign = "t"; started_at = $old } | ConvertTo-Json |
+    Set-Content -LiteralPath $pf -Encoding UTF8
+$okOld = Test-DaemonIdentity -TargetPid $me
+$newStart = (Get-Date).ToUniversalTime().ToString("o")
+@{ pid = $me + 1; campaign = "t"; started_at = $newStart } | ConvertTo-Json |
+    Set-Content -LiteralPath $pf -Encoding UTF8
+$okPid = Test-DaemonIdentity -TargetPid $me
+Write-Output ("{0} {1} {2}" -f $okSame, $okOld, $okPid)
+''', encoding="utf-8-sig")
+    out = subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                          "-File", str(harness)],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, f"harness упал: {out.stderr}"
+    tokens = out.stdout.strip().split()
+    assert tokens[-3:] == ["True", "False", "False"], \
+        f"identity: совпадение/старый старт/чужой pid → {tokens} " \
+        f"(stderr={out.stderr!r})"
+
+
+def test_tray_visible_flag_behavior(tmp_path):
+    """PS 5.1 harness: absent/empty flag falls back to env; "0"/"1" win."""
+    if os.name != "nt":
+        pytest.skip("PowerShell: Windows-only")
+    ps = shutil.which("powershell") or shutil.which("pwsh")
+    assert ps, "не найден powershell/pwsh"
+    t = _text(TRAY)
+    fn = t[t.index("function Test-UserVisibleFlag"):]
+    fn = fn[:fn.index("function Send-TrayCtrlC")]
+    harness = tmp_path / "flag.ps1"
+    harness.write_text(f'''$script:FlagPath = "{tmp_path / 'flag'}"
+{fn}
+function Try-Env($v) {{
+    $env:OZON_KEEP_WINDOW = $v
+    Write-Output (Test-UserVisibleFlag)
+}}
+Remove-Item -LiteralPath $script:FlagPath -ErrorAction SilentlyContinue
+$absentOn = Try-Env "1"
+$absentOff = Try-Env "0"
+Set-Content -LiteralPath $script:FlagPath -Value "0" -Encoding UTF8
+$hiddenOn = Try-Env "1"
+Set-Content -LiteralPath $script:FlagPath -Value "1" -Encoding UTF8
+$shownOff = Try-Env "0"
+[IO.File]::WriteAllText($script:FlagPath, "")
+$emptyOn = Try-Env "1"
+$emptyOff = Try-Env "0"
+Write-Output ("{{0}} {{1}} {{2}} {{3}} {{4}} {{5}}" -f $absentOn,
+    $absentOff, $hiddenOn, $shownOff, $emptyOn, $emptyOff)
+''', encoding="utf-8-sig")
+    out = subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                          "-File", str(harness)],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, f"harness упал: {out.stderr}"
+    tokens = out.stdout.strip().split()
+    assert tokens[-6:] == ["True", "False", "False", "True",
+                           "True", "False"], \
+        f"absent/\"0\"/\"1\"/empty → {tokens} (stderr={out.stderr!r})"
 
 
 def test_tray_reconcile_enforces_both_modes():

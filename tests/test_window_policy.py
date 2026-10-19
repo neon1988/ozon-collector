@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -428,7 +429,6 @@ def test_singleton_guard_is_one_per_process():
 # ---- интеграция с Session ---------------------------------------------------
 
 def _fake_session(keep_window=False, owner="collector", kind="chrome", pid=777):
-    from types import SimpleNamespace
     return SimpleNamespace(keep_window=keep_window, browser_owner=owner,
                            kind=kind,
                            browser_pid=SimpleNamespace(pid=pid) if pid else None,
@@ -507,6 +507,160 @@ def test_session_visible_mode_not_guarded(monkeypatch):
     assert g.watched_pids() == {}
     cdp.Session._sync_window_guard(sess, " (t)", enforce_hidden=False)
     assert g.watched_pids() == {}
+
+
+def test_session_keep_window_yields_to_tray_hidden(monkeypatch, tmp_path):
+    """Явный "0" из трея сильнее keep_window и в Session-стороже.
+
+    --window-mode visible задаёт стартовый режим; после «Свернуть» окно
+    обязано снова попасть под охрану, иначе при падении трея оно останется
+    видимым (MAJOR ревью 2026-10-19).
+    """
+    from ozon_collector import cdp
+    flag = tmp_path / "window_visible.flag"
+    flag.write_text("0", encoding="utf-8")
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+    g = _guard_with(monkeypatch)
+    sess = _fake_session(keep_window=True)
+    cdp.Session._sync_window_guard(sess, " (t)", enforce_hidden=True)
+    assert g.watched_pids() == {777: "9222"}
+
+
+def test_apply_window_policy_honors_tray_hidden(monkeypatch, tmp_path):
+    """keep_window must not resurrect windows after the tray wrote "0"."""
+    from ozon_collector import cdp
+    flag = tmp_path / "window_visible.flag"
+    flag.write_text("0", encoding="utf-8")
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+    calls = []
+    monkeypatch.setattr(cdp.Session, "_keep_window_visible",
+                        lambda self: calls.append("keep"))
+    monkeypatch.setattr(cdp.Session, "_minimize_window",
+                        lambda self: calls.append("min"))
+    monkeypatch.setattr(
+        cdp.Session, "_sync_window_guard",
+        lambda self, why="", enforce_hidden=False:
+        calls.append(("sync", enforce_hidden)))
+    sess = cdp.Session.__new__(cdp.Session)
+    sess.keep_window = True
+    sess.kind = "chrome"
+    cdp.Session._apply_window_policy(sess, " (t)")
+    assert calls == ["min", ("sync", True)], calls
+
+
+def test_apply_window_policy_tray_visible_beats_env_hidden(monkeypatch, tmp_path):
+    """env hidden + tray "1": the tray is authoritative, window stays visible."""
+    from ozon_collector import cdp
+    flag = tmp_path / "window_visible.flag"
+    flag.write_text("1", encoding="utf-8")
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "0")
+    calls = []
+    monkeypatch.setattr(cdp.Session, "_keep_window_visible",
+                        lambda self: calls.append("keep"))
+    monkeypatch.setattr(cdp.Session, "_minimize_window",
+                        lambda self: calls.append("min"))
+    monkeypatch.setattr(
+        cdp.Session, "_sync_window_guard",
+        lambda self, why="", enforce_hidden=False:
+        calls.append(("sync", enforce_hidden)))
+    sess = cdp.Session.__new__(cdp.Session)
+    sess.keep_window = False
+    sess.kind = "chrome"
+    cdp.Session._apply_window_policy(sess, " (t)")
+    assert calls == ["keep", ("sync", False)], calls
+
+
+def test_apply_window_policy_never_touches_external(monkeypatch, tmp_path):
+    """Tray "1" must not show/move the user's own Chrome (external owner)."""
+    from ozon_collector import cdp
+    flag = tmp_path / "window_visible.flag"
+    flag.write_text("1", encoding="utf-8")
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+    calls = []
+    monkeypatch.setattr(cdp.Session, "_keep_window_visible",
+                        lambda self: calls.append("keep"))
+    monkeypatch.setattr(cdp.Session, "_minimize_window",
+                        lambda self: calls.append("min"))
+    monkeypatch.setattr(
+        cdp.Session, "_sync_window_guard",
+        lambda self, why="", enforce_hidden=False:
+        calls.append(("sync", enforce_hidden)))
+    sess = cdp.Session.__new__(cdp.Session)
+    sess.keep_window = True
+    sess.kind = "chrome"
+    sess.browser_owner = "external"
+    cdp.Session._apply_window_policy(sess, " (t)")
+    assert calls == [("sync", False)], calls
+
+
+def test_geometry_guard_never_normalizes_external(monkeypatch):
+    """External Chrome desync must not trigger Browser.setWindowBounds."""
+    from ozon_collector import cdp
+    calls = []
+    monkeypatch.setattr(
+        cdp.Session, "_assert_geometry_ok",
+        lambda self, page, tolerance=3.0: (False, {"hwnd_rect": [0, 0, 1, 1]}))
+    monkeypatch.setattr(cdp.Session, "_normalize_window_geometry",
+                        lambda self, *a, **k: calls.append("norm"))
+    sess = cdp.Session.__new__(cdp.Session)
+    sess.browser_owner = "external"
+    ok, m = cdp.Session._geometry_guard(sess, object())
+    assert ok is True, "внешнее окно не должно блокировать пазл"
+    assert calls == [], "normalize тронул чужое окно"
+    assert m.get("skipped") == "external", m
+
+
+def test_sync_window_guard_tray_visible_not_watched(monkeypatch, tmp_path):
+    """Tray "1" + env hidden must not register the window for hiding."""
+    from ozon_collector import cdp
+    flag = tmp_path / "window_visible.flag"
+    flag.write_text("1", encoding="utf-8")
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "0")
+    g = _guard_with(monkeypatch)
+    cdp.Session._sync_window_guard(_fake_session(keep_window=False), " (t)",
+                                   enforce_hidden=True)
+    assert g.watched_pids() == {}
+
+
+def test_minimize_window_skips_native_when_tray_visible(monkeypatch, tmp_path):
+    """Direct minimize path obeys the tray flag too (review 2026-10-19)."""
+    from ozon_collector import cdp
+    flag = tmp_path / "window_visible.flag"
+    flag.write_text("1", encoding="utf-8")
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    calls = []
+    monkeypatch.setattr(cdp.Session, "_sync_window_guard", lambda *a, **k: None)
+    monkeypatch.setattr(cdp.Session, "_normalize_window_geometry",
+                        lambda self, *a, **k: False)
+    monkeypatch.setattr(cdp.Session, "_minimize_window_native",
+                        lambda self, *a, **k: calls.append("native"))
+    sess = cdp.Session.__new__(cdp.Session)
+    sess.kind = "chrome"
+    sess.browser_owner = "collector"
+    cdp.Session._minimize_window(sess)
+    assert calls == [], "окно скрыто вопреки явному visible из трея"
+
+
+def test_apply_window_policy_firefox_hidden_skips_restore(monkeypatch, tmp_path):
+    """Debug Firefox must not restore its window after an explicit hidden."""
+    from ozon_collector import cdp
+    flag = tmp_path / "window_visible.flag"
+    flag.write_text("0", encoding="utf-8")
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    calls = []
+    monkeypatch.setattr(cdp.Session, "_restore_window_native",
+                        lambda self, **kw: calls.append("restore"))
+    monkeypatch.setattr(cdp.Session, "_sync_window_guard", lambda self, *a, **k: None)
+    sess = cdp.Session.__new__(cdp.Session)
+    sess.keep_window = True
+    sess.kind = "firefox"
+    cdp.Session._apply_window_policy(sess, " (t)")
+    assert calls == [], "firefox развернулся вопреки явному hidden"
 
 
 def test_session_external_browser_not_guarded(monkeypatch):
@@ -987,6 +1141,68 @@ def test_flag_file_roundtrip(monkeypatch, tmp_path):
     wp.clear_user_visible()      # повторный вызов — не исключение
 
 
+def test_hidden_flag_overrides_keep_window_env(monkeypatch, tmp_path):
+    """Explicit tray "0" beats OZON_KEEP_WINDOW after start (owner 2026-10-19).
+
+    The console/env sets the initial mode; the tray is authoritative after
+    that. Without this the env=1 passed to workers would resurrect windows the
+    owner hid in the tray.
+    """
+    flag = tmp_path / "window_visible.flag"
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+    flag.write_text("0", encoding="utf-8")
+    assert wp.user_visible() is False
+    assert wp.user_hidden() is True
+    assert wp._keep_window_env() is False
+    # PS 5.1 Set-Content -Encoding UTF8 writes a BOM: it must not turn the
+    # explicit "1" into "no opinion".
+    flag.write_text("\ufeff1", encoding="utf-8")
+    assert wp.user_hidden() is False
+    assert wp.user_visible() is True
+    assert wp._keep_window_env() is True
+
+
+def test_empty_visible_flag_means_no_opinion(monkeypatch, tmp_path):
+    """An interrupted flag write must not mean visible (review 2026-10-19)."""
+    flag = tmp_path / "window_visible.flag"
+    flag.write_text("", encoding="utf-8")
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", flag)
+    monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+    assert wp.user_visible() is False
+    assert wp.user_hidden() is False
+    assert wp._keep_window_env() is True
+
+
+@pytest.mark.skipif(wp.os.name != "nt", reason="hook: нужен Windows")
+def test_hook_is_replaced_after_quit_was_posted():
+    """A stuck hook must not survive into a restart (NIT review 2026-10-19).
+
+    stop() posts WM_QUIT; if the thread outlives the join, is_alive() stays
+    True and the old start() would keep it — the guard would then run without
+    instant window hiding. start() must replace it.
+    """
+    g = wp.WindowGuard(poll_s=0.01)
+    blocker = threading.Event()
+
+    def stuck():
+        blocker.wait(10)
+
+    t = threading.Thread(target=stuck, daemon=True)
+    t.start()
+    g._hook_thread = t
+    g._hook_quit_sent = True
+    g.start()
+    try:
+        assert g._hook_thread is not t, \
+            "хук с отправленным WM_QUIT не пересоздан"
+        assert g._hook_quit_sent is False
+    finally:
+        blocker.set()
+        g.stop()
+        t.join(timeout=5)
+
+
 def test_user_visible_flag_lives_in_data_dir():
     """Флаг — общий контракт трей↔Python: data/window_visible.flag.
 
@@ -1350,12 +1566,47 @@ class TestSentinel:
             "выключенный сторож обязан объяснить отказ в логе"
         monkeypatch.setenv("OZON_WINDOW_GUARD", "1")
         monkeypatch.setenv("OZON_KEEP_WINDOW", "1")
+        monkeypatch.setattr(wp, "sentinel_tick", lambda **kw: {"stub": True})
         caplog.clear()
         with caplog.at_level(logging.INFO,
                              logger="ozon_collector.window_policy"):
-            assert wp.sentinel_start() is False
+            try:
+                assert wp.sentinel_start() is True, \
+                    ("стартовый visible не отменяет старт сторожа: явный "
+                     "hidden из трея обязан сработать даже без трея")
+            finally:
+                wp.sentinel_stop()
         assert any("visible" in r.getMessage() for r in caplog.records), \
-            "visible-режим обязан логировать, почему сентинел не нужен"
+            "visible-режим обязан логировать, что сторож ждёт явного hidden"
+
+    def test_tick_rechecks_user_visible_before_hide(self):
+        """A flip to visible during the scan cancels the hide (review 2026-10-19)."""
+        state = {"n": 0}
+
+        def uv():
+            state["n"] += 1
+            return state["n"] > 1
+
+        hidden = []
+        res = wp.sentinel_tick(hide=self._record(hidden), rows=self._rows(),
+                               pids=dict(self._OURS), uv=uv)
+        assert hidden == [], "тик спрятал окно после переключения в visible"
+        assert res["skipped"] == "user_visible", res
+
+    def test_on_show_rechecks_user_visible_before_hide(self, monkeypatch):
+        """The hook re-checks visible after its profile scan (review 2026-10-19)."""
+        monkeypatch.setattr(wp, "_hwnd_pid", lambda hwnd: 500)
+        state = {"n": 0}
+
+        def uv():
+            state["n"] += 1
+            return state["n"] > 1
+
+        hidden = []
+        ok = wp.sentinel_on_show(0x4040, hide=self._record(hidden),
+                                 pids=dict(self._OURS), uv=uv)
+        assert ok is False and hidden == [], \
+            "хук спрятал окно после переключения в visible"
 
     def test_on_show_hides_our_window(self, monkeypatch):
         hidden = []
@@ -1720,9 +1971,12 @@ def test_pid_alive_delegates_to_process(monkeypatch):
     assert wp._pid_alive(2 ** 24) is False  # guard from the shared impl
 
 
-def test_keep_window_env_uses_shared_env_bool(monkeypatch):
+def test_keep_window_env_uses_shared_env_bool(monkeypatch, tmp_path):
     """D5: OZON_KEEP_WINDOW=true/yes/on is recognized the same way as in
     launch_chrome.ps1 and cdp.Session (shared process.env_bool)."""
+    # Hermetic: a real data/window_visible.flag ("0") on the dev machine must
+    # not leak into the env decision.
+    monkeypatch.setattr(wp, "USER_VISIBLE_FLAG", tmp_path / "absent.flag")
     monkeypatch.setenv("OZON_KEEP_WINDOW", "true")
     assert wp._keep_window_env() is True
     monkeypatch.setenv("OZON_KEEP_WINDOW", "0")

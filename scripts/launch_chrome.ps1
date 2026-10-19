@@ -496,9 +496,29 @@ function Restore-Focus {
 $keepWindowMode = $env:OZON_KEEP_WINDOW -match '^(1|true|yes|on)$'
 $windowVisibleFlag = Join-Path (Split-Path -Parent $PSScriptRoot) "data\window_visible.flag"
 
+# Tray state: "1" = user shows the windows, "0" = user hid them (beats the
+# console/env initial mode — owner 2026-10-19). Absent = env decides.
+# Re-read on every tick: the owner can hide the windows at any moment.
+function Test-ShowAnyway {
+    $state = ""
+    if (Test-Path $windowVisibleFlag) {
+        $state = Get-Content -LiteralPath $windowVisibleFlag -Raw -ErrorAction SilentlyContinue
+        if ($null -eq $state) { $state = "" }
+        $state = $state.Trim()
+    }
+    if ($state -eq "0") { return $false }
+    if ($state -eq "1") { return $true }
+    return $keepWindowMode
+}
+
 # Первый проход: находим окно и ставим WS_EX_NOACTIVATE как можно раньше,
-# НЕ показывая его (оно скрыто с рождения — SW_HIDE).
-$minimized = Invoke-MinimizeNoActivate $targetPid 10000
+# НЕ показывая его (оно скрыто с рождения — SW_HIDE). В visible-режиме окно
+# не трогаем: стартовый env или явный "1" из трея означает «показывать»
+# (owner 2026-10-19; ревью: финальный hide игнорировал флаг).
+$minimized = $false
+if (-not (Test-ShowAnyway)) {
+    $minimized = Invoke-MinimizeNoActivate $targetPid 10000
+}
 
 # Фокус: Chrome крадёт его через 0.3-0.4 с после старта (замер 2026-10-06).
 # Слепых 500 мс здесь больше НЕТ: они вместе с поздним первым проходом
@@ -521,7 +541,8 @@ for ($i = 0; $i -lt 200; $i++) {
     }
     # Пере-скрытие: NO-OP, если окно уже скрыто (стиль не переставляется).
     # Пользователь развернул окна (флаг) / режим visible — не боремся с ним.
-    if (-not ($keepWindowMode -or (Test-Path $windowVisibleFlag))) {
+    # Явный трей-«0» прячет окно даже при OZON_KEEP_WINDOW=1.
+    if (-not (Test-ShowAnyway)) {
         $null = Invoke-MinimizeNoActivate $targetPid 20
     }
     if (-not $focusDone -and ((Get-Date) - $loopT0).TotalMilliseconds -ge 450) {
@@ -546,7 +567,7 @@ if (-not $focusDone) {
     # проход пере-скрытия, и только потом фокус (находки ревью 2026-10-18).
     $focusLeft = 450 - ((Get-Date) - $loopT0).TotalMilliseconds
     if ($focusLeft -gt 0) { Start-Sleep -Milliseconds ([int]$focusLeft + 1) }
-    if (-not ($keepWindowMode -or (Test-Path $windowVisibleFlag))) {
+    if (-not (Test-ShowAnyway)) {
         $null = Invoke-MinimizeNoActivate $targetPid 20
     }
     Restore-Focus -PrevFg $prevFg
@@ -592,16 +613,24 @@ if (-not $ready) {
 # над панелью задач мини-плитку-призрак с крестиком (живой замер 2026-10-16:
 # vis=True icon=True rect=0,1004,160,1032 — «плитка» владельца) и на свёрнутом
 # окне перестают идти кадры. Окно остаётся скрытым (SW_HIDE от CreateProcess).
-# Финальный проход — БЕЗУСЛОВНО (до 2026-10-16 он шёл только при провале
-# первого): между проходами Chrome мог показать окно повторно.
-$finalHide = Invoke-MinimizeNoActivate $targetPid 3000
+# Финальный проход — безусловный в hidden-режиме (до 2026-10-16 он шёл только
+# при провале первого): между проходами Chrome мог показать окно повторно.
+# Visible-режим (env или трей) финальный проход не трогает — иначе лаунчер
+# прятал бы окно, которое трей только что показал (ревью 2026-10-19).
+$showNow = Test-ShowAnyway
+$finalHide = $false
+if (-not $showNow) {
+    $finalHide = Invoke-MinimizeNoActivate $targetPid 3000
+}
 $minimized = $minimized -or $finalHide
 # Фокус: Chrome крадёт его на старте (SetForegroundWindow, замер 2026-10-06),
 # а демон-сторож вернёт его только к connect (2-7 с) — всё это время окно
 # пользователя без фокуса. Вызов был потерян при переписывании лаунчера,
 # функция Restore-Focus оставалась мёртвой; возвращён 2026-10-16.
 Restore-Focus -PrevFg $prevFg
-if ($minimized) {
+if ($showNow) {
+    Write-Host "OK: окно PID $targetPid не скрыто лаунчером (visible-режим; показ — трей/CDP)"
+} elseif ($minimized) {
     Write-Host "OK: окно PID $targetPid скрыто, стиль TOOLWINDOW|NOACTIVATE применён"
 } else {
     Write-Warning "не удалось найти окно PID $targetPid для применения стиля"
@@ -633,7 +662,9 @@ if ($dutyS -gt 0) {
         if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
             break        # Chromium закрылся — караулить больше нечего
         }
-        if ($keepWindowMode -or (Test-Path $windowVisibleFlag)) {
+        # Перечитываем состояние трея: «Свернуть» может прийти уже во время
+        # караула, и явный "0" обязан победить env-дефолт (owner 2026-10-19).
+        if (Test-ShowAnyway) {
             break        # окна хотят видимыми: не боремся с треем/режимом
         }
         $null = Invoke-MinimizeNoActivate $targetPid 20

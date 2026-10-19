@@ -74,6 +74,142 @@ def test_characteristics_not_culled_by_content_visibility(evaluate):
         f"culling обнулил characteristics: {chars!r}"
 
 
+def test_characteristics_new_hashed_markup(evaluate):
+    """Ozon 2026-10 hashed markup: rows of two DIV cells, no dl.
+
+    Live dump data/1000750402/dom/2026-10-02.html.gz: webShortCharacteristics
+    keeps rows `div.pdp_bp` (key + value cells) and zero dl. The old extractor
+    returned {} and production silently lost every product's characteristics
+    (owner: fix urgently, 2026-10-19).
+    """
+    html = '''<html><body>
+      <div data-widget="webShortCharacteristics" class="pdp_b9o">
+        <div class="pdp_ob9"><span>О товаре</span>
+          <div class="b5_7_3-a0"><div>Перейти к описанию</div>
+            <div>5</div></div></div>
+        <div class="pdp_o9b">
+          <div class="pdp_bp pdp_bo6">
+            <div class="pdp_b6o pdp_o6b"><span>Тип</span></div>
+            <div class="pdp_b6o pdp_ob7"><span>Презервативы</span></div>
+          </div>
+          <div class="pdp_bp pdp_bo6">
+            <div class="pdp_b6o pdp_o6b"><span>Бренд</span></div>
+            <div class="pdp_b6o pdp_ob7"><a href="/brand/masculan-1"><span>Masculan</span></a></div>
+          </div>
+          <div class="pdp_bp pdp_bo6">
+            <div class="pdp_b6o pdp_o6b"><span>Вид</span></div>
+            <div class="pdp_b6o pdp_ob7"><span>Анатомической формы, </span><span>Ультратонкие</span></div>
+          </div>
+        </div>
+      </div></body></html>'''
+    d = evaluate(html=html)
+    chars = d.get("characteristics") or {}
+    assert chars.get("Тип") == "Презервативы", f"chars={chars!r}"
+    assert chars.get("Бренд") == "Masculan", f"chars={chars!r}"
+    assert "Анатомической формы" in (chars.get("Вид") or ""), f"chars={chars!r}"
+    assert "О товаре" not in chars and "Перейти к описанию" not in chars, \
+        f"шапка виджета попала в rows: {chars!r}"
+
+
+def test_characteristics_two_structural_rows_beat_global_dl(evaluate):
+    """Even 2 hashed rows win over a global unrelated dl (review 2026-10-19).
+
+    With the old >=3 threshold these rows fell through to `dl.tsBodyMBold`
+    and an unrelated list could become characteristics.
+    """
+    html = '''<html><body>
+      <div data-widget="webShortCharacteristics">
+        <div class="row"><div>Тип</div><div>Презервативы</div></div>
+        <div class="row"><div>Бренд</div><div>Masculan</div></div>
+      </div>
+      <dl class="tsBodyMBold"><dt>Похожие товары</dt><dd>Не характеристики</dd></dl>
+      </body></html>'''
+    chars = evaluate(html=html).get("characteristics") or {}
+    assert chars == {"Тип": "Презервативы", "Бренд": "Masculan"}, chars
+
+
+def test_characteristics_char_meta_marks_culled_full_widget(evaluate):
+    """Culled full widget + short rows: meta must request a retry."""
+    html = '''<html><body>
+      <div data-widget="webCharacteristics"></div>
+      <div data-widget="webShortCharacteristics">
+        <div class="row"><div>Тип</div><div>Презервативы</div></div>
+      </div></body></html>'''
+    d = evaluate(html=html)
+    meta = d.get("char_meta") or {}
+    assert meta.get("full_present") is True
+    assert meta.get("full_empty") is True
+    assert meta.get("source") == "short"
+    assert (d.get("characteristics") or {}).get("Тип") == "Презервативы"
+
+
+def test_characteristics_real_content_visibility_culls_full_widget(browser):
+    """Real content-visibility:auto below the fold empties the full widget.
+
+    No CV_UNSKIP_CSS here: the page must cull like Ozon does. Probe
+    2026-10-19: full_rows=0/full_empty=True, short rows still extracted, so
+    collect_product retries exactly on this signal.
+    """
+    from ozon_collector.collect import PRODUCT_JS
+    html = '''<html><body>
+      <div style="height:5000px">spacer</div>
+      <div data-widget="webCharacteristics"
+           style="content-visibility:auto;contain-intrinsic-size:0 400px">
+        <div class="row"><div>Тип</div><div>Презервативы</div></div>
+      </div>
+      <div data-widget="webShortCharacteristics">
+        <div class="row"><div>Тип</div><div>Презервативы</div></div>
+      </div></body></html>'''
+    page = browser.new_page(viewport={"width": 1280, "height": 720})
+    try:
+        page.route("**/*", lambda route: route.abort())
+        page.set_content(html, wait_until="domcontentloaded")
+        d = page.evaluate(PRODUCT_JS, {})
+    finally:
+        page.close()
+    meta = d.get("char_meta") or {}
+    assert meta.get("full_present") is True
+    assert meta.get("full_rows") == 0, meta
+    assert meta.get("full_empty") is True, meta
+    assert meta.get("source") == "short", meta
+    assert (d.get("characteristics") or {}).get("Тип") == "Презервативы"
+
+
+def test_characteristics_text_fallback_opt_in(evaluate):
+    """Text-pair fallback is the last resort and off unless enabled.
+
+    Owner 2026-10-19 approved it as a reserve: pairing arbitrary widget text
+    can invent key/value rows, so it runs only when the caller asks for it.
+    """
+    html = '''<html><body>
+      <div data-widget="webShortCharacteristics">
+        <div>О товаре</div><div>Перейти к описанию</div>
+        <div>Тип</div><div>Презервативы</div>
+        <div>Бренд</div><div>Masculan</div>
+        <div>Страна</div><div>Китай</div>
+      </div></body></html>'''
+    off = evaluate(html=html).get("characteristics") or {}
+    assert off == {}, f"fallback обязан быть выключен по умолчанию: {off!r}"
+    on = evaluate(html=html, opts={"char_text_fallback": True})
+    chars = on.get("characteristics") or {}
+    assert chars.get("Тип") == "Презервативы", f"chars={chars!r}"
+    assert chars.get("Бренд") == "Masculan", f"chars={chars!r}"
+    assert "О товаре" not in chars, f"шапка попала в fallback: {chars!r}"
+
+
+def test_characteristics_text_fallback_filters_single_header_line(evaluate):
+    """One leftover header line must not shift every pair (review 2026-10-19)."""
+    html = '''<html><body>
+      <div data-widget="webShortCharacteristics">
+        <div>О товаре</div><div>Тип</div><div>Презервативы</div>
+        <div>Бренд</div><div>Masculan</div>
+      </div></body></html>'''
+    chars = (evaluate(html=html, opts={"char_text_fallback": True})
+             .get("characteristics") or {})
+    assert chars.get("Тип") == "Презервативы", chars
+    assert chars.get("Бренд") == "Masculan", chars
+
+
 def test_empty_page_no_crash(evaluate):
     d = evaluate(html="<html><body><p>товара нет</p></body></html>")
     assert isinstance(d, dict)

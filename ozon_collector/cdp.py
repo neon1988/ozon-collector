@@ -711,15 +711,9 @@ class Session:
             self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
         self._managed_pages = [self.page]
         self._attach_geom_guard()
-        if self.keep_window:
-            # Окно коллектора видимо и на всех: не сворачиваем (env/CLI
-            # --window-mode visible). SWP/ShowWindow снаружи бесполезны,
-            # т.к. Chrome возвращает окно: запрет минимизации — здесь.
-            self._keep_window_visible()
-            self._sync_window_guard(" (connect)", enforce_hidden=False)
-        else:
-            self._minimize_window()
-            self._sync_window_guard(" (connect)", enforce_hidden=True)
+        # Единая политика: keep_window с поправкой на явный "0" из трея
+        # (owner 2026-10-19) — тот же путь, что new_page/recycle.
+        self._apply_window_policy(" (connect)")
         # Теперь pid зарегистрирован (или гвард выключен/в external — тогда
         # note_user_window ничего не запомнит, см. его проверку по реестру).
         if _wp_guard is not None:
@@ -777,19 +771,24 @@ class Session:
                  f"{'private' if private else self.browser_profile}, "
                  f"pid={getattr(self.browser_pid, 'pid', None)}, "
                  f"binary={binary or 'system'}")
-        if self.keep_window:
+        if self.keep_window and not _WP.user_hidden():
             self._keep_window_visible()
         elif getattr(self, "kind", "chrome") == "firefox":
-            # Свёрнутое окно Firefox не рендерит lazy-блоки: IntersectionObserver
-            # не срабатывает, webListReviews не монтируется — 0 отзывов через
-            # cli.py при 12 в том же профиле с видимым окном (замер 2026-09-25,
-            # D:\Temp\opencode\ff_vmode_probe.py). Поэтому окно разворачиваем
-            # без активации (WS_EX_NOACTIVATE + TOPMOST) — фокус не крадём.
-            log.info("[cdp] firefox: окно разворачиваю без фокуса — свёрнутое "
-                     "окно не монтирует lazy-блоки отзывов и теряет вкладку "
-                     "при выгрузке по памяти")
-            self._restore_window_native(pids=self._firefox_pids(),
-                                        window_class=FIREFOX_WINDOW_CLASS)
+            if _WP.user_hidden():
+                log.debug("[cdp] firefox: hidden requested — restore skipped")
+            else:
+                # Свёрнутое окно Firefox не рендерит lazy-блоки:
+                # IntersectionObserver не срабатывает, webListReviews не
+                # монтируется — 0 отзывов через cli.py при 12 в том же
+                # профиле с видимым окном (замер 2026-09-25,
+                # D:\Temp\opencode\ff_vmode_probe.py). Поэтому окно
+                # разворачиваем без активации (WS_EX_NOACTIVATE + TOPMOST) —
+                # фокус не крадём.
+                log.info("[cdp] firefox: окно разворачиваю без фокуса — "
+                         "свёрнутое окно не монтирует lazy-блоки отзывов и "
+                         "теряет вкладку при выгрузке по памяти")
+                self._restore_window_native(pids=self._firefox_pids(),
+                                            window_class=FIREFOX_WINDOW_CLASS)
         else:
             self._minimize_window()
 
@@ -851,6 +850,9 @@ class Session:
             log.info("external Chrome: окно не сворачиваю — чужое окно "
                      "оператора (window_policy сторожит только collector)")
         else:
+            if _WP.user_visible() and not _WP.user_hidden():
+                log.debug("chrome: minimize skipped — tray shows the windows")
+                return
             self._minimize_window_native(P.cdp_port(self.cdp_url))
 
     def _apply_window_policy(self, why: str = ""):
@@ -868,13 +870,26 @@ class Session:
         само всплывает через ~30-40 с после старта и забирает фокус, а этот
         код вызывается только на connect/new_page/recycle.
         """
-        if getattr(self, "keep_window", False):
+        if getattr(self, "browser_owner", None) == "external":
+            # Чужой Chrome оператора: ни скрывать, ни показывать, ни двигать.
+            # Трей-«1» не даёт права трогать окно пользователя (ревью
+            # 2026-10-19: keep через user_visible доходил до external).
+            self._sync_window_guard(why, enforce_hidden=False)
+            log.info("external Chrome: политика окна пропущена — чужое окно%s",
+                     why)
+            return
+        keep = ((getattr(self, "keep_window", False) or _WP.user_visible())
+                and not _WP.user_hidden())
+        if keep:
             self._keep_window_visible()
             self._sync_window_guard(why, enforce_hidden=False)
         elif getattr(self, "kind", "chrome") == "firefox":
-            log.debug("firefox: окно разворачиваю без фокуса%s", why)
-            self._restore_window_native(pids=self._firefox_pids(),
-                                        window_class=FIREFOX_WINDOW_CLASS)
+            if _WP.user_hidden():
+                log.debug("firefox: hidden requested — restore skipped%s", why)
+            else:
+                log.debug("firefox: окно разворачиваю без фокуса%s", why)
+                self._restore_window_native(pids=self._firefox_pids(),
+                                            window_class=FIREFOX_WINDOW_CLASS)
             self._sync_window_guard(why, enforce_hidden=False)
         else:
             self._minimize_window()
@@ -895,8 +910,10 @@ class Session:
         guard = _WP.guard()
         if guard is None:
             return                      # выключено — окна пользователя не трогаем
+        keep = ((getattr(self, "keep_window", False) or _WP.user_visible())
+                and not _WP.user_hidden())
         hide = (enforce_hidden
-                and not getattr(self, "keep_window", False)
+                and not keep
                 and getattr(self, "browser_owner", None) == "collector"
                 and getattr(self, "kind", "chrome") == "chrome")
         if hide:
@@ -935,6 +952,8 @@ class Session:
         выполнена (окно было рассинхронизировано).
         """
         if os.name != "nt":
+            return False
+        if getattr(self, "browser_owner", None) == "external":
             return False
         if getattr(self, "kind", "chrome") == "firefox":
             # Firefox: нет CDP Browser.setWindowBounds — чинить нечем, нечего
@@ -1041,7 +1060,14 @@ class Session:
         revalidate. Возвращает (ok, metrics). Разделяет ЧТЕНИЕ (всегда
         читает-редактирует только при расхождении) и ДЕЙСТВИЕ подъёма
         геометрии — не пере-устанавливает геометрию на каждый пазл.
+
+        Чужой Chrome (`external`) не трогаем даже при рассинхроне: его окно
+        принадлежит пользователю (инвариант 2026-10-15; дыра найдена ревью
+        2026-10-19 — normalize звал Browser.setWindowBounds).
         """
+        if getattr(self, "browser_owner", None) == "external":
+            log.info("geometry guard: external Chrome — normalize пропущен")
+            return True, {"skipped": "external"}
         ok, m = self._assert_geometry_ok(page, tolerance=tolerance)
         if ok:
             m["normalized"] = False
@@ -1137,6 +1163,10 @@ class Session:
         координаты в границы экрана (Chrome сам задаёт позицию, SWP снаружи
         бесполезен). Firefox: CDP bounds нет — только native SW_RESTORE+TOPMOST.
         """
+        if _WP.user_hidden():
+            # Трей явно свернул окна после старта: env-дефолт не воскрешает
+            # окно при переподключении (owner 2026-10-19).
+            return
         if getattr(self, "kind", "chrome") == "firefox":
             self._restore_window_native(pids=self._firefox_pids(),
                                         window_class=FIREFOX_WINDOW_CLASS)

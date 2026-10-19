@@ -301,7 +301,15 @@ $script:FlagPath = Join-Path $script:FlagDir "window_visible.flag"
 
 function Set-UserVisibleFlag {
     New-Item -ItemType Directory -Path $script:FlagDir -Force | Out-Null
-    New-Item -ItemType File -Path $script:FlagPath -Force | Out-Null
+    # "1" = пользователь смотрит окна; "0" = трей явно свернул их. Явный "0"
+    # сильнее env-дефолта (слова владельца 2026-10-19: консоль при запуске
+    # задаёт стартовый режим, дальше главный — трей).
+    Set-Content -LiteralPath $script:FlagPath -Value "1" -Encoding UTF8
+}
+
+function Set-UserHiddenFlag {
+    New-Item -ItemType Directory -Path $script:FlagDir -Force | Out-Null
+    Set-Content -LiteralPath $script:FlagPath -Value "0" -Encoding UTF8
 }
 
 function Clear-UserVisibleFlag {
@@ -309,7 +317,17 @@ function Clear-UserVisibleFlag {
 }
 
 function Test-UserVisibleFlag {
-    return (Test-Path -LiteralPath $script:FlagPath)
+    # Нет файла/пустой файл — решает стартовый env (--window-mode visible).
+    # Трей стартует ПОСЛЕ apply_window_mode и обязан сохранить выбранный
+    # режим, иначе патруль спрячет окна через 2 с (BLOCKER ревью 2026-10-19).
+    # Пустой файл = оборванная запись, трактуем как отсутствие (MINOR ревью).
+    $fallback = $env:OZON_KEEP_WINDOW -match '^(1|true|yes|on)$'
+    if (-not (Test-Path -LiteralPath $script:FlagPath)) { return $fallback }
+    $v = Get-Content -LiteralPath $script:FlagPath -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $v) { return $fallback }
+    $v = $v.Trim()
+    if ($v -eq "") { return $fallback }
+    return ($v -ne "0")
 }
 
 function Send-TrayCtrlC {
@@ -328,8 +346,10 @@ function Show-CollectorWindows {
 function Hide-CollectorWindows {
     $wins = @(Get-CollectorWindows)
     foreach ($h in $wins) { [CollectorTrayWin]::Minimize($h) }
-    # Флаг ПОСЛЕ скрытия: пока прятали — сторож молчал.
-    Clear-UserVisibleFlag
+    # Флаг ПОСЛЕ скрытия: пока прятали — сторож молчал. Явный "0" (а не
+    # удаление файла): иначе OZON_KEEP_WINDOW воскресил бы окна при
+    # переподключении (owner 2026-10-19).
+    Set-UserHiddenFlag
     return $wins.Count
 }
 
@@ -432,6 +452,32 @@ function Close-Tray {
 
 $script:stopStage = 0
 
+function Test-DaemonIdentity {
+    # WMI-free identity fallback (owner 2026-10-19: «трей должен убивать
+    # демона»). WMI may be down while the daemon is alive, and killing an
+    # unverified pid is forbidden (PID reuse). The daemon pidfile holds
+    # pid + started_at (key_daemon.PidLock), so compare them with the live
+    # process start time; 30 s covers pidfile-write vs process-start skew.
+    param([int]$TargetPid)
+    $pidFile = Join-Path (Split-Path -Parent $PSScriptRoot) "data\key_daemon.pid"
+    try {
+        $meta = Get-Content -LiteralPath $pidFile -Raw -ErrorAction Stop |
+            ConvertFrom-Json
+    }
+    catch { return $false }
+    if (-not $meta -or [int]$meta.pid -ne $TargetPid) { return $false }
+    try {
+        $proc = Get-Process -Id $TargetPid -ErrorAction Stop
+        $started = [datetime]::Parse($meta.started_at,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind)
+        $delta = [math]::Abs(
+            ($proc.StartTime.ToUniversalTime() - $started.ToUniversalTime()).TotalSeconds)
+        return ($delta -le 30)
+    }
+    catch { return $false }
+}
+
 function Stop-DaemonHard {
     Stop-Process -Id $WatchPid -Force -ErrorAction SilentlyContinue
     Close-Tray
@@ -460,12 +506,17 @@ function Stop-Daemon {
     }
     catch { $cimOk = $false }
     if (-not $cimOk) {
-        $notify.ShowBalloonTip(3000, "ozon-collector",
-            "Не удалось проверить демона (WMI). Остановка отменена — повторите «Выход».",
-            [System.Windows.Forms.ToolTipIcon]::Warning)
-        return
+        # WMI down is not "daemon gone" and not a license to signal an
+        # unverified pid (PID reuse). The daemon pidfile + process start time
+        # prove identity without WMI (owner 2026-10-19).
+        if (-not (Test-DaemonIdentity -TargetPid $WatchPid)) {
+            $notify.ShowBalloonTip(3000, "ozon-collector",
+                "Не удалось проверить демона (WMI). Остановка отменена — повторите «Выход».",
+                [System.Windows.Forms.ToolTipIcon]::Warning)
+            return
+        }
     }
-    if (-not $proc -or $proc.CommandLine -notlike "*key_daemon*") {
+    elseif (-not $proc -or $proc.CommandLine -notlike "*key_daemon*") {
         Close-Tray                                # демона уже нет
         return
     }
@@ -514,7 +565,16 @@ if ($WatchPid -gt 0) {
                     -ErrorAction Stop
             }
             catch { $cimOk = $false }
-            if ($cimOk -and (-not $proc -or $proc.CommandLine -notlike "*key_daemon*")) {
+            if ($cimOk) {
+                if (-not $proc -or $proc.CommandLine -notlike "*key_daemon*") {
+                    $watch.Stop()
+                    Close-Tray
+                }
+            }
+            elseif (-not (Test-DaemonIdentity -TargetPid $WatchPid)) {
+                # WMI down AND the pidfile/start-time identity fails: the
+                # daemon is gone (or the pid is no longer ours) — the icon
+                # must not outlive it (owner 2026-10-19).
                 $watch.Stop()
                 Close-Tray
             }
