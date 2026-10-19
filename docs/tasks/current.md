@@ -1,6 +1,17 @@
 # Текущее состояние — ozon-collector
 
-Обновлено 2026-10-18 (11): одиннадцатый заход — «серое окно с крестиком»:
+Обновлено 2026-10-19 (12): двенадцатый заход — аудит трёх субагентов (зоны:
+экстракторы/тесты, окно-лаунчер-сторож, демон/оркестрация) + 8 фиксов (A–H):
+флейк xiaomi — `content-visibility`, а не гонка; трей читал сбой WMI как
+«демона нет»; `WindowGuard` не перезапускался; живой pid выкидывался на
+непроверяемой identity; recycle-путь без раннего сторожа окна; форс-стоп мимо
+респавна; 2-й Ctrl+C не работал в QA-фазах; `pending_pids` без
+`run_cfg.data_dir`. Verify: **1813 passed, 6 skipped, 1 xfailed**, 307 с.
+Ревью: 1 MAJOR закрыт (трей эскалировал Ctrl+C на непроверенный pid при
+сбое WMI — теперь ранний return), MINOR закрыты (stop под локом, retry на
+непроверяемой identity, дедуп finalized); открыт более глубокий
+production-корень потери характеристик (см. «Открыто после ревью»).
+Ранее (11): одиннадцатый заход — «серое окно с крестиком»:
 источник — сам Chrome (`Target.createTarget` показывает окно, фон-флаг не
 помогает), гашение опаздывало на 10-30 мс, и окно успевало мигнуть серым
 пустым прямоугольником. Фикс: скрытое окно паркуется за краем виртуального
@@ -28,6 +39,97 @@ visible, трей — переключатель), «Выход» в трее о
 корень «плитки» — свёрнутое TOOLWINDOW-окно — устранён (только SW_HIDE).
 Ранее: третий заход (GUID DeleteTab, патруль панели задач, balloon); трей-пульт
 («Правка 8»); 15.10 — BLOCKER + все 15 MAJOR аудита починены, verify ALL GREEN.
+
+## Двенадцатый заход (2026-10-19): аудит трёх субагентов — 8 фиксов (A–H)
+
+**Запрос владельца:** «дожимай аудит»; зоны — экстракторы/тесты,
+окно-лаунчер-сторож (заходы 7–11), демон/оркестрация + верификация бэклога.
+Аудит тремя субагентами; корни найдены чтением кода; фиксы A–H + 9 пинов.
+
+**A (корень флейка xiaomi, доказан живым репро `.tmp/cl_regress.py`):**
+не гонка `set_content`→`evaluate` (гипотеза 10-го захода опровергнута), а
+`content-visibility:auto`: PDP-контент в `xiaomi.html.gz` обёрнут
+`<div data-widget="paginator" style="...content-visibility:auto">`; в
+skipped-состоянии `innerText==''` → `chars={}` (rating вне обёртки цел —
+поэтому валился только критерий chars). Фикс: `conftest.CV_UNSKIP_CSS` +
+`page.add_style_tag` в трёх evaluate-фикстурах; живой контроль: без фикса
+`chars={}`, с фиксом `{'Артикул': '12345', 'Бренд': 'TestBrand'}`. Пин:
+`test_characteristics_not_culled_by_content_visibility`.
+
+**B.** `collector_tray.ps1`: сбой WMI читался как «демона нет»
+(`-ErrorAction SilentlyContinue` → `$null`) — «Выход» и watchdog закрывали
+трей при живом демоне. Фикс: `$cimOk` (Stop-Daemon :454-461, watchdog
+:503-510). Пин: `test_tray_distinguishes_wmi_failure_from_missing_process`.
+
+**C.** `window_policy.WindowGuard`: повторный `start()` после `stop()` молча
+не стартовал (early-return по мёртвому `_thread`, `_stop` не сброшен) —
+сторож оставался снятым. Фикс: `start`/`stop` под локом, join с timeout,
+рестарт пары потоков. Пин: `test_event_hook_restart_after_stop`.
+
+**D.** `window_policy._pid_owns_port`: «не смог проверить» возвращалось как
+`False` → `_drop_dead_browsers` выкидывал ЖИВОЙ pid из охраны, и окно снова
+показывалось. Фикс: `Optional[bool]`, `None` = «неизвестно» → pid остаётся
+под охраной. Пины: `test_pid_owns_port_none_when_unverifiable`,
+`test_unknown_port_ownership_keeps_pid_watched`.
+
+**E.** `browser.launch`: recycle-путь (`restart`→`launch`) не отдавал pid
+раннему сторожу окна до конца `_await_launch` — щель показа Chrome. Фикс:
+`cdp._watch_launcher_window` сразу после CreateProcess. Пин:
+`test_launch_guards_launcher_window_early`.
+
+**F.** `parallel._force_stop`/финализация ходили по исходному списку —
+живая замена после респавна переживала форс-стоп (её добивал только
+`os._exit` демона). Фикс: обход по `all_wctxs` + дедуп по `worker_idx`
+(побеждает последний; мёртвые оригиналы не дублируют payload в отчёте —
+замечание ревью). Пин:
+`test_await_force_stop_covers_restarted_replacement`.
+
+**G.** `key_daemon`: 2-й Ctrl+C не проверялся внутри QA-фаз — демон
+дожидался всех батчей QA перед выходом. Фикс: `_force_exit_guard()` перед
+каждым батчем (`classify_new_pids`, `_qa_clean`); сигнатура
+`_emergency_shutdown(progress_path=None)`. Пин:
+`test_classify_checks_force_before_qa_batches`.
+
+**H.** `key_daemon`: `pending_pids`/`split_done_pending` вызывались без
+`data_dir` — у кампаний с `run_cfg.data_dir` вердикты/pending считались по
+дефолтному каталогу. Фикс: helper `_run_data_dir(progress)` + вызовы в
+`summarize`/`split_done_pending`/`pending_pids`/финальном сборе. Пин:
+`test_run_data_dir_reads_run_cfg`.
+
+**Блокировано решением владельца (не чинили):** (c) гонка режима окон
+env↔трей-флаг (`OZON_WINDOW_VISIBLE` vs `data/window_visible.flag`); опция
+textContent-fallback в `product.js`. **Бэклог:** (b) `sweep_stray_browsers`
+не подключать; (d) мёртвый `shard_items` не трогать; (e) сплит
+`window_policy.py` отложен.
+
+**Прогоны:** точечные (6 файлов, 539; 4 файла, 457; 2 файла, 127; 1 файл, 97) —
+зелёные; полный `scripts/verify.ps1` — **ALL GREEN ×6**: 1813 (306.75 с) → 1813
+(329.75 с, ревью-1) → 1814 (310.05 с, ревью-2) → 1815 (316.75 с, ревью-3: join
+выживших, backoff от конца probe, image-check в None-ветке) → 1815 (309.69 с,
+ревью-4: join-гейт по `_stop`, избыточный `start()` снова мгновенный — живой
+замер 0.00 с) → **1816 (318.53 с, ревью-5: пины чужого образа и повтора probe)**.
+
+**Открыто после ревью (2026-10-19):** production-потеря характеристик — не в
+этом диффе и глубже тестового фикса: у свежих raw `product.characteristics`
+массово пуст (`"characteristics": {}` — 100+ файлов выборочно, включая
+октябрьские), а в сохранённых DOM-снапшотах характеристик НЕТ ни одного
+`<dl>` (снапшот `data/1000750402/dom/2026-10-02.html.gz`: `dl=0`, `pdp_bp=7`;
+строки — хэшеподобные классы `b5_7_3-*`/`pdp_ob9`), тогда как `product.js:87-116`
+парсит только `dl` и `[class*="Row"]`. Потеря тихая: `qa_raw.py` и
+`incomplete` в `collect.py` характеристики не проверяют. Следующий заход:
+fallback в `product.js` под новую разметку + скролл/ожидание виджета
+характеристик в `collect_product` + проверка в `qa_raw`. (Ссылки ревьюера на
+конкретные файлы не сошлись: `data/5872410267_raw.json` в data/ нет, а
+markup виден только в gz-снапшотах.) Мелочи того же отчёта: QA-батч держит
+exit до 900 с (G-лимит); сбой WMI в watchdog не логируется, а при постоянном
+WMI-сбое «Выход» недоступен — компромисс осознанный (B-dop; идея —
+WMI-free identity-fallback); узкая дыра рестарта hook-потока: если stop() уже
+послал WM_QUIT, новый start() увидит `is_alive=True` и хук не поднимет — показы
+гасятся только тиками до следующего старта (NIT ревью-4, не в этой волне); имя
+dom-снапшота — только дата (`collect.py:2483`, перезапись при двух прогонах
+в один день); наблюдение I/O: `test_classify_multibatch_aggregates` раз в 3
+фокус-прогона упёрся в 30-с timeout на `write_text` (изолированно и на
+полном прогоне — зелёный).
 
 ## Одиннадцатый заход (2026-10-18): «серое окно с крестиком» — показ Chrome на новой вкладке
 
@@ -201,7 +303,7 @@ fd-capture (`OSError: Bad file descriptor` → INTERNALERROR; доказано
 stash-экспериментом) — `tests/conftest.py` autouse-глушилка + маркер
 `allow_early_window_watch`.
 
-**Ревью (medium, субагент), 3 раунда:** BLOCKER/MAJOR нет. Round 1 закрыт:
+**Ревью (medium, субагент), раунды 1–4:** BLOCKER/MAJOR нет. Round 1 закрыт:
 запись grace-метки под локом, `EARLY_WATCH_GRACE_S=45`, комментарий про
 дубликат-запуск в логе, тест retry-ветки, `has_file()` удалён, строже
 контракт `-TimeoutSec 2`. Round 2 закрыт: в grace каждый тик сверяется ОБРАЗ
@@ -223,13 +325,14 @@ visible-режима у PS1-пере-скрытия не был запинен �
 
 **Verify:** `scripts/verify.ps1` — **ALL GREEN** ×4 (run4: 1794 passed, 304 с;
 run5 после round-2: 1796, 297 с; run6 после round-3: 1798, 311 с; финальный
-run7 после round-4: **1798 passed, 6 skipped, 1 xfailed, 300 с**). Флейк
+run7 после round-4: **1798 passed, 6 skipped, 1 xfailed, 300 с**; run8:
+1798 passed, 6 skipped, 1 xfailed, 314 с). Флейк
 `test_extract_live_markup[xiaomi]` (`chars=0`) падал
-2 полных прогона из 4 (run1/run3; run2/run4 зелёные; изолированно и файлом
-всегда зелёный) — известный флейк 7-8 заходов, к правкам отношения не имеет
-(файл не тронут). Гипотеза прежняя: гонка `set_content`→`evaluate` в фикстуре
-`evaluate` под нагрузкой (`tests/conftest.py:308`). Следующий шаг: ожидание
-`readyState`/маркера после `set_content`.
+2 полных прогона из 8 (плюс повтор в 11-м заходе; изолированно и файлом
+всегда зелёный) — флейк заходов 7–11. **Корень найден в 12-м заходе:** не
+гонка `set_content`→`evaluate`, а `content-visibility:auto` у PDP
+(xiaomi.html.gz обёрнут `[data-widget=paginator]`; skipped → `innerText=''`);
+фикс `CV_UNSKIP_CSS` + регресс-тест (см. раздел «Двенадцатый заход» выше).
 
 ## Восьмой заход (2026-10-17): «серые окна с крестиком» — код-аудит субагентами
 
