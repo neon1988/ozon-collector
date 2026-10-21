@@ -39,6 +39,7 @@ logs/{campaign}_daemon.log. Итог сбора читает из машиноч
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -115,6 +116,24 @@ CHECKPOINT_EVERY_S = int(os.environ.get("KD_CHECKPOINT_EVERY", "60") or 60)
 INFLIGHT_NAME = "inflight.json"
 TERMINAL_STATES = {"COMPLETED", "COMPLETED_MIN", "ABANDONED", "NEEDS_ATTENTION",
                    "INTERRUPTED"}
+
+
+def _clear_interrupted_state(progress: dict) -> bool:
+    """Allow a documented Ctrl+C resume: INTERRUPTED is terminal for THIS run.
+
+    The module contract says a graceful stop keeps the campaign resumable, but
+    the loop treats INTERRUPTED as terminal and exits before the first run. The
+    next launch clears that marker; NEEDS_ATTENTION and finished campaigns stay
+    terminal.
+    """
+    if progress.get("final_state") != "INTERRUPTED":
+        return False
+    progress["final_state"] = None
+    progress["final_reason"] = None
+    progress["final_note"] = None
+    return True
+
+
 OK_VERDICTS = {"OK", "WARN"}
 # Формализованные состояния runtime-цикла демона (для status.json / state API),
 # отдельно от TERMINAL_STATES (итог кампании). Внутренние фазы:
@@ -1184,6 +1203,55 @@ def _bump_challenge_control(progress: dict, signature: str | None = None) -> dic
     return cc
 
 
+_CAMPAIGN_NAME_RE = re.compile(r"^(?!\.)[\w.-]{1,80}$", re.UNICODE)
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _safe_new_campaign_name(name: str) -> bool:
+    if not isinstance(name, str) or not _CAMPAIGN_NAME_RE.fullmatch(name):
+        return False
+    if name.endswith((".", " ")):
+        return False
+    return name.split(".")[0].upper() not in _WINDOWS_RESERVED_NAMES
+
+
+def validate_campaign_name(name: str) -> str:
+    """Reject campaign names that can escape data/campaigns (I6 safety).
+
+    New names are restricted to a portable charset. A campaign directory that
+    already exists stays resumable/resettable even if an older CLI created it
+    with spaces, because rejecting it would strand real progress data.
+    """
+    if _safe_new_campaign_name(name):
+        return name
+    existing = (
+        isinstance(name, str)
+        and bool(name)
+        and os.path.basename(name) == name
+        and name not in (".", "..")
+        and not name.startswith(".")
+        and not name.endswith((".", " "))
+        and name.split(".")[0].upper() not in _WINDOWS_RESERVED_NAMES
+        and (CAMPAIGNS_DIR / name).is_dir()
+    )
+    if existing:
+        return name
+    raise SystemExit(
+        f"key_daemon: недопустимое имя кампании {name!r}: разрешены буквы, "
+        "цифры, '_', '-', '.' (до 80 символов), без разделителей пути; "
+        "существующие кампании принимаются как есть")
+
+
+def _run_sort_key(run_id: str) -> tuple[int, int]:
+    """Chronological order for run_<epoch>_<seq> ids (seq is not padded)."""
+    m = re.fullmatch(r"run_(\d+)_(\d+)", run_id)
+    return (int(m.group(1)), int(m.group(2))) if m else (-1, -1)
+
+
 def _recover_interrupted_run(progress: dict, data_dir: str,
                              qa_fn: Optional[Callable[[list[str]], dict]] = None):
     """Transactional recovery по run-журналу при resume.
@@ -1199,7 +1267,7 @@ def _recover_interrupted_run(progress: dict, data_dir: str,
         return
     run_ids = sorted(
         (f.stem for f in jdir.glob("*.json") if f.name.endswith(".json")),
-        key=lambda rid: rid)
+        key=_run_sort_key)
     if not run_ids:
         return
     last = run_ids[-1]
@@ -1313,7 +1381,8 @@ def _parse_qa_json_report(path: str) -> Optional[dict]:
     return parsed
 
 
-def run_qa_batch(pids: Iterable[str]) -> dict:
+def run_qa_batch(pids: Iterable[str],
+                 data_dir: str = DEFAULT_DATA_DIR) -> dict:
     """Офлайн QA по батчу PID через qa_raw.py (без отчёта). Возвращает сводку.
 
     Машинный контракт — JSON-файл (--report-json), stdout парсится только как
@@ -1324,9 +1393,9 @@ def run_qa_batch(pids: Iterable[str]) -> dict:
     os.close(fd)
     try:
         cmd = [PYTHON, "-u", "-X", "utf8", QA_RAW, "--pids", ",".join(pids),
-               "--report-json", report]
+               "--data-dir", str(data_dir), "--report-json", report]
         res = subprocess.run(cmd, capture_output=True, text=True,
-                             encoding="utf-8", timeout=900,
+                             encoding="utf-8", timeout=900, cwd=str(ROOT),
                              creationflags=(getattr(subprocess,
                                                     "CREATE_NO_WINDOW",
                                                     0x08000000)
@@ -1388,8 +1457,8 @@ def classify_new_pids(progress: dict, candidates: Iterable[str],
       - при fail>0 per_pid ДОЛЖЕН покрывать ВСЕ PID батча, иначе fail-пид может
         получить fallback OK → parse_error=True.
     """
-    qa_fn = qa_fn or run_qa_batch
     data_dir = _run_data_dir(progress) or DEFAULT_DATA_DIR
+    qa_fn = qa_fn or functools.partial(run_qa_batch, data_dir=data_dir)
     base_verdicts = dict(progress.get("verdicts", {}))
     verdicts = dict(base_verdicts)
     verdict_meta = dict(progress.get("verdict_meta", {}))
@@ -1464,7 +1533,8 @@ def classify_new_pids(progress: dict, candidates: Iterable[str],
 # ---------------------------------------------------------------------------
 # запуск сбора (in-process) и обновление manifest
 # ---------------------------------------------------------------------------
-def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
+def _inproc_gather_cfg(cfg: dict, max_age_s: int,
+                       mode: str | None = None) -> dict:
     """gather_cfg для in-process сбора — дефолты прежнего CLI search.
 
     Демон запускал CLI без большинства опций → действовали дефолты CLI
@@ -1474,7 +1544,12 @@ def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
     решение владельца). Берётся ИЗ run_cfg манифеста: при resume конфиг — это
     манифест, а не аргументы текущего запуска (инвариант 4). Поле в кампаниях,
     созданных до появления ключа, отсутствует → дефолт 1.
+
+    Rescan MUST bypass the cache and overwrite the canonical raw: otherwise a
+    failed PID with a fresh raw is a cache hit, the old raw is re-QA'd, and the
+    rescan budget is spent without any new data (I5).
     """
+    rescan = mode == "rescan"
     return {
         "variant": "",
         "max_pages": 12,
@@ -1483,7 +1558,7 @@ def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
         "no_dom": False,
         "no_variant_mode": False,
         "sorts": ["published_at_desc", "score_asc"],  # DEFAULT_SORTS
-        "max_age_s": max_age_s,
+        "max_age_s": 0 if rescan else max_age_s,
         "no_ocr": True,          # --ocr не передаётся демоном
         "skip_reviews": cfg.get("skip_reviews", False),
         # Размер выдачи воркеру. Кламп вниз единицей: batch_size<=0 в
@@ -1496,7 +1571,10 @@ def _inproc_gather_cfg(cfg: dict, max_age_s: int) -> dict:
         "threads": 8,
         "no_preproc": False,
         "dedup_replies": True,   # без --no-dedup-replies
-        "overwrite": False,
+        "overwrite": rescan,
+        # Normal (non-rescan) fresh data is written to a timestamped file when
+        # canonical exists; promote it so QA/manifest never validate stale raw.
+        "promote_raw": True,
         "min_rating": None,
         "window_mode": cfg.get("window_mode"),
         "scroll_jitter_seed": None,
@@ -1522,7 +1600,7 @@ def _inproc_collect(progress: dict, run_id: str, mode: str,
     camp = progress["campaign"]
     parallel = max(1, int(cfg.get("parallel", 1)))
     max_age_s = K.parse_max_age(cfg.get("max_age", "7d"))
-    gather_cfg = _inproc_gather_cfg(cfg, max_age_s)
+    gather_cfg = _inproc_gather_cfg(cfg, max_age_s, mode=mode)
 
     session_budget = None
     if cfg.get("session_budget_wall_clock"):
@@ -1941,6 +2019,7 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
                  name_source: str = "explicit",
                  name_source_value: Optional[str] = None,
                  qa_fn: Optional[Callable[[list[str]], dict]] = None) -> dict:
+    validate_campaign_name(campaign)
     lock = PidLock(DATA_DIR / "key_daemon.pid")
     if not lock.acquire(campaign):
         raise SystemExit("key_daemon уже запущен (pid-файл)")
@@ -1981,6 +2060,11 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
         progress_path = camp_dir / "progress.json"
 
     existing = load_json(progress_path)
+    if existing is None and progress_path.is_file():
+        raise SystemExit(
+            f"key_daemon: {progress_path} существует, но не читается как JSON — "
+            "не начинаю новую кампанию поверх повреждённого состояния; "
+            "исправьте файл или запустите с --reset")
     fresh = existing is None
     progress = existing or default_manifest(
         campaign, target, min_valid, url, out,
@@ -2142,6 +2226,10 @@ def run_campaign(campaign: str, url: str, target: int, min_valid: int,
             _emit_event(progress, "MANIFEST_RUN_CFG_MODIFIED")
         progress["run_cfg_hash"] = cfg_hash
 
+        if not fresh and _clear_interrupted_state(progress):
+            log.warning("resume: снят final_state=INTERRUPTED — кампания "
+                        "продолжает недособранное")
+            _emit_event(progress, "INTERRUPTED_RESUMED")
         started_ts = datetime.fromisoformat(progress["started_at"]).timestamp()
         _set_state(progress, "STARTING", "DAEMON_STARTED",
                    fresh=fresh, target=target)
@@ -2623,7 +2711,8 @@ def finalize_campaign(progress: dict, progress_path: Path,
     из snapshot заменяются чистыми из резерва, пока не наберётся target чистых
     или не исчерпан резерв.
     """
-    qa_fn = qa_fn or run_qa_batch
+    qa_fn = qa_fn or functools.partial(
+        run_qa_batch, data_dir=_run_data_dir(progress) or DEFAULT_DATA_DIR)
     target = progress["target_count"]
     min_valid = progress.get("min_valid", 0)
     reason = progress.get("final_reason")
@@ -3101,6 +3190,7 @@ def main(argv=None):
         campaign, name_source, name_source_value = args.campaign, "explicit", None
     else:
         campaign, name_source, name_source_value = campaign_from_url(args.url or "")
+    validate_campaign_name(campaign)
     # Лог — ДО трея, apply_window_mode и sentinel_start: до 2026-10-18 attach
     # жил только в run_campaign (ниже), и все строки старта («режим окна»,
     # «сентинел запущен», «сентинел НЕ запущен: …») пропадали — _write_file

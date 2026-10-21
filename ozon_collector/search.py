@@ -28,7 +28,8 @@ from . import log
 from . import net as _net
 from . import process as P
 from . import puzzle as _puzzle
-from .cdp import browser_alive, browser_tabs_count
+from .cdp import (_wait_launch_marker_pid, browser_alive,
+                  browser_tabs_count)
 from .gather import run_gather
 from .report import digest_rating, sort_digest_products
 
@@ -351,8 +352,33 @@ def _recycle_browser(sess, manager, launch_id: str):
     old = [P.ProcessRecord(launch_id, ident)
            for ident in P.browser_processes(
                sess.cdp_url, profile_token=manager.profile_token)]
-    manager.restart(old, launch_id)
-    sess.reconnect()
+    res = manager.restart(old, launch_id)
+    owned = getattr(res, "owned", None)
+    try:
+        # The port is ready before launch_chrome flushes its ownership marker.
+        # reconnect must see the NEW marker, otherwise our own browser becomes
+        # external and cleanup/guard skip it (live gap 300+ ms).
+        marker_pid = _wait_launch_marker_pid(
+            getattr(manager, "profile_path", None)
+            or P.profile_path(manager.profile_token),
+            timeout_s=3.0)
+        sess.reconnect()
+        if getattr(sess, "browser_owner", None) != "collector":
+            # A marker timeout means reconnect hit the live browser before
+            # ownership was flushed and marked it external. Continuing would
+            # disable cleanup/guard for our own main and leak the profile.
+            raise B.BrowserOwnershipError(
+                f"recycle: reconnect не подтвердил collector-ownership "
+                f"(marker_pid={marker_pid}, "
+                f"owner={getattr(sess, 'browser_owner', None)!r})")
+    except Exception:
+        if owned:
+            try:
+                manager.force_stop(owned)
+            except Exception as stop_err:
+                log.error(f"[search] recycle: force_stop нового main "
+                          f"FAILED: {type(stop_err).__name__}: {stop_err}")
+        raise
 
 
 # Профилактический recycle (ADR §14.5): recycle ТОЛЬКО по browser stability

@@ -372,6 +372,24 @@ def test_user_visible_flag_makes_guard_sleep(monkeypatch):
     assert out == {"unminimized": 0, "focus_restored": 0}
 
 
+def test_tick_rechecks_user_visible_inside_loop(monkeypatch):
+    """Трей может включить visible уже после стартовой проверки тика."""
+    fake = FakeWin32(windows=[_win(155, 500, iconic=False)],
+                     fg=_win(155, 500)).install(monkeypatch)
+    state = {"n": 0}
+
+    def uv():
+        state["n"] += 1
+        return state["n"] > 1
+
+    monkeypatch.setattr(wp, "user_visible", uv)
+    g = wp.WindowGuard()
+    g.watch(500, "9222", autostart=False)
+    out = g.tick()
+    assert fake.minimized == [], "окно спрятано после включения visible"
+    assert out == {"unminimized": 0, "focus_restored": 0}
+
+
 def test_flag_removed_and_windows_are_hidden_again(monkeypatch):
     """Флаг снят («Свернуть окна сбора») — сторож снова прячет окна."""
     fake = FakeWin32(windows=[_win(161, 500, iconic=False)]).install(monkeypatch)

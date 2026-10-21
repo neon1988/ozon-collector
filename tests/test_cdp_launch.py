@@ -152,7 +152,8 @@ class TestFreeStaleProfile:
         m_kill = mock.Mock(return_value=list(killed or []))
         monkeypatch.setattr(cdp.P, "browser_processes", fake_procs)
         monkeypatch.setattr(cdp.P, "kill_identities", m_kill)
-        monkeypatch.setattr(cdp, "_launch_marker", lambda p: marker)
+        monkeypatch.setattr(cdp, "_launch_marker_pid",
+                            lambda p: 111 if marker else None)
         return m_kill
 
     def test_no_holders_is_noop(self, monkeypatch):
@@ -185,6 +186,8 @@ class TestFreeStaleProfile:
         m_kill = self._install(monkeypatch, procs=holders, killed=[111])
         m_prof = mock.Mock(return_value=children)
         monkeypatch.setattr(cdp.P, "profile_processes", m_prof)
+        monkeypatch.setattr(cdp.P, "profile_process_roles",
+                            lambda token: ([], list(children)))
         waits = []
 
         def _wait(_token, timeout_s=8.0):
@@ -201,6 +204,46 @@ class TestFreeStaleProfile:
         assert children in killed_sets, \
             f"потомки должны быть добиты, убито: {killed_sets}"
 
+    def test_surviving_our_main_keeps_marker(self, monkeypatch):
+        """kill_identities returns only dead pids; a surviving main is still
+        ours by marker and must not be reclassified as foreign."""
+        main = cdp.P.ProcessIdentity(pid=111, start_key="k1")
+        holders = [main]
+        self._install(monkeypatch, procs=holders, killed=[])
+        monkeypatch.setattr(cdp.P, "wait_profile_released",
+                            lambda *_a, **_k: [111])
+        monkeypatch.setattr(cdp.P, "profile_process_roles",
+                            lambda token: ([main], []))
+        m_drop = mock.Mock()
+        monkeypatch.setattr(cdp, "_drop_launch_marker", m_drop)
+        assert cdp._free_stale_profile(
+            "http://127.0.0.1:9222", "ozon-profile") == []
+        m_drop.assert_not_called()
+
+    def test_marker_for_helper_does_not_claim_main(self, monkeypatch):
+        """A helper PID in the marker cannot authorize killing a main."""
+        holders = [cdp.P.ProcessIdentity(pid=111, start_key="k1")]
+        m_kill = self._install(monkeypatch, procs=holders, killed=[111])
+        monkeypatch.setattr(cdp, "_launch_marker_pid", lambda p: 222)
+        assert cdp._free_stale_profile(
+            "http://127.0.0.1:9222", "ozon-profile") == []
+        m_kill.assert_not_called()
+
+    def test_helper_marker_cannot_claim_main_via_profile_fallback(
+            self, monkeypatch):
+        """profile_processes includes helpers; marker must match a main."""
+        main = cdp.P.ProcessIdentity(pid=111, start_key="k1")
+        helper = cdp.P.ProcessIdentity(pid=222, start_key="k2")
+        m_kill = self._install(monkeypatch, procs=[], killed=[111])
+        monkeypatch.setattr(cdp, "_launch_marker_pid", lambda p: 222)
+        monkeypatch.setattr(cdp.P, "profile_processes",
+                            lambda token: [main, helper])
+        monkeypatch.setattr(cdp.P, "profile_process_roles",
+                            lambda token: ([main], [helper]))
+        assert cdp._free_stale_profile(
+            "http://127.0.0.1:9222", "ozon-profile") == []
+        m_kill.assert_not_called()
+
     def test_foreign_profile_untouched(self, monkeypatch):
         """Без маркера запуска профиль считается чужим — окно не рвём."""
         holders = [cdp.P.ProcessIdentity(pid=333, start_key="k3")]
@@ -212,6 +255,46 @@ class TestFreeStaleProfile:
     def test_listing_error_is_not_fatal(self, monkeypatch):
         m_kill = self._install(monkeypatch, raises=RuntimeError("WMI down"))
         assert cdp._free_stale_profile("http://127.0.0.1:9222", "ozon-profile") == []
+        m_kill.assert_not_called()
+
+    def test_crashed_main_helpers_are_killed_without_marker(self, monkeypatch):
+        """Main crashed -> stale marker pid is dead; helper children still hold
+        the profile and must be cleaned (otherwise the next bootstrap dies)."""
+        helpers = [cdp.P.ProcessIdentity(pid=222, start_key="k2"),
+                   cdp.P.ProcessIdentity(pid=333, start_key="k3")]
+        monkeypatch.setattr(cdp.P, "browser_processes",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(cdp.P, "profile_processes",
+                            lambda token: list(helpers))
+        monkeypatch.setattr(cdp.P, "profile_process_roles",
+                            lambda token: ([], list(helpers)))
+        monkeypatch.setattr(cdp, "_launch_marker", lambda p: False)
+        m_kill = mock.Mock(return_value=[222, 333])
+        monkeypatch.setattr(cdp.P, "kill_identities", m_kill)
+        monkeypatch.setattr(cdp.P, "wait_profile_released",
+                            lambda *_a, **_k: [])
+        m_drop = mock.Mock()
+        monkeypatch.setattr(cdp, "_drop_launch_marker", m_drop)
+        monkeypatch.setattr(cdp, "_launch_marker_pid", lambda p: None)
+        freed = cdp._free_stale_profile("http://127.0.0.1:9222", "ozon-profile")
+        assert freed == [222, 333]
+        m_kill.assert_called_once_with(helpers)
+        m_drop.assert_called_once()
+
+    def test_dead_main_with_foreign_main_is_untouched(self, monkeypatch):
+        main = cdp.P.ProcessIdentity(pid=111, start_key="k1")
+        older = [cdp.P.ProcessIdentity(pid=111, start_key="k1")]
+        monkeypatch.setattr(cdp.P, "browser_processes",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(cdp.P, "profile_processes",
+                            lambda token: list(older))
+        monkeypatch.setattr(cdp.P, "profile_process_roles",
+                            lambda token: ([main], []))
+        monkeypatch.setattr(cdp, "_launch_marker", lambda p: False)
+        m_kill = mock.Mock()
+        monkeypatch.setattr(cdp.P, "kill_identities", m_kill)
+        assert cdp._free_stale_profile(
+            "http://127.0.0.1:9222", "ozon-profile") == []
         m_kill.assert_not_called()
 
 
@@ -354,6 +437,10 @@ class TestSessionAutoLaunch:
             cdp, "launch_and_wait",
             lambda *a, **kw: launches.__setitem__("n", launches["n"] + 1) or True)
         monkeypatch.setattr(cdp, "browser_alive", lambda url: alive())
+        # Launch-path tests default to "no marker": ownership stays external.
+        # Individual tests override this to model launch_chrome's marker.
+        monkeypatch.setattr(cdp, "_wait_launch_marker_pid",
+                            lambda *a, **kw: None)
 
         class FakeBrowser:
             contexts = [type("FakeCtx", (), {"pages": [object()],
@@ -384,6 +471,31 @@ class TestSessionAutoLaunch:
         s = cdp.Session("http://127.0.0.1:9999")
         assert s._browser is not None
         assert launches["n"] == 1
+
+    def test_launch_without_marker_is_external(self, monkeypatch):
+        """launch_and_wait может принять чужой Chrome на сдвинутом порту."""
+        seq = iter([False, True])
+        self._install(monkeypatch, lambda: next(seq))
+        calls = []
+        monkeypatch.setattr(cdp.Session, "_minimize_window_native",
+                            lambda *a, **kw: calls.append("minimize"))
+        s = cdp.Session("http://127.0.0.1:9999")
+        assert s.browser_owner == "external"
+        assert calls == [], "чужое окно после launch свернули"
+
+    def test_launch_with_matching_marker_is_collector(self, monkeypatch):
+        seq = iter([False, True])
+        self._install(monkeypatch, lambda: next(seq))
+        monkeypatch.setattr(cdp, "_wait_launch_marker_pid",
+                            lambda *a, **kw: 555)
+        monkeypatch.setattr(
+            cdp, "_browser_pid",
+            lambda url, token=None: cdp.P.ProcessIdentity(pid=555,
+                                                          start_key="k"))
+        monkeypatch.setattr(cdp.Session, "_minimize_window_native",
+                            lambda *a, **kw: None)
+        s = cdp.Session("http://127.0.0.1:9999")
+        assert s.browser_owner == "collector"
 
     def test_connects_to_shifted_port_not_dead_one(self, monkeypatch):
         """База сдвинулась (9222 забрала Windows) — connect идёт на живой порт.
@@ -513,7 +625,7 @@ class TestSessionAutoLaunch:
     def test_external_chrome_window_not_minimized(self, monkeypatch):
         """Чужой Chrome: окно пользователя не сворачиваем (аудит 2026-10-15)."""
         self._install(monkeypatch, lambda: True)
-        monkeypatch.setattr(cdp, "_launch_marker", lambda p: False)
+        monkeypatch.setattr(cdp, "_launch_marker_pid", lambda p: None)
         calls = []
         monkeypatch.setattr(cdp.Session, "_minimize_window_native",
                             lambda *a, **kw: calls.append("minimize"))
@@ -524,13 +636,32 @@ class TestSessionAutoLaunch:
     def test_collector_chrome_window_still_minimized(self, monkeypatch):
         """Наш Chrome по-прежнему сворачивается (контроль к тесту external)."""
         self._install(monkeypatch, lambda: True)
-        monkeypatch.setattr(cdp, "_launch_marker", lambda p: True)
+        monkeypatch.setattr(cdp, "_launch_marker_pid", lambda p: 555)
+        monkeypatch.setattr(
+            cdp, "_browser_pid",
+            lambda url, token=None: cdp.P.ProcessIdentity(pid=555,
+                                                          start_key="k"))
         calls = []
         monkeypatch.setattr(cdp.Session, "_minimize_window_native",
                             lambda *a, **kw: calls.append("minimize"))
         s = cdp.Session("http://127.0.0.1:9999")
         assert s.browser_owner == "collector"
         assert calls == ["minimize"]
+
+    def test_marker_for_other_main_is_external(self, monkeypatch):
+        """Marker PID must match the main serving this CDP port."""
+        self._install(monkeypatch, lambda: True)
+        monkeypatch.setattr(cdp, "_launch_marker_pid", lambda p: 555)
+        monkeypatch.setattr(
+            cdp, "_browser_pid",
+            lambda url, token=None: cdp.P.ProcessIdentity(pid=777,
+                                                          start_key="k"))
+        calls = []
+        monkeypatch.setattr(cdp.Session, "_minimize_window_native",
+                            lambda *a, **kw: calls.append("minimize"))
+        s = cdp.Session("http://127.0.0.1:9999")
+        assert s.browser_owner == "external"
+        assert calls == []
 
     def test_reconnect_after_close(self, monkeypatch):
         """reconnect: закрывает старую сессию и подключается заново."""
@@ -678,11 +809,68 @@ class TestSessionNewPage:
 
 # ---- этап 1: ownership (ADR §14.1) -------------------------------------------
 
-def test_launch_marker_detects_collector_profile(tmp_path):
-    """launch_chrome ставит маркер → Session считает профиль collector'ским."""
+def test_launch_marker_rejects_legacy_timestamp(tmp_path):
+    """Timestamp-only marker cannot prove ownership (no PID) -> external."""
     assert cdp._launch_marker(str(tmp_path)) is False
-    (tmp_path / ".ozon_collector_launched").write_text("2026-08-31", encoding="utf-8")
+    (tmp_path / ".ozon_collector_launched").write_text(
+        "2026-08-31", encoding="utf-8")
+    assert cdp._launch_marker(str(tmp_path)) is False
+
+
+def _write_marker(tmp_path, pid=123, started=None):
+    started = time.time() if started is None else started
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started))
+    (tmp_path / ".ozon_collector_launched").write_text(
+        f'{{"pid": {pid}, "started_at": "{stamp}"}}', encoding="utf-8")
+    return started
+
+
+def test_launch_marker_detects_collector_profile(tmp_path, monkeypatch):
+    """JSON marker matches the live process start time -> collector."""
+    started = _write_marker(tmp_path)
+    monkeypatch.setattr(cdp.P, "process_start_epoch", lambda pid: started)
     assert cdp._launch_marker(str(tmp_path)) is True
+
+
+def test_launch_marker_rejects_stale_pid(tmp_path, monkeypatch):
+    """JSON-маркер умершего запуска не делает ручной Chrome «нашим»."""
+    _write_marker(tmp_path)
+    monkeypatch.setattr(cdp.P, "process_start_epoch", lambda pid: None)
+    assert cdp._launch_marker(str(tmp_path)) is False
+
+
+def test_launch_marker_rejects_reused_pid(tmp_path, monkeypatch):
+    """PID переиспользован: время старта процесса другое -> external."""
+    started = _write_marker(tmp_path)
+    monkeypatch.setattr(cdp.P, "process_start_epoch",
+                        lambda pid: started - 3600)
+    assert cdp._launch_marker(str(tmp_path)) is False
+
+
+def test_launch_marker_rejects_pid_started_after_marker(tmp_path, monkeypatch):
+    """PID was reused AFTER the marker was written: not the launched process."""
+    started = _write_marker(tmp_path)
+    monkeypatch.setattr(cdp.P, "process_start_epoch",
+                        lambda pid: started + 5)
+    assert cdp._launch_marker(str(tmp_path)) is False
+
+
+def test_wait_launch_marker_pid_polls_until_marker(tmp_path, monkeypatch):
+    seq = iter([None, None, 555])
+    monkeypatch.setattr(cdp, "_launch_marker_pid", lambda p: next(seq))
+    assert cdp._wait_launch_marker_pid(str(tmp_path), timeout_s=1.0) == 555
+
+
+def test_wait_launch_marker_pid_timeout_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(cdp, "_launch_marker_pid", lambda p: None)
+    assert cdp._wait_launch_marker_pid(str(tmp_path), timeout_s=0) is None
+
+
+def test_launch_marker_requires_started_at(tmp_path, monkeypatch):
+    (tmp_path / ".ozon_collector_launched").write_text(
+        '{"pid": 123}', encoding="utf-8")
+    monkeypatch.setattr(cdp.P, "process_start_epoch", lambda pid: time.time())
+    assert cdp._launch_marker(str(tmp_path)) is False
 
 
 class TestEnsureSingleWorkerTab:

@@ -61,7 +61,7 @@ from ozon_collector.collect import (
 try:
     from ozon_collector.collect import VM_BAD_REASONS
 except ImportError:
-    VM_BAD_REASONS = {"click_error", "click_no_effect", "timeout", "disabled"}
+    VM_BAD_REASONS = {"click_error", "click_no_effect", "timeout"}
 
 TOLERANCE_RATIO = 0.03
 STARS_MISSING_WARN_SHARE = 0.05
@@ -459,15 +459,36 @@ def scan_file(path, pid):
 
 
 def discover(data_dir, since=None, only_pids=None):
-    items = []
-    for p in sorted(Path(data_dir).glob("*_raw.json")):
-        pid = p.name[: -len("_raw.json")]
+    """Return the newest raw per PID, including timestamped fresh runs.
+
+    A normal (non-overwrite) gather writes {pid}_raw.<ts>.<i>.json next to a
+    stale canonical {pid}_raw.json. QA must validate the fresh artifact, not
+    the old canonical, otherwise a successful rescan is reported as stale.
+    """
+    latest = {}
+    for p in Path(data_dir).glob("*_raw*.json"):
+        pid, sep, suffix = p.name.partition("_raw")
+        # Canonical suffix is ".json"; timestamped is ".<ts>.<i>.json".
+        if not sep or not pid.isdigit() or not suffix.startswith("."):
+            continue
         if only_pids and pid not in only_pids:
             continue
-        if since is not None:
-            mtime = dt.datetime.fromtimestamp(p.stat().st_mtime)
-            if mtime < since:
-                continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            # The file vanished between glob and stat: skip it instead of
+            # aborting the whole QA batch (which the daemon treats as K4
+            # parse_error -> terminal NEEDS_ATTENTION).
+            continue
+        prev = latest.get(pid)
+        if prev is None or mtime > prev[0]:
+            latest[pid] = (mtime, p)
+    items = []
+    for pid in sorted(latest):
+        mtime, p = latest[pid]
+        if since is not None and \
+                dt.datetime.fromtimestamp(mtime) < since:
+            continue
         items.append((pid, p))
     return items
 
@@ -626,9 +647,12 @@ def main(argv=None):
     # args.pids — строка с запятыми/пробелами; parse_pids ждёт список токенов
     pid_tokens = (args.pids or "").replace(",", " ").split()
     only_pids = set(parse_pids(pid_tokens)) if pid_tokens else None
+    if only_pids and since is not None:
+        ap.error("--since несовместим с --pids: batch-контракт требует "
+                 "строку на каждый запрошенный pid")
 
     items = discover(args.data_dir, since, only_pids)
-    if not items:
+    if not items and not only_pids:
         print("[qa] нет файлов для скана", file=sys.stderr)
         return 2
     reports = []
@@ -636,6 +660,20 @@ def main(argv=None):
         reports.append(scan_file(path, pid))
         if i % 25 == 0 or i == len(items):
             print(f"[qa] просканировано {i}/{len(items)}", file=sys.stderr)
+
+    if only_pids:
+        # A requested raw may vanish or appear between discovery and the scan.
+        # Judge by what was actually scanned: re-scan a newly appeared file,
+        # keep the broken row of a file that vanished during scan_file, and add
+        # a broken row only for a pid that is absent altogether. This keeps
+        # products == len(batch) for the daemon's K4 invariant.
+        scanned = {pid for pid, _ in items}
+        current = dict(discover(args.data_dir, since, only_pids))
+        for pid in sorted(only_pids - scanned):
+            if pid in current:
+                reports.append(scan_file(current[pid], pid))
+            else:
+                reports.append(_broken_report(pid, "raw file missing"))
 
     summary = summarize(reports)
     print_console(reports, summary)

@@ -175,6 +175,30 @@ def _validate_raw(raw: dict, pid: str | None = None) -> str | None:
     return None
 
 
+def _covers_variant(raw: dict, target_variant: dict | None) -> bool:
+    """Whether the cached raw was collected for the requested variant.
+
+    A raw with an explicit target_variant is a CLI slice and must never satisfy
+    another target or the whole-product request. For the whole-product request
+    (empty target) a native-filter raw is the collector's representation of the
+    product even though its variant_count is the active variant, not
+    rating_count. Only an unconfirmed variant_count=0 is rejected: it could be
+    a parse failure, while a confirmed zero is cacheable.
+    """
+    stored = raw.get("target_variant") or {}
+    if target_variant:
+        return stored == target_variant
+    if stored:
+        return False
+    vm = raw.get("reviews_variant_mode") or {}
+    if not vm.get("used"):
+        # No native variant filter: the raw covers the whole product.
+        return True
+    if vm.get("variant_count") == 0:
+        return bool(raw.get("no_reviews_confirmed")) and not raw.get("reviews")
+    return True
+
+
 def _covers_sorts(raw: dict, sorts) -> bool:
     """Покрывает ли raw все запрошенные сортировки отзывов.
 
@@ -191,7 +215,8 @@ def _covers_sorts(raw: dict, sorts) -> bool:
 
 
 def _best_raw(pid: str, data_dir: str = "data",
-              sorts=None) -> tuple[dict | None, str]:
+              sorts=None, target_variant: dict | None = None
+              ) -> tuple[dict | None, str]:
     """Лучший валидный raw среди канона и timestamp-файлов.
 
     Кандидаты ранжируются по (наличие отзывов, дата сбора, число отзывов):
@@ -223,6 +248,10 @@ def _best_raw(pid: str, data_dir: str = "data",
         if not _covers_sorts(raw, sorts):
             if first_reason is None:
                 first_reason = "sorts_missing"
+            continue
+        if not _covers_variant(raw, target_variant):
+            if first_reason is None:
+                first_reason = "variant_mismatch"
             continue
         dt = _parse_utc(raw.get("collected_at_utc"))
         reviews = int(raw.get("reviews_collected") or 0)
@@ -297,7 +326,8 @@ def cached_version(pid: str, data_dir: str = "data"):
 
 def cache_check(pid: str, max_age_s: int,
                 data_dir: str = "data",
-                sorts=None) -> tuple[dict | None, str]:
+                sorts=None, target_variant: dict | None = None
+                ) -> tuple[dict | None, str]:
     """Проверяет кеш raw (канон + timestamp-файлы). Возвращает (raw|None, reason).
 
     Ищет лучший валидный raw среди data/{pid}_raw.json и data/{pid}_raw.*.json
@@ -308,14 +338,19 @@ def cache_check(pid: str, max_age_s: int,
     без них (напр. старый дефолт без score_asc), кешем не считается → "miss"
     и повторный сбор. Иначе канон вернёт raw без негативных отзывов.
 
+    target_variant (необязательно) — разобранный вариант товара. Raw,
+    собранный для другого варианта (или для всего товара при непустом
+    запросе), кешем не считается: иначе variant slice утекает в общий сбор.
+
     reason: off | missing | pid_mismatch | incomplete | incompatible |
             old_version | newer_version | bad_timestamp | sorts_missing |
-            stale | hit
+            variant_mismatch | stale | hit
     """
     if max_age_s <= 0:
         return None, "off"
 
-    raw, reason = _best_raw(pid, data_dir, sorts=sorts)
+    raw, reason = _best_raw(pid, data_dir, sorts=sorts,
+                            target_variant=target_variant)
     if raw is None:
         return None, reason
 

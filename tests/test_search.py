@@ -1424,20 +1424,59 @@ def test_recycle_browser_collector_restarts(monkeypatch):
     import ozon_collector.search as _S
     sess = _FakeSess([{"pid": "1", "url": "u1"}])
     sess.browser_owner = "collector"
-    restarts = []
-    reconnects = []
-    sess.reconnect = lambda: reconnects.append("reconnect") or None
+    events = []
+    sess.reconnect = lambda: events.append("reconnect") or None
 
     class FakeManager:
         profile_token = "ozon-profile"
+        profile_path = r"C:\profiles\ozon-profile"
         def restart(self, old, launch_id):
-            restarts.append(launch_id)
+            events.append(f"restart:{launch_id}")
 
+    def wait_marker(path, timeout_s=0):
+        assert path == FakeManager.profile_path
+        assert timeout_s >= 3.0
+        events.append("marker")
+        return 1
+
+    monkeypatch.setattr(_S, "_wait_launch_marker_pid", wait_marker)
     monkeypatch.setattr(_S.P, "browser_processes",
                         lambda cdp_url, profile_token: [("ident",)])
     _S._recycle_browser(sess, FakeManager(), "c-r1")
-    assert restarts == ["c-r1"]
-    assert reconnects == ["reconnect"]
+    assert events == ["restart:c-r1", "marker", "reconnect"], \
+        "reconnect раньше marker → свой браузер станет external"
+
+
+def test_recycle_marker_timeout_does_not_accept_external(monkeypatch):
+    """Marker timeout + owner=external must fail, not disable cleanup."""
+    import pytest
+    import ozon_collector.search as _S
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    sess.browser_owner = "collector"
+
+    def reconnect():
+        sess.browser_owner = "external"
+
+    sess.reconnect = reconnect
+
+    created = object()
+    stopped = []
+
+    class FakeManager:
+        profile_token = "ozon-profile"
+        profile_path = r"C:\profiles\ozon-profile"
+        def restart(self, old, launch_id):
+            return type("R", (), {"owned": [created]})()
+        def force_stop(self, owned, wait_s=None):
+            stopped.extend(owned)
+
+    monkeypatch.setattr(_S, "_wait_launch_marker_pid",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(_S.P, "browser_processes",
+                        lambda cdp_url, profile_token: [("ident",)])
+    with pytest.raises(_S.B.BrowserOwnershipError):
+        _S._recycle_browser(sess, FakeManager(), "c-r2")
+    assert stopped == [created], "новый main остался жить после сбоя recycle"
 
 
 # ---- Кооперативная остановка докрутки ссылок (Ctrl+C) ------------------------

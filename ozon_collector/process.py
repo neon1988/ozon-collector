@@ -546,6 +546,44 @@ def process_identity(pid: int) -> ProcessIdentity | None:
     return _linux_process_identity(pid)
 
 
+def _linux_boot_epoch() -> float | None:
+    try:
+        with open("/proc/stat", "r", encoding="utf-8",
+                  errors="replace") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except OSError:
+        return None
+    return None
+
+
+def process_start_epoch(pid: int) -> float | None:
+    """Wall-clock start time of a live process, or None when unavailable.
+
+    Used to bind an ownership marker to one process instance: a marker that
+    stores pid + started_at cannot survive PID reuse if the live process
+    started at a different wall-clock time.
+    """
+    ident = process_identity(pid)
+    if ident is None:
+        return None
+    if os.name == "nt":
+        try:
+            # FILETIME counts 100 ns since 1601-01-01 UTC.
+            return int(ident.start_key) / 10_000_000 - 11_644_473_600
+        except (TypeError, ValueError):
+            return None
+    boot = _linux_boot_epoch()
+    clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else None
+    if boot is None or not clk:
+        return None
+    try:
+        return boot + int(ident.start_key) / float(clk)
+    except (TypeError, ValueError):
+        return None
+
+
 def _linux_identity_alive(identity: ProcessIdentity) -> bool:
     st = _linux_proc_stat(identity.pid)
     if st is None:
@@ -1415,6 +1453,34 @@ def wait_exit(identity: ProcessIdentity, wait_s: float = 3.0) -> bool:
     return _linux_wait_exit(identity, wait_s)
 
 
+def profile_process_roles(profile_token: str = PROFILE_TOKEN
+                          ) -> tuple[list[ProcessIdentity],
+                                     list[ProcessIdentity]]:
+    """Split profile holders into (main, helper) identities.
+
+    A crashed main Chromium can leave renderer/gpu children holding the profile
+    singleton lock. Such helpers may be killed safely only when no main process
+    exists for the profile: a live main without a CDP port belongs to the user
+    (connection to an already-running browser), not to the collector.
+    """
+    mains: list[ProcessIdentity] = []
+    helpers: list[ProcessIdentity] = []
+    for pid, argv, _ppid in _iter_chromium_processes():
+        udd = None
+        is_helper = False
+        for a in argv:
+            if a.startswith("--user-data-dir="):
+                udd = a.split("=", 1)[1].strip("\"'")
+            elif a.startswith("--type="):
+                is_helper = True
+        if not udd or os.path.basename(udd.rstrip("/\\")) != profile_token:
+            continue
+        ident = process_identity(pid)
+        if ident is not None:
+            (helpers if is_helper else mains).append(ident)
+    return mains, helpers
+
+
 def profile_processes(profile_token: str = PROFILE_TOKEN
                      ) -> list[ProcessIdentity]:
     """ВСЕ процессы Chromium с нашим profile_token — включая потомков.
@@ -1427,9 +1493,10 @@ def profile_processes(profile_token: str = PROFILE_TOKEN
     прогоне 2026-10-03 16:0x: MAIN найден и убит, семь потомков остались,
     четыре запуска подряд Chromium EXITED).
 
-    Профиль проверяется по имени последнего компонента --user-data-dir плюс
-    маркер запуска .ozon_collector_launched, поэтому ручное окно пользователя не
-    затрагивается (см. ADR §14.5 про ownership identity).
+    Профиль проверяется только по имени последнего компонента
+    --user-data-dir. Функция возвращает и чужие процессы на том же профиле;
+    ownership (наш запуск или ручной Chrome) проверяется отдельно по маркеру
+    .ozon_collector_launched в cdp._launch_marker (ADR §14.5).
     """
     out: list[ProcessIdentity] = []
     for pid, argv, _ppid in _iter_chromium_processes():

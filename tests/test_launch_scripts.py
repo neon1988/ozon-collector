@@ -135,6 +135,30 @@ def test_both_deny_permission_prompts():
             f"Chrome снова станет видимым окном поверх чужих окон")
 
 
+def test_ps1_marks_live_browser_with_silent_cdp():
+    """Live Chrome whose DevTools port never answered still needs the marker:
+    otherwise cleanup classifies it as foreign and the profile stays locked."""
+    t = _text(PS1)
+    assert "$aliveAfterLaunch" in t
+    assert "$ownsPort -and ($ready -or $aliveAfterLaunch)" in t
+    marker = t.find(".ozon_collector_launched")
+    assert marker > 0, "PS1 не пишет ownership marker"
+    assert marker < t.find("if (-not $ready)"), (
+        "marker must be written before the failure diagnostic branch")
+    # pwsh 7 deserializes ISO timestamps to DateTime; ::Parse(string) throws,
+    # while the cast handles both DateTime and string from 5.1.
+    assert "::Parse($existing.started_at)" not in t
+    assert "[DateTimeOffset]$existing.started_at" in t
+
+
+def test_sh_profile_held_uses_exact_argv():
+    """Substring/regex matching made worker profiles suppress the main marker."""
+    t = _text(SH)
+    assert 'grep -Fqx -- "--user-data-dir=${PROFILE%/}"' in t
+    assert t.find("grep -Fqx") < t.find("PROFILE_HELD=1")
+    assert "ARGV_HAS_PROFILE" in t, "wrapper launches need an argv fallback"
+
+
 def test_ps1_parses_as_powershell():
     """Синтаксическая проверка PS1 (на Windows; на других ОС — пропуск)."""
     if os.name != "nt":

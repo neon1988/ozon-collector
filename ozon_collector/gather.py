@@ -88,9 +88,11 @@ def run_gather(cfg: dict, sess=None) -> dict:
     out_raw = cfg.get("out_raw") or K.raw_save_path(pid, overwrite=overwrite)
     canon = K.raw_path(pid)
     if out_raw != canon and os.path.exists(canon):
+        promote = bool(cfg.get("promote_raw"))
         log.warning(f"[gather] pid={pid}: {canon} уже существует — "
                     f"новый прогон в {os.path.basename(out_raw)} "
-                    f"(перезапись только с --overwrite)")
+                    f"({'promote в canonical после сбора' if promote else 'перезапись только с --overwrite'})")
+    fresh_collected = False
     result = {
         "pid": pid,
         "ok": False,
@@ -101,7 +103,9 @@ def run_gather(cfg: dict, sess=None) -> dict:
         "ocr": "off",
     }
     try:
-        raw, reason = K.cache_check(pid, max_age_s, sorts=cfg.get("sorts"))
+        raw, reason = K.cache_check(
+            pid, max_age_s, sorts=cfg.get("sorts"),
+            target_variant=C.parse_variant(cfg.get("variant") or ""))
         result["cache"] = ("hit" if reason == "hit"
                            else "stale" if reason == "stale" else "miss")
         if reason == "hit":
@@ -127,7 +131,8 @@ def run_gather(cfg: dict, sess=None) -> dict:
             log.info(f"[gather] pid={pid}: cache=miss ({reason})")
 
         if raw is not None:
-            problems = C.variant_review_problems(raw)
+            problems = C.variant_review_problems(
+                raw, allow_filter_disabled=bool(cfg.get("no_variant_mode")))
             if problems:
                 log.warning(f"[gather] pid={pid}: кеш-хит с браком "
                             f"({'; '.join(problems)}) — игнорирую кеш, "
@@ -151,11 +156,15 @@ def run_gather(cfg: dict, sess=None) -> dict:
                 skip_reviews=cfg.get("skip_reviews", False),
                 reviews_api=cfg.get("reviews_api"),
             )
+            fresh_collected = True
             log.info(f"[gather] pid={pid}: collect — {len(raw.get('reviews', []))} отзывов")
             # Проверки объёма отзывов неприменимы в режиме без отзывов
             # (reviews намеренно пустые, а не брак сбора).
             problems = ([] if cfg.get("skip_reviews")
-                        else C.variant_review_problems(raw))
+                        else C.variant_review_problems(
+                            raw,
+                            allow_filter_disabled=bool(
+                                cfg.get("no_variant_mode"))))
             if problems:
                 _delete_raw_file(out_raw)
                 raise B.VariantShortError(
@@ -186,6 +195,18 @@ def run_gather(cfg: dict, sess=None) -> dict:
         else:
             result["ocr"] = "off"
             log.info(f"[gather] pid={pid}: ocr=off")
+
+        if fresh_collected and cfg.get("promote_raw") and out_raw != canon:
+            # Daemon runs keep the canonical raw as the source of truth for
+            # QA/manifest. A timestamped fresh file must not leave stale
+            # canonical data in place.
+            try:
+                os.replace(out_raw, canon)
+                log.info(f"[gather] pid={pid}: fresh raw promoted to "
+                         f"{os.path.basename(canon)}")
+            except OSError as e:
+                log.error(f"[gather] pid={pid}: не удалось promote raw: "
+                          f"{type(e).__name__}: {e}")
 
         result["markdown"] = R.render(
             raw, dedup_replies=cfg.get("dedup_replies", True))

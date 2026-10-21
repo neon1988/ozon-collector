@@ -182,6 +182,71 @@ def test_cache_check_sorts_none_hit(tmp_path):
     assert reason == "hit" and r["pid"] == "42"
 
 
+def _write_variant_raw(tmp_path, stored_variant):
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "42", "incomplete": False,
+        "collected_at_utc": _now_utc_str(minutes=-5),
+        "target_variant": stored_variant,
+    }
+    with open(os.path.join(tmp_path, "42_raw.json"), "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+
+
+def test_cache_check_same_variant_hit(tmp_path):
+    variant = {"Цвет": "белый"}
+    _write_variant_raw(tmp_path, variant)
+    raw, reason = cache_check("42", 86400, str(tmp_path),
+                              target_variant=variant)
+    assert reason == "hit" and raw["pid"] == "42"
+
+
+def test_cache_check_other_variant_miss(tmp_path):
+    _write_variant_raw(tmp_path, {"Цвет": "белый"})
+    raw, reason = cache_check("42", 86400, str(tmp_path),
+                              target_variant={"Цвет": "чёрный"})
+    assert raw is None and reason == "variant_mismatch"
+
+
+def test_cache_check_variant_slice_not_whole_product(tmp_path):
+    _write_variant_raw(tmp_path, {"Цвет": "белый"})
+    raw, reason = cache_check("42", 86400, str(tmp_path))
+    assert raw is None and reason == "variant_mismatch"
+
+
+def test_cache_check_whole_product_not_variant_slice(tmp_path):
+    _write_variant_raw(tmp_path, None)
+    raw, reason = cache_check("42", 86400, str(tmp_path),
+                              target_variant={"Цвет": "белый"})
+    assert raw is None and reason == "variant_mismatch"
+
+
+def _write_variant_slice(tmp_path, vc, rc):
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "42", "incomplete": False,
+        "collected_at_utc": _now_utc_str(minutes=-5),
+        "target_variant": None,
+        "product": {"rating_count": rc},
+        "reviews_variant_mode": {"used": True, "variant_count": vc},
+    }
+    _write_cache_json(tmp_path, "42", raw)
+
+
+def test_cache_check_native_slice_is_whole_product(tmp_path):
+    """used=True with active vc (50/370) is the daemon's whole-product raw."""
+    _write_variant_slice(tmp_path, 50, 370)
+    raw, reason = cache_check("42", 86400, str(tmp_path))
+    assert reason == "hit" and raw["pid"] == "42"
+
+
+def test_cache_check_zero_variant_without_confirmation_rejected(tmp_path):
+    """vc=0 without no_reviews_confirmed could be a parse failure."""
+    _write_variant_slice(tmp_path, 0, 370)
+    raw, reason = cache_check("42", 86400, str(tmp_path))
+    assert raw is None and reason == "variant_mismatch"
+
+
 def test_cache_check_missing(tmp_path):
     raw, reason = cache_check("999", 86400, str(tmp_path))
     assert raw is None and reason == "missing"
@@ -237,7 +302,7 @@ def test_cache_check_confirmed_zero_hit(tmp_path):
 
 
 def test_cache_check_confirmed_zero_widget_hit(tmp_path):
-    """0 отзывов варианта (used=True, variant_count=0) + incomplete → hit."""
+    """Confirmed 0 reviews (used=True, vc=0, rating_count unknown) is cacheable."""
     raw = {
         "schema_version": "2.0", "collector_version": VERSION,
         "pid": "22", "incomplete": True,
@@ -252,7 +317,23 @@ def test_cache_check_confirmed_zero_widget_hit(tmp_path):
     }
     _write_cache_json(tmp_path, "22", raw)
     r, reason = cache_check("22", 86400, str(tmp_path))
-    assert reason == "hit"
+    assert reason == "hit" and r["pid"] == "22"
+
+
+def test_cache_check_zero_variant_with_reviews_rejected(tmp_path):
+    """vc=0 plus collected reviews cannot be a confirmed zero variant."""
+    raw = {
+        "schema_version": "2.0", "collector_version": VERSION,
+        "pid": "23", "incomplete": False,
+        "no_reviews_confirmed": True,
+        "reviews": [{"uuid": "u1"}],
+        "product": {"rating_count": 370},
+        "reviews_variant_mode": {"used": True, "variant_count": 0},
+        "collected_at_utc": _now_utc_str(minutes=-5),
+    }
+    _write_cache_json(tmp_path, "23", raw)
+    r, reason = cache_check("23", 86400, str(tmp_path))
+    assert r is None and reason == "variant_mismatch"
 
 
 def test_cache_check_ambiguous_zero_still_incomplete(tmp_path):

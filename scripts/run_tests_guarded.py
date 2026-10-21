@@ -137,7 +137,10 @@ def main() -> int:
             time.sleep(1.0)
     except KeyboardInterrupt:
         print("\n[Watchdog] interrupted, killing pytest tree...", flush=True)
-        _kill_tree(process.pid if process.poll() is None else -1)
+        # Never pass -1 to os.kill: on POSIX that signals every process of the
+        # user session. If pytest already exited, there is nothing to kill.
+        if process.poll() is None:
+            _kill_tree(process.pid)
         return 130
     finally:
         if process.poll() is None:

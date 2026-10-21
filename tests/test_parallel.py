@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from collections import deque
+from unittest import mock
 
 import pytest
 
@@ -1049,9 +1050,144 @@ def test_stop_main_browser_finds_our_main_on_shifted_port(monkeypatch):
     monkeypatch.setattr(P, "kill_records",
                         lambda records, wait_s=3.0: killed.extend(records)
                         or records)
+    monkeypatch.setattr(PL, "_release_profile_children", lambda token=None: None)
     PL._stop_main_browser()
     assert len(killed) == 1, "main не остановлен: профиль останется занятым"
     assert killed[0].identity is ident
+
+
+def test_stop_main_browser_marker_filters_other_mains(monkeypatch):
+    """With a launch marker only its main is ours; a manual one survives."""
+    ours = P.ProcessIdentity(111, "k1")
+    manual = P.ProcessIdentity(222, "k2")
+    killed = []
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "chrome")
+    monkeypatch.setattr(P, "profile_debug_ports",
+                        lambda token: {9444: [111, 222]})
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: {111: ours, 222: manual}[pid])
+    def marker(path):
+        assert os.path.isabs(path), f"marker got token instead of path: {path}"
+        return 111
+
+    monkeypatch.setattr(PL.cdp, "_launch_marker_pid", marker)
+    monkeypatch.setattr(P, "kill_records",
+                        lambda records, wait_s=3.0: killed.extend(records)
+                        or records)
+    monkeypatch.setattr(PL, "_release_profile_children", lambda token=None: None)
+    PL._stop_main_browser("collector")
+    assert [r.identity.pid for r in killed] == [111]
+
+
+def test_stop_main_browser_collector_without_marker_no_kill(monkeypatch):
+    """No marker -> ownership unproven; do not kill a debug-port Chrome."""
+    ident = P.ProcessIdentity(13672, "k1")
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "chrome")
+    monkeypatch.setattr(P, "profile_debug_ports",
+                        lambda token: {9444: [13672]})
+    monkeypatch.setattr(P, "process_identity", lambda pid: ident)
+    monkeypatch.setattr(PL.cdp, "_launch_marker_pid", lambda path: None)
+    m_kill = mock.Mock(return_value=[ident])
+    monkeypatch.setattr(P, "kill_records", m_kill)
+    PL._stop_main_browser("collector")
+    m_kill.assert_not_called()
+
+
+def test_stop_main_browser_dead_marker_reaps_helpers(monkeypatch):
+    """A dead marker means our main crashed; helpers must still be reaped."""
+    helper = P.ProcessIdentity(15001, "h1")
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "chrome")
+    monkeypatch.setattr(PL.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(P, "profile_debug_ports", lambda token: {})
+    monkeypatch.setattr(PL.cdp, "_launch_marker_pid", lambda path: None)
+    monkeypatch.setattr(P, "profile_process_roles",
+                        lambda token: ([], [helper]))
+    m_kill = mock.Mock(return_value=[helper])
+    monkeypatch.setattr(P, "kill_identities", m_kill)
+    monkeypatch.setattr(P, "wait_profile_released", lambda token: [])
+    m_clear = mock.Mock()
+    monkeypatch.setattr(PL, "_clear_launch_marker", m_clear)
+    PL._stop_main_browser("collector")
+    m_kill.assert_called_once_with([helper])
+    m_clear.assert_called_once()
+
+
+def test_stop_main_browser_partial_kill_keeps_marker(monkeypatch):
+    """A main that survived kill must not lose ownership before a retry."""
+    ident = P.ProcessIdentity(13672, "k1")
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "chrome")
+    monkeypatch.setattr(P, "profile_debug_ports",
+                        lambda token: {9444: [13672]})
+    monkeypatch.setattr(P, "process_identity", lambda pid: ident)
+    monkeypatch.setattr(P, "kill_records", lambda *a, **k: [])
+    m_release = mock.Mock()
+    monkeypatch.setattr(PL, "_release_profile_children", m_release)
+    m_clear = mock.Mock()
+    monkeypatch.setattr(PL, "_clear_launch_marker", m_clear)
+    PL._stop_main_browser()
+    m_release.assert_not_called()
+    m_clear.assert_not_called()
+
+
+def test_release_profile_children_never_kills_foreign_main(monkeypatch):
+    main = P.ProcessIdentity(111, "k1")
+    monkeypatch.setattr(P, "wait_profile_released", lambda *a, **k: [111])
+    monkeypatch.setattr(P, "profile_process_roles",
+                        lambda token: ([main], []))
+    m_kill = mock.Mock()
+    monkeypatch.setattr(P, "kill_identities", m_kill)
+    m_clear = mock.Mock()
+    monkeypatch.setattr(PL, "_clear_launch_marker", m_clear)
+    assert PL._release_profile_children() is False
+    m_kill.assert_not_called()
+    m_clear.assert_called_once()
+
+
+def test_release_profile_children_kills_helpers_only(monkeypatch):
+    helper = P.ProcessIdentity(222, "k2")
+    monkeypatch.setattr(P, "wait_profile_released",
+                        lambda *a, **k: [222] if not k.get("timeout_s") else [])
+    monkeypatch.setattr(P, "profile_process_roles",
+                        lambda token: ([], [helper]))
+    m_kill = mock.Mock(return_value=[222])
+    monkeypatch.setattr(P, "kill_identities", m_kill)
+    assert PL._release_profile_children() is True
+    m_kill.assert_called_once_with([helper])
+
+
+def test_stop_main_browser_cleans_crashed_main_helpers(monkeypatch):
+    """Main crashed (no CDP port): renderer/gpu children still hold the profile.
+
+    The old path returned on empty `records`, so the next worker bootstrap died
+    on «profile captured by a live instance» until manual cleanup.
+    """
+    helpers = [P.ProcessIdentity(222, "k2"), P.ProcessIdentity(333, "k3")]
+    killed = []
+    cleared = []
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "chrome")
+    monkeypatch.setattr(P, "profile_debug_ports", lambda token: {})
+    monkeypatch.setattr(P, "profile_process_roles",
+                        lambda token: ([], list(helpers)))
+    monkeypatch.setattr(P, "kill_identities",
+                        lambda ids: killed.extend(ids) or [i.pid for i in ids])
+    monkeypatch.setattr(P, "wait_profile_released", lambda *a, **k: [])
+    monkeypatch.setattr(PL, "_clear_launch_marker",
+                        lambda token=None: cleared.append(True))
+    PL._stop_main_browser()
+    assert [i.pid for i in killed] == [222, 333]
+    assert cleared == [True]
+
+
+def test_stop_main_browser_keeps_foreign_main_without_port(monkeypatch):
+    main = P.ProcessIdentity(111, "k1")
+    monkeypatch.setattr(PL.B, "browser_kind", lambda: "chrome")
+    monkeypatch.setattr(P, "profile_debug_ports", lambda token: {})
+    monkeypatch.setattr(P, "profile_process_roles",
+                        lambda token: ([main], []))
+    m_kill = mock.Mock()
+    monkeypatch.setattr(P, "kill_identities", m_kill)
+    PL._stop_main_browser()
+    m_kill.assert_not_called()
 
 
 def test_bootstrap_default_skips_when_our_main_alive_on_shifted_port(
@@ -1082,6 +1218,15 @@ def test_stop_main_browser_noop_without_processes(monkeypatch):
     monkeypatch.setattr(P, "firefox_browser_processes", lambda token: [])
     monkeypatch.setattr(PL.B, "browser_kind", lambda: "firefox")
     PL._stop_main_browser()
+
+
+def test_stop_main_browser_never_touches_external(monkeypatch):
+    """browser_owner=external — чужой Chrome пользователя нельзя гасить."""
+    def _boom():
+        raise AssertionError("external owner must not even probe browser_kind")
+
+    monkeypatch.setattr(PL.B, "browser_kind", _boom)
+    PL._stop_main_browser("external")
 
 
 class _FakePage:
@@ -1284,7 +1429,7 @@ def test_collect_parallel_graceful_link_stop_returns_partial(monkeypatch):
 
     stopped = []
     monkeypatch.setattr(PL, "_stop_main_browser",
-                        lambda: stopped.append(1))
+                        lambda *a, **k: stopped.append(1))
     monkeypatch.setattr(PL.cdp, "Session", lambda *a, **k: _FakeSession())
 
     class _FakeManager:
@@ -1329,7 +1474,7 @@ def test_collect_parallel_force_link_stop_propagates(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(PL, "_stop_main_browser", lambda: None)
+    monkeypatch.setattr(PL, "_stop_main_browser", lambda *a, **k: None)
     monkeypatch.setattr(PL.cdp, "Session", lambda *a, **k: _FakeSession())
     monkeypatch.setattr(PL, "BrowserProcessManager", lambda *a, **k: object())
 
@@ -1364,7 +1509,7 @@ class _FakeCache:
         self.stale = stale or set()
         self.calls = []
 
-    def __call__(self, pid, max_age_s, data_dir="data", sorts=None):
+    def __call__(self, pid, max_age_s, data_dir="data", sorts=None, **kw):
         self.calls.append((pid, max_age_s))
         if pid in self.stale:
             return None, "stale"
@@ -1377,7 +1522,7 @@ def test_batch_needs_browser_all_cache_hit(monkeypatch):
     """Вся пачка cache=hit → браузер НЕ нужен (сбор из кэша без Chromium)."""
     cc = _FakeCache(hits={"1000", "1001", "1002"})
     monkeypatch.setattr(PL.K, "cache_check", cc)
-    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw, **kw: [])
     items = _items(3)
     assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is False
 
@@ -1386,7 +1531,7 @@ def test_batch_needs_browser_miss_requires_browser(monkeypatch):
     """Хоть один cache-miss в пачке → браузер нужен."""
     cc = _FakeCache(hits={"1000", "1001"})
     monkeypatch.setattr(PL.K, "cache_check", cc)
-    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw, **kw: [])
     items = _items(3)  # 1002 не в кэше
     assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is True
 
@@ -1395,7 +1540,7 @@ def test_batch_needs_browser_stale_requires_browser(monkeypatch):
     """stale = кэш устарел → пересбор живьём → браузер нужен."""
     cc = _FakeCache(hits={"1000"}, stale={"1001"})
     monkeypatch.setattr(PL.K, "cache_check", cc)
-    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw, **kw: [])
     items = _items(2)
     assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is True
 
@@ -1405,7 +1550,7 @@ def test_batch_needs_browser_review_break_requires_browser(monkeypatch):
     cc = _FakeCache(hits={"1000", "1001"})
     monkeypatch.setattr(PL.K, "cache_check", cc)
     monkeypatch.setattr(PL.C, "variant_review_problems",
-                        lambda raw: ["мало отзывов"])
+                        lambda raw, **kw: ["мало отзывов"])
     items = _items(2)
     assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is True
 
@@ -1417,7 +1562,7 @@ def test_batch_needs_browser_cache_off(monkeypatch):
     """
     cc = _FakeCache(hits=set())
     monkeypatch.setattr(PL.K, "cache_check", cc)
-    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw, **kw: [])
     items = _items(2)
     assert PL._batch_needs_browser(items, {}) is True
 
@@ -1428,7 +1573,7 @@ def test_batch_needs_browser_cache_error_conservative(monkeypatch):
         raise OSError("cache read failed")
 
     monkeypatch.setattr(PL.K, "cache_check", _boom)
-    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw, **kw: [])
     items = _items(2)
     assert PL._batch_needs_browser(items, {"max_age_s": 3600}) is True
 
@@ -1466,7 +1611,8 @@ def test_collect_batch_without_browser_adds_format_fields(monkeypatch):
 def _patch_cache(monkeypatch, hits: set, stale: set = None):
     monkeypatch.setattr(PL.K, "cache_check",
                         _FakeCache(hits=hits, stale=stale or set()))
-    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    monkeypatch.setattr(PL.C, "variant_review_problems",
+                        lambda raw, **kw: [])
 
 
 def test_first_browser_index_mid_batch(monkeypatch):
@@ -1480,6 +1626,23 @@ def test_first_browser_index_all_hit(monkeypatch):
     _patch_cache(monkeypatch, hits={"1000", "1001", "1002"})
     items = _items(3)
     assert PL._first_browser_index(items, {"max_age_s": 3600}) == 3
+
+
+def test_item_needs_browser_passes_no_variant_mode(monkeypatch):
+    """Lazy-start must mirror run_gather's relaxed filter-disabled policy."""
+    monkeypatch.setattr(PL.K, "cache_check",
+                        lambda *a, **kw: ({"pid": "1000"}, "hit"))
+    seen = {}
+
+    def problems(raw, allow_filter_disabled=False):
+        seen["allow"] = allow_filter_disabled
+        return []
+
+    monkeypatch.setattr(PL.C, "variant_review_problems", problems)
+    item = _items(1)[0]
+    assert PL._item_needs_browser(
+        item, {"max_age_s": 3600, "no_variant_mode": True}) is False
+    assert seen["allow"] is True
 
 
 def test_first_browser_index_empty_batch():
@@ -1685,13 +1848,13 @@ def test_take_batch_caches_verdicts_per_pid(monkeypatch):
     calls = []
 
     class _CountingCache(_FakeCache):
-        def __call__(self, pid, max_age_s, data_dir="data", sorts=None):
+        def __call__(self, pid, max_age_s, data_dir="data", sorts=None, **kw):
             calls.append(pid)
             return super().__call__(pid, max_age_s, data_dir, sorts)
 
     monkeypatch.setattr(PL.K, "cache_check",
                         _CountingCache(hits={"1000", "1001"}))
-    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw, **kw: [])
     from collections import deque
     q = deque(_items(2))
     verdicts = {}

@@ -18,6 +18,81 @@ if ROOT not in sys.path:
 import scripts.key_daemon as k  # noqa: E402
 
 
+def test_clear_interrupted_state_allows_resume():
+    p = {"final_state": "INTERRUPTED", "final_reason": "user_interrupt",
+         "final_note": "stop"}
+    assert k._clear_interrupted_state(p) is True
+    assert p["final_state"] is None and p["final_reason"] is None
+
+
+def test_clear_interrupted_state_keeps_other_terminal_states():
+    p = {"final_state": "NEEDS_ATTENTION", "final_reason": "x"}
+    assert k._clear_interrupted_state(p) is False
+    assert p["final_state"] == "NEEDS_ATTENTION"
+
+
+def test_validate_campaign_name_rejects_path_escape():
+    for bad in ("../x", "a/b", "a\\b", ".hidden", "..", ""):
+        with pytest.raises(SystemExit):
+            k.validate_campaign_name(bad)
+    assert k.validate_campaign_name("sprey_dlya-gorla.1") == \
+        "sprey_dlya-gorla.1"
+
+
+def test_validate_campaign_name_allows_existing_legacy_name(
+        tmp_path, monkeypatch):
+    legacy = tmp_path / "my campaign"
+    legacy.mkdir()
+    monkeypatch.setattr(k, "CAMPAIGNS_DIR", tmp_path)
+    assert k.validate_campaign_name("my campaign") == "my campaign"
+    with pytest.raises(SystemExit):
+        k.validate_campaign_name("missing campaign")
+
+
+def test_validate_campaign_name_rejects_windows_reserved_names():
+    for bad in ("CON", "nul.txt", "COM1", "campaign."):
+        with pytest.raises(SystemExit):
+            k.validate_campaign_name(bad)
+
+
+def test_inproc_gather_cfg_rescan_bypasses_cache():
+    normal = k._inproc_gather_cfg({}, 3600, mode="full")
+    rescan = k._inproc_gather_cfg({}, 3600, mode="rescan")
+    assert normal["max_age_s"] == 3600 and normal["overwrite"] is False
+    assert rescan["max_age_s"] == 0 and rescan["overwrite"] is True
+
+
+def test_run_sort_key_orders_unpadded_sequence():
+    ids = ["run_100_10", "run_100_9", "run_99_100"]
+    assert sorted(ids, key=k._run_sort_key) == [
+        "run_99_100", "run_100_9", "run_100_10"]
+
+
+def test_run_qa_batch_passes_absolute_data_dir(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        seen["cwd"] = kw.get("cwd")
+        report = cmd[cmd.index("--report-json") + 1]
+        with open(report, "w", encoding="utf-8") as f:
+            json.dump({
+                "summary": {"products": 1, "ok": 1, "warn": 0, "fail": 0},
+                "products": [{"pid": "1", "verdict": "OK", "issues": []}],
+            }, f)
+
+        class R:
+            returncode = 0
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(k.subprocess, "run", fake_run)
+    out = k.run_qa_batch(["1"], data_dir=str(tmp_path))
+    assert out["ok"] == 1
+    assert seen["cmd"][seen["cmd"].index("--data-dir") + 1] == str(tmp_path)
+    assert seen["cwd"] == str(k.ROOT)
+
+
 # ---------------------------------------------------------------------------
 # Тестовый shim для удалённого k.build_cli_args (fac(argv) остаются
 # совместимыми с протоколом, который проверяют интеграционные тесты)

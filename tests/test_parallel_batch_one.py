@@ -44,7 +44,7 @@ class _FakeCache:
         self.stale = stale or set()
         self.calls = []
 
-    def __call__(self, pid, max_age_s, data_dir="data", sorts=None):
+    def __call__(self, pid, max_age_s, data_dir="data", sorts=None, **kw):
         self.calls.append(pid)
         if pid in self.stale:
             return None, "stale"
@@ -56,7 +56,8 @@ class _FakeCache:
 def _patch_cache(monkeypatch, hits, stale=None):
     monkeypatch.setattr(PL.K, "cache_check",
                         _FakeCache(hits=set(hits), stale=set(stale or ())))
-    monkeypatch.setattr(PL.C, "variant_review_problems", lambda raw: [])
+    monkeypatch.setattr(PL.C, "variant_review_problems",
+                        lambda raw, **kw: [])
 
 
 def _take(monkeypatch, queue, hits, stale, prefer_miss, size=1, worker=1):

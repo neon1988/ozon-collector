@@ -324,6 +324,16 @@ def test_bring_to_front_records_window_hide():
     assert page.n_front == 1
 
 
+def test_bring_to_front_skips_external_owner():
+    """Чужой Chrome: не поднимаем вкладку и не трогаем окно."""
+    reason = [""]
+    page, _cdp_obj = _win_page("normal")
+    page._ozon_browser_owner = "external"
+    assert puzzle_capture._bring_to_front(page, reason) is False
+    assert "skip_external" in reason[0]
+    assert page.n_front == 0
+
+
 class TestSolvedSummaryOrder:
     """Строка лога не должна врать о счётчике solved.
 

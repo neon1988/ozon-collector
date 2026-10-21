@@ -1205,19 +1205,27 @@ class WindowGuard:
                      f"окна этого процесса не трогаем")
         return [p for p, _ in stale]
 
+    def _uv_suspended(self) -> bool:
+        """True while the tray asks to show windows; logs the transition once."""
+        if not user_visible():
+            return False
+        if not self._uv_logged:
+            self._uv_logged = True
+            log.info("window_policy: окна развёрнуты пользователем (трей) — "
+                     "сторож спит, окна не трогаю")
+        return True
+
     def tick(self) -> dict:
         """Одна итерация: вернуть инвариант «окно скрыто, фокус у пользователя».
 
         Единственное исключение — флаг user_visible(): трей развернул окна для
         пользователя, и сторож не трогает ни окна, ни фокус, пока флаг стоит.
+        The flag is re-checked during the tick: the tray can flip it after the
+        initial check, and one hide would fight the user's explicit choice.
 
         Возвращает счётчики (для тестов и телеметрии).
         """
-        if user_visible():
-            if not self._uv_logged:
-                self._uv_logged = True
-                log.info("window_policy: окна развёрнуты пользователем (трей) — "
-                         "сторож спит, окна не трогаю")
+        if self._uv_suspended():
             return {"unminimized": 0, "focus_restored": 0}
         if self._uv_logged:
             self._uv_logged = False
@@ -1234,6 +1242,8 @@ class WindowGuard:
         unminimized = 0
         fg = foreground()
         for row in list_chrome_windows():
+            if self._uv_suspended():
+                return {"unminimized": unminimized, "focus_restored": 0}
             if row.pid not in pids:
                 continue                       # чужой браузер — не трогаем
             if not row.visible:
@@ -1255,6 +1265,8 @@ class WindowGuard:
                     f"({row.width}x{row.height}) — прячу; "
                     f"заголовок {row.title[:40]!r}")
         focus_restored = 0
+        if self._uv_suspended():
+            return {"unminimized": unminimized, "focus_restored": 0}
         if fg is not None:
             if fg.pid in pids:
                 if self._last_fg and window_exists(self._last_fg):

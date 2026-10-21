@@ -232,6 +232,12 @@ def _bring_to_front(page, reason_box=None) -> bool:
     best-effort: нет API/ошибка — продолжаем как раньше, причина пишется в
     reason_box, чтобы по логу было видно, что кадр был плоским из-за окна.
     """
+    if getattr(page, "_ozon_browser_owner", "collector") == "external":
+        # Page.bringToFront shows the window on some Chromium builds; the
+        # user's own browser must never be raised by the collector.
+        if reason_box is not None:
+            reason_box[0] += " front=skip_external"
+        return False
     hid = ensure_render_window(page)
     try:
         page.bring_to_front()

@@ -598,12 +598,15 @@ def _item_needs_browser(item, gather_cfg: dict) -> bool:
     try:
         raw, reason = K.cache_check(
             pid, gather_cfg.get("max_age_s", 0),
-            sorts=gather_cfg.get("sorts"))
+            sorts=gather_cfg.get("sorts"),
+            target_variant=C.parse_variant(gather_cfg.get("variant") or ""))
     except Exception:
         return True
     if raw is None or reason != "hit":
         return True
-    return bool(C.variant_review_problems(raw))
+    return bool(C.variant_review_problems(
+        raw, allow_filter_disabled=bool(
+            gather_cfg.get("no_variant_mode"))))
 
 
 def _first_browser_index(items, gather_cfg: dict) -> int:
@@ -1697,7 +1700,59 @@ def _await_workers(wctxs: list, deadline: float,
     return finalized
 
 
-def _stop_main_browser():
+def _release_profile_children(profile_token: str = P.PROFILE_TOKEN) -> bool:
+    """Kill renderer/gpu leftovers after the main Chromium is gone.
+
+    The singleton profile lock is held by children too; without this wait the
+    next worker bootstrap can fail with "profile captured by a live instance".
+    Returns True when no process holds the profile anymore.
+    """
+    left = P.wait_profile_released(profile_token)
+    if not left:
+        return True
+    try:
+        mains, helpers = P.profile_process_roles(profile_token)
+        if mains:
+            # A manual main appeared during the wait: never kill it, and drop
+            # our stale marker so the next cleanup cannot claim it.
+            log.error(f"profile release {profile_token!r}: чужой main "
+                      f"{[m.pid for m in mains]} — не трогаю")
+            _clear_launch_marker(profile_token)
+            return False
+        killed = P.kill_identities(helpers)
+        still = P.wait_profile_released(profile_token, timeout_s=5.0)
+    except Exception as e:
+        log.warning(f"profile release {profile_token}: "
+                    f"{type(e).__name__}: {e}")
+        return False
+    if still:
+        log.error(f"профиль {profile_token!r} НЕ освободился после main-stop: "
+                  f"{still} держат профиль")
+        try:
+            mains, _helpers_left = P.profile_process_roles(profile_token)
+        except Exception:
+            mains = []
+        if mains:
+            _clear_launch_marker(profile_token)
+        return False
+    log.info(f"профиль {profile_token!r} освобождён "
+             f"(добито потомков: {len(killed)})")
+    return True
+
+
+def _clear_launch_marker(profile_token: str = P.PROFILE_TOKEN) -> None:
+    """Drop the ownership marker after our browser is fully stopped."""
+    path = os.path.join(P.profile_path(profile_token),
+                        ".ozon_collector_launched")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.debug(f"launch marker {path}: {type(e).__name__}: {e}")
+
+
+def _stop_main_browser(owner: str | None = None):
     """Полный останов main-браузера (main-профиль) ДО воркеров.
 
     chrome: manager по CDP-порту 9222 — Session.close гасит только CDP-клиент,
@@ -1705,7 +1760,13 @@ def _stop_main_browser():
     firefox: driver.quit() в Session.close асинхронен, поэтому дожимаем
     процессы по токену профиля. Иначе bootstrap воркеров увидит живой main и
     пропустит сев сессии → cold worker-профиль → блок «Похоже, нет соединения».
+
+    owner == "external" — чужой браузер пользователя: не трогаем никогда
+    (ADR §14.1), даже в finally.
     """
+    if owner == "external":
+        log.info("main stop: browser_owner=external — чужой браузер не трогаю")
+        return
     if B.browser_kind() == "firefox":
         records = [P.ProcessRecord("main-stop-ff", ident)
                    for ident in P.firefox_browser_processes(P.PROFILE_TOKEN)]
@@ -1725,6 +1786,28 @@ def _stop_main_browser():
     # кук: [WinError 32] «файл занят другим процессом».
     records = []
     _by_port = P.profile_debug_ports(P.PROFILE_TOKEN)
+    _marker_pid = (cdp._launch_marker_pid(P.profile_path(P.PROFILE_TOKEN))
+                   if owner == "collector" else None)
+    if owner == "collector" and _marker_pid is None:
+        _marker_file = os.path.join(P.profile_path(P.PROFILE_TOKEN),
+                                    ".ozon_collector_launched")
+        if not os.path.exists(_marker_file):
+            # Ownership was asserted earlier but no marker exists now. Without
+            # it we cannot distinguish our main from a manual debug-port
+            # Chrome; leaking the profile is safer than killing a user window.
+            log.warning("main stop: marker исчез — main не трогаю")
+            return
+        # Marker exists but its PID is dead: our main crashed and only
+        # renderer/gpu helpers remain. Skip live debug mains (manual) and let
+        # the orphan branch below reap the helpers.
+        log.info("main stop: marker есть, pid мёртв — чищу только helpers")
+        _by_port = {}
+    if _marker_pid is not None:
+        # A launch marker names exactly one main. Everything else on this
+        # profile is a manual browser and must survive cleanup.
+        _by_port = {port: [pid for pid in pids if pid == _marker_pid]
+                    for port, pids in _by_port.items()}
+        _by_port = {port: pids for port, pids in _by_port.items() if pids}
     _ports = sorted(_by_port)
     for _port in _ports:
         for _pid in _by_port[_port]:
@@ -1732,11 +1815,45 @@ def _stop_main_browser():
             if _ident is not None:
                 records.append(P.ProcessRecord(f"main-stop-{_port}", _ident))
     if not records:
+        # A main that crashed on its own leaves no debug port, but its
+        # renderer/gpu children still hold the profile singleton. Kill those
+        # helpers only: a live main without CDP is the user's browser.
+        try:
+            mains, helpers = P.profile_process_roles(P.PROFILE_TOKEN)
+            if mains:
+                log.info("main stop: main без CDP — не наш или ручной, "
+                         "не трогаю")
+                return
+            if helpers:
+                killed = P.kill_identities(helpers)
+                left = P.wait_profile_released(P.PROFILE_TOKEN)
+                if not left:
+                    _clear_launch_marker()
+                    log.warning(f"main stop: осиротевшие потомки сняты "
+                                f"({len(killed)}), профиль освобождён")
+                else:
+                    mains_now, _helpers_now = P.profile_process_roles(
+                        P.PROFILE_TOKEN)
+                    if mains_now:
+                        _clear_launch_marker()
+                    log.warning(f"main stop: профиль всё ещё держат {left}")
+        except Exception as e:
+            log.warning(f"main stop: очистка осиротевших потомков: "
+                        f"{type(e).__name__}: {e}")
         return
     try:
         killed = P.kill_records(records, wait_s=5.0)
+        if len(killed) < len(records):
+            # Our main survived (AccessDenied / D-state). Keep the marker so a
+            # later cleanup can retry; releasing children now would mistake the
+            # surviving owner for a foreign browser and drop ownership.
+            log.error(f"main Chromium: убито {len(killed)} из {len(records)}, "
+                      f"маркер оставлен для повтора")
+            return
         log.info(f"main Chromium stopped ({len(killed)} процесс(ов), "
                  f"порты {_ports})")
+        if _release_profile_children():
+            _clear_launch_marker()
     except Exception as e:
         log.warning(f"stop main Chromium: {type(e).__name__}: {e}")
 
@@ -1871,7 +1988,7 @@ def collect_parallel(url: str, limit: int, gather_cfg: dict, parallel: int,
                 sess.close()
             except Exception:
                 pass
-            _stop_main_browser()
+            _stop_main_browser(getattr(sess, "browser_owner", None))
 
     found = len(links)
     links = S._filter_skip_pids(links, skip_pids)

@@ -209,6 +209,40 @@ def test_run_gather_broken_structure_fails(monkeypatch, capsys):
 from ozon_collector.collect import variant_review_problems
 
 
+def test_variant_problems_filter_disabled_is_strict_by_default():
+    """CLI --no-variant-mode raw must not be accepted as a daemon cache hit."""
+    raw = _raw()
+    raw["reviews"] = [{"uuid": f"u{i}"} for i in range(8)]
+    raw["reviews_variant_mode"] = {
+        "used": False, "reason": "disabled", "variant_count": None}
+    assert variant_review_problems(raw) == ["filter_disabled"]
+    assert variant_review_problems(raw, allow_filter_disabled=True) == []
+
+
+def test_gather_rejects_disabled_filter_cache_hit(monkeypatch):
+    """A cached all-reviews raw is recollected when the caller wants I1."""
+    stale = _raw()
+    stale["reviews"] = [{"uuid": f"u{i}"} for i in range(5)]
+    stale["reviews_variant_mode"] = {
+        "used": False, "reason": "disabled", "variant_count": None}
+    fresh = _raw()
+    fresh["reviews"] = [{"uuid": f"n{i}"} for i in range(5)]
+    fresh["reviews_variant_mode"] = {
+        "used": True, "variant_count": 5}
+    calls = []
+
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma, **kw: (stale, "hit"))
+    monkeypatch.setattr("ozon_collector.gather.C.collect",
+                        lambda **kw: calls.append(kw) or fresh)
+    monkeypatch.setattr("ozon_collector.gather.R.render", lambda r, **kw: "# ok")
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "max_age_s": 86400, "no_ocr": True})
+    assert res["ok"] is True
+    assert calls, "cache hit with filter_disabled must be ignored"
+    assert res["cache"] == "miss"
+
+
 def test_variant_problems_short_count():
     raw = _raw()
     raw["reviews"] = [{"uuid": f"u{i}"} for i in range(8)]
@@ -243,6 +277,15 @@ def test_variant_problems_zero_reviews_variant():
     raw["reviews_variant_mode"] = {"used": True, "variant_count": 0}
     raw["product"] = {"rating_count": 370}
     assert variant_review_problems(raw) == []
+
+
+def test_variant_problems_zero_variant_with_reviews_is_bad():
+    """vc=0 + reviews means the native filter was not active."""
+    raw = _raw()
+    raw["reviews"] = [{"uuid": "u1"}]
+    raw["reviews_variant_mode"] = {"used": True, "variant_count": 0}
+    raw["product"] = {"rating_count": 370}
+    assert variant_review_problems(raw) == ["zero_variant_but_reviews(1)"]
 
 
 def test_variant_problems_small_count_tolerance():
@@ -538,3 +581,31 @@ def test_run_gather_skip_reviews_cache_hit_keeps_full(monkeypatch):
     assert not called
     assert res["cache"] == "hit"
     assert res["ok"] is True
+
+
+def test_promote_raw_replaces_stale_canonical(tmp_path, monkeypatch):
+    """Daemon fresh data must become canonical before QA/manifest read it."""
+    canon = tmp_path / "42_raw.json"
+    fresh = tmp_path / "42_raw.20261020-120000.1.json"
+    canon.write_text('{"old": true}', encoding="utf-8")
+
+    def collect(**kw):
+        with open(kw["out_path"], "w", encoding="utf-8") as f:
+            f.write('{"new": true}')
+        return _raw()
+
+    monkeypatch.setattr("ozon_collector.gather.K.cache_check",
+                        lambda pid, ma, **kw: (None, "miss"))
+    monkeypatch.setattr("ozon_collector.gather.K.raw_path",
+                        lambda pid: str(canon))
+    monkeypatch.setattr("ozon_collector.gather.C.collect", collect)
+    monkeypatch.setattr("ozon_collector.gather.C.variant_review_problems",
+                        lambda raw, **kw: [])
+    monkeypatch.setattr("ozon_collector.gather.R.render",
+                        lambda r, **kw: "# ok")
+    res = run_gather({"pid": "42", "url": "https://www.ozon.ru/product/42",
+                      "out_raw": str(fresh), "promote_raw": True,
+                      "max_age_s": 86400, "no_ocr": True})
+    assert res["ok"] is True
+    assert canon.read_text(encoding="utf-8") == '{"new": true}'
+    assert not fresh.exists()

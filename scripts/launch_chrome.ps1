@@ -77,14 +77,13 @@ if (-not $Chrome) {
 # тогда полагаемся на уже запущенный инстанс.
 New-Item -ItemType Directory -Force -Path $Profile | Out-Null
 
-# Маркер запуска коллектором (ADR §14.1, ownership): Session по нему отличает
-# наш запуск (browser_owner=collector) от ручного/чужого (external).
-Set-Content -Path (Join-Path $Profile ".ozon_collector_launched") `
-    -Value (Get-Date -Format "o") -Encoding UTF8 | Out-Null
+# Маркер запуска коллектором пишется ПОСЛЕ CreateProcess (см. ниже): запись до
+# port-gate оставляла «наш» маркер после отказа лаунчера, и ручной Chrome на
+# том же профиле ошибочно считался collector (review 2026-10-20).
 
 $chromeArgs = @(
     "--remote-debugging-port=$Port",
-    "--user-data-dir=$Profile",
+    "--user-data-dir=`"$Profile`"",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-features=OptimizationHints,MediaRouter",
@@ -122,7 +121,7 @@ $chromeArgs = @(
 # ВНИМАНИЕ: аргумент виден в CommandLine процесса (WMI/CIM) — не кладите
 # пароль прокси в общий доступ. Для socks5 с кредами нужен PAC/расширение:
 # Chrome игнорирует логин/пароль из URL для socks5 (предупреждает cdp.py).
-$proxyArg = if ($Proxy) { "--proxy-server=$Proxy" } else { $null }
+$proxyArg = if ($Proxy) { "--proxy-server=`"$Proxy`"" } else { $null }
 
 # Запуск через CreateProcess со STARTUPINFO.wShowWindow=SW_HIDE (0):
 # окно создаётся СКРЫТЫМ и физически не может активироваться/украсть фокус,
@@ -418,6 +417,38 @@ if ($targetPid -lt 0) {
 # сразу после CreateProcess, до всех остальных шагов; маркер ASCII.
 Write-Host "LAUNCHER-PID: $targetPid"
 
+# Ownership marker must appear before the CDP-ready loop: launch_and_wait can
+# give up after 30 s while the launcher is still polling for up to 210 s.
+# Write it early only when no live marker exists, so a manual browser's marker
+# is never overwritten by a delegated launch.
+$markerPath = Join-Path $Profile ".ozon_collector_launched"
+$startedAt = $null
+try {
+    $startedAt = (Get-Process -Id $targetPid -ErrorAction Stop).StartTime.ToString("o")
+} catch { }
+$existingAlive = $false
+if (Test-Path -LiteralPath $markerPath) {
+    try {
+        $existing = Get-Content -LiteralPath $markerPath -Raw |
+                    ConvertFrom-Json
+        $existingProc = Get-Process -Id $existing.pid `
+                        -ErrorAction SilentlyContinue
+        if ($null -ne $existingProc) {
+            # Same one-sided check as cdp._launch_marker_pid: a reused PID
+            # that started after the marker cannot own the profile.
+            $markerStart = [DateTimeOffset]$existing.started_at
+            $procStart = [DateTimeOffset]$existingProc.StartTime
+            $skew = ($procStart - $markerStart).TotalSeconds
+            $existingAlive = ($skew -le 2 -and $skew -ge -60)
+        }
+    } catch { }
+}
+if ($startedAt -and -not $existingAlive) {
+    Set-Content -Path $markerPath -Encoding ASCII `
+        -Value (@{ pid = $targetPid; started_at = $startedAt } |
+                ConvertTo-Json -Compress) | Out-Null
+}
+
 function Invoke-MinimizeNoActivate($PidToWatch, $WaitMs) {
     # Применяет к окну WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW, НЕ показывая его:
     # показ даже свёрнутым рождает над панелью задач «мини-плитку-призрак» с
@@ -560,6 +591,39 @@ for ($i = 0; $i -lt 200; $i++) {
         break
     } catch { }
 }
+# Ownership marker: the launched PID is ours even when CDP never came up.
+# Without this marker a live Chrome with a silent DevTools port is classified
+# as foreign and the profile can never be freed (incident 2026-10-03). A
+# delegated launch (Chrome joined an existing instance and our PID exited)
+# must not overwrite the live browser's marker, hence the listener check when
+# the port answered.
+$aliveAfterLaunch = $null -ne (Get-Process -Id $targetPid `
+                               -ErrorAction SilentlyContinue)
+$ownsPort = $true
+if ($ready) {
+    $ownedListener = $null
+    try {
+        $ownedListener = (Get-NetTCPConnection -State Listen -LocalPort $Port `
+                          -ErrorAction SilentlyContinue |
+                          Where-Object { $_.LocalAddress -eq "127.0.0.1" } |
+                          Select-Object -First 1).OwningProcess
+    } catch { }
+    if ($null -ne $ownedListener) {
+        $ownsPort = ($ownedListener -eq $targetPid)
+    }
+}
+if ($ownsPort -and ($ready -or $aliveAfterLaunch)) {
+    try {
+        $startedAt = (Get-Process -Id $targetPid `
+                      -ErrorAction Stop).StartTime.ToString("o")
+    } catch { }
+    if ($startedAt) {
+        Set-Content -Path $markerPath -Encoding ASCII `
+            -Value (@{ pid = $targetPid; started_at = $startedAt } |
+                    ConvertTo-Json -Compress) | Out-Null
+    }
+}
+
 if (-not $focusDone) {
     # Мгновенный успех порта (break на первых итерациях): возврат фокуса
     # случился бы ДО кражи (Chrome крадёт его на 0.3-0.4 с) — досыпаем

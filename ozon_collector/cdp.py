@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 import time
+from datetime import datetime
 from typing import Optional
 
 
@@ -372,6 +373,7 @@ def _free_stale_profile(cdp_url: str, profile_token: str) -> list[int]:
         log.warning("[cdp] не удалось перечислить процессы профиля "
                     f"{profile_token!r}: {type(e).__name__}: {e}")
         return []
+    main_on_port = bool(holders)
     if not holders:
         # Порт в cdp_url мог уже смениться (динамическая база), а зомби
         # держит профиль на СТАРОМ порту: browser_processes матчит
@@ -386,11 +388,44 @@ def _free_stale_profile(cdp_url: str, profile_token: str) -> list[int]:
             return []
     if not holders:
         return []
-    if not _launch_marker(P.profile_path(profile_token)):
-        log.warning(f"[cdp] профиль {profile_token!r} занят посторонним "
-                    f"браузером (pid={[h.pid for h in holders]}), маркера "
-                    f"запуска нет — чужое окно не трогаю")
-        return []
+    marker_pid = _launch_marker_pid(P.profile_path(profile_token))
+    marker = False
+    cached_roles = None
+    if marker_pid is not None:
+        if main_on_port:
+            # browser_processes matches only a main (helpers have --type=).
+            marker = marker_pid in {h.pid for h in holders}
+        else:
+            # profile_processes includes helpers: a helper PID in the marker
+            # must not authorize killing the real main.
+            try:
+                cached_roles = P.profile_process_roles(profile_token)
+            except Exception as e:
+                log.warning(f"[cdp] не удалось разделить роли профиля "
+                            f"{profile_token!r}: {type(e).__name__}: {e}")
+                return []
+            marker = marker_pid in {h.pid for h in cached_roles[0]}
+    if not marker:
+        if main_on_port:
+            log.warning(f"[cdp] профиль {profile_token!r} занят посторонним "
+                        f"браузером (pid={[h.pid for h in holders]}), маркера "
+                        f"запуска нет — чужое окно не трогаю")
+            return []
+        # A crashed main leaves renderer/gpu children without a marker match.
+        # Kill helpers only: a live main without a CDP port is the user's
+        # browser and must survive (ADR §14.1).
+        mains, helpers = (cached_roles
+                          if cached_roles is not None
+                          else P.profile_process_roles(profile_token))
+        if mains:
+            log.warning(f"[cdp] профиль {profile_token!r} держит main без CDP "
+                        f"(pid={[h.pid for h in mains]}) — чужое окно не трогаю")
+            return []
+        if not helpers:
+            return []
+        holders = helpers
+        log.warning(f"[cdp] профиль {profile_token!r}: main мёртв, "
+                    f"осиротевшие потомки {[h.pid for h in helpers]}")
     pids = [h.pid for h in holders]
     freed = P.kill_identities(holders)
     # Главный процесс убит — но renderer/gpu/utility держат профиль ещё секунды.
@@ -402,14 +437,36 @@ def _free_stale_profile(cdp_url: str, profile_token: str) -> list[int]:
         log.warning(f"[cdp] профиль {profile_token!r} всё ещё держат "
                     f"{len(left)} процессов-потомков {left} после убийства "
                     f"главного — добиваю")
-        leftover = P.profile_processes(profile_token)
-        freed += P.kill_identities(leftover)
+        mains, helpers = P.profile_process_roles(profile_token)
+        if mains:
+            survived = [m for m in mains
+                        if marker_pid is not None and m.pid == marker_pid]
+            if survived:
+                # Our main survived TerminateProcess; keep the marker so the
+                # next cleanup may retry instead of declaring it foreign.
+                log.error(f"[cdp] профиль {profile_token!r}: наш main пережил "
+                          f"kill {[m.pid for m in survived]} — маркер оставлен "
+                          f"для повтора")
+                return freed
+            # A manual main appeared while we were waiting (up to 8 s). Its
+            # window is not ours: never kill it, and drop the stale marker so
+            # the next cleanup cannot treat it as collector-owned.
+            log.error(f"[cdp] профиль {profile_token!r}: появился чужой main "
+                      f"{[m.pid for m in mains]} — не трогаю")
+            _drop_launch_marker(P.profile_path(profile_token))
+            return freed
+        freed += P.kill_identities(helpers)
         still = P.wait_profile_released(profile_token, timeout_s=5.0)
         if still:
             log.error(f"[cdp] профиль {profile_token!r} НЕ освободился: "
                       f"{still} держат профиль, следующий Chromium упадёт")
+            # The dead main PID stays in the marker; the next cleanup treats
+            # the marker as stale and retries the helper-only path.
         else:
             log.info(f"[cdp] профиль {profile_token!r} освобождён полностью")
+            _drop_launch_marker(P.profile_path(profile_token))
+    else:
+        _drop_launch_marker(P.profile_path(profile_token))
     log.warning(f"[cdp] профиль {profile_token!r} держал нерабочий браузер "
                 f"(CDP не отвечает): снят pid={pids} -> освобождён={freed}")
     return freed
@@ -656,6 +713,8 @@ class Session:
         # Гвард по умолчанию выключен, guard() может быть None.
         _wp_guard = _WP.guard()
         was_alive = browser_alive(self.cdp_url)
+        marker_pid = None
+        launched = False
         if self.auto_launch and not was_alive:
             if _wp_guard is not None:
                 _wp_guard.note_user_window()
@@ -665,12 +724,15 @@ class Session:
             self.cdp_url = effective_cdp_url(self.cdp_url,
                                              self.profile_token)
             self.browser_owner = "collector"
+            launched = True
+            # launch_and_wait может вернуть уже живой ручной Chrome на том же
+            # профиле (порт был занят). Ownership доказывает только marker.
+            marker_pid = _wait_launch_marker_pid(self.browser_profile)
         else:
             # Браузер уже жив. Если профиль помечен нашим launch_chrome
             # (маркер-файл) — считаем его collector'ским; иначе external.
-            self.browser_owner = (
-                "collector" if _launch_marker(self.browser_profile)
-                else "external")
+            marker_pid = _launch_marker_pid(self.browser_profile)
+            self.browser_owner = "collector" if marker_pid else "external"
         self._playwright = sync_playwright().start()
         try:
             self._browser = self._playwright.chromium.connect_over_cdp(
@@ -680,6 +742,8 @@ class Session:
                 try:
                     launch_and_wait(self.cdp_url,
                                     profile_token=self.profile_token)
+                    launched = True
+                    marker_pid = _wait_launch_marker_pid(self.browser_profile)
                     self._browser = self._playwright.chromium.connect_over_cdp(
                         self.cdp_url)
                 except Exception:
@@ -701,23 +765,51 @@ class Session:
                 except Exception:
                     pass
                 raise
-        self.browser_pid = _browser_pid(self.cdp_url, self.profile_token)
-        ctx = self._browser.contexts[0]
-        if self.browser_owner == "external":
-            # external: НЕ трогаем первую попавшуюся вкладку (может быть
-            # личной пользователя) — создаём свою managed-страницу.
-            self.page = ctx.new_page()
-        else:
-            self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        self._managed_pages = [self.page]
-        self._attach_geom_guard()
-        # Единая политика: keep_window с поправкой на явный "0" из трея
-        # (owner 2026-10-19) — тот же путь, что new_page/recycle.
-        self._apply_window_policy(" (connect)")
-        # Теперь pid зарегистрирован (или гвард выключен/в external — тогда
-        # note_user_window ничего не запомнит, см. его проверку по реестру).
-        if _wp_guard is not None:
-            _wp_guard.note_user_window()
+        try:
+            self.browser_pid = _browser_pid(self.cdp_url, self.profile_token)
+            if (marker_pid is not None
+                    and (self.browser_pid is None
+                         or self.browser_pid.pid != marker_pid)):
+                # The marker names another process (or the port serves a
+                # different browser): never treat that window as ours.
+                log.warning(f"[cdp] marker pid={marker_pid}, но на "
+                            f"{self.cdp_url} профиль "
+                            f"{self.profile_token!r} держит "
+                            f"{getattr(self.browser_pid, 'pid', None)} — "
+                            f"считаю браузер external")
+                self.browser_owner = "external"
+            elif marker_pid is None and launched:
+                # launch_and_wait may have found someone else's live Chrome on
+                # this profile (port shift). Without a marker there is no proof
+                # that the window belongs to the collector.
+                log.warning(f"[cdp] после launch нет marker для профиля "
+                            f"{self.profile_token!r} — браузер external")
+                self.browser_owner = "external"
+            ctx = self._browser.contexts[0]
+            if self.browser_owner == "external":
+                # external: НЕ трогаем первую попавшуюся вкладку (может быть
+                # личной пользователя) — создаём свою managed-страницу.
+                self.page = ctx.new_page()
+            else:
+                self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            self._managed_pages = [self.page]
+            self._attach_geom_guard()
+            # Единая политика: keep_window с поправкой на явный "0" из трея
+            # (owner 2026-10-19) — тот же путь, что new_page/recycle.
+            self._apply_window_policy(" (connect)")
+            # Теперь pid зарегистрирован (или гвард выключен/в external — тогда
+            # note_user_window ничего не запомнит, см. его проверку по реестру).
+            if _wp_guard is not None:
+                _wp_guard.note_user_window()
+        except Exception:
+            # Post-connect setup failed: the Playwright driver would otherwise
+            # keep living after __init__ raised (same leak class as the second
+            # connect failure above).
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            raise
 
     def _connect_firefox(self):
         """Firefox-бэкенд: stock Firefox через geckodriver (Selenium/Marionette).
@@ -1423,6 +1515,7 @@ class Session:
         try:
             self.page._geom_guard = self._geometry_guard
             self.page._ozon_ensure_window_hidden = self._ensure_window_hidden
+            self.page._ozon_browser_owner = self.browser_owner
         except Exception:
             pass
 
@@ -1592,18 +1685,89 @@ def browser_alive(cdp_url: str = "http://127.0.0.1:9222") -> bool:
         return False
 
 
-def _launch_marker(profile_path: str) -> bool:
-    """Маркер запуска launch_chrome: файл .ozon_collector_launched в профиле.
+_MARKER_START_TOLERANCE_S = 60.0
+_MARKER_FUTURE_TOLERANCE_S = 2.0
+_LEGACY_MARKER_WARNED: set[str] = set()
 
-    Ставится launch_chrome.ps1/.sh при запуске браузера коллектором.
-    Используется для определения browser_owner (ADR §14.1): браузер, поднятый
-    нашим скриптом, помечен; ручной браузер (или чужой профиль) — нет.
+
+def _launch_marker_pid(profile_path: str) -> int | None:
+    """Return the launched main PID when the marker still proves ownership.
+
+    The marker is JSON with ``pid`` and ``started_at``. A live PID alone is not
+    enough: after PID reuse a manual Chrome could look like ours. The marker is
+    written after launch, so the process must have started at or before that
+    timestamp; a process started later is rejected. Legacy timestamp-only
+    markers carry no PID and are untrusted.
     """
+    marker = os.path.join(profile_path, ".ozon_collector_launched")
     try:
-        return os.path.isfile(os.path.join(profile_path,
-                                           ".ozon_collector_launched"))
-    except Exception:
-        return False
+        with open(marker, "r", encoding="utf-8-sig") as f:
+            text = f.read().strip()
+    except (OSError, UnicodeError):
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        if profile_path not in _LEGACY_MARKER_WARNED:
+            _LEGACY_MARKER_WARNED.add(profile_path)
+            log.warning(f"[cdp] legacy launch marker без pid в профиле "
+                        f"{profile_path!r} — ownership не доказан, считаю "
+                        f"чужим; удали .ozon_collector_launched, если это "
+                        f"остаток старого запуска")
+        return None
+    if not isinstance(data, dict) or not data.get("pid"):
+        return None
+    try:
+        marker_pid = int(data["pid"])
+        marker_dt = datetime.fromisoformat(str(data["started_at"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if marker_dt.tzinfo is None:
+        marker_dt = marker_dt.astimezone()
+    marker_ts = marker_dt.timestamp()
+    started = P.process_start_epoch(marker_pid)
+    if started is None:
+        return None
+    # The marker is written AFTER the launch, so a real process starts at or
+    # before it. A process that started later (same PID reused) is not ours;
+    # allow only clock/scheduler jitter in the one-sided window.
+    skew = started - marker_ts
+    if skew > _MARKER_FUTURE_TOLERANCE_S or \
+            skew < -_MARKER_START_TOLERANCE_S:
+        log.warning(f"[cdp] launch marker pid={marker_pid} не совпал по "
+                    f"времени старта (маркер {marker_ts:.0f}, процесс "
+                    f"{started:.0f}, skew {skew:.0f}с) — PID переиспользован, "
+                    f"считаю чужим")
+        return None
+    return marker_pid
+
+
+def _launch_marker(profile_path: str) -> bool:
+    """Whether the profile marker still belongs to a live collector launch."""
+    return _launch_marker_pid(profile_path) is not None
+
+
+def _wait_launch_marker_pid(profile_path: str,
+                           timeout_s: float = 5.0) -> int | None:
+    """Wait for launch_chrome to flush its marker after the port came up."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        pid = _launch_marker_pid(profile_path)
+        if pid is not None:
+            return pid
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def _drop_launch_marker(profile_path: str) -> None:
+    """Remove the ownership marker after the profile is fully released."""
+    try:
+        os.remove(os.path.join(profile_path, ".ozon_collector_launched"))
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.debug(f"[cdp] launch marker remove: {type(e).__name__}: {e}")
 
 
 def _browser_pid(cdp_url: str, profile_token: str = P.PROFILE_TOKEN):

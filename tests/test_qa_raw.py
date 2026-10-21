@@ -11,7 +11,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from ozon_collector.collect import CHALLENGE_TITLE_MARKERS
-from scripts.qa_raw import exit_code_for, qa_product, scan_file, summarize
+from scripts.qa_raw import (discover, exit_code_for, qa_product, scan_file,
+                            summarize)
 
 # Данные должны быть «свежими» относительно момента прогона: qa_raw ругается
 # OLD_DATA (WARN), если age_days > OLD_DATA_DAYS (7). Замораживать дату нельзя —
@@ -427,3 +428,50 @@ def test_reviews_skipped_price_only_is_fail():
     rep = qa_product(raw, "42")
     assert rep["verdict"] == "FAIL"
     assert "INCOMPLETE_CARD" in _codes(rep)
+
+def test_missing_pid_gets_broken_row_for_batch_invariant(tmp_path):
+    """A vanished raw must still be a row: dropping it makes the daemon's
+    products==len(batch) check fail and turns the entire batch into parse_error."""
+    import json
+    from scripts import qa_raw
+
+    report = tmp_path / "qa.json"
+    code = qa_raw.main(["--pids", "999", "--data-dir", str(tmp_path),
+                        "--report-json", str(report)])
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert code == 1
+    assert payload["summary"]["products"] == 1
+    assert payload["summary"]["fail"] == 1
+    assert payload["products"][0]["pid"] == "999"
+    assert payload["products"][0]["verdict"] == "FAIL"
+
+
+def test_pids_with_since_is_rejected(tmp_path):
+    """--since could hide a requested pid and break products==len(batch)."""
+    from scripts import qa_raw
+
+    try:
+        qa_raw.main(["--pids", "999", "--since", "2026-08-21",
+                     "--data-dir", str(tmp_path)])
+    except SystemExit as e:
+        assert e.code == 2
+    else:
+        raise AssertionError("--since with --pids must fail")
+
+
+def test_discover_prefers_freshest_timestamped_raw(tmp_path):
+    """A normal gather keeps a stale canonical; QA must read the fresh file."""
+    canon = tmp_path / "101_raw.json"
+    fresh = tmp_path / "101_raw.20261020-120000.1.json"
+    canon.write_text("{}", encoding="utf-8")
+    fresh.write_text("{}", encoding="utf-8")
+    os.utime(canon, (1_700_000_000, 1_700_000_000))
+    os.utime(fresh, (1_800_000_000, 1_800_000_000))
+    assert discover(tmp_path) == [("101", fresh)]
+
+
+def test_discover_ignores_non_raw_suffixes(tmp_path):
+    (tmp_path / "101_raw.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "101_raw_backup.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "gallery_101_raw.json").write_text("{}", encoding="utf-8")
+    assert [pid for pid, _ in discover(tmp_path)] == ["101"]

@@ -108,14 +108,16 @@ SORT_DEVIATION_RATIO = 0.7
 
 # used=False с этими reason — реальный сбой активации варианта (брак);
 # no_widget/no_variant_opt — легитимно (тумблера нет, список и так варианта).
-VM_BAD_REASONS = {"click_error", "click_no_effect", "timeout", "disabled"}
+VM_BAD_REASONS = {"click_error", "click_no_effect", "timeout"}
 
 
-def variant_review_problems(raw) -> list:
+def variant_review_problems(raw, allow_filter_disabled: bool = False) -> list:
     """Брак варианта/числа отзывов по правилу «собранное = Этот вариант (N)».
 
     Возвращает список проблем ([] = ок):
     - reviews_variant_mode.used == False с reason из VM_BAD_REASONS;
+    - reason == "disabled" без allow_filter_disabled: это raw, собранный с
+      --no-variant-mode, и он не должен попадать в демон как кеш-хит (I1);
     - variant_count <= 100 и собрано меньше с учётом допуска 3%
       (стена логина на границе vc≈100 отрезает ~1-3 карточки; пример:
       4483627458 — собрано 98/100, в DOM без логина доступно 96);
@@ -137,7 +139,8 @@ def variant_review_problems(raw) -> list:
         # Явный ноль от виджета варианта: у выбранного варианта отзывов нет.
         # Подставлять rating_count всего товара нельзя — это чужие отзывы
         # других вариантов (ложный short(0/370, cap~100), кейс 5575856356).
-        return []
+        # Reviews next to vc=0 mean the filter was not actually active.
+        return [] if n == 0 else [f"zero_variant_but_reviews({n})"]
     if not (isinstance(vc, int) and vc > 0):
         # Нет виджета варианта -> ожидаемый объём = число отзывов товара.
         rc = (raw.get("product") or {}).get("rating_count")
@@ -148,6 +151,8 @@ def variant_review_problems(raw) -> list:
         reason = vm.get("reason")
         if reason in VM_BAD_REASONS:
             problems.append(f"filter_not_used(reason={reason})")
+        elif reason == "disabled" and not allow_filter_disabled:
+            problems.append("filter_disabled")
     if isinstance(vc, int) and vc > 0:
         if vc <= VARIANT_COUNT_FULL_LIMIT:
             tol = max(1, round(vc * VARIANT_TOLERANCE_RATIO))
@@ -157,6 +162,12 @@ def variant_review_problems(raw) -> list:
             problems.append(f"short({n}/{vc}, cap~100)")
         if vc > VARIANT_COUNT_FULL_LIMIT:
             per_sort: dict = {}
+            # Seed with the requested sorts: a pass that returned zero reviews
+            # leaves no review keys, and without the seed the dead pass is
+            # invisible to the deviation check.
+            for s in raw.get("reviews_sorts") or []:
+                if s:
+                    per_sort[s] = 0
             for r in raw.get("reviews") or []:
                 if not isinstance(r, dict):
                     continue
@@ -1396,15 +1407,19 @@ def _parse_comment_api(body: bytes) -> tuple[list | None, str]:
             continue
         if c.get("isDeleted"):
             continue
-        text = (c.get("comment") or "").strip()
+        comment = c.get("comment")
+        text = comment.strip() if isinstance(comment, str) else ""
         if not text:
             continue
-        author = (c.get("author") or {})
-        name = (author.get("firstName") or "").strip()
+        author = c.get("author")
+        author = author if isinstance(author, dict) else {}
+        name = str(author.get("firstName") or "").strip()
         if not name:
-            brand = ((c.get("author") or {}).get("clientOfficial") or {})
-            name = (brand.get("brandName") or "").strip()
-        usefulness = (c.get("usefulness") or {})
+            brand = author.get("clientOfficial")
+            brand = brand if isinstance(brand, dict) else {}
+            name = str(brand.get("brandName") or "").strip()
+        usefulness = c.get("usefulness")
+        usefulness = usefulness if isinstance(usefulness, dict) else {}
         out.append({
             "uuid": c.get("uuid"),
             "author": name,
@@ -2086,19 +2101,25 @@ def _finalize_variant_mode(variant_mode: dict | None, reviews: list,
                            apply_variant_mode: bool) -> dict:
     """Обогащает/собирает diagnostic variant_mode (см. collect_reviews)."""
     if apply_variant_mode:
-        matched_variant = sum(1 for r in reviews if r.get("variant"))
-        dropped = len(reviews) - matched_variant
         variant_mode = variant_mode or {
             "used": False, "clicked": False, "variant_present": False,
             "variant_count": None, "active": None, "total_count": None,
             "reason": "no_pages",
         }
-        variant_mode["reviews_matched_variant"] = matched_variant
-        variant_mode["reviews_dropped_by_client_filter"] = dropped
-        if variant_mode.get("used") is True and matched_variant == 0:
-            warning = "native_filter_active_no_matching_reviews"
-            variant_mode["warning"] = warning
-            log.warning(f"[collect] warning: {warning}")
+        if variant_mode.get("used") is True:
+            matched_variant = sum(1 for r in reviews if r.get("variant"))
+            variant_mode["reviews_matched_variant"] = matched_variant
+            variant_mode["reviews_dropped_by_client_filter"] = (
+                len(reviews) - matched_variant)
+            if matched_variant == 0:
+                warning = "native_filter_active_no_matching_reviews"
+                variant_mode["warning"] = warning
+                log.warning(f"[collect] warning: {warning}")
+        else:
+            # The native filter never ran; "matched" is undefined and the
+            # old len(reviews) - matched arithmetic fabricated dropped reviews.
+            variant_mode["reviews_matched_variant"] = None
+            variant_mode["reviews_dropped_by_client_filter"] = 0
         return variant_mode
     base = {"used": False, "variant_present": False, "active": None,
             "variant_count": None, "total_count": None,
@@ -2136,6 +2157,52 @@ def _canonical_product_url(page, url: str) -> str:
                     f"{type(e).__name__}: {e}")
         return url
     return canon
+
+
+def _require_same_origin(url: str, reference: str) -> None:
+    """Reject a foreign host before any navigation to a caller-supplied URL."""
+    ref = urllib.parse.urlsplit(reference or "")
+    target = urllib.parse.urlsplit(url or "")
+    if not target.netloc:
+        return
+    if (target.scheme.lower(), target.netloc.lower()) != (
+            ref.scheme.lower(), ref.netloc.lower()):
+        raise RuntimeError(
+            f"reviews_url origin mismatch: {target.netloc} != {ref.netloc}")
+
+
+def _reviews_tab_url(page, product_url: str, reviews_url: str | None,
+                     expected_pid: str | None) -> str:
+    """Build the reviews-tab URL without duplicating "?" or trusting a foreign PID.
+
+    Ozon links copied from a browser often carry a query string. Naive
+    concatenation produced "...?at=...?tab=reviews" and the tab never opened.
+    A caller-supplied reviews URL for another product would silently attach
+    foreign reviews to the requested PID, so it is rejected.
+    """
+    if reviews_url:
+        reviews_url = urllib.parse.urljoin(product_url, reviews_url)
+    if reviews_url and expected_pid:
+        _require_same_origin(reviews_url, product_url)
+        rid = pid_from_url(reviews_url)
+        if rid == "unknown" or str(rid) != str(expected_pid):
+            raise RuntimeError(
+                f"reviews_url PID mismatch: requested {expected_pid}, "
+                f"reviews_url points to {rid}")
+    base = _canonical_product_url(page, reviews_url) if reviews_url else product_url
+    if reviews_url and expected_pid:
+        rid = pid_from_url(base)
+        if rid == "unknown" or str(rid) != str(expected_pid):
+            raise RuntimeError(
+                f"reviews_url PID mismatch: requested {expected_pid}, "
+                f"reviews_url points to {rid}")
+    parts = urllib.parse.urlsplit(base or "")
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(
+        parts.query, keep_blank_values=True) if k != "tab"]
+    query.append(("tab", "reviews"))
+    return urllib.parse.urlunsplit((
+        parts.scheme, parts.netloc, parts.path,
+        urllib.parse.urlencode(query), parts.fragment))
 
 
 def collect_reviews(
@@ -2248,9 +2315,14 @@ def collect_reviews(
 
 
 def pid_from_url(url: str) -> str:
-    url = (url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
-    m = re.search(r"(?:-(\d+)|/(\d+))/?$", url)
-    return (m.group(1) or m.group(2)) if m else "unknown"
+    """Extract the product id from the /product/<slug>-<id>/ path segment.
+
+    Looking only at the end of the URL was unsafe: ".../product/456/reviews/"
+    produced "unknown" and bypassed the foreign-PID guard.
+    """
+    path = urllib.parse.urlsplit(url or "").path
+    m = re.search(r"/product/(?:[^/?#]*-)?(\d+)(?:/|$)", path)
+    return m.group(1) if m else "unknown"
 
 
 REVIEWS_API_ENV = "OZON_REVIEWS_API"
@@ -2434,9 +2506,8 @@ def collect(
                     raise
                 log.warning(f"[collect] dom snapshot warn: {e}")
                 dom_html = None
-        rurl = reviews_url or product_url + "?tab=reviews"
-        if reviews_url:
-            rurl = _canonical_product_url(sess.page, reviews_url) + "?tab=reviews"
+        rurl = _reviews_tab_url(sess.page, product_url, reviews_url,
+                                requested_pid)
         rc = product.get("rating_count")
         no_count_hint = not (isinstance(rc, int) and rc > 0)
         if skip_reviews:
@@ -2544,9 +2615,9 @@ def collect(
         pid = pid_from_url(product_url)
         out_path = K.raw_save_path(pid, overwrite=overwrite)
     if out_path != K.raw_path(pid_from_url(product_url)) and not overwrite:
-        print(f"[collect] {K.raw_path(pid_from_url(product_url))} уже "
-              f"существует — сохраняю в {os.path.basename(out_path)} "
-              f"(перезапись только с --overwrite)")
+        log.info(f"[collect] {K.raw_path(pid_from_url(product_url))} уже "
+                 f"существует — сохраняю в {out_path} "
+                 f"(перезапись только с --overwrite)")
     K.atomic_write_json(out_path, raw)
     log.info(f"[collect] сохранено: {out_path} ({len(reviews)} отзывов)")
     return raw

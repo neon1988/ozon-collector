@@ -53,10 +53,15 @@ def _add_reviews_api_arg(parser) -> None:
 
 
 def _parse_sorts(value):
-    """Парсит --sorts 'a,b,c' в список (None при пустом значении)."""
+    """Парсит --sorts 'a,b,c' в список (None при пустом значении).
+
+    A value made only of separators ("," / " , ") yields an empty list; treat
+    it as "not specified" so the default sort is used instead of zero passes.
+    """
     if not value:
         return None
-    return [v.strip() for v in value.split(",") if v.strip()]
+    sorts = [v.strip() for v in value.split(",") if v.strip()]
+    return sorts or None
 
 
 def parse_pids(raw):
@@ -133,8 +138,7 @@ def cmd_collect(args):
         sorts=_parse_sorts(args.sorts),
         reviews_api=args.reviews_api or None,
     )
-    log.info(f"[cli] DONE. reviews={raw['reviews_collected']}, "
-             f"out=data/{C.pid_from_url(url)}_raw.json")
+    log.info(f"[cli] DONE. reviews={raw['reviews_collected']}")
 
 
 def cmd_ocr(args):

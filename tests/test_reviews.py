@@ -19,6 +19,56 @@ from ozon_collector.collect import EXPAND_REVIEWS_JS, REVIEWS_JS  # noqa: E402
 import ozon_collector.collect as collect_mod
 
 
+def test_reviews_tab_url_does_not_duplicate_query():
+    url = collect_mod._reviews_tab_url(
+        None, "https://www.ozon.ru/product/123/",
+        "https://www.ozon.ru/product/test-123/?at=abc", "123")
+    assert url == "https://www.ozon.ru/product/test-123/?at=abc&tab=reviews"
+
+
+def test_reviews_tab_url_rejects_foreign_pid():
+    with pytest.raises(RuntimeError, match="PID mismatch"):
+        collect_mod._reviews_tab_url(
+            None, "https://www.ozon.ru/product/123/",
+            "https://www.ozon.ru/product/test-999/", "123")
+
+
+def test_reviews_tab_url_accepts_relative_path():
+    url = collect_mod._reviews_tab_url(
+        None, "https://www.ozon.ru/product/123/",
+        "/product/test-123/?at=abc", "123")
+    assert url == "https://www.ozon.ru/product/test-123/?at=abc&tab=reviews"
+
+
+def test_reviews_tab_url_rejects_foreign_host_before_navigation():
+    class _Page:
+        def goto(self, *a, **k):
+            raise AssertionError("must not navigate to a foreign host")
+
+    with pytest.raises(RuntimeError, match="origin mismatch"):
+        collect_mod._reviews_tab_url(
+            _Page(), "https://www.ozon.ru/product/123/",
+            "https://evil.example/product/123/reviews/", "123")
+
+
+def test_reviews_tab_url_rejects_pid_with_extra_path_segments():
+    with pytest.raises(RuntimeError, match="PID mismatch"):
+        collect_mod._reviews_tab_url(
+            None, "https://www.ozon.ru/product/123/",
+            "https://www.ozon.ru/product/456/reviews/", "123")
+
+
+def test_reviews_tab_url_rejects_short_foreign_pid_before_navigation():
+    class _Page:
+        def goto(self, *a, **k):
+            raise AssertionError("must not navigate to a foreign short URL")
+
+    with pytest.raises(RuntimeError, match="PID mismatch"):
+        collect_mod._reviews_tab_url(
+            _Page(), "https://www.ozon.ru/product/123/",
+            "https://www.ozon.ru/product/456", "123")
+
+
 def test_review_extract_live_markup(evaluate_reviews):
     d = evaluate_reviews(name="xiaomi")
     assert d["ok"] is True
@@ -1241,6 +1291,8 @@ def test_pid_from_url_variants():
         ("/product/3627230434/?tab=reviews", "3627230434"),
         ("https://www.ozon.ru/product/2000-1234567/", "1234567"),
         ("https://ozon.ru/product/1234567#reviews", "1234567"),
+        ("https://www.ozon.ru/product/1234567/reviews/", "1234567"),
+        ("https://www.ozon.ru/product/slug-1234567/anything", "1234567"),
     ]
     for url, pid in cases:
         assert collect_mod.pid_from_url(url) == pid, url
