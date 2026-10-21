@@ -2,7 +2,7 @@
   "task": "15th wave: deep repository audit - cache variant, URL trust, profile ownership, daemon/QA batch",
   "updated_at": "2026-10-21",
   "verify": "ALL GREEN 1906 passed, 6 skipped, 1 xfailed (301.67s)",
-  "commits": [],
+  "commits": ["f509a01", "7c188f2"],
   "next": [
     "Live check missing: short collect/QA on a real campaign after the audit fixes (marker, windows, characteristics)",
     "Linux launch_chrome.sh not executed live",
