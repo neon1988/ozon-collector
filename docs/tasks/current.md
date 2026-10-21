@@ -1,6 +1,27 @@
 # Текущее состояние — ozon-collector
 
-Обновлено 2026-10-19 (13): тринадцатый заход — ответы владельца на 5 вопросов
+Обновлено 2026-10-21 (15): пятнадцатый заход — хвост глубокого аудита.
+Закрыты: ownership launch (marker ждётся до `reconnect`, PID+start time,
+односторонний допуск), recycle с `force_stop` нового main, early marker в
+PS1 с фактическим `StartTime`, `_stop_main_browser` различает missing/dead
+marker, QA `discover` берёт свежайший timestamped raw, `promote_raw` в демоне,
+lazy-browser получает `no_variant_mode`, кэш: `stored`-контракт + confirmed
+zero (нативный срез не режется по `rating_count`). Verify: **ALL GREEN —
+1906 passed, 6 skipped, 1 xfailed** (301.67 с). Отчёт:
+`docs/audit/2026-10-20-deep-audit.md`. Живой collect/QA и Linux `.sh` не
+проверены; рабочее дерево не закоммичено.
+
+Ранее (14): четырнадцатый заход — глубокий аудит всего
+репозитория тремя read-only субагентами: 29 находок, 8 P1. Починены
+variant-blind кэш, `disabled` в `VM_BAD_REASONS`, обход `reviews_url`
+(чужой PID/хост), kill чужого main, stale/legacy marker и PID reuse,
+`INTERRUPTED` resume, CWD-зависимый QA и batch-потери. Добавлены
+helper-only очистка профиля, строгий ownership marker (PID + start time),
+same-origin проверка URL и точный pgrep в `.sh`. Verify: **ALL GREEN — 1886
+passed, 6 skipped, 1 xfailed** (303.89 с). Отчёт:
+`docs/audit/2026-10-20-deep-audit.md`.
+
+Ранее (13): тринадцатый заход — ответы владельца на 5 вопросов
 ревью: (1) production-потеря характеристик починена под новую разметку Ozon
 2026-10 (хешированные классы, строки из двух DIV, `dl=0`): структурный парсер
 + text-pair fallback под env-флагом + скролл виджета при пустом первом
@@ -56,6 +77,39 @@ visible, трей — переключатель), «Выход» в трее о
 корень «плитки» — свёрнутое TOOLWINDOW-окно — устранён (только SW_HIDE).
 Ранее: третий заход (GUID DeleteTab, патруль панели задач, balloon); трей-пульт
 («Правка 8»); 15.10 — BLOCKER + все 15 MAJOR аудита починены, verify ALL GREEN.
+
+## Четырнадцатый заход (2026-10-20): глубокий аудит всего репозитория
+
+**Запрос:** провести глубокий аудит всего проекта, исправить найденные баги,
+улучшить ключевые модули и оставить отчёт из трёх частей.
+
+**Метод:** три read-only субагента (кэш/сбор/URL, браузер/окна/ownership,
+демон/QA/тесты), затем адверсариальное ревью диффа. 29 находок, 8 P1.
+
+**Закрытые P1:**
+
+- кэш возвращал raw другого варианта (I1) — `cache._covers_variant`;
+- rescan не заменял canonical raw — `max_age_s=0/overwrite=True`;
+- `"disabled"` считался допустимым исходом — вынесен в `filter_disabled`;
+- `reviews_url` с чужим PID/хостом или `/reviews/` обходил защиту —
+  strict `pid_from_url` + same-origin + `urljoin`;
+- очистка профиля убивала чужой main — external защищён, helpers-only;
+- stale/legacy marker и PID reuse давали ownership — JSON + start time;
+- `INTERRUPTED` не снимался при resume — `_clear_interrupted_state`;
+- QA зависел от CWD и терял PID — absolute data_dir + broken rows;
+- batch `--since` + `--pids` мог скрыть PID — запрещён.
+
+**Ключевые усиления:** `process_start_epoch` (FILETIME/btime),
+`profile_process_roles`, marker-membership в `_free_stale_profile`,
+сверка marker PID с `_browser_pid` в `Session._connect`, точный pgrep в
+`launch_chrome.sh`, marker для живого Chrome с молчащим CDP в `.ps1`.
+
+**Тесты:** добавлены регрессии marker/PID reuse/helper holder, foreign host,
+`/reviews/`, relative URL, missing PID, `--since`+`--pids`, launcher marker,
+campaign names. Итог: **1886 passed, 6 skipped, 1 xfailed** (303.89 с).
+
+**Открыто:** живой collect/QA на реальной кампании не запускался; финальный
+reviewer после последней правки не получен (сетевая ошибка free-модели).
 
 ## Тринадцатый заход (2026-10-19): характеристики под новую разметку + решения владельца
 
