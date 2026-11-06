@@ -2,9 +2,8 @@
   "task": "16th wave: daemon hang on goto renderer_failure + Ctrl+C (bounded hang probe, stop-before-recovery)",
   "updated_at": "2026-11-06",
   "verify": "ALL GREEN 1911 passed, 6 skipped, 1 xfailed (289.58s)",
-  "commits": [],
+  "commits": ["94b68e7"],
   "next": [
-    "Commit the fix after user approval (4 files modified, no commit yet)",
     "Live check: rerun blok_pitaniya_atx_450w campaign (--reset) and confirm Ctrl+C exits during goto/recovery",
     "Separate task: bound the remaining page.evaluate calls (cdp.Session.eval, _feed_appeared, _collect_links, check_challenge) or add a force-exit watchdog"
   ],

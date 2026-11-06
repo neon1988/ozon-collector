@@ -13,7 +13,7 @@
 BLOCKER/MAJOR). Сирота Chrome PID 16984 снят по identity. Не проверено вживую:
 повторный прогон кампании; остаточный риск — другие неограниченные `evaluate`
 (`cdp.Session.eval`, `_feed_appeared`, `_collect_links`, `check_challenge`)
-могут так же держать Ctrl+C, нужен отдельный force-watchdog. Коммита нет.
+могут так же держать Ctrl+C, нужен отдельный force-watchdog. Коммит: 94b68e7.
 
 Ранее (15): пятнадцатый заход — хвост глубокого аудита.
 Закрыты: ownership launch (marker ждётся до `reconnect`, PID+start time,
