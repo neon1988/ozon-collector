@@ -1,6 +1,21 @@
 # Текущее состояние — ozon-collector
 
-Обновлено 2026-10-21 (15): пятнадцатый заход — хвост глубокого аудита.
+Обновлено 2026-11-06 (16): шестнадцатый заход — зависание `key_daemon` на
+`goto renderer_failure` + Ctrl+C. Корень: recovery-вкладка зависшего renderer
+(`title=about:blank`), затем `_classify_hang` звал `page.evaluate("1+1")` без
+таймаута и блокировал главный поток 38 минут (18:35:39→19:13:55); Ctrl+C лишь
+ставил флаг, force-выход проверялся только на границах цикла. Фикс:
+`wait_for_function` с таймаутом 10 с вместо `evaluate`; `_stop_before_recovery`
+на верху цикла, после `classify_error` и в начале каждой recovery-ветки →
+`CollectionInterrupted` вместо new_tab/recycle. Тесты: 148 в
+`test_browser.py`+`test_search.py`; полный `verify` — **ALL GREEN 1911 passed,
+6 skipped, 1 xfailed** (289.58 с); reviewer раунды 1–4, финал SHIP (0
+BLOCKER/MAJOR). Сирота Chrome PID 16984 снят по identity. Не проверено вживую:
+повторный прогон кампании; остаточный риск — другие неограниченные `evaluate`
+(`cdp.Session.eval`, `_feed_appeared`, `_collect_links`, `check_challenge`)
+могут так же держать Ctrl+C, нужен отдельный force-watchdog. Коммита нет.
+
+Ранее (15): пятнадцатый заход — хвост глубокого аудита.
 Закрыты: ownership launch (marker ждётся до `reconnect`, PID+start time,
 односторонний допуск), recycle с `force_stop` нового main, early marker в
 PS1 с фактическим `StartTime`, `_stop_main_browser` различает missing/dead

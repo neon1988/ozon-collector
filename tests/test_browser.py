@@ -256,22 +256,60 @@ def test_classify_timeout_is_unknown():
 
 
 class _HangPage:
-    """Зависший renderer: evaluate не возвращается (TimeoutError)."""
+    """Зависший renderer: контрольная проба не возвращается (TimeoutError)."""
 
-    def evaluate(self, *args, **kwargs):
+    def wait_for_function(self, *args, **kwargs):
         from playwright.sync_api import TimeoutError
         raise TimeoutError("Timeout 4000ms exceeded")
 
 
 class _LivePage:
-    """Живая страница: evaluate отвечает мгновенно."""
+    """Живая страница: контрольная проба отвечает мгновенно."""
 
-    def evaluate(self, *args, **kwargs):
-        return 2
+    def __init__(self):
+        self.calls = []
+
+    def wait_for_function(self, expression, **kwargs):
+        self.calls.append((expression, kwargs))
+        return None
+
+
+def test_classify_hang_probe_is_bounded_and_not_raf():
+    """У evaluate в Playwright нет таймаута: проба зависшего renderer'а
+    обязана быть ограничена драйвером и не полагаться на rAF (на скрытой
+    вкладке он не приходит). Живой случай 2026-11-06: 38 минут блокировки
+    главного потока, из-за чего Ctrl+C не срабатывал."""
+    from playwright.sync_api import TimeoutError
+    page = _LivePage()
+    c = B.classify_error(TimeoutError("Timeout 60000ms exceeded"),
+                         sess=_FakeSess(page=page))
+    assert c.error_kind == "unknown"
+    assert page.calls, "контрольная проба не вызывалась"
+    _, kwargs = page.calls[0]
+    assert 1000 <= kwargs["timeout"] <= B.HANG_PROBE_TIMEOUT_MS
+    assert isinstance(kwargs["polling"], (int, float))
+    assert kwargs["polling"] > 0
+
+
+def test_classify_hang_without_bounded_probe_does_not_call_evaluate():
+    """Нет wait_for_function → unknown, а не неограниченный evaluate.
+
+    evaluate на зависшем renderer'е не возвращается и вешает главный поток
+    навсегда; такой fallback запрещён."""
+
+    class _EvalOnlyPage:
+        def evaluate(self, *args, **kwargs):
+            raise AssertionError("неограниченный evaluate вызван")
+
+    from playwright.sync_api import TimeoutError
+    c = B.classify_error(TimeoutError("Timeout 60000ms exceeded"),
+                         sess=_FakeSess(page=_EvalOnlyPage()))
+    assert c.error_kind == "unknown"
+    assert c.should_recycle is False
 
 
 def test_classify_timeout_hang_recycles():
-    """TimeoutError + страница не отвечает на контрольный evaluate →
+    """TimeoutError + страница не отвечает на контрольную пробу →
     renderer_hang, recyclable (перезапуск браузера)."""
     from playwright.sync_api import TimeoutError
     c = B.classify_error(
@@ -283,7 +321,7 @@ def test_classify_timeout_hang_recycles():
 
 
 def test_classify_timeout_live_page_not_recyclable():
-    """TimeoutError, но страница жива (контрольный evaluate отвечает) →
+    """TimeoutError, но страница жива (контрольная проба отвечает) →
     временная задержка, НЕ recycle."""
     from playwright.sync_api import TimeoutError
     c = B.classify_error(

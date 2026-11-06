@@ -1,12 +1,15 @@
 {
-  "task": "15th wave: deep repository audit - cache variant, URL trust, profile ownership, daemon/QA batch",
-  "updated_at": "2026-10-21",
-  "verify": "ALL GREEN 1906 passed, 6 skipped, 1 xfailed (301.67s)",
-  "commits": ["f509a01", "7c188f2"],
+  "task": "16th wave: daemon hang on goto renderer_failure + Ctrl+C (bounded hang probe, stop-before-recovery)",
+  "updated_at": "2026-11-06",
+  "verify": "ALL GREEN 1911 passed, 6 skipped, 1 xfailed (289.58s)",
+  "commits": [],
   "next": [
-    "Live check missing: short collect/QA on a real campaign after the audit fixes (marker, windows, characteristics)",
-    "Linux launch_chrome.sh not executed live",
-    "Review report: docs/audit/2026-10-20-deep-audit.md"
+    "Commit the fix after user approval (4 files modified, no commit yet)",
+    "Live check: rerun blok_pitaniya_atx_450w campaign (--reset) and confirm Ctrl+C exits during goto/recovery",
+    "Separate task: bound the remaining page.evaluate calls (cdp.Session.eval, _feed_appeared, _collect_links, check_challenge) or add a force-exit watchdog"
   ],
-  "failed": []
+  "failed": [
+    "py-spy dump of hung daemon failed with os error 31",
+    "connect_over_cdp probe hung >25s on the stuck renderer; killed after identity check"
+  ]
 }

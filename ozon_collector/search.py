@@ -653,13 +653,17 @@ def _collect_links_with_recovery(sess, manager, url: str, limit: int,
     attempts = 0
     incident_new_tab = INCIDENT_NEW_TAB_MAX
     incident_recycle = INCIDENT_RECYCLE_MAX
-    while True:
+
+    def _stop_before_recovery():
+        """FORCE/STOP пришёл — recovery-операцию не запускаем."""
         if force_event is not None and force_event.is_set():
             raise CollectionInterrupted(forced=True)
         if stop_event is not None and stop_event.is_set():
-            log.info("[stop] прерывание докрутки выдачи до повторной попытки "
-                     "(Ctrl+C)")
+            log.info("[stop] прерывание докрутки выдачи до recovery (Ctrl+C)")
             raise CollectionInterrupted(forced=False)
+
+    while True:
+        _stop_before_recovery()
         attempt_t0 = time.time()
         attempts += 1
         try:
@@ -690,10 +694,21 @@ def _collect_links_with_recovery(sess, manager, url: str, limit: int,
         except Exception as e:
             if isinstance(e, CollectionInterrupted):
                 raise
+            # Stop/force пришёл, пока шла попытка (goto/сбор): recovery после
+            # него запрещён. Иначе после Ctrl+C открывается новая вкладка или
+            # перезапускается браузер — тот самый «recycle→reconnect→попытка»,
+            # ради которого stop_event и передаётся (см. docstring).
+            _stop_before_recovery()
             cls = B.classify_error(e, sess=sess)
+            # Стоп мог прийти во время classify (у TimeoutError это проба до
+            # 10 с): проверяем ещё раз ДО выхода по не-recyclable ошибке,
+            # иначе оригинальное исключение уйдёт вместо CollectionInterrupted
+            # и graceful-partial путь в parallel.py не сработает.
+            _stop_before_recovery()
             kind = cls.error_kind or "unknown"
             # access_challenge → FSM-лестница (FAB залипает на вкладке):
             if kind == "access_challenge" and incident_new_tab > 0:
+                _stop_before_recovery()
                 incident_new_tab -= 1
                 nt_used = INCIDENT_NEW_TAB_MAX - incident_new_tab
                 log.warning(f"[search] докрутка выдачи: access_challenge → "
@@ -712,6 +727,7 @@ def _collect_links_with_recovery(sess, manager, url: str, limit: int,
                     raise
                 continue
             if kind == "access_challenge" and incident_recycle > 0:
+                _stop_before_recovery()
                 incident_recycle -= 1
                 rc_used = INCIDENT_RECYCLE_MAX - incident_recycle
                 log.warning(f"[search] докрутка выдачи: access_challenge → "
@@ -729,6 +745,7 @@ def _collect_links_with_recovery(sess, manager, url: str, limit: int,
                 continue
             if not cls.should_recycle or attempts > max_recycles:
                 raise
+            _stop_before_recovery()
             kind = cls.error_kind or "unknown"
             log.warning(f"[search] докрутка выдачи: {kind} -> recycle браузера "
                         f"(попытка {attempts}/{max_recycles})",

@@ -320,7 +320,8 @@ def is_renderer_failure(exc) -> bool:
     Такие исключения НЕЛЬЗЯ проглатывать ниже по стеку (scroll/expand/goto):
     их надо пробрасывать наверх, чтобы сработал recovery (R1 restart + R2 retry).
     TimeoutError трактуется как подозрение на hang (операция не вернулась);
-    окончательный вердикт даёт classify_error (контрольный evaluate).
+    окончательный вердикт даёт classify_error (контрольная проба
+    wait_for_function с таймаутом).
     """
     from playwright.sync_api import Error as PWError
     if not isinstance(exc, PWError):
@@ -490,19 +491,37 @@ class BrowserProbe:
         return ProbeState.UNKNOWN, attempts
 
 
+HANG_PROBE_TIMEOUT_MS = 10000
+HANG_PROBE_POLL_MS = 100
+
+
 def _classify_hang(sess, signature: bool) -> Classification:
     """TimeoutError: операция не вернулась за таймаут (подозрение на hang).
 
-    Отличить «долго, но живо» от «renderer завис» контрольным evaluate
-    на живой странице: если страница отвечает на 1+1 — это временная
-    задержка (unknown, НЕ recyclable); если evaluate сам не возвращается
-    или кидает renderer-ошибку — renderer завис/упал (recyclable).
+    Отличить «долго, но живо» от «renderer завис» контрольным пробником
+    на живой странице: если страница отвечает — это временная
+    задержка (unknown, НЕ recyclable); если пробник не отвечает за
+    HANG_PROBE_TIMEOUT_MS или кидает renderer-ошибку — renderer завис/упал
+    (recyclable).
+
+    Проба ОБЯЗАНА быть с таймаутом: у `page.evaluate` в Playwright таймаута
+    нет, и на зависшем renderer'е он блокирует главный поток навсегда
+    (живой случай 2026-11-06: 38 минут, Ctrl+C не срабатывал).
+    `wait_for_function` ограничен драйвером; polling не «raf», иначе на
+    фоновой/скрытой вкладке кадры не приходят и проба врёт.
     """
     page = getattr(sess, "page", None)
-    if page is None:
+    probe = getattr(page, "wait_for_function", None) if page is not None else None
+    if probe is None:
+        # Нет ограниченного API — лучше «не знаем», чем вечный evaluate:
+        # решение всё равно recyclable только при доказанном hang.
         return Classification("unknown", signature=signature)
     try:
-        page.evaluate("1+1")
+        # JSHandle намеренно не dispose: dispose — протокольный вызов без
+        # таймаута, то есть ещё один шанс навсегда встать на зависшем
+        # renderer'е. Один boolean-handle освобождается с контекстом страницы.
+        probe("() => true", timeout=HANG_PROBE_TIMEOUT_MS,
+              polling=HANG_PROBE_POLL_MS)
     except Exception:
         return Classification("renderer_failure", probe_state="renderer_hang",
                               signature=signature)

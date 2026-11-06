@@ -1202,9 +1202,9 @@ def test_warmup_home_challenge_switches_tab(monkeypatch):
 
 
 class _HangPage:
-    """Зависший renderer: evaluate не возвращается (TimeoutError)."""
+    """Зависший renderer: контрольная проба не возвращается (TimeoutError)."""
 
-    def evaluate(self, *args, **kwargs):
+    def wait_for_function(self, *args, **kwargs):
         from playwright.sync_api import TimeoutError
         raise TimeoutError("Timeout 4000ms exceeded")
 
@@ -1690,6 +1690,111 @@ def test_collect_links_with_recovery_stop_blocks_retry(monkeypatch):
     else:
         raise AssertionError("ожидали CollectionInterrupted (graceful)")
     assert recycled == []            # повторная recovery НЕ запускалась
+
+
+def test_collect_links_with_recovery_stop_during_attempt_blocks_new_tab():
+    """Ctrl+C пришёл во время попытки → recovery не запускаем.
+
+    stop_event проверялся только на верху цикла: после Ctrl+C во время goto
+    открывалась новая вкладка (живой случай 2026-11-06), то есть стоп
+    игнорировался до следующей итерации."""
+    import threading as _t
+    import ozon_collector.search as _S
+    stop = _t.Event()
+    opened = []
+
+    class _Sess:
+        def goto(self, url, wait_ms=None):
+            stop.set()               # Ctrl+C прилетел внутри попытки
+            raise B.AccessChallengeError("анти-бот (search_page)")
+
+        def new_page(self):
+            opened.append(True)
+
+        @property
+        def page(self):
+            return None
+
+    try:
+        _collect_links_with_recovery(_Sess(), manager=None, url="u",
+                                     limit=5, max_recycles=2,
+                                     recovery={"events": []},
+                                     stop_event=stop)
+    except CollectionInterrupted as exc:
+        assert not exc.forced
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (graceful)")
+    assert opened == []              # new_tab после стопа НЕ открывался
+
+
+def test_collect_links_with_recovery_stop_during_hang_probe_blocks_recycle(
+        monkeypatch):
+    """Стоп во время 10-секундной hang-пробы → recycle не запускается.
+
+    Именно это окно закрывает фикс: classify_error для TimeoutError делает
+    bounded-пробу, и Ctrl+C может прийти внутри неё."""
+    import threading as _t
+    from playwright.sync_api import TimeoutError as PWTimeout
+    import ozon_collector.search as _S
+    stop = _t.Event()
+    recycled = []
+
+    class _ProbeStopPage:
+        def wait_for_function(self, *args, **kwargs):
+            stop.set()               # Ctrl+C внутри hang-пробы
+            raise PWTimeout("Timeout 10000ms exceeded")
+
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    sess.page = _ProbeStopPage()
+
+    def fake_links(*args, **kwargs):
+        raise PWTimeout("Timeout 60000ms exceeded")
+
+    monkeypatch.setattr(_S, "_collect_links", fake_links)
+    monkeypatch.setattr(_S, "_recycle_browser",
+                        lambda sess, manager, la: recycled.append(la))
+    try:
+        _collect_links_with_recovery(sess, manager=None, url="u", limit=5,
+                                     max_recycles=2, recovery={"events": []},
+                                     stop_event=stop)
+    except CollectionInterrupted as exc:
+        assert not exc.forced
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (graceful)")
+    assert recycled == []            # recycle после стопа НЕ запускался
+
+
+def test_collect_links_with_recovery_stop_during_probe_raises_interrupt(
+        monkeypatch):
+    """Стоп во время пробы при не-recyclable исходе → CollectionInterrupted,
+    а не оригинальный TimeoutError (иначе parallel.py не увидит graceful)."""
+    import threading as _t
+    from playwright.sync_api import TimeoutError as PWTimeout
+    import ozon_collector.search as _S
+    stop = _t.Event()
+
+    class _ProbeLiveStopPage:
+        def wait_for_function(self, *args, **kwargs):
+            stop.set()
+            return None              # страница жива → classify даст unknown
+
+    sess = _FakeSess([{"pid": "1", "url": "u1"}])
+    sess.page = _ProbeLiveStopPage()
+
+    def fake_links(*args, **kwargs):
+        raise PWTimeout("Timeout 60000ms exceeded")
+
+    monkeypatch.setattr(_S, "_collect_links", fake_links)
+    try:
+        _collect_links_with_recovery(sess, manager=None, url="u", limit=5,
+                                     max_recycles=2, recovery={"events": []},
+                                     stop_event=stop)
+    except CollectionInterrupted as exc:
+        assert not exc.forced
+    except PWTimeout:
+        raise AssertionError("оригинальный TimeoutError вместо остановки")
+    else:
+        raise AssertionError("ожидали CollectionInterrupted (graceful)")
 
 
 # ---- ревизия 2.9 P0: невалидный URL не доходит до Page.goto -----------------
