@@ -827,9 +827,10 @@ def _matches_browser(args, port: int,
     """Browser-процесс Chromium на нашем profile+port (не дочерний renderer).
 
     Дочерние процессы (renderer/gpu/utility) наследуют команду, но имеют
-    --type=... — они исключаются. --user-data-dir считается нашим, если
-    последний компонент пути == profile_token (по умолчанию PROFILE_TOKEN;
-    для воркеров — 'ozon-profile-worker-{k}').
+    --type=... — они исключаются. --user-data-dir сравнивается ПОЛНЫМ
+    нормализованным путём с profile_path(profile_token): basename пропускал
+    чужой Chrome с тем же именем каталога из другого OZON_PROFILE_BASE
+    (ревью 2026-11-09).
     """
     user_data_dir: str | None = None
     has_port = False
@@ -845,8 +846,8 @@ def _matches_browser(args, port: int,
         return False
     if has_type:
         return False
-    name = os.path.basename(user_data_dir.rstrip("/\\"))
-    return name == profile_token
+    want = os.path.normcase(os.path.normpath(profile_path(profile_token)))
+    return os.path.normcase(os.path.normpath(user_data_dir)) == want
 
 
 def _linux_iter_chromium_processes():
@@ -1154,16 +1155,226 @@ def _is_our_firefox_profile_argv(argv: list[str]) -> bool:
     return False
 
 
-def _matches_profile_token(args, profile_token: str) -> bool:
-    """Chromium-процесс на нашем профиле (main или дочерний --type=...)."""
-    user_data_dir: str | None = None
+def _argv_debug_port(args) -> int | None:
+    """--remote-debugging-port=N из argv (None, если флага нет/битый)."""
     for a in args:
-        if a.startswith("--user-data-dir="):
-            user_data_dir = a.split("=", 1)[1].strip("\"'")
-    if not user_data_dir:
+        if a.startswith("--remote-debugging-port="):
+            try:
+                return int(a.split("=", 1)[1].strip("\"'"))
+            except ValueError:
+                return None
+    return None
+
+
+def _matches_profile_token(args, profile_token: str) -> bool:
+    """Chromium-процесс на нашем профиле (main или дочерний --type=...).
+
+    Сравнивается ПОЛНЫЙ нормализованный путь: basename пропускал бы чужой
+    Chrome с тем же именем каталога из другого OZON_PROFILE_BASE (ревью
+    2026-11-09). Порт не учитывается — он может сдвинуться (динамическая база).
+    """
+    want = os.path.normcase(os.path.normpath(profile_path(profile_token)))
+    for a in args:
+        if not a.startswith("--user-data-dir="):
+            continue
+        cand = a.split("=", 1)[1].strip("\"'")
+        if os.path.normcase(os.path.normpath(cand)) == want:
+            return True
+    return False
+
+
+# search-first: ok — тема только этого репозитория (живой лог preflight/orphan),
+# внешних API/версий нет; источник — код process.py/parallel.py и docs/tasks.
+
+#: Аренда владельца браузера воркера (внутри профиля).
+#: Зачем: PPID нашего chrome — powershell-лаунчер, который сразу выходит,
+#: поэтому «жив ли владелец» по PPID не определить, а ответ CDP даёт лишь
+#: «браузер жив» (осиротевший Chromium тоже отвечает). Аренду пишет процесс,
+#: который запустил/принял браузер (pid + start_key), и снимает при остановке.
+OWNER_LEASE_NAME = ".ozon_collector_owner.json"
+
+
+def owner_lease_path(profile_path: str) -> str:
+    return os.path.join(profile_path, OWNER_LEASE_NAME)
+
+
+def write_owner_lease(profile_path: str, pid: int | None = None,
+                      port: int | None = None,
+                      profile_token: str | None = None) -> bool:
+    """Записать аренду владельца атомарно. Best-effort (не роняет запуск).
+
+    Каталог профиля НЕ создаётся: аренда имеет смысл только для уже
+    существующего профиля, а тесты/чужие пути не должны оставлять следов.
+    """
+    if pid is None:
+        pid = os.getpid()
+    try:
+        ident = process_identity(int(pid))
+    except Exception:
+        # best-effort: сбой identity не должен ронять запуск после Popen.
+        ident = None
+    if ident is None or not getattr(ident, "start_key", None):
+        # Аренда без start_key выключает защиту от PID-reuse: pid мог быть
+        # переиспользован, и «живым владельцем» стал бы чужой процесс.
+        # Лучше не писать аренду вовсе (missing + живой CDP = не трогаем).
+        # Старую аренду снимаем: под мёртвым владельцем живой воркер выглядел
+        # бы для чужого preflight осиротевшим (ревью 2026-11-09).
+        log.warning(f"[lease] не пишу аренду {owner_lease_path(profile_path)}: "
+                    f"identity pid={pid} недоступна")
+        clear_owner_lease(profile_path)
         return False
-    name = os.path.basename(user_data_dir.rstrip("/\\"))
-    return name == profile_token
+    payload = {
+        "pid": int(pid),
+        "start_key": getattr(ident, "start_key", None),
+        "port": int(port) if port is not None else None,
+        "profile_token": profile_token,
+        "written_at": time.time(),
+    }
+    path = owner_lease_path(profile_path)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        log.warning(f"[lease] не удалось записать аренду {path}: {e}")
+        return False
+
+
+#: Состояния аренды. «Нет файла», «битый файл» и «не читается» обязаны
+#: различаться: первое — легаси/ручной браузер (не трогаем при живом CDP),
+#: второе — наша аренда, которой нельзя доверять (владельца установить нельзя →
+#: осиротевший), третье — файловый лок (AV/индексатор): доказательством чужого
+#: владельца не является, поэтому браузер не трогаем (fail-safe).
+LEASE_MISSING = "missing"
+LEASE_OK = "ok"
+LEASE_BROKEN = "broken"
+LEASE_UNREADABLE = "unreadable"
+
+
+def _lease_payload_valid(data) -> bool:
+    """Структура аренды: pid>0 и непустой start_key.
+
+    Аренда без start_key выключала бы защиту от PID-reuse на стороне чтения,
+    поэтому доверять ей нельзя: это BROKEN, а не OK (ревью 2026-11-09).
+    """
+    if not isinstance(data, dict):
+        return False
+    pid = data.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    return bool(data.get("start_key"))
+
+
+def owner_lease_status(profile_path: str) -> tuple[str, dict | None]:
+    """Состояние аренды профиля: (missing|ok|broken|unreadable, payload|None).
+
+    Раньше read_owner_lease сводил «нет файла», OSError и битый JSON к None,
+    и любой сбой чтения включал FailSafe «CDP жив → не трогаем» — зомби жил
+    вечно, preflight падал (ревью 2026-11-09). Обратная ошибка тоже опасна:
+    устойчивый OSError чтения убивал бы браузер ЖИВОГО воркера из-за чужого
+    файлового лока, поэтому OSError после retry — отдельное состояние
+    UNREADABLE (не доказательство осиротелости), а BROKEN — только структурно
+    битый JSON.
+    """
+    path = owner_lease_path(profile_path)
+    data = None
+    for attempt in (0, 1):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            break
+        except FileNotFoundError:
+            return LEASE_MISSING, None
+        except ValueError:
+            return LEASE_BROKEN, None
+        except OSError:
+            # Транзиентный sharing/AV-lock не должен превращать аренду
+            # живого воркера в BROKEN (иначе убьём его браузер): один retry.
+            if attempt == 0:
+                time.sleep(0.05)
+                continue
+            return LEASE_UNREADABLE, None
+    if not _lease_payload_valid(data):
+        return LEASE_BROKEN, None
+    return LEASE_OK, data
+
+
+def read_owner_lease(profile_path: str) -> dict | None:
+    """Аренда владельца профиля или None (нет файла/битый JSON)."""
+    return owner_lease_status(profile_path)[1]
+
+
+def _lease_owner_alive(lease: dict | None) -> bool:
+    """Жив ли владелец из уже прочитанной аренды (защита от PID-reuse).
+
+    Fail-safe направлен в сторону «не убивать»: pid жив, но identity не
+    читается (гонка завершения/права) — это НЕ доказательство чужого
+    владельца, поэтому считаем владельца живым (ревью 2026-11-09). Убийство
+    без сверки start_key запрещено; следующий preflight перепроверит.
+    """
+    if not lease:
+        return False
+    pid = lease.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if not pid_alive(pid):
+        return False
+    ident = process_identity(pid)
+    if ident is None:
+        time.sleep(0.05)
+        ident = process_identity(pid)
+    if ident is None:
+        log.warning(f"[lease] pid {pid} жив, но identity не читается — "
+                    "считаю владельца живым (убийство без сверки запрещено)")
+        return True
+    want = lease.get("start_key")
+    if not want:
+        # Аренда без start_key защиту от PID-reuse не даёт: владельцем мог
+        # стать чужой процесс с тем же pid (ревью 2026-11-09).
+        log.warning(f"[lease] pid {pid}: в аренде нет start_key — "
+                    "владельца доказать нельзя, считаю мёртвым")
+        return False
+    return ident.start_key == want
+
+
+def owner_lease_alive(profile_path: str) -> bool:
+    """Жив ли процесс-владелец из аренды (с защитой от PID-reuse).
+
+    pid_alive обязателен ДО process_identity: на Windows OpenProcess отдаёт
+    handle даже недавно завершившегося процесса (GetProcessTimes при этом
+    читается), поэтому одна identity даёт ложное «жив» (живой замер
+    2026-11-09: мёртвый лаунчер 9320 «ожил» в проверке preflight).
+    """
+    return _lease_owner_alive(read_owner_lease(profile_path))
+
+
+def clear_owner_lease(profile_path: str) -> None:
+    """Снять аренду владельца (best-effort)."""
+    try:
+        os.remove(owner_lease_path(profile_path))
+    except OSError:
+        pass
+
+
+def owner_lease_blocks_stop(profile_path: str) -> bool:
+    """Запрещает ли аренда убийство браузера: живой ЧУЖОЙ владелец.
+
+    Своя аренда (pid == наш) не мешает: воркер сам гасит свой браузер в
+    `_cleanup_worker`. Повторное чтение аренды непосредственно перед
+    kill_records закрывает окно второго WMI-скана (force_stop → _matching
+    идёт до 30 с), в котором параллельный прогон успевает принять уже
+    поднятый браузер — его нельзя убивать (ревью 2026-11-09, TOCTOU).
+    """
+    lease = read_owner_lease(profile_path)
+    if not lease or lease.get("pid") == os.getpid():
+        return False
+    return _lease_owner_alive(lease)
 
 
 def cdp_responds(cdp_url: str, timeout_s: float = 1.5) -> bool:
@@ -1190,36 +1401,86 @@ def orphaned_worker_browser_processes(
 
     Воркер (python-процесс) запускает СВОЙ Chromium. Если воркер был убит
     принудительно (kill/Ctrl+C/таймаут), его `finally` не выполняется и
-    браузер остаётся жить — это осиротевший зомби. Здесь такой Chromium
-    идентифицируется по родителю: родитель main chrome-процесса обязан быть
-    python-процессом воркера. Родитель мёртв/не python → кандидат в осиротевшие.
+    браузер остаётся жить — это осиротевший зомби.
 
-    ДВЕ защиты, обе обязательны (правило «чужой процесс не трогать»):
+    Признак владельца — АРЕНДА `OWNER_LEASE_NAME` в профиле: процесс,
+    запустивший/принявший браузер, пишет pid + start_key. PPID для этого не
+    годится: chrome запускает powershell-лаунчер, который сразу выходит,
+    поэтому у ЖИВОГО браузера родитель тоже «мёртв» (замер 2026-10-06).
+    Ответ CDP — не признак владельца: осиротевший Chromium продолжает
+    отвечать. FailSafe «CDP отвечает → не трогаем» навсегда оставлял зомби
+    жить, а preflight падал на занятом порту (живой замер 2026-11-09:
+    worker4/9226, демон не мог стартовать 4 раза подряд).
 
-    1. **FailSafe в сторону «не трогать».** PPID у нашего chrome — это
-       powershell-лаунчер (`launch_chrome.ps1` делает CreateProcess), а не
-       python-воркер, поэтому проверка «родитель = python» почти всегда ложна.
-       Поэтому кандидатом считается процесс, у которого родитель И НЕ наш
-       владелец; решить окончательно можно только по ответам CDP.
-    2. **CDP отвечает → браузер жив, не трогаем.** Живой браузер не бывает
-       осиротевшим по определению: им пользуется воркер (или оператор вручную).
+    Правила:
+    - аренда есть и её pid+start_key живы → браузер работающего воркера,
+      не трогаем (второй параллельный запуск не убьёт чужой сбор);
+    - аренды нет и CDP отвечает → легаси/ручной браузер без аренды, не
+      трогаем (правило «чужой процесс не убивать»);
+    - аренда не читается (устойчивый файловый лок) → доказательства
+      осиротелости нет, не трогаем — следующий preflight перепроверит;
+    - аренда структурно битая (битый JSON/нет start_key) → доверять нечему,
+      считаем осиротевшим;
+    - аренда мертва или CDP молчит → осиротевший, возвращаем весь лес.
 
-    Если main-браузер на (порт, профиль) осиротел — возвращаем ВСЕ
+    Если main-браузер на профиле осиротел — возвращаем ВСЕ
     chromium-процессы этого профиля (main + дочерние renderer/gpu/utility).
     Убить только main нельзя: дочерние переживают и Chrome перезапускает
     main. Вернувшийся список можно force_stop (это не чужие процессы —
     профиль наш, а владельца-воркера больше нет).
     """
-    if cdp_responds(cdp_url):
-        # браузер жив — его не трогаем, даже если родитель «мёртв»
+    ppath = profile_path(profile_token)
+    state, lease = owner_lease_status(ppath)
+    if state == LEASE_OK and _lease_owner_alive(lease):
         return []
-    port = cdp_port(cdp_url)
+    if state == LEASE_MISSING and cdp_responds(cdp_url):
+        # Браузер без аренды (запущен старой версией/вручную): не трогаем.
+        log.warning(f"[preflight] {profile_token}: браузер без аренды "
+                    "владельца, CDP жив — не трогаю (легаси/ручной запуск)")
+        return []
+    if state == LEASE_UNREADABLE:
+        # Файловый лок (AV/индексатор) — не доказательство чужого владельца:
+        # убийство браузера живого воркера дороже лишнего preflight-раунда.
+        log.warning(f"[preflight] {profile_token}: аренда владельца не "
+                    "читается (файловый лок?) — не трогаю, проверю в следующий "
+                    "раз")
+        return []
+    if state == LEASE_BROKEN:
+        log.warning(f"[preflight] {profile_token}: аренда владельца "
+                    "повреждена — владельца установить нельзя, считаю браузер "
+                    "осиротевшим")
+
+    # Профиль воркера уникален, порт может сдвинуться (динамическая база),
+    # поэтому ищем main по профилю на ЛЮБОМ порту.
+    mains: list[tuple[int, list[str]]] = []
+    for pid, argv, _ppid in _iter_chromium_processes():
+        if not _matches_profile_token(argv, profile_token):
+            continue
+        if any(a.startswith("--type=") for a in argv):
+            continue
+        mains.append((pid, argv))
+    if state == LEASE_MISSING:
+        # Легаси-браузер без аренды мог занять СДВИНУТЫЙ порт (9444+), а
+        # настроенный cdp_url молчит. Живой CDP самого main — доказательство,
+        # что браузер работает: не трогаем (ревью 2026-11-09).
+        alive_pids = {
+            pid for pid, argv in mains
+            if (port := _argv_debug_port(argv))
+            and cdp_responds(f"http://127.0.0.1:{port}")
+        }
+        if alive_pids:
+            log.warning(f"[preflight] {profile_token}: браузер(ы) без аренды "
+                        f"{sorted(alive_pids)} отвечают по своему CDP — не трогаю")
+            mains = [(pid, argv) for pid, argv in mains
+                     if pid not in alive_pids]
+    if not mains:
+        if state in (LEASE_OK, LEASE_BROKEN):
+            # Владелец мёртв/аренда битая и процессов на профиле нет — снимаем
+            # аренду, иначе её состояние повторяется в каждом preflight.
+            clear_owner_lease(ppath)
+        return []
     orphans: list[ProcessIdentity] = []
-    for pid, argv, ppid in _iter_chromium_processes():
-        if not _matches_browser(argv, port, profile_token=profile_token):
-            continue
-        if _parent_owner_alive(ppid):
-            continue
+    for pid, _argv in mains:
         ident = process_identity(pid)
         if ident is not None:
             orphans.append(ident)
@@ -1230,7 +1491,7 @@ def orphaned_worker_browser_processes(
     # порт; их PPID-цепочка уходит к осиротевшему main). Дочерние процессы
     # своего профиля и ДРУГОГО живого браузера не трогаем.
     descendant_pids: set[int] = set()
-    frontier = {i.pid for i in orphans}
+    frontier = {pid for pid, _argv in mains}
     while frontier:
         nxt: set[int] = set()
         for pid, argv, ppid in _iter_chromium_processes():
@@ -1247,44 +1508,16 @@ def orphaned_worker_browser_processes(
         ident = process_identity(pid)
         if ident is not None:
             out.append(ident)
+    if out:
+        # TOCTOU: пока шёл медленный WMI-скан, новый воркер мог записать
+        # живую аренду и поднять браузер. Решение по устаревшему снимку
+        # убило бы браузер живого воркера (ревью 2026-11-09) — перечитываем.
+        state2, lease2 = owner_lease_status(ppath)
+        if state2 == LEASE_OK and _lease_owner_alive(lease2):
+            log.info(f"[preflight] {profile_token}: владелец ожил во время "
+                     "скана — осиротевших не убиваю")
+            return []
     return out
-
-
-def _parent_owner_alive(ppid: int | None) -> bool:
-    """Жив ли родительский python-процесс воркера (по PPID).
-
-    None (PPID не определился) трактуем как «родителя нет» → осиротевший
-    (консервативно для preflight: лишний force_stop безвреден, а вот
-    заблокированный запуск из-за зомби — вреден).
-    """
-    if ppid is None:
-        return False
-    try:
-        if os.name == "nt":
-            # Недостаточно проверить «есть ли процесс»: PID-reuse может дать
-            # чужой живой процесс с тем же PID. Имя процесса обязано быть
-            # python/pythonw (воркер-процесс). Читаем через WMI по PPID.
-            cmd = [
-                "powershell", "-NoProfile", "-Command",
-                (f"(Get-CimInstance Win32_Process -Filter "
-                 f"\"ProcessId={int(ppid)}\").Name"),
-            ]
-            out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=15, creationflags=_NO_WINDOW)
-            if out.returncode != 0 or not out.stdout.strip():
-                return False
-            name = out.stdout.strip().lower()
-            return name.startswith("python")
-        else:
-            # Linux: жив ли python-процесс с данным PPID (родитель воркера)
-            try:
-                with open(f"/proc/{int(ppid)}/comm", "rb") as f:
-                    comm = f.read().decode("utf-8", "replace").strip().lower()
-            except OSError:
-                return False
-            return comm.startswith("python")
-    except Exception:
-        return False
 
 
 # ---- Linux: pidfd (exit detection + сигналы) -------------------------------

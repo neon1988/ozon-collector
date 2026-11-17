@@ -279,6 +279,14 @@ def _launch_script(cdp_url: str, profile_path: str | None = None,
     except OSError as e:
         raise RuntimeError(f"не удалось запустить {name}: "
                            f"{type(e).__name__}: {e}") from e
+    # Аренда владельца: по ней preflight отличает зомби (владелец мёртв) от
+    # браузера работающего воркера. Только воркер-профили: main опознаётся
+    # маркером .ozon_collector_launched, а в профиль воркера аренда ложится
+    # рядом с браузером (живой замер 2026-11-09: зомби worker4 держал 9226).
+    if profile_path and profile_token and profile_token != P.PROFILE_TOKEN:
+        P.write_owner_lease(profile_path, pid=os.getpid(),
+                            port=P.cdp_port(cdp_url),
+                            profile_token=profile_token)
     return LaunchRun(logf, proc)
 
 
@@ -849,4 +857,18 @@ class BrowserProcessManager:
                 raise BrowserOwnershipError(
                     f"чужой/неизвестный Chromium на {self.cdp_url}: {ident}; "
                     "ownership violation — требуется ручное вмешательство")
+        # Окно между preflight-сканом и этим WMI-сканом (до 30 с): аренду
+        # мог записать ЖИВОЙ параллельный прогон, принявший этот браузер.
+        # Перечитываем ровно перед kill (ревью 2026-11-09, TOCTOU).
+        if owned and P.owner_lease_blocks_stop(self.profile_path):
+            log.warning(f"[browser] {self.cdp_url}: живой владелец аренды — "
+                        "kill отменён (браузер работает у другого прогона)")
+            return
         P.kill_records(owned, wait_s=wait_s)
+        # Аренда снимается только когда все owned-процессы подтверждённо
+        # мертвы: иначе живой браузер остался бы без владельца, и следующий
+        # preflight не смог бы отличить зомби от работающего воркера.
+        if owned and all(
+                getattr(r, "lifecycle", None) == P.Lifecycle.VERIFIED_DEAD
+                for r in owned):
+            P.clear_owner_lease(self.profile_path)

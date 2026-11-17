@@ -5,6 +5,7 @@ BrowserProcessManager (launch/restart/force_stop с ownership-гарантиям
 """
 from __future__ import annotations
 
+import os
 import unittest.mock as mock
 
 import pytest
@@ -127,6 +128,31 @@ def test_launch_script_keeps_predefined_chrome(monkeypatch, tmp_path):
     B._launch_script("http://127.0.0.1:9222")
 
     assert captured["env"]["CHROME"] == r"C:\my\chrome.exe"
+
+
+@pytest.mark.allow_browser_launch
+def test_launch_script_writes_worker_owner_lease(monkeypatch, tmp_path):
+    """Воркер-профиль: аренда пишется (pid воркера, порт), main — нет."""
+    import os
+    import subprocess
+
+    script = tmp_path / "launch_chrome.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: mock.Mock())
+    monkeypatch.setattr(B, "_launch_script_path", lambda: script)
+    lease = mock.Mock(return_value=True)
+    monkeypatch.setattr(P, "write_owner_lease", lease)
+
+    B._launch_script("http://127.0.0.1:9277",
+                     profile_path=r"C:\prof\ozon-profile-worker-1",
+                     profile_token="ozon-profile-worker-1")
+    lease.assert_called_once_with(
+        r"C:\prof\ozon-profile-worker-1", pid=os.getpid(), port=9277,
+        profile_token="ozon-profile-worker-1")
+
+    lease.reset_mock()
+    B._launch_script("http://127.0.0.1:9222")
+    lease.assert_not_called()
 
 
 @pytest.mark.allow_browser_launch
@@ -690,11 +716,16 @@ def test_classify_unknown_when_probe_healthy(monkeypatch):
 # ---- BrowserProcessManager: launch ------------------------------------------
 
 def _patch_manager(monkeypatch, processes=None, cdp_ready=None):
-    """Подмена окружения manager: browser_processes/_cdp_ready/sleep/launch_script."""
+    """Подмена окружения manager: browser_processes/_cdp_ready/sleep/launch_script.
+
+    Аренда владельца изолируется: реальный файл профиля на диске делал бы
+    результат force_stop зависимым от состояния машины.
+    """
     m = B.BrowserProcessManager(
         cdp_url="http://127.0.0.1:9222",
         launch_wait_s=0.2, kill_wait_s=0.2, capture_interval=0.01)
     monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    monkeypatch.setattr(P, "read_owner_lease", lambda path: None)
     monkeypatch.setattr(B, "_launch_script",
                         lambda cdp_url, profile_path=None,
                         profile_token=None: None)
@@ -848,6 +879,60 @@ def test_force_stop_own_processes(monkeypatch):
     monkeypatch.setattr(P, "kill_records", killed)
     m.force_stop([own], wait_s=0.1)
     killed.assert_called_once()
+
+
+def test_force_stop_blocked_by_live_foreign_lease(monkeypatch):
+    """Живой чужой владелец аренды (adoption во время скана) → kill отменён."""
+    own = _rec(1000)
+    m = _patch_manager(monkeypatch, processes=[own.identity])
+    killed = mock.Mock(return_value=[own])
+    monkeypatch.setattr(P, "kill_records", killed)
+    monkeypatch.setattr(P, "read_owner_lease",
+                        lambda path: {"pid": 555, "start_key": "k"})
+    monkeypatch.setattr(P, "_lease_owner_alive", lambda lease: True)
+    m.force_stop([own], wait_s=0.1)
+    killed.assert_not_called()
+    assert own.lifecycle == P.Lifecycle.CREATED
+
+
+def test_force_stop_not_blocked_by_own_lease(monkeypatch):
+    """Своя аренда (pid == наш) не мешает воркеру гасить свой браузер."""
+    own = _rec(1000)
+    m = _patch_manager(monkeypatch, processes=[own.identity])
+    killed = mock.Mock(return_value=[own])
+    monkeypatch.setattr(P, "kill_records", killed)
+    monkeypatch.setattr(P, "read_owner_lease",
+                        lambda path: {"pid": os.getpid(), "start_key": "k"})
+    monkeypatch.setattr(P, "_lease_owner_alive",
+                        lambda lease: (_ for _ in ()).throw(
+                            AssertionError("свою аренду проверять не надо")))
+    m.force_stop([own], wait_s=0.1)
+    killed.assert_called_once()
+
+
+def test_force_stop_clears_lease_only_when_verified_dead(monkeypatch):
+    own = _rec(1000)
+    m = _patch_manager(monkeypatch, processes=[own.identity])
+    monkeypatch.setattr(P, "kill_records",
+                        lambda records, wait_s=None: records)
+    cleared = mock.Mock()
+    monkeypatch.setattr(P, "clear_owner_lease", cleared)
+
+    m.force_stop([own], wait_s=0.1)
+    cleared.assert_not_called()
+
+    own.set_lifecycle(P.Lifecycle.VERIFIED_DEAD)
+    m.force_stop([own], wait_s=0.1)
+    cleared.assert_called_once_with(m.profile_path)
+
+
+def test_force_stop_empty_owned_keeps_lease(monkeypatch):
+    """all([]) == True не должен снимать аренду живого владельца."""
+    m = _patch_manager(monkeypatch, processes=[])
+    cleared = mock.Mock()
+    monkeypatch.setattr(P, "clear_owner_lease", cleared)
+    m.force_stop([], wait_s=0.1)
+    cleared.assert_not_called()
 
 
 # ---- BrowserWatchdog --------------------------------------------------------

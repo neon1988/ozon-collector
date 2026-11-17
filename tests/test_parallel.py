@@ -264,66 +264,317 @@ def test_browser_processes_token_matching(monkeypatch):
                                profile_token="ozon-profile-worker-1") == []
 
 
-def test_orphaned_worker_browser_detects_dead_parent(monkeypatch):
-    """Браузер воркера с мёртвым родителем считается осиротевшим и
-    подлежит автоочистке; с живым python-родителем — НЕ осиротевший."""
+def _orphan_argv(port=9223, worker=1):
     base = P.profile_base_dir()
-    argv = [
+    return [
         "C:/Program Files/Chrome/chrome.exe",
-        f"--user-data-dir={base}\\ozon-profile-worker-1",
-        "--remote-debugging-port=9223",
+        f"--user-data-dir={base}\\ozon-profile-worker-{worker}",
+        f"--remote-debugging-port={port}",
     ]
-    fake = [
-        (111, argv, 555),   # родитель 555 (мёртв/не python) → осиротевший
-        (222, argv, 666),   # родитель 666 — живой python → не осиротевший
-    ]
-    monkeypatch.setattr(P, "_iter_chromium_processes", lambda: iter(fake))
+
+
+def test_orphan_detected_when_lease_owner_dead(monkeypatch):
+    """Аренда есть, владелец мёртв → браузер осиротевший (даже если CDP жив)."""
+    argv = _orphan_argv()
+    monkeypatch.setattr(P, "_iter_chromium_processes",
+                        lambda: iter([(111, argv, 555)]))
     monkeypatch.setattr(P, "process_identity",
                         lambda pid: P.ProcessIdentity(pid, f"k{pid}"))
-    # 555 мёртв, 666 живой
-    monkeypatch.setattr(P, "_parent_owner_alive",
-                        lambda ppid: ppid == 666)
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_OK, {"pid": 555}))
+    monkeypatch.setattr(P, "_lease_owner_alive", lambda lease: False)
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: True)
+    ids = P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1")
+    assert [i.pid for i in ids] == [111]
+
+
+def test_orphan_found_on_shifted_port(monkeypatch):
+    """Порт мог сдвинуться (динамическая база): ищем профиль на любом порту."""
+    argv = _orphan_argv(port=9444)
+    monkeypatch.setattr(P, "_iter_chromium_processes",
+                        lambda: iter([(111, argv, 555)]))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid, f"k{pid}"))
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_MISSING, None))
     monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: False)
     ids = P.orphaned_worker_browser_processes(
         "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1")
     assert [i.pid for i in ids] == [111]
 
 
-def test_live_cdp_browser_is_never_treated_as_orphan(monkeypatch):
-    """ЖИВОЙ браузер не бывает осиротевшим, даже если родитель «мёртв».
+def test_live_lease_owner_keeps_browser(monkeypatch):
+    """Аренда жива (работающий воркер) → браузер не трогаем, WMI не нужен.
 
-    Регрессия 2026-10-06: PPID нашего chrome — это powershell-лаунчер, а
-    `_parent_owner_alive` требует имя «python», поэтому проверка всегда давала
-    «родитель мёртв». Второй параллельный запуск в preflight убивал браузеры
-    РАБОТАЮЩЕГО демона. Ответ CDP — единственный честный признак жизни.
+    Регрессия 2026-10-06: второй параллельный запуск в preflight убивал
+    браузеры РАБОТАЮЩЕГО демона. Аренда pid+start_key — доказательство
+    владельца; она заменяет прежний FailSafe «CDP отвечает → не трогаем»,
+    который навсегда оставлял жить зомби (живой замер 2026-11-09).
     """
-    base = P.profile_base_dir()
-    argv = [
-        "C:/Program Files/Chrome/chrome.exe",
-        f"--user-data-dir={base}\\ozon-profile-worker-1",
-        "--remote-debugging-port=9223",
-    ]
-    monkeypatch.setattr(P, "_iter_chromium_processes",
-                        lambda: iter([(111, argv, 555)]))
-    monkeypatch.setattr(P, "process_identity",
-                        lambda pid: P.ProcessIdentity(pid, f"k{pid}"))
-    monkeypatch.setattr(P, "_parent_owner_alive", lambda ppid: False)
-    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: True)
+    def _boom():
+        raise AssertionError("процессы не должны перечисляться при живой аренде")
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_OK, {"pid": 555}))
+    monkeypatch.setattr(P, "_lease_owner_alive", lambda lease: True)
+    monkeypatch.setattr(P, "_iter_chromium_processes", _boom)
     assert P.orphaned_worker_browser_processes(
         "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
 
 
-def test_orphan_scan_does_not_touch_processes_when_cdp_answers(monkeypatch):
-    """При живом CDP перечисление процессов даже не выполняется.
-
-    Стоит дорого (WMI на каждый процесс) и бессмысленно: браузер жив.
-    """
+def test_legacy_browser_without_lease_and_live_cdp_is_kept(monkeypatch):
+    """Браузер без аренды (старая версия/вручную) и живой CDP → не трогаем."""
     def _boom():
-        raise AssertionError("процессы не должны перечисляться при живом CDP")
+        raise AssertionError("процессы не должны перечисляться без аренды")
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_MISSING, None))
     monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: True)
     monkeypatch.setattr(P, "_iter_chromium_processes", _boom)
     assert P.orphaned_worker_browser_processes(
         "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
+
+
+def test_broken_lease_with_live_cdp_is_orphan(monkeypatch):
+    """Битый JSON аренды → владельца нет, зомби убивается даже при живом CDP."""
+    argv = _orphan_argv()
+    monkeypatch.setattr(P, "_iter_chromium_processes",
+                        lambda: iter([(111, argv, 555)]))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid, f"k{pid}"))
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_BROKEN, None))
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: True)
+    ids = P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1")
+    assert [i.pid for i in ids] == [111]
+
+
+def test_legacy_browser_on_shifted_port_is_kept(monkeypatch):
+    """Легаси без аренды на сдвинутом порту: живёт свой CDP → не трогаем."""
+    argv = _orphan_argv(port=9444)
+    monkeypatch.setattr(P, "_iter_chromium_processes",
+                        lambda: iter([(111, argv, 555)]))
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_MISSING, None))
+    monkeypatch.setattr(P, "cdp_responds",
+                        lambda url, **kw: url.endswith(":9444"))
+    assert P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
+
+
+def test_orphan_scan_real_profile_paths(monkeypatch, profile_base):
+    """Интеграционный шов: аренда в profile_path(token) ↔ скан по argv."""
+    import json
+    pp = P.profile_path("ozon-profile-worker-1")
+    os.makedirs(pp)
+    with open(P.owner_lease_path(pp), "w", encoding="utf-8") as f:
+        json.dump({"pid": 999_999_999, "start_key": "k"}, f)
+    argv = ["chrome.exe", f"--user-data-dir={pp}",
+            "--remote-debugging-port=9444"]
+    monkeypatch.setattr(P, "_iter_chromium_processes",
+                        lambda: iter([(111, argv, 555)]))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid, f"k{pid}"))
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: False)
+    ids = P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1")
+    assert [i.pid for i in ids] == [111]
+
+
+def test_orphan_scan_rereads_lease_after_slow_scan(monkeypatch):
+    """TOCTOU: за время WMI-скана воркер ожил → его браузер не убиваем."""
+    argv = _orphan_argv()
+    monkeypatch.setattr(P, "_iter_chromium_processes",
+                        lambda: iter([(111, argv, 555)]))
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid, f"k{pid}"))
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_OK, {"pid": 555}))
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: False)
+    alive = iter([False, True])
+    monkeypatch.setattr(P, "_lease_owner_alive", lambda lease: next(alive))
+    assert P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
+
+
+def test_orphan_scan_clears_dead_lease_without_processes(monkeypatch):
+    """Мёртвая аренда без процессов снимается, а не повторяется вечно."""
+    monkeypatch.setattr(P, "_iter_chromium_processes", lambda: iter([]))
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_OK, {"pid": 555}))
+    monkeypatch.setattr(P, "_lease_owner_alive", lambda lease: False)
+    cleared = mock.Mock()
+    monkeypatch.setattr(P, "clear_owner_lease", cleared)
+    assert P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
+    cleared.assert_called_once_with(P.profile_path("ozon-profile-worker-1"))
+
+
+def test_owner_lease_retries_transient_read_error(monkeypatch, profile_base):
+    """Транзиентный OSError чтения аренды — retry, а не BROKEN (не убиваем)."""
+    pp = str(profile_base / "ozon-profile-worker-4")
+    os.makedirs(pp)
+    real_load = P.json.load
+    calls = {"n": 0}
+
+    def flaky(f):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("sharing violation")
+        return real_load(f)
+
+    monkeypatch.setattr(P.json, "load", flaky)
+    monkeypatch.setattr(P.time, "sleep", lambda s: None)
+    with open(P.owner_lease_path(pp), "w", encoding="utf-8") as f:
+        f.write('{"pid": 1, "start_key": "k"}')
+    assert P.owner_lease_status(pp)[0] == P.LEASE_OK
+    assert calls["n"] == 2
+
+
+def test_owner_lease_persistent_read_error_is_unreadable(monkeypatch,
+                                                        profile_base):
+    """Устойчивый файловый лок → UNREADABLE, а не BROKEN (не убиваем)."""
+    pp = str(profile_base / "ozon-profile-worker-4")
+    os.makedirs(pp, exist_ok=True)
+    with open(P.owner_lease_path(pp), "w", encoding="utf-8") as f:
+        f.write('{"pid": 1, "start_key": "k"}')
+
+    def locked(_f):
+        raise OSError("sharing violation")
+
+    monkeypatch.setattr(P.json, "load", locked)
+    monkeypatch.setattr(P.time, "sleep", lambda s: None)
+    assert P.owner_lease_status(pp) == (P.LEASE_UNREADABLE, None)
+
+
+def test_orphan_scan_keeps_browser_when_lease_unreadable(monkeypatch):
+    """Аренда не читается → доказательства осиротелости нет, не трогаем."""
+    def _boom():
+        raise AssertionError("процессы не должны перечисляться (fail-safe)")
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_UNREADABLE, None))
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: False)
+    monkeypatch.setattr(P, "_iter_chromium_processes", _boom)
+    assert P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
+
+
+def test_owner_lease_without_start_key_is_broken(profile_base):
+    """Аренда без start_key не доказательство владельца (PID-reuse)."""
+    import json
+    pp = str(profile_base / "ozon-profile-worker-3")
+    os.makedirs(pp, exist_ok=True)
+    with open(P.owner_lease_path(pp), "w", encoding="utf-8") as f:
+        json.dump({"pid": os.getpid()}, f)
+    assert P.owner_lease_status(pp) == (P.LEASE_BROKEN, None)
+    assert not P.owner_lease_alive(pp)
+
+
+def test_orphan_scan_clears_broken_lease_without_processes(monkeypatch):
+    """Битая аренда без процессов тоже снимается, а не логируется вечно."""
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_BROKEN, None))
+    monkeypatch.setattr(P, "_iter_chromium_processes", lambda: iter([]))
+    cleared = mock.Mock()
+    monkeypatch.setattr(P, "clear_owner_lease", cleared)
+    assert P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
+    cleared.assert_called_once_with(P.profile_path("ozon-profile-worker-1"))
+
+
+def test_write_owner_lease_clears_stale_lease_on_identity_failure(
+        monkeypatch, profile_base):
+    """Не смогли доказать свою identity → старую аренду не оставляем."""
+    pp = str(profile_base / "ozon-profile-worker-2")
+    os.makedirs(pp, exist_ok=True)
+    with open(P.owner_lease_path(pp), "w", encoding="utf-8") as f:
+        f.write('{"pid": 123456, "start_key": "dead"}')
+    monkeypatch.setattr(P, "process_identity", lambda pid: None)
+    assert P.write_owner_lease(pp, pid=os.getpid()) is False
+    assert not os.path.exists(P.owner_lease_path(pp))
+
+
+def test_orphan_scan_returns_empty_when_no_browser_processes(monkeypatch):
+    """Аренды нет, CDP молчит, процессов нет → осиротевших нет."""
+    monkeypatch.setattr(P, "owner_lease_status",
+                        lambda path: (P.LEASE_MISSING, None))
+    monkeypatch.setattr(P, "cdp_responds", lambda url, **kw: False)
+    monkeypatch.setattr(P, "_iter_chromium_processes", lambda: iter([]))
+    assert P.orphaned_worker_browser_processes(
+        "http://127.0.0.1:9223", profile_token="ozon-profile-worker-1") == []
+
+
+def test_profile_match_requires_full_path(monkeypatch):
+    """Чужой Chrome с тем же именем каталога из другого base не матчится."""
+    foreign = [
+        "C:/Other/opencode/ozon-profile-worker-1/chrome.exe",
+        "--user-data-dir=C:\\Other\\opencode\\ozon-profile-worker-1",
+    ]
+    assert not P._matches_profile_token(
+        foreign, "ozon-profile-worker-1")
+    assert P._matches_profile_token(
+        _orphan_argv(), "ozon-profile-worker-1")
+
+
+# ---- аренда владельца профиля ------------------------------------------------
+
+def test_owner_lease_roundtrip_and_pid_reuse(profile_base):
+    """Аренда переживает запись/чтение, а PID-reuse ловится по start_key."""
+    import json
+    pp = str(profile_base / "ozon-profile-worker-1")
+    os.makedirs(pp)
+    assert P.write_owner_lease(pp, pid=os.getpid(), port=9223,
+                               profile_token="ozon-profile-worker-1")
+    lease = P.read_owner_lease(pp)
+    assert lease["pid"] == os.getpid()
+    assert lease["port"] == 9223
+    assert P.owner_lease_alive(pp)
+    # Тот же pid, но другой start_key = переиспользованный PID → не владелец.
+    lease["start_key"] = "definitely-not-this-process"
+    with open(P.owner_lease_path(pp), "w", encoding="utf-8") as f:
+        json.dump(lease, f)
+    assert not P.owner_lease_alive(pp)
+    P.clear_owner_lease(pp)
+    assert P.read_owner_lease(pp) is None
+
+
+def test_owner_lease_dead_pid(profile_base):
+    """Мёртвый pid → аренда не пишется (нет identity/start_key), владельца нет."""
+    pp = str(profile_base / "ozon-profile-worker-2")
+    os.makedirs(pp)
+    assert P.write_owner_lease(pp, pid=999_999_999, port=9224,
+                               profile_token="ozon-profile-worker-2") is False
+    assert P.owner_lease_status(pp) == (P.LEASE_MISSING, None)
+    assert not P.owner_lease_alive(pp)
+
+
+def test_lease_owner_alive_with_unreadable_identity(monkeypatch):
+    """pid жив, identity не читается → НЕ владелец-мертвец: не убиваем."""
+    monkeypatch.setattr(P, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(P, "process_identity", lambda pid: None)
+    monkeypatch.setattr(P.time, "sleep", lambda s: None)
+    assert P._lease_owner_alive({"pid": 555, "start_key": "k"}) is True
+    # Явный mismatch start_key — доказательство PID-reuse → владелец мёртв.
+    monkeypatch.setattr(P, "process_identity",
+                        lambda pid: P.ProcessIdentity(pid, "other"))
+    assert P._lease_owner_alive({"pid": 555, "start_key": "k"}) is False
+
+
+def test_owner_lease_write_is_best_effort(profile_base):
+    """Нет каталога профиля → запись не падает и не создаёт его."""
+    pp = str(profile_base / "missing-profile")
+    assert P.write_owner_lease(pp, pid=os.getpid()) is False
+    assert not os.path.exists(pp)
+
+
+def test_owner_lease_ignores_broken_json(profile_base):
+    pp = str(profile_base / "ozon-profile-worker-3")
+    os.makedirs(pp)
+    with open(P.owner_lease_path(pp), "w", encoding="utf-8") as f:
+        f.write("{not json")
+    assert P.owner_lease_status(pp) == (P.LEASE_BROKEN, None)
+    assert P.read_owner_lease(pp) is None
+    assert not P.owner_lease_alive(pp)
 
 
 # ---- preflight -----------------------------------------------------------------

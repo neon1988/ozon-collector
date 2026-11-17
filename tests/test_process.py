@@ -145,15 +145,20 @@ def test_tokenize_cmdline_respects_quotes():
                        r"\opencode\ozon-profile")
 
 
+def _our_data_dir(token: str | None = None) -> str:
+    """--user-data-dir нашего профиля: сравнение идёт ПОЛНЫМ путём."""
+    return f"--user-data-dir={P.profile_path(token or P.PROFILE_TOKEN)}"
+
+
 def test_matches_browser_positive():
     args = ["chrome", "--remote-debugging-port=9222",
-            "--user-data-dir=/tmp/opencode/ozon-profile", "--no-first-run"]
+            _our_data_dir(), "--no-first-run"]
     assert P._matches_browser(args, 9222)
 
 
 def test_matches_browser_wrong_port():
     args = ["chrome", "--remote-debugging-port=9333",
-            "--user-data-dir=/tmp/opencode/ozon-profile"]
+            _our_data_dir()]
     assert not P._matches_browser(args, 9222)
 
 
@@ -163,9 +168,16 @@ def test_matches_browser_wrong_profile():
     assert not P._matches_browser(args, 9222)
 
 
+def test_matches_browser_same_basename_other_base():
+    """Чужой Chrome с тем же именем каталога из другого base — не наш."""
+    args = ["chrome", "--remote-debugging-port=9222",
+            "--user-data-dir=C:\\Other\\opencode\\ozon-profile"]
+    assert not P._matches_browser(args, 9222)
+
+
 def test_matches_browser_renderer_child_excluded():
     args = ["chrome", "--remote-debugging-port=9222",
-            "--user-data-dir=/tmp/opencode/ozon-profile",
+            _our_data_dir(),
             "--type=renderer", "--no-sandbox"]
     assert not P._matches_browser(args, 9222)
 
@@ -177,14 +189,12 @@ def test_matches_browser_missing_udp():
 
 def test_browser_processes_filters_to_browser_only(monkeypatch):
     """Из потока процессов берём только Browser-процесс на нашем profile+port."""
+    udd = _our_data_dir()
     fake = [
-        (1001, ["chrome", "--remote-debugging-port=9222",
-                "--user-data-dir=/tmp/opencode/ozon-profile"], 900),
-        (1002, ["chrome", "--remote-debugging-port=9222",
-                "--user-data-dir=/tmp/opencode/ozon-profile",
+        (1001, ["chrome", "--remote-debugging-port=9222", udd], 900),
+        (1002, ["chrome", "--remote-debugging-port=9222", udd,
                 "--type=renderer"], 1001),
-        (1003, ["chrome", "--remote-debugging-port=9333",
-                "--user-data-dir=/tmp/opencode/ozon-profile"], 900),
+        (1003, ["chrome", "--remote-debugging-port=9333", udd], 900),
         (1004, ["chrome", "--remote-debugging-port=9222",
                 "--user-data-dir=/tmp/opencode/other-profile"], 900),
     ]

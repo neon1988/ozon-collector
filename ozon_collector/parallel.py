@@ -871,6 +871,16 @@ def worker_main(spec: dict, task: dict, conn, p2w_conn):
 
         def _ensure_session():
             """Поднять браузер воркера + прогреть сессию."""
+            # Аренда владельца ДО handshake: браузер мог быть доставлен
+            # живым (adoption) под старой мёртвой арендой — чужой preflight
+            # в это окно убил бы принятый браузер (ревью 2026-11-09).
+            # launch тоже пишет аренду, дубль безвреден (тот же pid).
+            # Firefox аренду не использует (chromium-профиль не его) —
+            # не оставляем ему чужую висящую аренду.
+            if spec.get("kind") != "firefox":
+                P.write_owner_lease(spec["profile_path"], pid=os.getpid(),
+                                    port=spec["port"],
+                                    profile_token=spec["profile_token"])
             s = _make_session(spec)
             m = _make_manager(spec)
             set_scroll_jitter_seed(task.get("scroll_jitter_seed"))
